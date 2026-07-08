@@ -316,9 +316,20 @@ static pte_t fixmap_pte[PTRS_PER_PTE] __page_aligned_bss;
 
 pgd_t early_pg_dir[PTRS_PER_PGD] __initdata __aligned(PAGE_SIZE);
 
+#if defined(CONFIG_XIP_KERNEL) && defined(__PAGETABLE_PMD_FOLDED)
+static pte_t trampoline_pte[PTRS_PER_PTE] __page_aligned_bss;
+static pte_t early_pte[PTRS_PER_PTE] __initdata __aligned(PAGE_SIZE);
+#endif
+
 #ifdef CONFIG_XIP_KERNEL
 #define pt_ops			(*(struct pt_alloc_ops *)XIP_FIXUP(&pt_ops))
 #define trampoline_pg_dir      ((pgd_t *)XIP_FIXUP(trampoline_pg_dir))
+
+#ifdef __PAGETABLE_PMD_FOLDED
+#define trampoline_pte         ((pte_t *)XIP_FIXUP(trampoline_pte))
+#define early_pte              ((pte_t *)XIP_FIXUP(early_pte))
+#endif
+
 #define fixmap_pte             ((pte_t *)XIP_FIXUP(fixmap_pte))
 #define early_pg_dir           ((pgd_t *)XIP_FIXUP(early_pg_dir))
 #endif /* CONFIG_XIP_KERNEL */
@@ -717,10 +728,12 @@ extern char _xiprom[], _exiprom[], __data_loc;
 asmlinkage void __init __copy_data(void)
 {
 	void *from = (void *)(&__data_loc);
-	void *to = (void *)CONFIG_PHYS_RAM_BASE;
-	size_t sz = (size_t)((uintptr_t)(&_end) - (uintptr_t)(&_sdata));
+	char *to = (char *)CONFIG_PHYS_RAM_BASE;
+	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) - (uintptr_t)(&_sdata));
+	size_t bss_sz = (size_t)((uintptr_t)(&_end) - (uintptr_t)(&__bss_start));
 
-	memcpy(to, from, sz);
+	memcpy(to, from, data_sz);
+	memset(to + data_sz, 0, bss_sz);
 }
 #endif
 
@@ -916,6 +929,33 @@ static void __init relocate_kernel(void)
 #endif /* CONFIG_RELOCATABLE */
 
 #ifdef CONFIG_XIP_KERNEL
+static bool __init kernel_xip_uses_4k_leaf_mappings(void)
+{
+	return !IS_ENABLED(CONFIG_64BIT) &&
+	       !!(kernel_map.xiprom & (PGDIR_SIZE - 1));
+}
+
+#ifdef __PAGETABLE_PMD_FOLDED
+static void __init create_kernel_xip_pte_mapping(pgd_t *pgdir, pte_t *ptep)
+{
+	uintptr_t va, end_va;
+	uintptr_t pgd_idx = pgd_index(kernel_map.virt_addr);
+
+	BUG_ON(!kernel_xip_uses_4k_leaf_mappings());
+	BUG_ON(kernel_map.xiprom_sz > PGDIR_SIZE);
+
+	memset(ptep, 0, PAGE_SIZE);
+	pgdir[pgd_idx] = pfn_pgd(PFN_DOWN((uintptr_t)ptep), PAGE_TABLE);
+
+	end_va = kernel_map.virt_addr + kernel_map.xiprom_sz;
+	for (va = kernel_map.virt_addr; va < end_va; va += PAGE_SIZE)
+		create_pte_mapping(ptep, va,
+				   kernel_map.xiprom +
+				   (va - kernel_map.virt_addr),
+				   PAGE_SIZE, PAGE_KERNEL_EXEC);
+}
+#endif
+
 static void __init create_kernel_page_table(pgd_t *pgdir,
 					    __always_unused bool early)
 {
@@ -923,10 +963,24 @@ static void __init create_kernel_page_table(pgd_t *pgdir,
 
 	/* Map the flash resident part */
 	end_va = kernel_map.virt_addr + kernel_map.xiprom_sz;
-	for (va = kernel_map.virt_addr; va < end_va; va += PMD_SIZE)
-		create_pgd_mapping(pgdir, va,
-				   kernel_map.xiprom + (va - kernel_map.virt_addr),
-				   PMD_SIZE, PAGE_KERNEL_EXEC);
+	if (kernel_xip_uses_4k_leaf_mappings()) {
+#ifdef __PAGETABLE_PMD_FOLDED
+		if (early)
+			create_kernel_xip_pte_mapping(pgdir, early_pte);
+		else
+#endif
+			for (va = kernel_map.virt_addr; va < end_va; va += PAGE_SIZE)
+				create_pgd_mapping(pgdir, va,
+						   kernel_map.xiprom +
+						   (va - kernel_map.virt_addr),
+						   PAGE_SIZE, PAGE_KERNEL_EXEC);
+	} else {
+		for (va = kernel_map.virt_addr; va < end_va; va += PMD_SIZE)
+			create_pgd_mapping(pgdir, va,
+					   kernel_map.xiprom +
+					   (va - kernel_map.virt_addr),
+					   PMD_SIZE, PAGE_KERNEL_EXEC);
+	}
 
 	/* Map the data in RAM */
 	start_va = kernel_map.virt_addr + (uintptr_t)&_sdata - (uintptr_t)&_start;
@@ -1131,8 +1185,16 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * physical addresses (if the start of dram is different from the
 	 * kernel physical address start).
 	 */
-	kernel_map.va_pa_offset = IS_ENABLED(CONFIG_64BIT) ?
-				0UL : PAGE_OFFSET - kernel_map.phys_addr;
+	if (IS_ENABLED(CONFIG_64BIT)) {
+		kernel_map.va_pa_offset = 0UL;
+	} else if (IS_ENABLED(CONFIG_XIP_KERNEL)) {
+		kernel_map.va_pa_offset = kernel_map.virt_addr +
+					   (uintptr_t)&_sdata -
+					   (uintptr_t)&_start -
+					   kernel_map.phys_addr;
+	} else {
+		kernel_map.va_pa_offset = PAGE_OFFSET - kernel_map.phys_addr;
+	}
 
 	memory_limit = KERN_VIRT_SIZE;
 
@@ -1195,8 +1257,19 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 #endif
 #else
 	/* Setup trampoline PGD */
+#ifdef CONFIG_XIP_KERNEL
+	if (kernel_xip_uses_4k_leaf_mappings())
+		create_kernel_xip_pte_mapping(trampoline_pg_dir,
+					      trampoline_pte);
+	else
+		create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
+				   kernel_map.xiprom, PGDIR_SIZE,
+				   PAGE_KERNEL_EXEC);
+#else
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
-			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+			   kernel_map.phys_addr, PGDIR_SIZE,
+			   PAGE_KERNEL_EXEC);
+#endif
 #endif
 
 	/*
@@ -1335,7 +1408,7 @@ static void __init setup_vm_final(void)
 	create_linear_mapping_page_table();
 
 	/* Map the kernel */
-	if (IS_ENABLED(CONFIG_64BIT))
+	if (IS_ENABLED(CONFIG_64BIT) || IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
 
 #ifdef CONFIG_KASAN

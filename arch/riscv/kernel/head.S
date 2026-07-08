@@ -183,6 +183,10 @@ secondary_start_sbi:
 .Lsetup_trap_vector:
 	/* Set trap vector to exception handler */
 	la a0, handle_exception
+#ifdef CONFIG_SOC_ESP32S31
+	/* ESP32-S31 uses CLIC mode, encoded in the low stvec bits. */
+	ori a0, a0, 3
+#endif
 	csrw CSR_TVEC, a0
 
 	/*
@@ -195,9 +199,16 @@ secondary_start_sbi:
 SYM_CODE_END(_start)
 
 SYM_CODE_START(_start_kernel)
+#ifdef CONFIG_SOC_ESP32S31
+	/* Keep S-mode interrupts off while the CLIC path is still firmware-owned. */
+	li t0, 2
+	csrc sstatus, t0
+#endif
 	/* Mask all interrupts */
+#ifndef CONFIG_SOC_ESP32S31
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
+#endif
 
 #ifdef CONFIG_RISCV_M_MODE
 	/* flush the instruction cache */
@@ -211,6 +222,9 @@ SYM_CODE_START(_start_kernel)
 	 * not implement PMPs, so we set up a quick trap handler to just skip
 	 * touching the PMPs on any trap.
 	 */
+
+	 /* Skip PMP configuration for bringup */
+#if !defined(CONFIG_SOC_ESP32S31)
 	la a0, .Lpmp_done
 	csrw CSR_TVEC, a0
 
@@ -220,6 +234,7 @@ SYM_CODE_START(_start_kernel)
 	csrw CSR_PMPCFG0, a0
 .align 2
 .Lpmp_done:
+#endif
 
 	/*
 	 * The hartid in a0 is expected later on, and we have no firmware

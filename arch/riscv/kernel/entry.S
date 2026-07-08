@@ -92,6 +92,14 @@ _new_vmalloc_restore_context_a0:
 .endm
 
 
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * ESP32-S31 runs with stvec forced to CLIC mode, whose BASE field is
+	 * 64-byte aligned.  Keep the common Linux exception entry on that
+	 * boundary so synchronous traps do not land before handle_exception.
+	 */
+	.balign 64
+#endif
 SYM_CODE_START(handle_exception)
 	/*
 	 * If coming from userspace, preserve the user thread pointer and load
@@ -187,6 +195,12 @@ SYM_CODE_START(handle_exception)
 	j ret_from_exception
 1:
 	/* Handle other exceptions */
+#ifdef CONFIG_SOC_ESP32S31
+	/* ESP32-S31 Hack: Mask CLIC implementation bits for exceptions */
+	li t0, 0xfff
+	and s4, s4, t0
+	REG_S s4, PT_CAUSE(sp)   /* Store masked cause so handlers see correct code */
+#endif
 	slli t0, s4, RISCV_LGPTR
 	la t1, excp_vect_table
 	la t2, excp_vect_table_end
