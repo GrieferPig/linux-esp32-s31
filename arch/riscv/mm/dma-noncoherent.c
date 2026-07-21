@@ -145,7 +145,8 @@ void arch_setup_dma_ops(struct device *dev, bool coherent)
 
 void riscv_noncoherent_supported(void)
 {
-	WARN(!riscv_cbom_block_size,
+	WARN(!riscv_cbom_block_size &&
+	     !IS_ENABLED(CONFIG_RISCV_NONSTANDARD_CACHE_OPS),
 	     "Non-coherent DMA support enabled without a block size\n");
 	noncoherent_supported = true;
 }

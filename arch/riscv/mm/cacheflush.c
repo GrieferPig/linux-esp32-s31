@@ -89,6 +89,8 @@ void flush_icache_pte(struct mm_struct *mm, pte_t pte)
 	struct folio *folio = page_folio(pte_page(pte));
 
 	if (!test_bit(PG_dcache_clean, &folio->flags)) {
+		esp32s31_cache_sync_for_exec(page_to_phys(pte_page(pte)),
+					    PAGE_SIZE);
 		flush_icache_mm(mm, false);
 		set_bit(PG_dcache_clean, &folio->flags);
 	}

@@ -10,10 +10,10 @@
 	#size-cells = <1>;
 	compatible = "espressif,esp32s31";
 
-	memory@c0000000 {
+	memory@50000000 {
 		device_type = "memory";
-		/* 16MB RAM */
-		reg = <0xC0000000 0x01000000>;
+		/* 15MB cached PSRAM; the top 1MB is reserved for OpenSBI. */
+		reg = <0x50000000 0x00F00000>;
 	};
 
 	aliases {
@@ -35,6 +35,12 @@
 			riscv,isa-extensions = "i", "m", "a", "zba", "zbb", "c",
 					       "zicntr", "zicsr", "zifencei";
 			mmu-type = "riscv,sv32";
+			i-cache-block-size = <64>;
+			i-cache-sets = <256>;
+			i-cache-size = <32768>;
+			d-cache-block-size = <64>;
+			d-cache-sets = <512>;
+			d-cache-size = <65536>;
 			cpu0_intc: interrupt-controller {
 				#interrupt-cells = <1>;
 				interrupt-controller;
@@ -60,6 +66,13 @@
 		#size-cells = <1>;
 		compatible = "simple-bus";
 		ranges;
+		dma-noncoherent;
+
+		cache: cache-controller@2c000000 {
+			compatible = "espressif,esp32s31-cache";
+			reg = <0x2c000000 0x1000>;
+			espressif,icache-id = <0>;
+		};
 
 		clic: interrupt-controller@10a00000 {
 			#interrupt-cells = <3>;

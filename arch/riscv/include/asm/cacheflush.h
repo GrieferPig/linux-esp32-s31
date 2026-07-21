@@ -7,6 +7,7 @@
 #define _ASM_RISCV_CACHEFLUSH_H
 
 #include <linux/mm.h>
+#include <linux/soc/espressif/esp32s31-cache.h>
 
 static inline void local_flush_icache_all(void)
 {
@@ -39,10 +40,12 @@ static inline void flush_dcache_page(struct page *page)
  * so instead we just flush the whole thing.
  */
 #define flush_icache_range(start, end) flush_icache_all()
-#define flush_icache_user_page(vma, pg, addr, len)	\
-do {							\
-	if (vma->vm_flags & VM_EXEC)			\
-		flush_icache_mm(vma->vm_mm, 0);		\
+#define flush_icache_user_page(vma, pg, addr, len)		\
+do {								\
+	if (vma->vm_flags & VM_EXEC) {				\
+		esp32s31_cache_sync_for_exec(page_to_phys(pg), PAGE_SIZE); \
+		flush_icache_mm(vma->vm_mm, 0);			\
+	}							\
 } while (0)
 
 #ifdef CONFIG_64BIT
