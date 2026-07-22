@@ -8,11 +8,12 @@ config MTD_ESP32S31_FLASH
 	depends on SOC_ESP32S31 && OF
 	help
 	  Expose the SPI flash window prepared by the ESP32-S31 bootloader as a
-	  read-only MTD NOR device. The bootloader maps the full flash at the
-	  device-tree supplied address; this driver reads the ESP-IDF partition
-	  table in Flash and registers its entries as MTD partitions.
-	  Writes and erases are deliberately not supported because Linux does not
-	  yet own the S31 MSPI flash controller.
+	  MTD NOR device. The bootloader maps the full flash at the device-tree
+	  supplied address; this driver reads the ESP-IDF partition table in Flash
+	  and registers its entries as writable MTD partitions. Writes and erases
+	  use an OpenSBI service that calls the ROM Flash API after the bootloader
+	  has enabled MSPI Flash auto-suspend, keeping the XIP instruction stream
+	  accessible.
 
 config MTD_PMC551
 	tristate "Ramix PMC551 PCI Mezzanine RAM card support"
