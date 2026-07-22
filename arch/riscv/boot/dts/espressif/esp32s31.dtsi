@@ -74,6 +74,27 @@
 			espressif,icache-id = <0>;
 		};
 
+		axi_gdma: dma-controller@20348000 {
+			compatible = "espressif,esp32s31-axi-gdma";
+			/* Reclaim bootloader-only internal DRAM after Linux handoff. */
+			reg = <0x20348000 0x1000>, <0x20587078 0x4>,
+			      <0x2f070000 0x8000>;
+			reg-names = "dma", "clkrst", "descriptors";
+			interrupt-parent = <&clic>;
+			interrupts = <33 48 IRQ_TYPE_LEVEL_HIGH>,
+				     <34 49 IRQ_TYPE_LEVEL_HIGH>,
+				     <35 50 IRQ_TYPE_LEVEL_HIGH>,
+				     <36 51 IRQ_TYPE_LEVEL_HIGH>,
+				     <37 52 IRQ_TYPE_LEVEL_HIGH>,
+				     <38 53 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx0", "rx1", "rx2",
+					  "tx0", "tx1", "tx2";
+			/* pair index, AXI peripheral trigger (LCD=0 .. SHA=5) */
+			#dma-cells = <2>;
+			dma-channels = <3>;
+			status = "okay";
+		};
+
 		clic: interrupt-controller@10a00000 {
 			#interrupt-cells = <3>;
 			#address-cells = <0>;
