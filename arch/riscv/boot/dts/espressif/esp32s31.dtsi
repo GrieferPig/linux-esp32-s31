@@ -19,6 +19,8 @@
 	aliases {
 		serial0 = &uart0;
 		serial1 = &usb_serial_jtag;
+		mmc0 = &sdmmc;
+		ethernet0 = &emac;
 	};
 
 	cpus {
@@ -61,6 +63,25 @@
 		clock-frequency = <40000000>;
 	};
 
+	/*
+	 * These clocks are established by bootloader/main before the OpenSBI
+	 * handoff.  They are deliberately fixed-clock providers: Linux has no S31
+	 * clock/power-domain controller yet, so it must not attempt to retune or
+	 * gate the underlying MPLL and CNNT SRAM domains.
+	 */
+	s31_sys_clk: system-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <80000000>;
+	};
+
+	sdmmc_ciu_clk: sdmmc-ciu-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* MPLL 500 MHz / bootloader-programmed divider 8. */
+		clock-frequency = <62500000>;
+	};
+
 	soc {
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -93,6 +114,69 @@
 			#dma-cells = <2>;
 			dma-channels = <3>;
 			status = "okay";
+		};
+
+		/*
+		 * The SDMMC and GMAC IP blocks are DesignWare cores.  The S31
+		 * gate/reset and SRAM low-power controls live in HP_SYS_CLKRST and
+		 * CNNT_SYS respectively, rather than in either core.  Do not bind
+		 * either core to the 40 MHz crystal: SDMMC is sourced from MPLL with
+		 * a programmable divider and GMAC has independently selectable MAC
+		 * and PTP clocks.
+		 *
+		 * The bootloader prepares the gates, reset state, pinmux and SRAM power
+		 * domains, then leaves them on for Linux.  A future S31 clock/genpd
+		 * controller must replace the fixed clocks before runtime PM or clock
+		 * rate changes are enabled.
+		 */
+		sdmmc: mmc@20342000 {
+			compatible = "snps,dw-mshc";
+			reg = <0x20342000 0x1000>;
+			interrupt-parent = <&clic>;
+			/* raw CLIC interrupt, IDF ETS_SDIO_HOST_INTR_SOURCE */
+			interrupts = <16 3 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&s31_sys_clk>, <&sdmmc_ciu_clk>;
+			clock-names = "biu", "ciu";
+			bus-width = <4>;
+			cap-sd-highspeed;
+			cap-sdio-irq;
+			status = "okay";
+		};
+
+		emac: ethernet@20350000 {
+			compatible = "snps,dwmac";
+			/* MAC (0x0), PTP (0x700), and DMA (0x1000) register banks. */
+			reg = <0x20350000 0x2000>;
+			interrupt-parent = <&clic>;
+			/* raw CLIC interrupt, IDF ETS_SBD_INTR_SOURCE */
+			interrupts = <17 117 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "macirq";
+			clocks = <&s31_sys_clk>, <&s31_sys_clk>, <&xtal>;
+			clock-names = "stmmaceth", "pclk", "ptp_ref";
+			/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
+			phy-mode = "rgmii-rxid";
+			phy-handle = <&yt8531>;
+			status = "okay";
+
+			mdio {
+				compatible = "snps,dwmac-mdio";
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				yt8531: ethernet-phy@0 {
+					compatible = "ethernet-phy-id4f51.e91b";
+					reg = <0>;
+					/* PHY strap: RXDLY enabled, TXDLY disabled. */
+					rx-internal-delay-ps = <1950>;
+					motorcomm,auto-sleep-disabled;
+				};
+			};
+		};
+
+		/* Entire 16 MiB Flash, mapped by the bootloader at a non-XIP alias. */
+		flash: flash@41000000 {
+			compatible = "espressif,esp32s31-flash-mtd";
+			reg = <0x41000000 0x01000000>;
 		};
 
 		usb_phy: phy@20380000 {
