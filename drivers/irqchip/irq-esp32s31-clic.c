@@ -46,7 +46,7 @@
 #include <asm/irq.h>
 
 int esp32s31_clic_set_priority(unsigned int irq, unsigned int level,
-				      unsigned int prio);
+			      unsigned int prio);
 void esp32s31_clic_handle_irq(struct pt_regs *regs);
 void esp32s31_clic_unexpected(struct pt_regs *regs);
 
@@ -256,12 +256,9 @@ static void esp32s31_clic_irq_eoi(struct irq_data *d)
 	unsigned long flags;
 
 	/*
-	 * For edge-triggered interrupts the ESP32-S31 CLIC uses
-	 * write-1-to-clear semantics on the IP (Interrupt Pending)
-	 * bit.  Writing 1 clears the edge-triggered pending latch;
-	 * writing 0 has no effect.  Confirmed against ESP-IDF
-	 * rv_utils_intr_edge_ack() which does:
-	 *   REG_SET_BIT(CLIC_INT_CTRL_REG(irq), CLIC_INT_IP);
+	 * For edge-triggered interrupts the ESP32-S31 CLIC pending latch is
+	 * acknowledged by writing 0 to the byte-wide IP register, as demonstrated
+	 * by the S31 S-mode CLIC reference implementation.
 	 *
 	 * Level-triggered interrupts are cleared by the device
 	 * de-asserting its interrupt line; no software action needed.
@@ -741,10 +738,9 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 	generic_handle_domain_irq(clic->domain, irq_id);
 
 	/*
-	 * No claim/completion needed — the hardware tracks the current
-	 * interrupt level via mintstatus.  When we mret, the CLIC restores
-	 * the previous level and delivers any pending same-level-or-lower
-	 * interrupts.
+	 * No claim/completion is needed.  The architecture trampoline restores
+	 * the complete saved scause before sstatus; sret then restores the prior
+	 * interrupt level from scause into sintstatus.
 	 */
 
 out:

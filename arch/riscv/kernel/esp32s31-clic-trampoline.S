@@ -15,8 +15,9 @@
  *
  * We must:
  *   1. Save caller-saved registers → pt_regs on stack
- *   2. Call esp32s31_clic_handle_irq(regs) with MIE disabled
- *   3. Restore saved regs, mret
+ *   2. Dispatch the hard IRQ with SIE disabled
+ *   3. Run Linux's IRQ-exit work with interrupts disabled
+ *   4. Restore the interrupted context and execute exactly one sret
  *
  * Linux's generic IRQ core expects hard IRQ handlers to run with CPU
  * interrupts disabled. The ESP32-S31 CLIC can do hardware nesting, but this
@@ -243,20 +244,24 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	beqz	t0, .Lclic_exception
 
 .Lclic_interrupt:
-
 	/*
 	 * ── Call C handler ──────────────────────────────────────────
 	 *
-	 * void esp32s31_clic_handle_irq(struct pt_regs *regs)
+	 * void do_irq(struct pt_regs *regs)
 	 *
-	 * Pass pt_regs pointer in a0. Keep MIE disabled while Linux's generic IRQ
-	 * core runs; it will account and dispatch as a normal hardirq context.
+	 * Pass pt_regs pointer in a0. Keep SIE disabled while Linux's generic IRQ
+	 * entry code accounts and dispatches the interrupt as hardirq context.
 	 *
 	 * Load a preempt-safe stack pointer if we're in the kernel
 	 * (avoid using the interrupted user stack).
 	 */
 	mv	a0, sp
-	call	esp32s31_clic_handle_irq
+	call	do_irq
+	/*
+	 * A CLIC interrupt level is popped by xret.  Do not synthesize an early
+	 * xret here: a second final xret would pop the hardware nesting state
+	 * twice and eventually underflow it to the maximum level.
+	 */
 	j	.Lclic_irq_return
 
 .Lclic_exception:
@@ -282,10 +287,10 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	 * ── Disable interrupts during cleanup ───────────────────────
 	 *
 	 * The CLIC tracks nested interrupts via the level stack.
-	 * Clearing MIE prevents higher-level interrupts from
+	 * Clearing xIE prevents higher-level interrupts from
 	 * corrupting our restore sequence.
 	 */
-	csrci	CSR_STATUS, SR_MIE
+	csrci	CSR_STATUS, SR_IE
 
 	/*
 	 * If we are returning to userspace, publish the unwound kernel stack and
@@ -304,36 +309,32 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	/*
 	 * ── Restore context and return ──────────────────────────────
 	 *
-	 * MIE was cleared above.  Restore mepc first (no side effects),
-	 * then mstatus with MIE forcibly masked off so that restoring
-	 * the saved mstatus does not accidentally re-enable interrupts
-	 * mid-way through the GPR restore loop.  mret at the end will
-	 * atomically restore the correct MIE ← MPIE.
+	 * xIE was cleared above.  Restore xcause, xstatus, then xepc in the
+	 * same order as ESP-IDF.  In particular, restore the saved status exactly:
+	 * S31 CLIC return semantics are not equivalent to synthesizing a standard
+	 * SPIE/SIE transition in software.
 	 */
 
-	/* Restore mepc first — no interrupt-state side effects */
-	REG_L	t0, PT_EPC_OFFSET(sp)
-	csrw	CSR_EPC, t0
-
-	/* Restore mstatus with MIE forcibly cleared */
-	REG_L	t0, PT_STATUS_OFFSET(sp)
-	li	t1, SR_MIE
-	not	t1, t1
-	and	t0, t0, t1
-	csrw	CSR_STATUS, t0
-
 	/*
-	 * Restore mcause — the ESP32-S31 CLIC uses mcause to track
+	 * Restore xcause before xstatus, matching ESP-IDF's CLIC return
+	 * sequence.  The ESP32-S31 CLIC uses xcause to track
 	 * interrupt level nesting.  When mret executes, the CLIC
-	 * hardware reads mcause to restore the previous level into
-	 * mintstatus.  Without this, nested interrupt priority
+	 * hardware reads xcause to restore the previous level into
+	 * xintstatus.  Without this, nested interrupt priority
 	 * tracking is corrupted.
 	 */
 	REG_L	t0, PT_CAUSE_OFFSET(sp)
 	csrw	CSR_CAUSE, t0
 
-	/* Now safe to restore GPRs — MIE is off, no preemption */
-	/* (Restore all GPRs except sp, restored last) */
+	/* Restore xstatus exactly as saved, matching ESP-IDF. */
+	REG_L	t0, PT_STATUS_OFFSET(sp)
+	csrw	CSR_STATUS, t0
+
+	/* Restore xepc after the CLIC state, as ESP-IDF does. */
+	REG_L	t0, PT_EPC_OFFSET(sp)
+	csrw	CSR_EPC, t0
+
+	/* Restore all GPRs except sp, restored last. */
 	REG_L	ra,  PT_RA_OFFSET(sp)
 	REG_L	gp,  PT_GP_OFFSET(sp)
 	REG_L	tp,  PT_TP_OFFSET(sp)
@@ -367,12 +368,12 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 
 	addi	sp, sp, PT_SIZE_ON_STACK
 
-	/*
-	 * mret returns to mepc, restores MIE ← MPIE, and informs the
-	 * CLIC that this interrupt level is done.  The CLIC then
-	 * delivers any pending interrupts at the restored level.
-	 */
+	/* xret restores xIE and the prior CLIC interrupt level atomically. */
+#ifdef CONFIG_RISCV_M_MODE
 	mret
+#else
+	sret
+#endif
 
 SYM_CODE_END(esp32s31_clic_trampoline)
 
