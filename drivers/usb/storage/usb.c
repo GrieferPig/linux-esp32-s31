@@ -37,6 +37,7 @@
 #include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
@@ -541,8 +542,19 @@ static int associate_dev(struct us_data *us, struct usb_interface *intf)
 	if (!us->cr)
 		return -ENOMEM;
 
-	us->iobuf = usb_alloc_coherent(us->pusb_dev, US_IOBUF_SIZE,
-			GFP_KERNEL, &us->iobuf_dma);
+	/*
+	 * S31 has no general coherent allocator. Its DWC2 HCD supports normal
+	 * streaming mappings, so map this small buffer for each URB instead.
+	 */
+	if (of_device_is_compatible(us->pusb_dev->bus->controller->of_node,
+				    "espressif,esp32s31-dwc2")) {
+		us->iobuf = kmalloc(US_IOBUF_SIZE, GFP_KERNEL);
+		us->iobuf_dma_coherent = false;
+	} else {
+		us->iobuf = usb_alloc_coherent(us->pusb_dev, US_IOBUF_SIZE,
+					GFP_KERNEL, &us->iobuf_dma);
+		us->iobuf_dma_coherent = true;
+	}
 	if (!us->iobuf) {
 		usb_stor_dbg(us, "I/O buffer allocation failed\n");
 		return -ENOMEM;
@@ -912,7 +924,11 @@ static void dissociate_dev(struct us_data *us)
 {
 	/* Free the buffers */
 	kfree(us->cr);
-	usb_free_coherent(us->pusb_dev, US_IOBUF_SIZE, us->iobuf, us->iobuf_dma);
+	if (us->iobuf_dma_coherent)
+		usb_free_coherent(us->pusb_dev, US_IOBUF_SIZE, us->iobuf,
+				  us->iobuf_dma);
+	else
+		kfree(us->iobuf);
 
 	/* Remove our private data from the interface */
 	usb_set_intfdata(us->pusb_intf, NULL);

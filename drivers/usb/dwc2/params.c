@@ -48,6 +48,25 @@ static void dwc2_set_his_params(struct dwc2_hsotg *hsotg)
 	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
 }
 
+static void dwc2_set_esp32s31_params(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_core_params *p = &hsotg->params;
+
+	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
+	p->phy_utmi_width = 16;
+	p->host_dma = true;
+	/* ESP-IDF uses SINGLE transfers when enabling this DWC2 AHB master. */
+	p->ahbcfg = GAHBCFG_HBSTLEN_SINGLE << GAHBCFG_HBSTLEN_SHIFT;
+	/*
+	 * S31 implements 896 FIFO words.  The generic DWC2 minimum assumes
+	 * enough RAM for two maximum packets plus high-bandwidth periodic
+	 * traffic and would otherwise program 1556 words past the SRAM end.
+	 */
+	p->host_rx_fifo_size = 512;
+	p->host_nperio_tx_fifo_size = 128;
+	p->host_perio_tx_fifo_size = 256;
+}
+
 static void dwc2_set_jz4775_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -305,6 +324,8 @@ static void dwc2_set_stm32mp15_hsotg_params(struct dwc2_hsotg *hsotg)
 
 const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "brcm,bcm2835-usb", .data = dwc2_set_bcm_params },
+	{ .compatible = "espressif,esp32s31-dwc2",
+	  .data = dwc2_set_esp32s31_params },
 	{ .compatible = "hisilicon,hi6220-usb", .data = dwc2_set_his_params },
 	{ .compatible = "ingenic,jz4775-otg", .data = dwc2_set_jz4775_params },
 	{ .compatible = "ingenic,jz4780-otg", .data = dwc2_set_jz4775_params },

@@ -1178,6 +1178,7 @@ struct dwc2_hsotg {
 	struct delayed_work start_work;
 	struct delayed_work reset_work;
 	struct work_struct phy_reset_work;
+	struct delayed_work irq_reenable_work;
 	u8 otg_port;
 	u32 *frame_list;
 	dma_addr_t frame_list_dma;

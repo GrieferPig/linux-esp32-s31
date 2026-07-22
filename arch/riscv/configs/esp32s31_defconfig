@@ -109,10 +109,18 @@ CONFIG_INET=y
 # CONFIG_I2C is not set
 # CONFIG_SPI is not set
 
-# SCSI / MMC / USB — off
-# CONFIG_SCSI is not set
+# SCSI disk support for USB mass storage
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
 # CONFIG_MMC is not set
-# CONFIG_USB_SUPPORT is not set
+
+# Integrated DesignWare USB2 host and UTMI PHY
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_DWC2=y
+CONFIG_USB_DWC2_HOST=y
+CONFIG_USB_STORAGE=y
+CONFIG_PHY_ESP32S31_USB=y
 
 # Network devices — off
 # CONFIG_NETDEVICES is not set
@@ -132,10 +140,11 @@ CONFIG_INET=y
 # CONFIG_VIRTIO_MENU is not set
 # CONFIG_VHOST_MENU is not set
 
-# Filesystems — only what initramfs needs
-# CONFIG_FAT_FS is not set
-# CONFIG_NLS_CODEPAGE_437 is not set
-# CONFIG_NLS_ISO8859_1 is not set
+# Filesystems — initramfs plus FAT-formatted removable storage
+CONFIG_FAT_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
 # CONFIG_FILE_LOCKING is not set
 # CONFIG_DNOTIFY is not set
 # CONFIG_INOTIFY_USER is not set
@@ -161,7 +170,6 @@ CONFIG_SERIAL_ESP32_CONSOLE=y
 CONFIG_INITRAMFS_SOURCE=""
 CONFIG_INITRAMFS_COMPRESSION_GZIP=y
 CONFIG_DECOMPRESS_GZIP=y
-# CONFIG_BLK_DEV_SD is not set
 # CONFIG_MMC_BLOCK is not set
 # CONFIG_MMC_DW is not set
 # CONFIG_MMC_DW_PLTFM is not set

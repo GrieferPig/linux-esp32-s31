@@ -24,6 +24,12 @@
 #include <linux/usb/ch11.h>
 #include <linux/usb/of.h>
 
+#ifdef CONFIG_SOC_ESP32S31
+#include <asm/csr.h>
+#define ESP32S31_CSR_SINTSTATUS		0xdb1
+#define ESP32S31_SINTSTATUS_SIL_MASK	0xff00
+#endif
+
 #include "core.h"
 #include "hcd.h"
 
@@ -2141,7 +2147,12 @@ static void dwc2_core_host_init(struct dwc2_hsotg *hsotg)
 	 * can vary from one PHY to another.
 	 */
 	usbcfg = dwc2_readl(hsotg, GUSBCFG);
-	usbcfg |= GUSBCFG_TOUTCAL(7);
+	usbcfg &= ~GUSBCFG_TOUTCAL_MASK;
+	if (of_device_is_compatible(hsotg->dev->of_node,
+				    "espressif,esp32s31-dwc2"))
+		usbcfg |= GUSBCFG_TOUTCAL(5);
+	else
+		usbcfg |= GUSBCFG_TOUTCAL(7);
 	dwc2_writel(hsotg, usbcfg, GUSBCFG);
 
 	/* Restart the Phy Clock */
@@ -4888,8 +4899,48 @@ static void _dwc2_hcd_endpoint_reset(struct usb_hcd *hcd,
 static irqreturn_t _dwc2_hcd_irq(struct usb_hcd *hcd)
 {
 	struct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);
+	irqreturn_t ret;
+	bool defer_reenable;
 
-	return dwc2_handle_hcd_intr(hsotg);
+	defer_reenable = of_device_is_compatible(hsotg->dev->of_node,
+					  "espressif,esp32s31-dwc2");
+	if (defer_reenable) {
+		/*
+		 * A newly queued channel can complete before the outer CLIC sret.
+		 * Keep the DWC level output low across that return boundary, then
+		 * expose completions after the CLIC hardware stack is unwound.
+		 */
+		dwc2_disable_global_interrupts(hsotg);
+		dwc2_readl(hsotg, GAHBCFG);
+	}
+
+	ret = dwc2_handle_hcd_intr(hsotg);
+	if (defer_reenable)
+		schedule_delayed_work(&hsotg->irq_reenable_work, 0);
+
+	return ret;
+}
+
+static void dwc2_irq_reenable_work(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg =
+		container_of(to_delayed_work(work), struct dwc2_hsotg,
+			     irq_reenable_work);
+
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * A worker can be scheduled by the interrupt-return path before the
+	 * final sret.  Do not expose the level interrupt until the CLIC hardware
+	 * stack confirms that the outer S-mode interrupt has been unwound.
+	 */
+	if (csr_read(ESP32S31_CSR_SINTSTATUS) &
+	    ESP32S31_SINTSTATUS_SIL_MASK) {
+		schedule_delayed_work(&hsotg->irq_reenable_work, 1);
+		return;
+	}
+#endif
+
+	dwc2_enable_global_interrupts(hsotg);
 }
 
 /*
@@ -5029,6 +5080,7 @@ static void dwc2_hcd_free(struct dwc2_hsotg *hsotg)
 	int i;
 
 	dev_dbg(hsotg->dev, "DWC OTG HCD FREE\n");
+	cancel_delayed_work_sync(&hsotg->irq_reenable_work);
 
 	/* Free memory for QH/QTD lists */
 	dwc2_qh_list_free(hsotg, &hsotg->non_periodic_sched_inactive);
@@ -5053,9 +5105,12 @@ static void dwc2_hcd_free(struct dwc2_hsotg *hsotg)
 
 	if (hsotg->params.host_dma) {
 		if (hsotg->status_buf) {
-			dma_free_coherent(hsotg->dev, DWC2_HCD_STATUS_BUF_SIZE,
-					  hsotg->status_buf,
-					  hsotg->status_buf_dma);
+			if (!of_device_is_compatible(hsotg->dev->of_node,
+						     "espressif,esp32s31-dwc2"))
+				dma_free_coherent(hsotg->dev,
+						  DWC2_HCD_STATUS_BUF_SIZE,
+						  hsotg->status_buf,
+						  hsotg->status_buf_dma);
 			hsotg->status_buf = NULL;
 		}
 	} else {
@@ -5174,6 +5229,37 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
 	hcd->rsrc_start = res->start;
 	hcd->rsrc_len = resource_size(res);
 
+	if (hsotg->params.host_dma &&
+	    of_device_is_compatible(hsotg->dev->of_node,
+				    "espressif,esp32s31-dwc2")) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+						   "local-mem");
+		if (!res) {
+			retval = -EINVAL;
+			goto error2;
+		}
+
+		if (resource_size(res) < DWC2_HCD_STATUS_BUF_SIZE) {
+			retval = -EINVAL;
+			goto error2;
+		}
+
+		/*
+		 * The core needs an addressable bit bucket for zero-length status
+		 * stages.  Keep only that buffer in internal SRAM; normal URBs use
+		 * streaming DMA so S31's non-coherent cache operations are applied.
+		 */
+		hsotg->status_buf = (void *)devm_ioremap(hsotg->dev, res->start,
+							 DWC2_HCD_STATUS_BUF_SIZE);
+		if (!hsotg->status_buf) {
+			retval = -ENOMEM;
+			goto error2;
+		}
+		hsotg->status_buf_dma = res->start;
+		memset_io((void __iomem *)hsotg->status_buf, 0,
+			  DWC2_HCD_STATUS_BUF_SIZE);
+	}
+
 	((struct wrapper_priv_data *)&hcd->hcd_priv)->hsotg = hsotg;
 	hsotg->priv = hcd;
 
@@ -5233,6 +5319,7 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
 	INIT_DELAYED_WORK(&hsotg->start_work, dwc2_hcd_start_func);
 	INIT_DELAYED_WORK(&hsotg->reset_work, dwc2_hcd_reset_func);
 	INIT_WORK(&hsotg->phy_reset_work, dwc2_hcd_phy_reset_func);
+	INIT_DELAYED_WORK(&hsotg->irq_reenable_work, dwc2_irq_reenable_work);
 
 	/*
 	 * Allocate space for storing data on status transactions. Normally no
@@ -5240,10 +5327,13 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
 	 * done after usb_add_hcd since that function allocates the DMA buffer
 	 * pool.
 	 */
-	if (hsotg->params.host_dma)
-		hsotg->status_buf = dma_alloc_coherent(hsotg->dev,
-					DWC2_HCD_STATUS_BUF_SIZE,
-					&hsotg->status_buf_dma, GFP_KERNEL);
+	if (hsotg->params.host_dma) {
+		if (!hsotg->status_buf)
+			hsotg->status_buf = dma_alloc_coherent(hsotg->dev,
+						DWC2_HCD_STATUS_BUF_SIZE,
+						&hsotg->status_buf_dma,
+						GFP_KERNEL);
+	}
 	else
 		hsotg->status_buf = kzalloc(DWC2_HCD_STATUS_BUF_SIZE,
 					  GFP_KERNEL);

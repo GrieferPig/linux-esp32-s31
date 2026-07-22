@@ -95,6 +95,29 @@
 			status = "okay";
 		};
 
+		usb_phy: phy@20380000 {
+			compatible = "espressif,esp32s31-usb-phy";
+			reg = <0x20380000 0x20>, <0x205870ac 0x4>,
+			      <0x20359030 0x4>, <0x20589024 0x4>,
+			      <0x205890b0 0x4>;
+			reg-names = "utmi", "clkrst", "otg-ctrl", "usb-ctrl",
+				    "phy-ctrl";
+			#phy-cells = <0>;
+		};
+
+		usb_otghs: usb@20300000 {
+			compatible = "espressif,esp32s31-dwc2", "snps,dwc2";
+			/* Internal SRAM used for DWC2's status-stage bit bucket. */
+			reg = <0x20300000 0x1000>, <0x2f050000 0x40>;
+			reg-names = "core", "local-mem";
+			interrupt-parent = <&clic>;
+			interrupts = <39 99 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb_phy>;
+			phy-names = "usb2-phy";
+			dr_mode = "host";
+			status = "okay";
+		};
+
 		clic: interrupt-controller@10a00000 {
 			#interrupt-cells = <3>;
 			#address-cells = <0>;
