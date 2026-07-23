@@ -87,17 +87,16 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 
 #define CLIC_CLINT_SW_ID 3 /* CLINT M-mode software int */
 #define CLIC_CLINT_TIMER_ID 7 /* CLINT M-mode timer int    */
-#define CLIC_S_SOFT_ID 1 /* S-mode software interrupt */
 #define CLIC_S_TIMER_ID 5 /* S-mode timer interrupt */
 #define CLIC_EXT_MIN_ID 16 /* First external IRQ        */
 #define CLIC_EXT_MAX_ID 47 /* Last external IRQ         */
 #define CLIC_NR_EXTERNAL 32 /* 16-47 inclusive           */
 #define CLIC_MAX_ID 47 /* Max interrupt ID          */
-
 /* ── CLIC configuration constants ───────────────────────────────── */
 
 #define ESP32S31_CLICINTCTLBITS 3 /* Hardwired on S31 */
 #define ESP32S31_NR_LEVELS (1 << ESP32S31_CLICINTCTLBITS) /* 8 */
+#define ESP32S31_EXTERNAL_LEVEL 1
 #define ESP32S31_MAX_PRIORITY \
 	31 /* Max sub-priority (unused at CLICINTCTLBITS=3) */
 
@@ -247,30 +246,22 @@ static void esp32s31_clic_irq_unmask(struct irq_data *d)
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
-static void esp32s31_clic_irq_eoi(struct irq_data *d)
+static void esp32s31_clic_irq_ack(struct irq_data *d)
 {
 	struct esp32s31_clic *clic = irq_data_get_irq_chip_data(d);
 	raw_spinlock_t *lock = this_cpu_ptr(&clic_lock);
 	u32 hwirq = d->hwirq;
-	u8 attr;
 	unsigned long flags;
 
 	/*
-	 * For edge-triggered interrupts the ESP32-S31 CLIC pending latch is
-	 * acknowledged by writing 0 to the byte-wide IP register, as demonstrated
-	 * by the S31 S-mode CLIC reference implementation.
-	 *
-	 * Level-triggered interrupts are cleared by the device
-	 * de-asserting its interrupt line; no software action needed.
-	 *
-	 * ATTR byte bit 1 (CLIC_ATTR_TRIG_EDGE) distinguishes
-	 * edge (1) from level (0).
+	 * S31 external slots retain clicintip after the matrix source has
+	 * deasserted.  Acknowledge both edge and level slots by writing zero.
+	 * handle_level_irq masks the slot before this callback, so a source that
+	 * is still genuinely asserted is sampled again only after the device
+	 * handler has cleared it and the slot is unmasked.
 	 */
 	raw_spin_lock_irqsave(lock, flags);
-	attr = clic_readb(clic, hwirq, ESP32S31_CLIC_INT_ATTR);
-	if (attr & CLIC_ATTR_TRIG_EDGE) {
-		clic_writeb(clic, hwirq, ESP32S31_CLIC_INT_IP, 0);
-	}
+	clic_writeb(clic, hwirq, ESP32S31_CLIC_INT_IP, 0);
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
@@ -294,12 +285,15 @@ static int esp32s31_clic_set_type(struct irq_data *d, unsigned int flow_type)
 	case IRQ_TYPE_LEVEL_HIGH:
 	case IRQ_TYPE_LEVEL_LOW:
 		attr = CLIC_ATTR_TRIG_LEVEL;
+		irq_set_handler_locked(d, handle_level_irq);
 		break;
 	case IRQ_TYPE_EDGE_RISING:
 		attr = CLIC_ATTR_TRIG_EDGE_RISE;
+		irq_set_handler_locked(d, handle_edge_irq);
 		break;
 	case IRQ_TYPE_EDGE_FALLING:
 		attr = CLIC_ATTR_TRIG_EDGE_FALL;
+		irq_set_handler_locked(d, handle_edge_irq);
 		break;
 	default:
 		return -EINVAL;
@@ -379,7 +373,7 @@ static struct irq_chip esp32s31_clic_chip = {
 	.name = "ESP32S31-CLIC",
 	.irq_mask = esp32s31_clic_irq_mask,
 	.irq_unmask = esp32s31_clic_irq_unmask,
-	.irq_eoi = esp32s31_clic_irq_eoi,
+	.irq_ack = esp32s31_clic_irq_ack,
 	.irq_set_type = esp32s31_clic_set_type,
 	.irq_set_affinity = esp32s31_clic_set_affinity,
 };
@@ -399,21 +393,35 @@ static void __iomem *esp32s31_sclic_regs __ro_after_init;
 
 static void esp32s31_intc_clic_irq_mask(struct irq_data *d)
 {
+	irq_hw_number_t hwirq = d->hwirq;
+
 	if (WARN_ON_ONCE(!esp32s31_sclic_regs))
 		return;
 
+	/*
+	 * Linux names the clock event as supervisor timer IRQ5, but S31's
+	 * physical compare is delivered directly on CLIC ID7.
+	 */
+	if (hwirq == CLIC_S_TIMER_ID)
+		hwirq = CLIC_CLINT_TIMER_ID;
+
 	writeb(0, esp32s31_sclic_regs + ESP32S31_SCLIC_CTRL_OFF +
-		  (d->hwirq * ESP32S31_CLIC_INT_STRIDE) +
+		  (hwirq * ESP32S31_CLIC_INT_STRIDE) +
 		  ESP32S31_CLIC_INT_IE);
 }
 
 static void esp32s31_intc_clic_irq_unmask(struct irq_data *d)
 {
+	irq_hw_number_t hwirq = d->hwirq;
+
 	if (WARN_ON_ONCE(!esp32s31_sclic_regs))
 		return;
 
+	if (hwirq == CLIC_S_TIMER_ID)
+		hwirq = CLIC_CLINT_TIMER_ID;
+
 	writeb(1, esp32s31_sclic_regs + ESP32S31_SCLIC_CTRL_OFF +
-		  (d->hwirq * ESP32S31_CLIC_INT_STRIDE) +
+		  (hwirq * ESP32S31_CLIC_INT_STRIDE) +
 		  ESP32S31_CLIC_INT_IE);
 }
 
@@ -475,7 +483,7 @@ static int esp32s31_clic_parse_fwspec(struct irq_fwspec *fwspec,
 
 	*hwirq = fwspec->param[0];
 	*source = UINT_MAX;
-	*level = 1;
+	*level = ESP32S31_EXTERNAL_LEVEL;
 	*type = IRQ_TYPE_NONE;
 
 	if (fwspec->param_count == 2)
@@ -505,7 +513,7 @@ static int esp32s31_clic_domain_map(struct irq_domain *d, unsigned int irq,
 	struct esp32s31_clic *clic = d->host_data;
 
 	irq_domain_set_info(d, irq, hwirq, &esp32s31_clic_chip, clic,
-			    handle_fasteoi_irq, NULL, NULL);
+			    handle_level_irq, NULL, NULL);
 
 	return 0;
 }
@@ -547,7 +555,7 @@ static int esp32s31_clic_domain_alloc(struct irq_domain *domain,
 #endif
 
 	irq_domain_set_info(domain, virq, hwirq, &esp32s31_clic_chip, clic,
-			    handle_fasteoi_irq, NULL, NULL);
+			    handle_level_irq, NULL, NULL);
 
 	raw_spin_lock_irqsave(this_cpu_ptr(&clic_lock), flags);
 	clic_writeb(clic, hwirq, ESP32S31_CLIC_INT_CTL,
@@ -555,7 +563,7 @@ static int esp32s31_clic_domain_alloc(struct irq_domain *domain,
 	raw_spin_unlock_irqrestore(this_cpu_ptr(&clic_lock), flags);
 
 	if (type != IRQ_TYPE_NONE)
-		esp32s31_clic_set_type(irq_get_irq_data(virq), type);
+		irq_set_irq_type(virq, type);
 
 	return 0;
 }
@@ -713,13 +721,26 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 	 * RISC-V interrupts routed through the riscv,cpu-intc domain.
 	 */
 	if (irq_id < CLIC_EXT_MIN_ID) {
+		unsigned long linux_irq_id = irq_id;
+
 #ifdef CONFIG_SOC_ESP32S31
-		/* Clear IP bit for S-mode edge-triggered local interrupts (e.g. Timer) */
+		/*
+		 * The local compare source is rearmed by programming MTIMECMP.
+		 * Clear its software IP latch with 0; unlike external edge slots,
+		 * writing 1 here prevents the next compare edge from being seen.
+		 */
 		u8 attr = clic_readb(clic, irq_id, ESP32S31_CLIC_INT_ATTR);
 		if (attr & CLIC_ATTR_TRIG_EDGE)
 			clic_writeb(clic, irq_id, ESP32S31_CLIC_INT_IP, 0);
+
+		/*
+		 * S31's physical compare source is local ID7.  The generic timer
+		 * is registered on architectural supervisor timer IRQ5.
+		 */
+		if (irq_id == CLIC_CLINT_TIMER_ID)
+			linux_irq_id = CLIC_S_TIMER_ID;
 #endif
-		regs->cause = CAUSE_IRQ_FLAG | irq_id;
+		regs->cause = CAUSE_IRQ_FLAG | linux_irq_id;
 #ifdef CONFIG_SOC_ESP32S31
 		if (fallback_handle_irq)
 			fallback_handle_irq(regs);
@@ -787,7 +808,8 @@ static void __init esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
 		clic_writeb(clic, i, ESP32S31_CLIC_INT_ATTR,
 			    mode_attr | CLIC_ATTR_TRIG_LEVEL);
 		clic_writeb(clic, i, ESP32S31_CLIC_INT_CTL,
-			    CLICCTL_MAKE(1, ESP32S31_MAX_PRIORITY));
+			    CLICCTL_MAKE(ESP32S31_EXTERNAL_LEVEL,
+					 ESP32S31_MAX_PRIORITY));
 	}
 
 	per_cpu(clic_per_cpu, hart) = clic;
@@ -854,14 +876,13 @@ static void __init esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
 
 #ifdef CONFIG_SOC_ESP32S31
 		/* Preserve OpenSBI-configured timer/software interrupts */
-		if (i == CLIC_CLINT_TIMER_ID || i == CLIC_CLINT_SW_ID ||
-		    i == CLIC_S_TIMER_ID || i == CLIC_S_SOFT_ID)
+		if (i == CLIC_CLINT_TIMER_ID || i == CLIC_CLINT_SW_ID)
 			continue;
 #endif
 
 		if (i >= CLIC_EXT_MIN_ID) {
 			attr |= CLIC_ATTR_SHV;
-			level = 1;
+			level = ESP32S31_EXTERNAL_LEVEL;
 		}
 
 		clic_writeb(clic, i, ESP32S31_CLIC_INT_IP, 0);

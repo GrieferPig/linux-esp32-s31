@@ -78,6 +78,7 @@ struct stmmac_tx_queue {
 	unsigned int cur_tx;
 	unsigned int dirty_tx;
 	dma_addr_t dma_tx_phy;
+	void *dma_tx_alloc;
 	dma_addr_t tx_tail_addr;
 	u32 mss;
 };
@@ -128,6 +129,7 @@ struct stmmac_rx_queue {
 	unsigned int buf_alloc_num;
 	u32 rx_zeroc_thresh;
 	dma_addr_t dma_rx_phy;
+	void *dma_rx_alloc;
 	u32 rx_tail_addr;
 	unsigned int state_saved;
 	struct {

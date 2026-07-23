@@ -130,31 +130,32 @@
 		 * rate changes are enabled.
 		 */
 		sdmmc: mmc@20342000 {
-			compatible = "snps,dw-mshc";
+			compatible = "espressif,esp32s31-dw-mshc", "snps,dw-mshc";
 			reg = <0x20342000 0x1000>;
 			interrupt-parent = <&clic>;
 			/* raw CLIC interrupt, IDF ETS_SDIO_HOST_INTR_SOURCE */
-			interrupts = <16 3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <16 3 IRQ_TYPE_EDGE_RISING>;
 			clocks = <&s31_sys_clk>, <&sdmmc_ciu_clk>;
 			clock-names = "biu", "ciu";
-			bus-width = <4>;
+			bus-width = <1>;
 			cap-sd-highspeed;
+			max-frequency = <12000000>;
 			cap-sdio-irq;
 			status = "okay";
 		};
 
 		emac: ethernet@20350000 {
-			compatible = "snps,dwmac";
+			compatible = "espressif,esp32s31-gmac", "snps,dwmac";
 			/* MAC (0x0), PTP (0x700), and DMA (0x1000) register banks. */
 			reg = <0x20350000 0x2000>;
 			interrupt-parent = <&clic>;
-			/* raw CLIC interrupt, IDF ETS_SBD_INTR_SOURCE */
-			interrupts = <17 117 IRQ_TYPE_LEVEL_HIGH>;
+			/* raw CLIC ID17, IDF ETS_SBD_INTR_SOURCE (matrix source 98). */
+			interrupts = <17 98 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "macirq";
 			clocks = <&s31_sys_clk>, <&s31_sys_clk>, <&xtal>;
 			clock-names = "stmmaceth", "pclk", "ptp_ref";
 			/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
-			phy-mode = "rgmii-rxid";
+			phy-mode = "rgmii-id";
 			phy-handle = <&yt8531>;
 			status = "okay";
 
@@ -168,6 +169,7 @@
 					reg = <0>;
 					/* PHY strap: RXDLY enabled, TXDLY disabled. */
 					rx-internal-delay-ps = <1950>;
+					tx-internal-delay-ps = <1950>;
 					motorcomm,auto-sleep-disabled;
 				};
 			};

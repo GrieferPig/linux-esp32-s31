@@ -159,6 +159,7 @@ CONFIG_MTD_ESP32S31_FLASH=y
 # Filesystems — initramfs plus FAT-formatted removable storage
 CONFIG_FAT_FS=y
 CONFIG_VFAT_FS=y
+CONFIG_EXT4_FS=y
 CONFIG_NLS_CODEPAGE_437=y
 CONFIG_NLS_ISO8859_1=y
 # CONFIG_FILE_LOCKING is not set
