@@ -505,20 +505,19 @@ static int dw_mci_idmac_init(struct dw_mci *host)
 		struct idmac_desc_64addr *p;
 		/* Number of descriptors in the ring buffer */
 		host->ring_size =
-			DESC_RING_BUF_SZ / sizeof(struct idmac_desc_64addr);
+			DESC_RING_BUF_SZ / (sizeof(struct idmac_desc_64addr) * 4);
 
 		/* Forward link the descriptor list */
 		for (i = 0, p = host->sg_cpu; i < host->ring_size - 1;
-								i++, p++) {
+								i++, p += 4) {
 			p->des6 = (host->sg_dma +
 					(sizeof(struct idmac_desc_64addr) *
-							(i + 1))) & 0xffffffff;
+							((i + 1) * 4))) & 0xffffffff;
 
 			p->des7 = (u64)(host->sg_dma +
 					(sizeof(struct idmac_desc_64addr) *
-							(i + 1))) >> 32;
+							((i + 1) * 4))) >> 32;
 			/* Initialize reserved and buffer size fields to "0" */
-			p->des0 = 0;
 			p->des1 = 0;
 			p->des2 = 0;
 			p->des3 = 0;
@@ -533,20 +532,20 @@ static int dw_mci_idmac_init(struct dw_mci *host)
 		struct idmac_desc *p;
 		/* Number of descriptors in the ring buffer */
 		host->ring_size =
-			DESC_RING_BUF_SZ / sizeof(struct idmac_desc);
+			DESC_RING_BUF_SZ / (sizeof(struct idmac_desc) * 4);
 
 		/* Forward link the descriptor list */
 		for (i = 0, p = host->sg_cpu;
 		     i < host->ring_size - 1;
-		     i++, p++) {
+		     i++, p += 4) {
 			p->des3 = cpu_to_le32(host->sg_dma +
-					(sizeof(struct idmac_desc) * (i + 1)));
-			p->des0 = 0;
+					(sizeof(struct idmac_desc) * ((i + 1) * 4)));
 			p->des1 = 0;
 		}
 
 		/* Set the last descriptor as the end-of-ring descriptor */
 		p->des3 = cpu_to_le32(host->sg_dma);
+		p->des1 = 0;
 		p->des0 = cpu_to_le32(IDMAC_DES0_ER);
 	}
 
@@ -591,7 +590,7 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 
 		u64 mem_addr = sg_dma_address(&data->sg[i]);
 
-		for ( ; length ; desc++) {
+		for ( ; length ; desc += 4) {
 			desc_len = (length <= DW_MCI_DESC_DATA_LENGTH) ?
 				   length : DW_MCI_DESC_DATA_LENGTH;
 
@@ -603,17 +602,29 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 			 * isn't still owned by IDMAC as IDMAC's write
 			 * ops and CPU's read ops are asynchronous.
 			 */
+#ifdef CONFIG_RISCV_DMA_NONCOHERENT
+			int retries = 10000;
+			do {
+				dma_sync_single_for_cpu(host->dev, host->sg_dma + ((void *)desc - host->sg_cpu), sizeof(*desc), DMA_FROM_DEVICE);
+				val = readl(&desc->des0);
+				if (!(val & IDMAC_DES0_OWN))
+					break;
+				udelay(10);
+			} while (--retries);
+			if (!retries)
+				goto err_own_bit;
+#else
 			if (readl_poll_timeout_atomic(&desc->des0, val,
 						!(val & IDMAC_DES0_OWN),
 						10, 100 * USEC_PER_MSEC))
 				goto err_own_bit;
+#endif
 
 			/*
 			 * Set the OWN bit and disable interrupts
 			 * for this descriptor
 			 */
-			desc->des0 = IDMAC_DES0_OWN | IDMAC_DES0_DIC |
-						IDMAC_DES0_CH;
+			desc->des0 = IDMAC_DES0_OWN | IDMAC_DES0_CH;
 
 			/* Buffer length */
 			IDMAC_64ADDR_SET_BUFFER1_SIZE(desc, desc_len);
@@ -633,9 +644,13 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 	/* Set first descriptor */
 	desc_first->des0 |= IDMAC_DES0_FD;
 
-	/* Set last descriptor */
-	desc_last->des0 &= ~(IDMAC_DES0_CH | IDMAC_DES0_DIC);
+	/* Set last descriptor - keep CH set for chained mode */
+	desc_last->des0 &= ~IDMAC_DES0_DIC;
 	desc_last->des0 |= IDMAC_DES0_LD;
+
+#ifdef CONFIG_RISCV_DMA_NONCOHERENT
+	dma_sync_single_for_device(host->dev, host->sg_dma, PAGE_SIZE, DMA_TO_DEVICE);
+#endif
 
 	return 0;
 err_own_bit:
@@ -663,7 +678,7 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 
 		u32 mem_addr = sg_dma_address(&data->sg[i]);
 
-		for ( ; length ; desc++) {
+		for ( ; length ; desc += 4) {
 			desc_len = (length <= DW_MCI_DESC_DATA_LENGTH) ?
 				   length : DW_MCI_DESC_DATA_LENGTH;
 
@@ -675,18 +690,30 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 			 * isn't still owned by IDMAC as IDMAC's write
 			 * ops and CPU's read ops are asynchronous.
 			 */
+#ifdef CONFIG_RISCV_DMA_NONCOHERENT
+			int retries = 10000;
+			do {
+				dma_sync_single_for_cpu(host->dev, host->sg_dma + ((void *)desc - host->sg_cpu), sizeof(*desc), DMA_FROM_DEVICE);
+				val = readl(&desc->des0);
+				if (!(val & IDMAC_DES0_OWN))
+					break;
+				udelay(10);
+			} while (--retries);
+			if (!retries)
+				goto err_own_bit;
+#else
 			if (readl_poll_timeout_atomic(&desc->des0, val,
 						      IDMAC_OWN_CLR64(val),
 						      10,
 						      100 * USEC_PER_MSEC))
 				goto err_own_bit;
+#endif
 
 			/*
 			 * Set the OWN bit and disable interrupts
 			 * for this descriptor
 			 */
 			desc->des0 = cpu_to_le32(IDMAC_DES0_OWN |
-						 IDMAC_DES0_DIC |
 						 IDMAC_DES0_CH);
 
 			/* Buffer length */
@@ -706,10 +733,16 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 	/* Set first descriptor */
 	desc_first->des0 |= cpu_to_le32(IDMAC_DES0_FD);
 
-	/* Set last descriptor */
-	desc_last->des0 &= cpu_to_le32(~(IDMAC_DES0_CH |
-				       IDMAC_DES0_DIC));
+	/* Set last descriptor - keep CH set for chained mode */
+	desc_last->des0 &= cpu_to_le32(~IDMAC_DES0_DIC);
 	desc_last->des0 |= cpu_to_le32(IDMAC_DES0_LD);
+
+#ifdef CONFIG_RISCV_DMA_NONCOHERENT
+	dma_sync_single_for_device(host->dev, host->sg_dma, PAGE_SIZE, DMA_TO_DEVICE);
+#endif
+
+	dev_info(host->dev, "DMA desc32: sg_len=%u blksz=%u blocks=%u total=%u\n",
+		 sg_len, data->blksz, data->blocks, data->blocks * data->blksz);
 
 	return 0;
 err_own_bit:
