@@ -87,13 +87,6 @@ MODULE_PARM_DESC(phyaddr, "Physical device address");
 #define ESP32S31_PSRAM_CACHED_BASE	0x50000000UL
 #define ESP32S31_PSRAM_DIRECT_BASE	0xc0000000UL
 #define ESP32S31_PSRAM_SIZE		0x01000000UL
-#define ESP32S31_CNNT_SYS_BASE		0x20359000UL
-#define ESP32S31_CNNT_SYS_SIZE		0x100
-#define ESP32S31_EMAC_REF_CTRL		0x40
-#define ESP32S31_EMAC_REF_CLK_SEL_M	GENMASK(1, 0)
-#define ESP32S31_EMAC_REF_CLK_EN	BIT(2)
-#define ESP32S31_EMAC_REF_CLK_DIV_M	GENMASK(15, 8)
-#define ESP32S31_EMAC_REF_CLK_DIV_S	8
 
 /*
  * Sv32 has no S31 memory-type PTE bits, so dma_alloc_coherent() cannot turn a
@@ -160,39 +153,33 @@ static void stmmac_esp32s31_free_desc(struct stmmac_priv *priv, size_t size,
 
 static void stmmac_esp32s31_set_rgmii_txc(struct stmmac_priv *priv, int speed)
 {
-	void __iomem *base;
-	u32 div, val;
+	unsigned long rate;
+	int ret;
 
 	if (!of_device_is_compatible(priv->device->of_node,
 				     "espressif,esp32s31-gmac"))
 		return;
+	if (!priv->plat->clk_tx)
+		return;
 
 	switch (speed) {
 	case SPEED_1000:
-		div = 3;		/* 500 MHz / (3 + 1) = 125 MHz */
+		rate = 125000000;
 		break;
 	case SPEED_100:
-		div = 19;	/* 500 MHz / (19 + 1) = 25 MHz */
+		rate = 25000000;
 		break;
 	case SPEED_10:
-		div = 199;	/* 500 MHz / (199 + 1) = 2.5 MHz */
+		rate = 2500000;
 		break;
 	default:
 		return;
 	}
 
-	base = ioremap(ESP32S31_CNNT_SYS_BASE, ESP32S31_CNNT_SYS_SIZE);
-	if (!base) {
-		netdev_warn(priv->dev, "failed to map S31 EMAC clock registers\n");
-		return;
-	}
-
-	val = readl(base + ESP32S31_EMAC_REF_CTRL);
-	val &= ~(ESP32S31_EMAC_REF_CLK_SEL_M | ESP32S31_EMAC_REF_CLK_DIV_M);
-	val |= ESP32S31_EMAC_REF_CLK_EN;
-	val |= div << ESP32S31_EMAC_REF_CLK_DIV_S;
-	writel(val, base + ESP32S31_EMAC_REF_CTRL);
-	iounmap(base);
+	ret = clk_set_rate(priv->plat->clk_tx, rate);
+	if (ret)
+		netdev_warn(priv->dev, "failed to set S31 RGMII TX clock: %d\n",
+			    ret);
 }
 
 #else
@@ -7369,7 +7356,7 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 		if (of_device_is_compatible(priv->device->of_node,
 					    "espressif,esp32s31-gmac")) {
 			priv->plat->tx_coe = 0;
-			priv->plat->force_thresh_dma_mode = 0;
+			priv->plat->force_thresh_dma_mode = 1;
 			priv->plat->force_sf_dma_mode = 0;
 			priv->plat->dma_cfg->pbl = 16;
 			priv->plat->dma_cfg->txpbl = 0;

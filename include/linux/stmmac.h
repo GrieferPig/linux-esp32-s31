@@ -250,6 +250,7 @@ struct plat_stmmacenet_data {
 	struct clk *stmmac_clk;
 	struct clk *pclk;
 	struct clk *clk_ptp_ref;
+	struct clk *clk_tx;
 	unsigned int clk_ptp_rate;
 	unsigned int clk_ref_rate;
 	unsigned int mult_fact_100ns;

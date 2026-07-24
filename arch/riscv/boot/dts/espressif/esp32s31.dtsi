@@ -4,6 +4,7 @@
  */
 
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/esp32s31-clock.h>
 
 / {
 	#address-cells = <1>;
@@ -63,25 +64,6 @@
 		clock-frequency = <40000000>;
 	};
 
-	/*
-	 * These clocks are established by bootloader/main before the OpenSBI
-	 * handoff.  They are deliberately fixed-clock providers: Linux has no S31
-	 * clock/power-domain controller yet, so it must not attempt to retune or
-	 * gate the underlying MPLL and CNNT SRAM domains.
-	 */
-	s31_sys_clk: system-clock {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <80000000>;
-	};
-
-	sdmmc_ciu_clk: sdmmc-ciu-clock {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		/* MPLL 500 MHz / bootloader-programmed divider 8. */
-		clock-frequency = <62500000>;
-	};
-
 	soc {
 		#address-cells = <1>;
 		#size-cells = <1>;
@@ -116,6 +98,13 @@
 			status = "okay";
 		};
 
+		clkc: clock-controller@20587000 {
+			compatible = "espressif,esp32s31-clock";
+			reg = <0x20587000 0x1000>, <0x20359000 0x1000>;
+			reg-names = "hp-sys-clkrst", "cnnt-sys";
+			#clock-cells = <1>;
+		};
+
 		/*
 		 * The SDMMC and GMAC IP blocks are DesignWare cores.  The S31
 		 * gate/reset and SRAM low-power controls live in HP_SYS_CLKRST and
@@ -124,10 +113,10 @@
 		 * a programmable divider and GMAC has independently selectable MAC
 		 * and PTP clocks.
 		 *
-		 * The bootloader prepares the gates, reset state, pinmux and SRAM power
-		 * domains, then leaves them on for Linux.  A future S31 clock/genpd
-		 * controller must replace the fixed clocks before runtime PM or clock
-		 * rate changes are enabled.
+		 * The S31 clock controller below owns the Linux-visible gates,
+		 * reset pulses, SRAM power forcing, and GMAC reference divider.
+		 * Runtime clock disable still intentionally leaves these domains on
+		 * until a fuller genpd/runtime-PM model exists.
 		 */
 		sdmmc: mmc@20342000 {
 			compatible = "espressif,esp32s31-dw-mshc", "snps,dw-mshc";
@@ -135,7 +124,8 @@
 			interrupt-parent = <&clic>;
 			/* raw CLIC interrupt, IDF ETS_SDIO_HOST_INTR_SOURCE */
 			interrupts = <16 3 IRQ_TYPE_EDGE_RISING>;
-			clocks = <&s31_sys_clk>, <&sdmmc_ciu_clk>;
+			clocks = <&clkc ESP32S31_CLK_SDMMC_BIU>,
+				 <&clkc ESP32S31_CLK_SDMMC_CIU>;
 			clock-names = "biu", "ciu";
 			bus-width = <1>;
 			cap-sd-highspeed;
@@ -152,8 +142,11 @@
 			/* raw CLIC ID17, IDF ETS_SBD_INTR_SOURCE (matrix source 98). */
 			interrupts = <17 98 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "macirq";
-			clocks = <&s31_sys_clk>, <&s31_sys_clk>, <&xtal>;
-			clock-names = "stmmaceth", "pclk", "ptp_ref";
+			clocks = <&clkc ESP32S31_CLK_EMAC_STMMACETH>,
+				 <&clkc ESP32S31_CLK_EMAC_PCLK>,
+				 <&clkc ESP32S31_CLK_EMAC_PTP_REF>,
+				 <&clkc ESP32S31_CLK_EMAC_RGMII_TXC>;
+			clock-names = "stmmaceth", "pclk", "ptp_ref", "tx";
 			/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
 			phy-mode = "rgmii-id";
 			phy-handle = <&yt8531>;
