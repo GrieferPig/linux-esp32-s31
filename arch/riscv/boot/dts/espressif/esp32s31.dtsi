@@ -157,6 +157,12 @@
 			/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
 			phy-mode = "rgmii-id";
 			phy-handle = <&yt8531>;
+			/*
+			 * The current S31 bring-up boards use flying-wire RGMII.
+			 * Keep the default link at 100 Mbps until a clock driver
+			 * and controlled board routing prove 1 Gbps reliable.
+			 */
+			max-speed = <100>;
 			status = "okay";
 
 			mdio {

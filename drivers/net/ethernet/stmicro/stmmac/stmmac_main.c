@@ -87,6 +87,13 @@ MODULE_PARM_DESC(phyaddr, "Physical device address");
 #define ESP32S31_PSRAM_CACHED_BASE	0x50000000UL
 #define ESP32S31_PSRAM_DIRECT_BASE	0xc0000000UL
 #define ESP32S31_PSRAM_SIZE		0x01000000UL
+#define ESP32S31_CNNT_SYS_BASE		0x20359000UL
+#define ESP32S31_CNNT_SYS_SIZE		0x100
+#define ESP32S31_EMAC_REF_CTRL		0x40
+#define ESP32S31_EMAC_REF_CLK_SEL_M	GENMASK(1, 0)
+#define ESP32S31_EMAC_REF_CLK_EN	BIT(2)
+#define ESP32S31_EMAC_REF_CLK_DIV_M	GENMASK(15, 8)
+#define ESP32S31_EMAC_REF_CLK_DIV_S	8
 
 /*
  * Sv32 has no S31 memory-type PTE bits, so dma_alloc_coherent() cannot turn a
@@ -150,6 +157,44 @@ static void stmmac_esp32s31_free_desc(struct stmmac_priv *priv, size_t size,
 	dma_unmap_single(priv->device, dma_addr, size, DMA_BIDIRECTIONAL);
 	kfree(alloc);
 }
+
+static void stmmac_esp32s31_set_rgmii_txc(struct stmmac_priv *priv, int speed)
+{
+	void __iomem *base;
+	u32 div, val;
+
+	if (!of_device_is_compatible(priv->device->of_node,
+				     "espressif,esp32s31-gmac"))
+		return;
+
+	switch (speed) {
+	case SPEED_1000:
+		div = 3;		/* 500 MHz / (3 + 1) = 125 MHz */
+		break;
+	case SPEED_100:
+		div = 19;	/* 500 MHz / (19 + 1) = 25 MHz */
+		break;
+	case SPEED_10:
+		div = 199;	/* 500 MHz / (199 + 1) = 2.5 MHz */
+		break;
+	default:
+		return;
+	}
+
+	base = ioremap(ESP32S31_CNNT_SYS_BASE, ESP32S31_CNNT_SYS_SIZE);
+	if (!base) {
+		netdev_warn(priv->dev, "failed to map S31 EMAC clock registers\n");
+		return;
+	}
+
+	val = readl(base + ESP32S31_EMAC_REF_CTRL);
+	val &= ~(ESP32S31_EMAC_REF_CLK_SEL_M | ESP32S31_EMAC_REF_CLK_DIV_M);
+	val |= ESP32S31_EMAC_REF_CLK_EN;
+	val |= div << ESP32S31_EMAC_REF_CLK_DIV_S;
+	writel(val, base + ESP32S31_EMAC_REF_CTRL);
+	iounmap(base);
+}
+
 #else
 static void *stmmac_esp32s31_alloc_desc(struct stmmac_priv *priv, size_t size,
 					dma_addr_t *dma_addr, void **alloc)
@@ -162,6 +207,10 @@ static void stmmac_esp32s31_free_desc(struct stmmac_priv *priv, size_t size,
 				      void *alloc)
 {
 	dma_free_coherent(priv->device, size, addr, dma_addr);
+}
+
+static void stmmac_esp32s31_set_rgmii_txc(struct stmmac_priv *priv, int speed)
+{
 }
 #endif
 
@@ -1171,6 +1220,8 @@ static void stmmac_mac_link_up(struct phylink_config *config,
 
 	if (priv->plat->fix_mac_speed)
 		priv->plat->fix_mac_speed(priv->plat->bsp_priv, speed, mode);
+
+	stmmac_esp32s31_set_rgmii_txc(priv, speed);
 
 	if (!duplex)
 		ctrl &= ~priv->hw->link.duplex;
@@ -2491,6 +2542,20 @@ static void stmmac_dma_operation_mode(struct stmmac_priv *priv)
 		txmode = tc;
 		rxmode = SF_DMA_MODE;
 	}
+
+#ifdef CONFIG_SOC_ESP32S31
+	if (of_device_is_compatible(priv->device->of_node,
+				    "espressif,esp32s31-gmac")) {
+		/*
+		 * S31 keeps the RX FIFO in threshold mode like ESP-IDF because
+		 * the DWMAC1000 RX FIFO is only 256 bytes.  TX still needs
+		 * store-and-forward when packet buffers live in PSRAM, otherwise
+		 * small software-checksummed packets can underflow or stall.
+		 */
+		txmode = SF_DMA_MODE;
+		rxmode = tc;
+	}
+#endif
 
 	/* configure all channels */
 	for (chan = 0; chan < rx_channels_count; chan++) {
@@ -4927,8 +4992,13 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
 		entry = STMMAC_GET_ENTRY(entry, priv->dma_conf.dma_rx_size);
 	}
 	rx_q->dirty_rx = entry;
-	rx_q->rx_tail_addr = rx_q->dma_rx_phy +
-			    (rx_q->dirty_rx * sizeof(struct dma_desc));
+	if (priv->extend_desc)
+		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
+				    (rx_q->dirty_rx *
+				     sizeof(struct dma_extended_desc));
+	else
+		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
+				    (rx_q->dirty_rx * sizeof(struct dma_desc));
 	stmmac_set_rx_tail_ptr(priv, priv->ioaddr, rx_q->rx_tail_addr, queue);
 }
 
@@ -7290,6 +7360,26 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 		else
 			priv->plat->tx_coe = priv->dma_cap.tx_coe;
 
+		/*
+		 * S31's checksum insertion corrupts some TCP packets (notably
+		 * pure ACKs).  Its ESP-IDF HAL also avoids 32-beat AXI bursts
+		 * and keeps the DWMAC1000 in threshold mode because the RX FIFO
+		 * is only 256 bytes.  Mirror those DMA constraints here.
+		 */
+		if (of_device_is_compatible(priv->device->of_node,
+					    "espressif,esp32s31-gmac")) {
+			priv->plat->tx_coe = 0;
+			priv->plat->force_thresh_dma_mode = 0;
+			priv->plat->force_sf_dma_mode = 0;
+			priv->plat->dma_cfg->pbl = 16;
+			priv->plat->dma_cfg->txpbl = 0;
+			priv->plat->dma_cfg->rxpbl = 0;
+			priv->plat->dma_cfg->pblx8 = false;
+			priv->plat->dma_cfg->mixed_burst = true;
+			priv->plat->dma_cfg->aal = true;
+			priv->plat->dma_cfg->fixed_burst = false;
+		}
+
 		/* In case of GMAC4 rx_coe is from HW cap register. */
 		priv->plat->rx_coe = priv->dma_cap.rx_coe;
 
@@ -7297,6 +7387,10 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 			priv->plat->rx_coe = STMMAC_RX_COE_TYPE2;
 		else if (priv->dma_cap.rx_coe_type1)
 			priv->plat->rx_coe = STMMAC_RX_COE_TYPE1;
+
+		if (of_device_is_compatible(priv->device->of_node,
+					    "espressif,esp32s31-gmac"))
+			priv->plat->rx_coe = STMMAC_RX_COE_NONE;
 
 	} else {
 		dev_info(priv->device, "No HW DMA feature register supported\n");
@@ -7737,6 +7831,18 @@ int stmmac_dvr_probe(struct device *device,
 	}
 
 	ndev->features |= ndev->hw_features | NETIF_F_HIGHDMA;
+#ifdef CONFIG_SOC_ESP32S31
+	if (of_device_is_compatible(priv->device->of_node,
+				    "espressif,esp32s31-gmac")) {
+		netdev_features_t s31_bad_tx_csum;
+
+		s31_bad_tx_csum = NETIF_F_CSUM_MASK | NETIF_F_TSO |
+				   NETIF_F_TSO6 | NETIF_F_GSO_UDP_L4;
+		ndev->hw_features &= ~s31_bad_tx_csum;
+		ndev->features &= ~s31_bad_tx_csum;
+		priv->tso = false;
+	}
+#endif
 	ndev->watchdog_timeo = msecs_to_jiffies(watchdog);
 #ifdef STMMAC_VLAN_TAG_USED
 	/* Both mac100 and gmac support receive VLAN tag detection */
