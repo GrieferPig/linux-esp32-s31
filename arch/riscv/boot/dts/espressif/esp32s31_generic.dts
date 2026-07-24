@@ -10,10 +10,7 @@
 	compatible = "espressif,esp32s31";
 
 	chosen {
-		bootargs = "earlycon=esp32s3uart,mmio32,0x2038a000 console=ttyS0,115200 rdinit=/init";
-		/* Linux copies the flash-mapped archive here before enabling the MMU. */
-		linux,initrd-start = <0x50800000>;
-		linux,initrd-end = <0x50DE0000>;
+		bootargs = "earlycon=esp32s3uart,mmio32,0x2038a000 console=ttyS0,115200 root=/dev/mtdblock7 rootfstype=squashfs ro rootwait init=/init";
 		stdout-path = "serial0:115200n8";
 	};
 };
