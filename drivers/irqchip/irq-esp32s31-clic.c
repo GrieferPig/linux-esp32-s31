@@ -357,6 +357,21 @@ int esp32s31_clic_set_priority(unsigned int irq, unsigned int level,
 
 	clic = irq_data_get_irq_chip_data(d);
 
+	/*
+	 * S31 is intentionally exposed as a non-nested, single-level interrupt
+	 * controller.  All S interrupts, including the timer configured by
+	 * OpenSBI, use the same effective CLIC level (ctl=0x3f).  Ignore caller
+	 * priority requests so no Linux driver can re-enable hardware nesting.
+	 */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31)) {
+		raw_spin_lock_irqsave(this_cpu_ptr(&clic_lock), flags);
+		clic_writeb(clic, d->hwirq, ESP32S31_CLIC_INT_CTL,
+			    CLICCTL_MAKE(ESP32S31_EXTERNAL_LEVEL,
+					 ESP32S31_MAX_PRIORITY));
+		raw_spin_unlock_irqrestore(this_cpu_ptr(&clic_lock), flags);
+		return 0;
+	}
+
 	if (level >= ESP32S31_NR_LEVELS || prio > ESP32S31_MAX_PRIORITY)
 		return -EINVAL;
 
@@ -700,19 +715,18 @@ static void (*fallback_handle_irq)(struct pt_regs *);
 void esp32s31_clic_handle_irq(struct pt_regs *regs)
 {
 	struct esp32s31_clic *clic = this_cpu_read(clic_per_cpu);
-	unsigned long raw_cause;
+	unsigned long logical_cause;
 	unsigned long irq_id;
 
 	if (WARN_ON(!clic))
 		return;
 
-	raw_cause = regs->cause;
+	logical_cause = regs->cause;
 
 	/*
-	 * In CLIC mode the low cause bits hold the interrupt ID while the
-	 * upper bits carry interrupt metadata such as the current level. The
-	 * standard CAUSE_IRQ_FLAG mask does not strip those CLIC-specific bits,
-	 * so decode only the cause code itself here.
+	 * entry.S has already separated the raw CLIC return token from the
+	 * logical Linux cause.  Only the architectural interrupt bit and the
+	 * low CLIC ID are visible here.
 	 */
 	irq_id = regs->cause & 0xfff;
 
@@ -747,7 +761,7 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 #else
 		handle_arch_irq(regs);
 #endif
-		regs->cause = raw_cause;
+		regs->cause = logical_cause;
 		goto out;
 	}
 
@@ -759,9 +773,9 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 	generic_handle_domain_irq(clic->domain, irq_id);
 
 	/*
-	 * No claim/completion is needed.  The architecture trampoline restores
-	 * the complete saved scause before sstatus; sret then restores the prior
-	 * interrupt level from scause into sintstatus.
+	 * No claim/completion is needed.  The architecture return path restores
+	 * cause_raw before sstatus; Linux never interprets or mutates that CLIC
+	 * hardware state.
 	 */
 
 out:
@@ -797,9 +811,8 @@ static void __init esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
 	csr_write(CSR_SINTTHRESH, 0);
 
 	/*
-	 * Local CLIC slots are owned by OpenSBI on S31.  In particular,
-	 * ID 7 must remain an M-mode timer interrupt so OpenSBI can process
-	 * its timer device and inject STIP to Linux through ID 5.
+	 * ID7 is configured by OpenSBI as a direct S-mode timer at the same
+	 * fixed level as every external interrupt.  Do not overwrite it here.
 	 */
 
 	for (i = CLIC_EXT_MIN_ID; i <= CLIC_EXT_MAX_ID; i++) {

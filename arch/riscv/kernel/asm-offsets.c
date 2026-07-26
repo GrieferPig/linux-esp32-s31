@@ -125,6 +125,9 @@ void asm_offsets(void)
 	OFFSET(PT_STATUS, pt_regs, status);
 	OFFSET(PT_BADADDR, pt_regs, badaddr);
 	OFFSET(PT_CAUSE, pt_regs, cause);
+#ifdef CONFIG_SOC_ESP32S31
+	OFFSET(PT_CAUSE_RAW, pt_regs, cause_raw);
+#endif
 
 	OFFSET(SUSPEND_CONTEXT_REGS, suspend_context, regs);
 

@@ -78,6 +78,7 @@
  *   sp + 0x84:  badaddr
  *   sp + 0x88:  cause
  *   sp + 0x8C:  orig_a0
+ *   sp + 0x90:  raw CLIC cause (hardware return token)
  *
  * Must match struct pt_regs in arch/riscv/include/asm/ptrace.h.
  */
@@ -128,6 +129,7 @@
 #define PT_BADADDR_OFFSET	0x84
 #define PT_CAUSE_OFFSET		0x88
 #define PT_ORIG_A0_OFFSET	0x8C
+#define PT_CAUSE_RAW_OFFSET	0x90
 
 #ifndef CONFIG_MMU
 #define do_page_fault do_trap_unknown
@@ -208,6 +210,10 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	REG_S	t1,  PT_BADADDR_OFFSET(sp)
 	csrr	t1, CSR_CAUSE
 	REG_S	t1,  PT_CAUSE_OFFSET(sp)
+	/* Non-nested S31 return token: never restore the 0xff SPIL sentinel. */
+	li	t2, 0xff00ffff
+	and	t1, t1, t2
+	REG_S	t1,  PT_CAUSE_RAW_OFFSET(sp)
 	csrr	t1, CSR_SCRATCH
 	REG_S	t1,  PT_TP_OFFSET(sp)
 
@@ -244,6 +250,13 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	beqz	t0, .Lclic_exception
 
 .Lclic_interrupt:
+	/* Expose only a conventional logical cause to the Linux IRQ core. */
+	REG_L	t1, PT_CAUSE_RAW_OFFSET(sp)
+	li	t0, 0xfff
+	and	t1, t1, t0
+	li	t0, CAUSE_IRQ_FLAG
+	or	t1, t1, t0
+	REG_S	t1, PT_CAUSE_OFFSET(sp)
 	/*
 	 * ── Call C handler ──────────────────────────────────────────
 	 *
@@ -316,14 +329,10 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	 */
 
 	/*
-	 * Restore xcause before xstatus, matching ESP-IDF's CLIC return
-	 * sequence.  The ESP32-S31 CLIC uses xcause to track
-	 * interrupt level nesting.  When mret executes, the CLIC
-	 * hardware reads xcause to restore the previous level into
-	 * xintstatus.  Without this, nested interrupt priority
-	 * tracking is corrupted.
+	 * Restore the private non-nested xcause token before xstatus.  xret
+	 * consumes this value to return xintstatus to the idle level.
 	 */
-	REG_L	t0, PT_CAUSE_OFFSET(sp)
+	REG_L	t0, PT_CAUSE_RAW_OFFSET(sp)
 	csrw	CSR_CAUSE, t0
 
 	/* Restore xstatus exactly as saved, matching ESP-IDF. */

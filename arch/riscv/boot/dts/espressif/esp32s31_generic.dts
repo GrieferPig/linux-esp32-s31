@@ -10,7 +10,6 @@
 	compatible = "espressif,esp32s31";
 
 	chosen {
-		bootargs = "earlycon=esp32s3uart,mmio32,0x2038a000 console=ttyS0,115200 root=/dev/mtdblock7 rootfstype=squashfs ro rootwait init=/init";
 		stdout-path = "serial0:115200n8";
 	};
 };

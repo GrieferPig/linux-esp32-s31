@@ -164,6 +164,18 @@ SYM_CODE_START(handle_exception)
 	REG_S s2, PT_EPC(sp)
 	REG_S s3, PT_BADADDR(sp)
 	REG_S s4, PT_CAUSE(sp)
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * Keep the CLIC return token out of Linux's logical cause field.  S31
+	 * can report SPIL=0xff at a privilege crossing; feeding that value back
+	 * to sret leaves SINTSTATUS.SIL at 0xff and blocks every level-0x3f
+	 * interrupt.  This controller is deliberately non-nested, so its only
+	 * valid software return level is the idle level (SPIL=0).
+	 */
+	li t0, 0xff00ffff
+	and t0, s4, t0
+	REG_S t0, PT_CAUSE_RAW(sp)
+#endif
 	REG_S s5, PT_TP(sp)
 
 	/*
@@ -191,6 +203,14 @@ SYM_CODE_START(handle_exception)
 	bge s4, zero, 1f
 
 	/* Handle interrupts */
+#ifdef CONFIG_SOC_ESP32S31
+	/* Linux sees only the architectural interrupt bit and CLIC ID. */
+	li t0, 0xfff
+	and s4, s4, t0
+	li t0, CAUSE_IRQ_FLAG
+	or s4, s4, t0
+	REG_S s4, PT_CAUSE(sp)
+#endif
 	call do_irq
 	j ret_from_exception
 1:
@@ -276,6 +296,16 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	REG_L  a2, PT_EPC(sp)
 	REG_SC x0, a2, PT_EPC(sp)
 
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * CLIC xret consumes xcause as a hardware return token.  PT_CAUSE is
+	 * deliberately logical and must never be written to scause.  Restore the
+	 * private, non-nested token for both interrupts and exceptions so a nested
+	 * synchronous trap cannot leave stale CLIC return state behind.
+	 */
+	REG_L a1, PT_CAUSE_RAW(sp)
+	csrw CSR_CAUSE, a1
+#endif
 	csrw CSR_STATUS, a0
 	csrw CSR_EPC, a2
 
