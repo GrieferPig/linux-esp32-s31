@@ -480,6 +480,8 @@ patternProperties:
     description: Seiko Epson Corp.
   "^esp,.*":
     description: Espressif Systems Co. Ltd.
+  "^espressif,.*":
+    description: Espressif Systems Co. Ltd.
   "^est,.*":
     description: ESTeem Wireless Modems
   "^ettus,.*":

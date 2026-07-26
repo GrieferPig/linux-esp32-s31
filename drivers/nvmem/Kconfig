@@ -28,6 +28,15 @@ source "drivers/nvmem/layouts/Kconfig"
 
 # Devices
 
+config NVMEM_ESP32S31_EFUSE
+	tristate "Espressif ESP32-S31 eFuse read window"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  Expose the read-only ESP32-S31 eFuse block-one shadow registers
+	  through the NVMEM framework. The factory MAC cell is converted
+	  from Espressif's eFuse byte ordering and supports the standard
+	  mac-base cell offset argument.
+
 config NVMEM_APPLE_EFUSES
 	tristate "Apple eFuse support"
 	depends on ARCH_APPLE || COMPILE_TEST

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Minimal ESP32-S31 clock/reset controller.
+ * ESP32-S31 peripheral clock/reset controller.
  *
- * This models the clocks Linux drivers currently consume instead of leaving
- * SDMMC/GMAC enabled only by bootloader side effects.  PLL programming is kept
- * fixed for now; the gate/reset/memory-power sequencing follows ESP-IDF's S31
- * LL helpers.
+ * This owns every gate, reset and connectivity-domain clock needed by the
+ * Linux UART, SDMMC and GMAC drivers.  PLL programming is kept fixed because
+ * the CPU, flash XIP and PSRAM need those PLLs before Linux can execute.
  */
 
 #include <linux/bitfield.h>
@@ -26,6 +25,7 @@
 #define HP_SDIO_HOST_CTRL0		0xc0
 #define HP_SDIO_HOST_FUNC_CTRL0		0xc4
 #define HP_EMAC_CTRL0			0xc8
+#define HP_UART0_CTRL0			0x88
 
 #define HP_SDMMC_SYS_CLK_EN		BIT(0)
 #define HP_SDIO_LS_CLK_SRC_SEL		BIT(2)
@@ -45,12 +45,27 @@
 
 #define HP_EMAC_SYS_CLK_EN		BIT(0)
 
+#define HP_UART_SYS_CLK_EN		BIT(0)
+#define HP_UART_APB_CLK_EN		BIT(1)
+#define HP_UART_CORE_RST_EN		BIT(2)
+#define HP_UART_APB_RST_EN		BIT(3)
+#define HP_UART_FORCE_NORST		BIT(4)
+#define HP_UART_CLK_SRC_SEL		GENMASK(6, 5)
+#define HP_UART_CLK_EN			BIT(7)
+#define HP_UART_SCLK_DIV_NUM		GENMASK(15, 8)
+#define HP_UART_SCLK_DIV_NUMERATOR	GENMASK(23, 16)
+#define HP_UART_SCLK_DIV_DENOMINATOR	GENMASK(31, 24)
+
 #define CNNT_CLK_EN			0x00
 #define CNNT_SYS_SDMMC_MEM_LP_CTRL	0x10
 #define CNNT_SYS_GMAC_MEM_LP_CTRL	0x1c
 #define CNNT_SYS_HP_SDMMC_CTRL		0x38
 #define CNNT_SYS_HP_EMAC_CTRL		0x3c
 #define CNNT_SYS_HP_EMAC_REF_CTRL	0x40
+#define CNNT_SYS_HP_EMAC_RMII_PAD_CTRL	0x44
+#define CNNT_SYS_HP_EMAC_RMII_CTRL	0x48
+#define CNNT_SYS_HP_EMAC_RX_CTRL		0x4c
+#define CNNT_SYS_HP_EMAC_TX_CTRL		0x50
 #define CNNT_SYS_HP_EMAC_PTP_CTRL	0x54
 #define CNNT_SYS_GMAC_CTRL0		0x60
 
@@ -73,6 +88,14 @@
 #define CNNT_EMAC_PTP_REF_CLK_EN	BIT(0)
 #define CNNT_EMAC_PTP_REF_CLK_SEL	BIT(1)
 
+#define CNNT_EMAC_RMII_PAD_CLK_EN	BIT(1)
+#define CNNT_EMAC_RMII_CLK_EN		BIT(1)
+#define CNNT_EMAC_RMII_PAD_OUT_CLK_EN	BIT(2)
+#define CNNT_EMAC_RX_PAD_CLK_EN		BIT(0)
+#define CNNT_EMAC_RX_CLK_SEL		BIT(2)
+#define CNNT_EMAC_RX_180_CLK_EN		BIT(3)
+#define CNNT_EMAC_TX_180_CLK_EN		BIT(3)
+
 #define CNNT_PHY_INTF_SEL		GENMASK(4, 2)
 #define CNNT_PHY_INTF_RGMII		1
 #define CNNT_GMAC_MEM_CLK_FORCE_ON	BIT(5)
@@ -83,6 +106,9 @@ struct esp32s31_clk_priv {
 	void __iomem *cnnt;
 	spinlock_t lock;
 	struct clk_hw_onecell_data *onecell;
+	bool sdmmc_initialized;
+	bool emac_initialized;
+	bool uart0_initialized;
 };
 
 enum esp32s31_clk_kind {
@@ -92,6 +118,7 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_EMAC_BUS,
 	ESP32S31_CLK_KIND_EMAC_PTP,
 	ESP32S31_CLK_KIND_EMAC_TXC,
+	ESP32S31_CLK_KIND_UART0,
 };
 
 struct esp32s31_clk {
@@ -152,6 +179,41 @@ static void esp32s31_emac_prepare(struct esp32s31_clk_priv *priv)
 		     CNNT_EMAC_USELESS_CLK_EN | CNNT_EMAC_FORCE_NORST);
 	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_CTRL, 0, CNNT_EMAC_RST_EN);
 	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_CTRL, CNNT_EMAC_RST_EN, 0);
+
+	/* IDF's native RGMII clock path: MPLL/4 TXC and pad-sourced RXC. */
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_REF_CTRL,
+		     CNNT_EMAC_REF_CLK_SEL | CNNT_EMAC_REF_CLK_DIV,
+		     CNNT_EMAC_REF_CLK_EN |
+		     FIELD_PREP(CNNT_EMAC_REF_CLK_DIV, 3));
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_RMII_PAD_CTRL,
+		     CNNT_EMAC_RMII_PAD_CLK_EN, 0);
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_RMII_CTRL,
+		     CNNT_EMAC_RMII_CLK_EN,
+		     CNNT_EMAC_RMII_PAD_OUT_CLK_EN);
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_RX_CTRL, 0,
+		     CNNT_EMAC_RX_PAD_CLK_EN | CNNT_EMAC_RX_CLK_SEL |
+		     CNNT_EMAC_RX_180_CLK_EN);
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_TX_CTRL, 0,
+		     CNNT_EMAC_TX_180_CLK_EN);
+	esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_PTP_CTRL,
+		     CNNT_EMAC_PTP_REF_CLK_SEL, CNNT_EMAC_PTP_REF_CLK_EN);
+}
+
+static void esp32s31_uart0_prepare(struct esp32s31_clk_priv *priv)
+{
+	u32 mask = HP_UART_SYS_CLK_EN | HP_UART_APB_CLK_EN |
+		   HP_UART_CORE_RST_EN | HP_UART_APB_RST_EN |
+		   HP_UART_FORCE_NORST | HP_UART_CLK_SRC_SEL |
+		   HP_UART_CLK_EN | HP_UART_SCLK_DIV_NUM |
+		   HP_UART_SCLK_DIV_NUMERATOR |
+		   HP_UART_SCLK_DIV_DENOMINATOR;
+	u32 val = HP_UART_SYS_CLK_EN | HP_UART_APB_CLK_EN |
+		  HP_UART_FORCE_NORST | HP_UART_CLK_EN;
+
+	/* XTAL source, integer divide by one, then reset the APB register bank. */
+	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, mask, val);
+	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, 0, HP_UART_APB_RST_EN);
+	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, HP_UART_APB_RST_EN, 0);
 }
 
 static int esp32s31_clk_prepare(struct clk_hw *hw)
@@ -165,20 +227,38 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 	switch (clk->kind) {
 	case ESP32S31_CLK_KIND_SDMMC_BIU:
 	case ESP32S31_CLK_KIND_SDMMC_CIU:
-		esp32s31_sdmmc_prepare(priv);
+		if (!priv->sdmmc_initialized) {
+			esp32s31_sdmmc_prepare(priv);
+			priv->sdmmc_initialized = true;
+		}
 		break;
 	case ESP32S31_CLK_KIND_EMAC_BUS:
-		esp32s31_emac_prepare(priv);
+		if (!priv->emac_initialized) {
+			esp32s31_emac_prepare(priv);
+			priv->emac_initialized = true;
+		}
 		break;
 	case ESP32S31_CLK_KIND_EMAC_PTP:
-		esp32s31_emac_prepare(priv);
+		if (!priv->emac_initialized) {
+			esp32s31_emac_prepare(priv);
+			priv->emac_initialized = true;
+		}
 		esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_PTP_CTRL,
 			     CNNT_EMAC_PTP_REF_CLK_SEL, CNNT_EMAC_PTP_REF_CLK_EN);
 		break;
 	case ESP32S31_CLK_KIND_EMAC_TXC:
-		esp32s31_emac_prepare(priv);
+		if (!priv->emac_initialized) {
+			esp32s31_emac_prepare(priv);
+			priv->emac_initialized = true;
+		}
 		esp32s31_rmw(priv->cnnt, CNNT_SYS_HP_EMAC_REF_CTRL,
 			     CNNT_EMAC_REF_CLK_SEL, CNNT_EMAC_REF_CLK_EN);
+		break;
+	case ESP32S31_CLK_KIND_UART0:
+		if (!priv->uart0_initialized) {
+			esp32s31_uart0_prepare(priv);
+			priv->uart0_initialized = true;
+		}
 		break;
 	case ESP32S31_CLK_KIND_FIXED:
 		break;
@@ -193,8 +273,7 @@ static void esp32s31_clk_unprepare(struct clk_hw *hw)
 {
 	/*
 	 * Leave S31 peripheral gates and SRAM power forced on for now.  The
-	 * current port has no genpd/runtime-PM sequencing, and the bootloader
-	 * also hands several of these domains to Linux already enabled.
+	 * current port has no genpd/runtime-PM sequencing.
 	 */
 }
 
@@ -391,7 +470,12 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 		return ret;
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_EMAC_RGMII_TXC,
 				    "emac-rgmii-txc", ESP32S31_CLK_KIND_EMAC_TXC,
-				    25000000);
+				    125000000);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_UART0,
+				    "uart0", ESP32S31_CLK_KIND_UART0,
+				    ESP32S31_XTAL_RATE);
 	if (ret)
 		return ret;
 

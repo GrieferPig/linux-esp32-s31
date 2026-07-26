@@ -5,6 +5,8 @@
 
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/clock/esp32s31-clock.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
 
 / {
 	#address-cells = <1>;
@@ -19,7 +21,6 @@
 
 	aliases {
 		serial0 = &uart0;
-		serial1 = &usb_serial_jtag;
 		mmc0 = &sdmmc;
 		ethernet0 = &emac;
 	};
@@ -105,6 +106,110 @@
 			#clock-cells = <1>;
 		};
 
+		efuse: efuse@20715050 {
+			compatible = "espressif,esp32s31-efuse";
+			/* IDF EFUSE_RD_MAC_SYS0..5: eFuse BLK1 read shadows. */
+			reg = <0x20715050 0x18>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				factory_mac: mac-address@0 {
+					compatible = "mac-base";
+					reg = <0x0 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+			};
+		};
+
+		gpio: pinctrl@20583000 {
+			compatible = "espressif,esp32s31-pinctrl";
+			reg = <0x20583000 0x1000>, <0x20582000 0x1000>,
+			      <0x20588000 0x1000>;
+			reg-names = "gpio", "iomux", "cnnt-pad-ctrl";
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&clic>;
+			/* GPIO_INTR0 matrix source 61, aggregated level output. */
+			interrupts = <18 61 IRQ_TYPE_LEVEL_HIGH>;
+
+			uart0_default: uart0-default-pins {
+				tx-pins {
+					pinmux = <ESP32S31_IOMUX(58, 0)>;
+					drive-strength = <20>;
+				};
+
+				rx-pins {
+					pinmux = <ESP32S31_IOMUX_IN(59, 0, 10)>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			sdmmc0_default: sdmmc0-default-pins {
+				clk-pins {
+					pinmux = <ESP32S31_IOMUX(24, 4)>;
+					bias-disable;
+					input-enable;
+					drive-strength = <40>;
+				};
+
+				cmd-data-pins {
+					pinmux = <ESP32S31_IOMUX(25, 4)>,
+						 <ESP32S31_IOMUX(20, 4)>;
+					bias-pull-up;
+					input-enable;
+					drive-strength = <40>;
+				};
+
+				control-signals {
+					/* IDF slot0 defaults: present, no SDIO IRQ, writable. */
+					pinmux = <ESP32S31_MATRIX_IN(ESP32S31_MATRIX_CONST_ZERO, 126, 0)>,
+						 <ESP32S31_MATRIX_IN(ESP32S31_MATRIX_CONST_ONE, 128, 0)>,
+						 <ESP32S31_MATRIX_IN(ESP32S31_MATRIX_CONST_ONE, 130,
+								  ESP32S31_PINMUX_INVERT)>;
+				};
+			};
+
+			emac_rgmii_default: emac-rgmii-default-pins {
+				smi-pins {
+					pinmux = <ESP32S31_MATRIX_OUT(5, 108, 0)>,
+						 <ESP32S31_MATRIX_OUT(6, 109, 0)>,
+						 <ESP32S31_MATRIX_IN(6, 107, 0)>;
+					bias-disable;
+					input-enable;
+					drive-strength = <20>;
+				};
+
+				tx-pins {
+					pinmux = <ESP32S31_IOMUX(8, 2)>,
+						 <ESP32S31_IOMUX(9, 2)>,
+						 <ESP32S31_IOMUX(10, 2)>,
+						 <ESP32S31_IOMUX(11, 2)>,
+						 <ESP32S31_IOMUX(12, 2)>,
+						 <ESP32S31_IOMUX(13, 2)>;
+					bias-disable;
+					drive-strength = <40>;
+				};
+
+				rx-pins {
+					pinmux = <ESP32S31_IOMUX_IN(14, 2, 184)>,
+						 <ESP32S31_IOMUX_IN(15, 2, 178)>,
+						 <ESP32S31_IOMUX_IN(16, 2, 182)>,
+						 <ESP32S31_IOMUX_IN(17, 2, 181)>,
+						 <ESP32S31_IOMUX_IN(18, 2, 180)>,
+						 <ESP32S31_IOMUX_IN(19, 2, 179)>;
+					bias-disable;
+					input-enable;
+				};
+			};
+		};
+
 		/*
 		 * The SDMMC and GMAC IP blocks are DesignWare cores.  The S31
 		 * gate/reset and SRAM low-power controls live in HP_SYS_CLKRST and
@@ -127,6 +232,8 @@
 			clocks = <&clkc ESP32S31_CLK_SDMMC_BIU>,
 				 <&clkc ESP32S31_CLK_SDMMC_CIU>;
 			clock-names = "biu", "ciu";
+			pinctrl-names = "default";
+			pinctrl-0 = <&sdmmc0_default>;
 			bus-width = <1>;
 			cap-sd-highspeed;
 			max-frequency = <12000000>;
@@ -147,6 +254,11 @@
 				 <&clkc ESP32S31_CLK_EMAC_PTP_REF>,
 				 <&clkc ESP32S31_CLK_EMAC_RGMII_TXC>;
 			clock-names = "stmmaceth", "pclk", "ptp_ref", "tx";
+			pinctrl-names = "default";
+			pinctrl-0 = <&emac_rgmii_default>;
+			/* Match IDF esp_read_mac(ESP_MAC_ETH): factory base + 3. */
+			nvmem-cells = <&factory_mac 3>;
+			nvmem-cell-names = "mac-address";
 			/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
 			phy-mode = "rgmii-id";
 			phy-handle = <&yt8531>;
@@ -166,6 +278,9 @@
 				yt8531: ethernet-phy@0 {
 					compatible = "ethernet-phy-id4f51.e91b";
 					reg = <0>;
+					reset-gpios = <&gpio 7 GPIO_ACTIVE_LOW>;
+					reset-assert-us = <10000>;
+					reset-deassert-us = <100000>;
 					/* PHY strap: RXDLY enabled, TXDLY disabled. */
 					rx-internal-delay-ps = <1950>;
 					tx-internal-delay-ps = <1950>;
@@ -217,16 +332,12 @@
 			reg = <0x2038a000 0x1000>;
 			interrupt-parent = <&clic>;
 			interrupts = <32 9 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&xtal>;
+			clocks = <&clkc ESP32S31_CLK_UART0>;
+			clock-frequency = <40000000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_default>;
 			status = "okay";
 		};
 
-		usb_serial_jtag: serial@20391000 {
-			compatible = "esp,esp32-usb-serial-jtag", "esp,esp32s3-acm";
-			reg = <0x20391000 0x1000>;
-			interrupt-parent = <&clic>;
-			interrupts = <22 2 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
-		};
 	};
 };
