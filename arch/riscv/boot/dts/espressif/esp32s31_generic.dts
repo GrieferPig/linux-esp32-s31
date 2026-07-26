@@ -15,14 +15,3 @@
 };
 
 &uart0 { status = "okay"; };
-
-/*
- * Dual-OS baseline: these DMA masters cannot currently access Linux's
- * uncached PSRAM alias. Keep them quiescent until their DMA address
- * translation is implemented; the dedicated SRAM carve-outs remain in the
- * SoC dtsi so they can be enabled independently later.
- */
-&axi_gdma { status = "disabled"; };
-&sdmmc { status = "disabled"; };
-&emac { status = "disabled"; };
-&usb_otghs { status = "disabled"; };

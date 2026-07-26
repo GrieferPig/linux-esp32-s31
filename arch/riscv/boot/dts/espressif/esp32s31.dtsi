@@ -13,10 +13,10 @@
 	#size-cells = <1>;
 	compatible = "espressif,esp32s31";
 
-	memory@c0000000 {
+	memory@50000000 {
 		device_type = "memory";
-		/* 15MB uncached PSRAM; the top 1MB is reserved for OpenSBI. */
-		reg = <0xc0000000 0x00F00000>;
+		/* 15MB cached PSRAM; the top 1MB is reserved for OpenSBI. */
+		reg = <0x50000000 0x00F00000>;
 	};
 
 	aliases {
