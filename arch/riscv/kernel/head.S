@@ -18,61 +18,6 @@
 #include "efi-header.S"
 
 __HEAD
-#ifdef CONFIG_SOC_ESP32S31
-	#define ESP32S31_INITRAMFS_FLASH_ADDR	0x40a20000
-	#define ESP32S31_INITRAMFS_PSRAM_ADDR	0x50800000
-	#define ESP32S31_INITRAMFS_SIZE	0x005e0000
-
-	/*
-	 * The bootloader maps the initramfs partition into the flash XIP window.
-	 * Linux must move it into System RAM before the generic initrd code checks
-	 * and reserves the DT-provided range.
-	 */
-	.macro ESP32S31_COPY_INITRAMFS_TO_PSRAM
-		li t0, ESP32S31_INITRAMFS_FLASH_ADDR
-		li t1, ESP32S31_INITRAMFS_PSRAM_ADDR
-		li t2, ESP32S31_INITRAMFS_SIZE
-		add t2, t0, t2
-.Linitramfs_copy\@:
-		lw t3, 0(t0)
-		lw t4, 4(t0)
-		lw t5, 8(t0)
-		lw t6, 12(t0)
-		sw t3, 0(t1)
-		sw t4, 4(t1)
-		sw t5, 8(t1)
-		sw t6, 12(t1)
-		addi t0, t0, 16
-		addi t1, t1, 16
-		bltu t0, t2, .Linitramfs_copy\@
-		fence rw, rw
-	.endm
-
-	.macro ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
-		li t0, 0x2c000000
-		li t1, 0x10		/* CACHE_MAP_L1_DCACHE */
-		sw t1, 0xa0(t0)
-		li t1, CONFIG_PHYS_RAM_BASE
-		sw t1, 0xa4(t0)
-		li t1, 0x01000000
-		sw t1, 0xa8(t0)
-		fence ow, ow
-		li t1, 0x4		/* CACHE_WRITEBACK_ENA */
-		sw t1, 0x9c(t0)
-.Lcache_wb_wait1\@:
-		lw t2, 0x9c(t0)
-		andi t2, t2, 0x10
-		beqz t2, .Lcache_wb_wait1\@
-		/* S31 writeback workaround from ESP-IDF: issue it twice. */
-		sw t1, 0x9c(t0)
-.Lcache_wb_wait2\@:
-		lw t2, 0x9c(t0)
-		andi t2, t2, 0x10
-		beqz t2, .Lcache_wb_wait2\@
-		fence iorw, iorw
-	.endm
-#endif
-
 SYM_CODE_START(_start)
 	/*
 	 * Image header expected by Linux boot-loaders. The image header data
@@ -342,7 +287,6 @@ SYM_CODE_START(_start_kernel)
 	mv s0, a0
 	mv s1, a1
 	call __copy_data
-	ESP32S31_COPY_INITRAMFS_TO_PSRAM
 
 	/* Restore hart ID and DTB physical address */
 	mv a0, s0
@@ -380,10 +324,6 @@ SYM_CODE_START(_start_kernel)
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 	call setup_vm
-#ifdef CONFIG_SOC_ESP32S31
-	/* Make the freshly built page tables visible to the Sv32 walker. */
-	ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
-#endif
 #ifdef CONFIG_MMU
 	la a0, early_pg_dir
 	XIP_FIXUP_OFFSET a0

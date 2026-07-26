@@ -476,7 +476,12 @@ static void esp32s31_intmatrix_route(struct esp32s31_clic *clic,
 		return;
 	}
 
-	reg = clic->intmatrix_regs + source * 4;
+	/*
+	 * Linux exposes physical hart1 as its single logical CPU0.  The S31
+	 * interrupt matrix is not address-virtualised, so route every Linux
+	 * peripheral through the core1 register bank.
+	 */
+	reg = clic->intmatrix_regs + ESP32S31_INTMATRIX_CORE_STRIDE + source * 4;
 	val = readl(reg);
 	val &= ~(ESP32S31_INTMATRIX_MAP_MASK |
 		 ESP32S31_INTMATRIX_PASS_LEVEL_MASK);

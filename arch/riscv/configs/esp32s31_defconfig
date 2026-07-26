@@ -1,13 +1,13 @@
 # ESP32-S31 XIP + MMU (Sv32) S-mode minimal defconfig
 # Kernel executes from the Linux flash XIP partition at 0x400b0000; writable
-# data is copied to cached PSRAM at 0x50000000. It runs in Supervisor mode
+# data is copied to uncached PSRAM at 0xc0000000. It runs in Supervisor mode
 # behind OpenSBI.
 CONFIG_MMU=y
 # CONFIG_RISCV_M_MODE is not set
 CONFIG_XIP_KERNEL=y
 CONFIG_XIP_PHYS_ADDR=0x400B0000
 CONFIG_PHYS_RAM_BASE_FIXED=y
-CONFIG_PHYS_RAM_BASE=0x50000000
+CONFIG_PHYS_RAM_BASE=0xC0000000
 CONFIG_SPARSEMEM_MANUAL=y
 CONFIG_SPARSEMEM=y
 CONFIG_NONPORTABLE=y
