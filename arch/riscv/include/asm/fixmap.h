@@ -37,6 +37,15 @@ enum fixed_addresses {
 	FIX_TEXT_POKE1,
 	FIX_TEXT_POKE0,
 	FIX_EARLYCON_MEM_BASE,
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * The Hosted window starts at a 0xf80 page offset, so its 64 KiB
+	 * resource spans 17 pages.  Keeping it in the permanent fixmap avoids
+	 * allocating an Sv32 PTE page at runtime on the non-coherent S31.
+	 */
+	FIX_S31_HOSTED_END,
+	FIX_S31_HOSTED_BEGIN = FIX_S31_HOSTED_END + 17 - 1,
+#endif
 
 	__end_of_permanent_fixed_addresses,
 	/*

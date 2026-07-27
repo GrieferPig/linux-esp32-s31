@@ -105,6 +105,12 @@ static void esp32s31_cache_dma_writeback(phys_addr_t paddr, size_t size)
 	esp32s31_cache_range(paddr, size, ESP32S31_CACHE_WRITEBACK);
 }
 
+void esp32s31_cache_writeback(phys_addr_t paddr, size_t size)
+{
+	esp32s31_cache_range(paddr, size, ESP32S31_CACHE_WRITEBACK);
+}
+EXPORT_SYMBOL_GPL(esp32s31_cache_writeback);
+
 static void esp32s31_cache_dma_invalidate(phys_addr_t paddr, size_t size)
 {
 	esp32s31_cache_range(paddr, size, ESP32S31_CACHE_INVALIDATE);

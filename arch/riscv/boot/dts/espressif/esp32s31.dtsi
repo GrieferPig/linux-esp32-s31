@@ -318,6 +318,16 @@
 			status = "okay";
 		};
 
+		hosted_sram: wireless@2f062f80 {
+			compatible = "espressif,esp32s31-hosted-sram";
+			/* 64 KiB HP SRAM shared exclusively by hart0 and hart1. */
+			reg = <0x2f062f80 0x10000>;
+			interrupt-parent = <&clic>;
+			/* CPU_INTR_FROM_CPU_2 source 67 -> free raw CLIC ID40. */
+			interrupts = <40 67 IRQ_TYPE_EDGE_RISING>;
+			status = "okay";
+		};
+
 		clic: interrupt-controller@10a00000 {
 			#interrupt-cells = <3>;
 			#address-cells = <0>;

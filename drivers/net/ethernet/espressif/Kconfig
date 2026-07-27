@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config ESP32S31_HOSTED_SRAM
+	bool "ESP32-S31 in-package ESP-Hosted SRAM transport"
+	depends on SOC_ESP32S31
+	depends on NET
+	select CRC32
+	help
+	  Expose the Wi-Fi radio firmware running on hart0 as an Ethernet
+	  interface on hart1.  Frames and Bluetooth HCI packets are transported
+	  through a pair of lockless rings in reserved HP SRAM.
+

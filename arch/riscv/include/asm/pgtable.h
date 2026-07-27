@@ -8,6 +8,7 @@
 
 #include <linux/mmzone.h>
 #include <linux/sizes.h>
+#include <linux/soc/espressif/esp32s31-cache.h>
 
 #include <asm/pgtable-bits.h>
 
@@ -242,6 +243,14 @@ static inline bool pmd_leaf(pmd_t pmd)
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
 	WRITE_ONCE(*pmdp, pmd);
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * On Sv32 this also publishes the root entry which points at a newly
+	 * allocated PTE page.  Flushing only the leaf PTE leaves the walker
+	 * unable to discover that page.
+	 */
+	esp32s31_cache_writeback(__pa(pmdp), sizeof(*pmdp));
+#endif
 }
 
 static inline void pmd_clear(pmd_t *pmdp)
@@ -545,6 +554,14 @@ static inline int pte_same(pte_t pte_a, pte_t pte_b)
 static inline void set_pte(pte_t *ptep, pte_t pteval)
 {
 	WRITE_ONCE(*ptep, pteval);
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31's Sv32 walker does not snoop the shared write-back D-cache.
+	 * Publish runtime page-table updates (notably ioremap mappings) before
+	 * the corresponding sfence.vma makes the translation usable.
+	 */
+	esp32s31_cache_writeback(__pa(ptep), sizeof(*ptep));
+#endif
 }
 
 void flush_icache_pte(struct mm_struct *mm, pte_t pte);

@@ -12,6 +12,8 @@ menuconfig ETHERNET
 
 if ETHERNET
 
+source "drivers/net/ethernet/espressif/Kconfig"
+
 config MDIO
 	tristate
 
