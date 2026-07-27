@@ -246,6 +246,7 @@ static void s31_process_frame(struct s31_hosted *hosted, const u8 *frame,
 
 	switch (header->if_type) {
 	case S31_HOSTED_STA_IF:
+	case S31_HOSTED_AP_IF:
 		if (length < ETH_HLEN || length > ETH_FRAME_LEN)
 			goto malformed;
 		skb = napi_alloc_skb(&hosted->napi, length + NET_IP_ALIGN);
@@ -261,6 +262,12 @@ static void s31_process_frame(struct s31_hosted *hosted, const u8 *frame,
 		break;
 	case S31_HOSTED_PRIV_IF:
 		s31_process_private(hosted, payload, length);
+		break;
+	case S31_HOSTED_HCI_IF:
+		/* Bluetooth HCI packets — future hci_s31 integration. */
+		dev_dbg_ratelimited(hosted->dev,
+				    "HCI packet received (%u bytes)\n",
+				    length);
 		break;
 	default:
 		dev_dbg_ratelimited(hosted->dev, "unhandled Hosted interface %u\n",
