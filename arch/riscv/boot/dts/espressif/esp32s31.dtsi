@@ -21,6 +21,8 @@
 
 	aliases {
 		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
 		mmc0 = &sdmmc;
 		ethernet0 = &emac;
 	};
@@ -106,10 +108,14 @@
 			#clock-cells = <1>;
 		};
 
-		efuse: efuse@20715050 {
+		efuse: efuse@2071502c {
 			compatible = "espressif,esp32s31-efuse";
-			/* IDF EFUSE_RD_MAC_SYS0..5: eFuse BLK1 read shadows. */
-			reg = <0x20715050 0x18>;
+			/*
+			 * IDF EFUSE_RD_WR_DIS through RD_SYS_PART2_DATA7:
+			 * complete BLK0..BLK9 read-shadow range.  Hardware
+			 * returns zero for blocks protected by RD_DIS.
+			 */
+			reg = <0x2071502c 0x13c>;
 			read-only;
 
 			nvmem-layout {
@@ -119,10 +125,18 @@
 
 				factory_mac: mac-address@0 {
 					compatible = "mac-base";
-					reg = <0x0 0x6>;
+					/* BLK1 starts 0x24 bytes into this provider. */
+					reg = <0x24 0x6>;
 					#nvmem-cell-cells = <1>;
 				};
 			};
+		};
+
+		trng: rng@20814000 {
+			compatible = "espressif,esp32s31-trng";
+			reg = <0x20814000 0x100>, <0x2071003c 0x4>;
+			reg-names = "trng", "clkrst";
+			status = "okay";
 		};
 
 		gpio: pinctrl@20583000 {
@@ -146,6 +160,32 @@
 
 				rx-pins {
 					pinmux = <ESP32S31_IOMUX_IN(59, 0, 10)>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			uart1_default: uart1-default-pins {
+				tx-pins {
+					pinmux = <ESP32S31_MATRIX_OUT(21, 13, 0)>;
+					drive-strength = <20>;
+				};
+
+				rx-pins {
+					pinmux = <ESP32S31_MATRIX_IN(22, 13, 0)>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			uart2_default: uart2-default-pins {
+				tx-pins {
+					pinmux = <ESP32S31_MATRIX_OUT(42, 16, 0)>;
+					drive-strength = <20>;
+				};
+
+				rx-pins {
+					pinmux = <ESP32S31_MATRIX_IN(43, 16, 0)>;
 					bias-pull-up;
 					input-enable;
 				};
@@ -346,6 +386,38 @@
 			clock-frequency = <40000000>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart0_default>;
+			status = "okay";
+		};
+
+		uart1: serial@2038b000 {
+			compatible = "esp,esp32s3-uart";
+			reg = <0x2038b000 0x1000>;
+			interrupt-parent = <&clic>;
+			interrupts = <19 10 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_UART1>;
+			clock-frequency = <40000000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart1_default>;
+			status = "okay";
+		};
+
+		uart2: serial@2038c000 {
+			compatible = "esp,esp32s3-uart";
+			reg = <0x2038c000 0x1000>;
+			interrupt-parent = <&clic>;
+			interrupts = <20 11 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_UART2>;
+			clock-frequency = <40000000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart2_default>;
+			status = "okay";
+		};
+
+		watchdog@20581000 {
+			compatible = "espressif,esp32s31-timg-wdt";
+			reg = <0x20581000 0x100>;
+			clocks = <&clkc ESP32S31_CLK_WDT1>;
+			timeout-sec = <30>;
 			status = "okay";
 		};
 

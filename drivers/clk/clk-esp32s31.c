@@ -26,6 +26,8 @@
 #define HP_SDIO_HOST_FUNC_CTRL0		0xc4
 #define HP_EMAC_CTRL0			0xc8
 #define HP_UART0_CTRL0			0x88
+#define HP_UART_CTRL_STRIDE		0x04
+#define HP_TIMERGRP1_CTRL0		0x11c
 
 #define HP_SDMMC_SYS_CLK_EN		BIT(0)
 #define HP_SDIO_LS_CLK_SRC_SEL		BIT(2)
@@ -55,6 +57,12 @@
 #define HP_UART_SCLK_DIV_NUM		GENMASK(15, 8)
 #define HP_UART_SCLK_DIV_NUMERATOR	GENMASK(23, 16)
 #define HP_UART_SCLK_DIV_DENOMINATOR	GENMASK(31, 24)
+
+#define HP_TIMERGRP_APB_CLK_EN		BIT(0)
+#define HP_TIMERGRP_RST_EN		BIT(1)
+#define HP_TIMERGRP_FORCE_NORST		BIT(2)
+#define HP_TIMERGRP_WDT_SRC_SEL		GENMASK(10, 9)
+#define HP_TIMERGRP_WDT_CLK_EN		BIT(11)
 
 #define CNNT_CLK_EN			0x00
 #define CNNT_SYS_SDMMC_MEM_LP_CTRL	0x10
@@ -108,7 +116,8 @@ struct esp32s31_clk_priv {
 	struct clk_hw_onecell_data *onecell;
 	bool sdmmc_initialized;
 	bool emac_initialized;
-	bool uart0_initialized;
+	bool uart_initialized[3];
+	bool wdt1_initialized;
 };
 
 enum esp32s31_clk_kind {
@@ -119,6 +128,9 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_EMAC_PTP,
 	ESP32S31_CLK_KIND_EMAC_TXC,
 	ESP32S31_CLK_KIND_UART0,
+	ESP32S31_CLK_KIND_UART1,
+	ESP32S31_CLK_KIND_UART2,
+	ESP32S31_CLK_KIND_WDT1,
 };
 
 struct esp32s31_clk {
@@ -199,8 +211,10 @@ static void esp32s31_emac_prepare(struct esp32s31_clk_priv *priv)
 		     CNNT_EMAC_PTP_REF_CLK_SEL, CNNT_EMAC_PTP_REF_CLK_EN);
 }
 
-static void esp32s31_uart0_prepare(struct esp32s31_clk_priv *priv)
+static void esp32s31_uart_prepare(struct esp32s31_clk_priv *priv,
+				  unsigned int port)
 {
+	u32 reg = HP_UART0_CTRL0 + port * HP_UART_CTRL_STRIDE;
 	u32 mask = HP_UART_SYS_CLK_EN | HP_UART_APB_CLK_EN |
 		   HP_UART_CORE_RST_EN | HP_UART_APB_RST_EN |
 		   HP_UART_FORCE_NORST | HP_UART_CLK_SRC_SEL |
@@ -211,9 +225,18 @@ static void esp32s31_uart0_prepare(struct esp32s31_clk_priv *priv)
 		  HP_UART_FORCE_NORST | HP_UART_CLK_EN;
 
 	/* XTAL source, integer divide by one, then reset the APB register bank. */
-	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, mask, val);
-	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, 0, HP_UART_APB_RST_EN);
-	esp32s31_rmw(priv->hp, HP_UART0_CTRL0, HP_UART_APB_RST_EN, 0);
+	esp32s31_rmw(priv->hp, reg, mask, val);
+	esp32s31_rmw(priv->hp, reg, 0, HP_UART_APB_RST_EN);
+	esp32s31_rmw(priv->hp, reg, HP_UART_APB_RST_EN, 0);
+}
+
+static void esp32s31_wdt1_prepare(struct esp32s31_clk_priv *priv)
+{
+	/* IDF default watchdog source is XTAL (source selector 0). */
+	esp32s31_rmw(priv->hp, HP_TIMERGRP1_CTRL0,
+		     HP_TIMERGRP_RST_EN | HP_TIMERGRP_WDT_SRC_SEL,
+		     HP_TIMERGRP_APB_CLK_EN | HP_TIMERGRP_FORCE_NORST |
+		     HP_TIMERGRP_WDT_CLK_EN);
 }
 
 static int esp32s31_clk_prepare(struct clk_hw *hw)
@@ -255,9 +278,20 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 			     CNNT_EMAC_REF_CLK_SEL, CNNT_EMAC_REF_CLK_EN);
 		break;
 	case ESP32S31_CLK_KIND_UART0:
-		if (!priv->uart0_initialized) {
-			esp32s31_uart0_prepare(priv);
-			priv->uart0_initialized = true;
+	case ESP32S31_CLK_KIND_UART1:
+	case ESP32S31_CLK_KIND_UART2: {
+		unsigned int port = clk->kind - ESP32S31_CLK_KIND_UART0;
+
+		if (!priv->uart_initialized[port]) {
+			esp32s31_uart_prepare(priv, port);
+			priv->uart_initialized[port] = true;
+		}
+		break;
+	}
+	case ESP32S31_CLK_KIND_WDT1:
+		if (!priv->wdt1_initialized) {
+			esp32s31_wdt1_prepare(priv);
+			priv->wdt1_initialized = true;
 		}
 		break;
 	case ESP32S31_CLK_KIND_FIXED:
@@ -475,6 +509,21 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 		return ret;
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_UART0,
 				    "uart0", ESP32S31_CLK_KIND_UART0,
+				    ESP32S31_XTAL_RATE);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_UART1,
+				    "uart1", ESP32S31_CLK_KIND_UART1,
+				    ESP32S31_XTAL_RATE);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_UART2,
+				    "uart2", ESP32S31_CLK_KIND_UART2,
+				    ESP32S31_XTAL_RATE);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_WDT1,
+				    "wdt1", ESP32S31_CLK_KIND_WDT1,
 				    ESP32S31_XTAL_RATE);
 	if (ret)
 		return ret;

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 eFuse read-window NVMEM provider
+ * ESP32-S31 eFuse read-shadow NVMEM provider
  *
- * The S31 hardware presents each eFuse block as little-endian 32-bit shadow
- * registers. ESP-IDF describes MAC_FACTORY in reverse byte order (BLK1 bits
- * 40..0), so mac-base cells need a six-byte reversal before the standard
- * consumer-specific address offset is applied.
+ * The S31 hardware presents all ten eFuse blocks as one contiguous range of
+ * little-endian 32-bit read-shadow registers. ESP-IDF describes MAC_FACTORY
+ * in reverse byte order (BLK1 bits 40..0), so mac-base cells need a six-byte
+ * reversal before the standard consumer-specific address offset is applied.
  */
 
 #include <linux/etherdevice.h>
