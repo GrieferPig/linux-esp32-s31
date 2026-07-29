@@ -141,6 +141,7 @@ CONFIG_STMMAC_PLATFORM=y
 CONFIG_DWMAC_GENERIC=y
 CONFIG_MOTORCOMM_PHY=y
 CONFIG_ESP32S31_HOSTED_SRAM=y
+CONFIG_BT=y
 
 # Bootloader-mapped SPI Flash, exported read-only as fixed MTD partitions
 CONFIG_MTD=y
