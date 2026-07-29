@@ -64,6 +64,11 @@
 #define HP_TIMERGRP_WDT_SRC_SEL		GENMASK(10, 9)
 #define HP_TIMERGRP_WDT_CLK_EN		BIT(11)
 
+#define HP_SYS_UART_MEM_LP_CTRL0		0x28c
+#define HP_SYS_UART_MEM_LP_STRIDE	0x04
+#define HP_SYS_UART_MEM_LP_EN		BIT(2)
+#define HP_SYS_UART_MEM_FORCE_CTRL	BIT(3)
+
 #define CNNT_CLK_EN			0x00
 #define CNNT_SYS_SDMMC_MEM_LP_CTRL	0x10
 #define CNNT_SYS_GMAC_MEM_LP_CTRL	0x1c
@@ -111,6 +116,7 @@
 
 struct esp32s31_clk_priv {
 	void __iomem *hp;
+	void __iomem *hp_sys;
 	void __iomem *cnnt;
 	spinlock_t lock;
 	struct clk_hw_onecell_data *onecell;
@@ -215,6 +221,8 @@ static void esp32s31_uart_prepare(struct esp32s31_clk_priv *priv,
 				  unsigned int port)
 {
 	u32 reg = HP_UART0_CTRL0 + port * HP_UART_CTRL_STRIDE;
+	u32 mem_reg = HP_SYS_UART_MEM_LP_CTRL0 +
+		      port * HP_SYS_UART_MEM_LP_STRIDE;
 	u32 mask = HP_UART_SYS_CLK_EN | HP_UART_APB_CLK_EN |
 		   HP_UART_CORE_RST_EN | HP_UART_APB_RST_EN |
 		   HP_UART_FORCE_NORST | HP_UART_CLK_SRC_SEL |
@@ -228,6 +236,11 @@ static void esp32s31_uart_prepare(struct esp32s31_clk_priv *priv,
 	esp32s31_rmw(priv->hp, reg, mask, val);
 	esp32s31_rmw(priv->hp, reg, 0, HP_UART_APB_RST_EN);
 	esp32s31_rmw(priv->hp, reg, HP_UART_APB_RST_EN, 0);
+
+	/* UART1/2 FIFO SRAM powers up disabled; force it on while in use. */
+	esp32s31_rmw(priv->hp_sys, mem_reg,
+		     HP_SYS_UART_MEM_LP_EN | HP_SYS_UART_MEM_FORCE_CTRL,
+		     HP_SYS_UART_MEM_FORCE_CTRL);
 }
 
 static void esp32s31_wdt1_prepare(struct esp32s31_clk_priv *priv)
@@ -452,6 +465,13 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 		return -EINVAL;
 	priv->hp = devm_ioremap(dev, res->start, resource_size(res));
 	if (!priv->hp)
+		return -ENOMEM;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "hp-system");
+	if (!res)
+		return -EINVAL;
+	priv->hp_sys = devm_ioremap(dev, res->start, resource_size(res));
+	if (!priv->hp_sys)
 		return -ENOMEM;
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cnnt-sys");

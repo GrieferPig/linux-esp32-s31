@@ -103,8 +103,9 @@
 
 		clkc: clock-controller@20587000 {
 			compatible = "espressif,esp32s31-clock";
-			reg = <0x20587000 0x1000>, <0x20359000 0x1000>;
-			reg-names = "hp-sys-clkrst", "cnnt-sys";
+			reg = <0x20587000 0x1000>, <0x20586000 0x1000>,
+			      <0x20359000 0x1000>;
+			reg-names = "hp-sys-clkrst", "hp-system", "cnnt-sys";
 			#clock-cells = <1>;
 		};
 
@@ -378,7 +379,7 @@
 		};
 
 		uart0: serial@2038a000 {
-			compatible = "esp,esp32s3-uart";
+			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038a000 0x1000>;
 			interrupt-parent = <&clic>;
 			interrupts = <32 9 IRQ_TYPE_LEVEL_HIGH>;
@@ -390,7 +391,7 @@
 		};
 
 		uart1: serial@2038b000 {
-			compatible = "esp,esp32s3-uart";
+			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038b000 0x1000>;
 			interrupt-parent = <&clic>;
 			interrupts = <19 10 IRQ_TYPE_LEVEL_HIGH>;
@@ -402,7 +403,7 @@
 		};
 
 		uart2: serial@2038c000 {
-			compatible = "esp,esp32s3-uart";
+			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038c000 0x1000>;
 			interrupt-parent = <&clic>;
 			interrupts = <20 11 IRQ_TYPE_LEVEL_HIGH>;

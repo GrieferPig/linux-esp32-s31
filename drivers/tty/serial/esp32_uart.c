@@ -69,6 +69,8 @@
 #define ESP32_UART_RX_FLOW_EN			BIT(23)
 #define ESP32S3_UART_RX_FLOW_EN			BIT(22)
 #define ESP32S3_UART_CLK_CONF_REG	0x78
+#define ESP32S31_UART_REG_UPDATE_REG	0x98
+#define ESP32S31_UART_REG_UPDATE		BIT(0)
 #define ESP32S3_UART_SCLK_DIV_B			GENMASK(5, 0)
 #define ESP32S3_UART_SCLK_DIV_A			GENMASK(11, 6)
 #define ESP32S3_UART_SCLK_DIV_NUM		GENMASK(19, 12)
@@ -102,6 +104,7 @@ struct esp32_uart_variant {
 	u32 rx_flow_en;
 	const char *type;
 	bool has_clkconf;
+	bool needs_reg_update;
 };
 
 static const struct esp32_uart_variant esp32_variant = {
@@ -123,6 +126,15 @@ static const struct esp32_uart_variant esp32s3_variant = {
 	.has_clkconf = true,
 };
 
+static const struct esp32_uart_variant esp32s31_variant = {
+	.clkdiv_mask = ESP32S3_UART_CLKDIV,
+	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
+	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
+	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
+	.type = "ESP32-S31 UART",
+	.needs_reg_update = true,
+};
+
 static const struct of_device_id esp32_uart_dt_ids[] = {
 	{
 		.compatible = "esp,esp32-uart",
@@ -130,6 +142,9 @@ static const struct of_device_id esp32_uart_dt_ids[] = {
 	}, {
 		.compatible = "esp,esp32s3-uart",
 		.data = &esp32s3_variant,
+	}, {
+		.compatible = "espressif,esp32s31-uart",
+		.data = &esp32s31_variant,
 	}, { /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, esp32_uart_dt_ids);
@@ -149,6 +164,18 @@ static void esp32_uart_write(struct uart_port *port, unsigned long reg, u32 v)
 static u32 esp32_uart_read(struct uart_port *port, unsigned long reg)
 {
 	return readl(port->membase + reg);
+}
+
+static void esp32_uart_update(struct uart_port *port)
+{
+	if (!port_variant(port)->needs_reg_update)
+		return;
+
+	esp32_uart_write(port, ESP32S31_UART_REG_UPDATE_REG,
+			 ESP32S31_UART_REG_UPDATE);
+	while (esp32_uart_read(port, ESP32S31_UART_REG_UPDATE_REG) &
+	       ESP32S31_UART_REG_UPDATE)
+		cpu_relax();
 }
 
 static u32 esp32_uart_tx_fifo_cnt(struct uart_port *port)
@@ -175,6 +202,20 @@ static void esp32_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
 	u32 conf0 = esp32_uart_read(port, UART_CONF0_REG);
 
+	if (port_variant(port)->needs_reg_update) {
+		/*
+		 * S31 keeps software RTS/DTR in different registers than S3.
+		 * The driver does not expose those unpinned modem signals, but
+		 * TIOCM_LOOP remains useful for controller self-tests.
+		 */
+		conf0 &= ~BIT(12);
+		if (mctrl & TIOCM_LOOP)
+			conf0 |= BIT(12);
+		esp32_uart_write(port, UART_CONF0_REG, conf0);
+		esp32_uart_update(port);
+		return;
+	}
+
 	conf0 &= ~(UART_LOOPBACK |
 		   UART_SW_RTS | UART_RTS_INV |
 		   UART_SW_DTR | UART_DTR_INV);
@@ -187,6 +228,7 @@ static void esp32_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 		conf0 |= UART_LOOPBACK;
 
 	esp32_uart_write(port, UART_CONF0_REG, conf0);
+	esp32_uart_update(port);
 }
 
 static unsigned int esp32_uart_get_mctrl(struct uart_port *port)
@@ -343,8 +385,10 @@ static int esp32_uart_startup(struct uart_port *port)
 	esp32_uart_write(port, UART_CONF1_REG,
 			 (1 << UART_RXFIFO_FULL_THRHD_SHIFT) |
 			 (1 << port_variant(port)->txfifo_empty_thrhd_shift));
-	esp32_uart_write(port, UART_INT_CLR_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
-	esp32_uart_write(port, UART_INT_ENA_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
+	esp32_uart_write(port, UART_INT_CLR_REG,
+			 UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
+	esp32_uart_write(port, UART_INT_ENA_REG,
+			 UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	return ret;
@@ -381,6 +425,7 @@ static bool esp32_uart_set_baud(struct uart_port *port, u32 baud)
 
 		esp32_uart_write(port, UART_CLKDIV_REG,
 				 div | FIELD_PREP(UART_CLKDIV_FRAG, frag));
+		esp32_uart_update(port);
 		return true;
 	}
 
@@ -667,6 +712,17 @@ static int __init esp32s3_uart_early_console_setup(struct earlycon_device *devic
 
 OF_EARLYCON_DECLARE(esp32s3uart, "esp,esp32s3-uart",
 		    esp32s3_uart_early_console_setup);
+
+static int __init esp32s31_uart_early_console_setup(struct earlycon_device *device,
+						    const char *options)
+{
+	device->port.private_data = (void *)&esp32s31_variant;
+
+	return esp32xx_uart_early_console_setup(device, options);
+}
+
+OF_EARLYCON_DECLARE(esp32s31uart, "espressif,esp32s31-uart",
+		    esp32s31_uart_early_console_setup);
 
 static struct uart_driver esp32_uart_reg = {
 	.owner		= THIS_MODULE,
