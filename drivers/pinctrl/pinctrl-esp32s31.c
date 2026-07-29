@@ -768,6 +768,16 @@ static int esp32s31_gpio_direction_output(struct gpio_chip *gc,
 	struct esp32s31_pinctrl *pctl = gpiochip_get_data(gc);
 	u32 reg = offset < 32 ? GPIO_ENABLE_W1TS : GPIO_ENABLE1_W1TS;
 
+	/*
+	 * S31 has native open-drain support, but open-source is emulated by
+	 * gpiolib by switching between input and push-pull high.  A previous
+	 * open-drain user may have left PAD_DRIVER set after releasing the
+	 * line, so make sure the emulated high state can actively drive it.
+	 */
+	if (gpiochip_line_is_open_source(gc, offset))
+		esp32s31_update_bits(pctl, esp32s31_pin_reg(pctl, offset),
+				       GPIO_PIN_PAD_DRIVER, 0);
+
 	esp32s31_gpio_set(gc, offset, value);
 	writel_relaxed(BIT(offset % 32), pctl->gpio_base + reg);
 	return 0;
