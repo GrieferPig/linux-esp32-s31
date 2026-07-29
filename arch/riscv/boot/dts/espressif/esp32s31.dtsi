@@ -168,12 +168,12 @@
 
 			uart1_default: uart1-default-pins {
 				tx-pins {
-					pinmux = <ESP32S31_MATRIX_OUT(21, 13, 0)>;
+					pinmux = <ESP32S31_MATRIX_OUT(42, 13, 0)>;
 					drive-strength = <20>;
 				};
 
 				rx-pins {
-					pinmux = <ESP32S31_MATRIX_IN(22, 13, 0)>;
+					pinmux = <ESP32S31_MATRIX_IN(43, 13, 0)>;
 					bias-pull-up;
 					input-enable;
 				};
@@ -399,7 +399,8 @@
 			clock-frequency = <40000000>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart1_default>;
-			status = "okay";
+			/* Untested; keep disabled by default. */
+			status = "disabled";
 		};
 
 		uart2: serial@2038c000 {
@@ -411,7 +412,8 @@
 			clock-frequency = <40000000>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart2_default>;
-			status = "okay";
+			/* Untested; keep disabled by default. */
+			status = "disabled";
 		};
 
 		watchdog@20581000 {
