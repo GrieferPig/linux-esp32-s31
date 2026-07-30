@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "uart1";
+};
+
+&gpio {
+	uart1_dynamic: uart1-dynamic-pins {
+		tx {
+			espressif,route-name = "uart1.tx";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(42, 13, 0)>;
+			drive-strength = <20>;
+		};
+		rx {
+			espressif,route-name = "uart1.rx";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(43, 13, 0)>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_dynamic>;
+	status = "okay";
+};

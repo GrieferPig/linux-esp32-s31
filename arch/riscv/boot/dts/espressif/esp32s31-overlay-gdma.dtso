@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "gdma";
+	espressif,resource-claims = "hp-int-source22";
+};
+
+&ahb_gdma {
+	status = "okay";
+};

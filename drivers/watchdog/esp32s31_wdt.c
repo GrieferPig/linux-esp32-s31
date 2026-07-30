@@ -162,7 +162,7 @@ static int esp32s31_wdt_set_timeout(struct watchdog_device *wdd,
 }
 
 static const struct watchdog_info esp32s31_wdt_info = {
-	.identity = "ESP32-S31 main watchdog",
+	.identity = "ESP32-S31 timer-group watchdog",
 	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
 };
 

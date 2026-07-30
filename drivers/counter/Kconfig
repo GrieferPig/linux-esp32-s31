@@ -78,6 +78,20 @@ config INTERRUPT_CNT
 	  To compile this driver as a module, choose M here: the
 	  module will be called interrupt-cnt.
 
+config ESP32S31_PCNT
+	tristate "Espressif ESP32-S31 pulse counter"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  Counter framework support for the two four-unit S31 PCNT blocks.
+
+config ESP32S31_SYSTEM_TIMERS
+	tristate "Espressif ESP32-S31 system and RTC timers"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  Read-only Counter framework access to both SYSTIMER counters and
+	  both low-power RTC timer counters.
+
 config MICROCHIP_TCB_CAPTURE
 	tristate "Microchip Timer Counter Capture driver"
 	depends on SOC_AT91SAM9 || SOC_SAM_V7 || COMPILE_TEST

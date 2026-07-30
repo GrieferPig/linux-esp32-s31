@@ -146,6 +146,9 @@ struct esp32s31_pinctrl {
 
 	struct gpio_chip gc;
 	u8 irq_types[ESP32S31_GPIO_NR];
+	u8 mux_function[ESP32S31_GPIO_NR];
+	u8 gmac_dedicated_users;
+	u8 sdio_dedicated_users;
 };
 
 static u64 esp32s31_bitmap_to_u64(const unsigned long *bitmap)
@@ -211,6 +214,21 @@ static int esp32s31_pinctrl_get_group_pins(struct pinctrl_dev *pctldev,
 					   unsigned int *npins)
 {
 	return pinctrl_generic_get_group_pins(pctldev, selector, pins, npins);
+}
+
+static int esp32s31_find_group_selector(struct pinctrl_dev *pctldev,
+					const char *name)
+{
+	unsigned int selector, count = pinctrl_generic_get_group_count(pctldev);
+
+	for (selector = 0; selector < count; selector++) {
+		const char *candidate =
+			pinctrl_generic_get_group_name(pctldev, selector);
+
+		if (candidate && !strcmp(candidate, name))
+			return selector;
+	}
+	return -EINVAL;
 }
 
 static void esp32s31_pinctrl_pin_dbg_show(struct pinctrl_dev *pctldev,
@@ -340,9 +358,21 @@ static int esp32s31_pinctrl_dt_node_to_map(struct pinctrl_dev *pctldev,
 				pins[npins++] = group->entries[i].pin;
 		}
 
-		ret = pinctrl_generic_add_group(pctldev, name, pins, npins, group);
-		if (ret < 0)
-			goto err_put_child;
+		ret = esp32s31_find_group_selector(pctldev, name);
+		if (ret >= 0) {
+			struct group_desc *old = pinctrl_generic_get_group(pctldev,
+									ret);
+
+			/* A same-name overlay is being reloaded with new routes. */
+			old->grp.pins = pins;
+			old->grp.npins = npins;
+			old->data = group;
+		} else {
+			ret = pinctrl_generic_add_group(pctldev, name, pins, npins,
+						group);
+			if (ret < 0)
+				goto err_put_child;
+		}
 
 		group_names[ngroups++] = name;
 		map[nmaps].type = PIN_MAP_TYPE_MUX_GROUP;
@@ -366,6 +396,14 @@ static int esp32s31_pinctrl_dt_node_to_map(struct pinctrl_dev *pctldev,
 					  ngroups, NULL);
 	if (ret < 0)
 		goto err_free;
+	{
+		struct function_desc *function = pinmux_generic_get_function(pctldev,
+									 ret);
+
+		/* pinmux_generic_add_function returns the existing selector too. */
+		function->func.groups = group_names;
+		function->func.ngroups = ngroups;
+	}
 
 	*maps = map;
 	*num_maps = nmaps;
@@ -392,22 +430,101 @@ static const struct pinctrl_ops esp32s31_pinctrl_ops = {
 static void esp32s31_set_iomux(struct esp32s31_pinctrl *pctl,
 			       unsigned int pin, unsigned int function)
 {
-	/* GPIO8..19 function 2 is the native RGMII group. */
-	if (pin >= 8 && pin <= 19 && function == 2)
-		esp32s31_update_bits(pctl,
-				       pctl->cnnt_pad_base + CNNT_PAD_CTRL,
-				       CNNT_PAD_GMAC_DEDICATED,
-				       CNNT_PAD_GMAC_DEDICATED);
+	unsigned long flags;
+	u32 val;
+	u8 old_function;
 
-	/* S31 SDMMC_LL_IOMUX_FUNC is function 4 for the native slot-0 group. */
-	if (pin >= 20 && pin <= 25 && function == 4)
-		esp32s31_update_bits(pctl,
-				       pctl->cnnt_pad_base + CNNT_PAD_CTRL,
-				       CNNT_PAD_SDIO_DEDICATED,
-				       CNNT_PAD_SDIO_DEDICATED);
+	raw_spin_lock_irqsave(&pctl->lock, flags);
+	old_function = pctl->mux_function[pin];
+	if (pin >= 8 && pin <= 19) {
+		if (old_function == 2 && function != 2)
+			pctl->gmac_dedicated_users--;
+		else if (old_function != 2 && function == 2)
+			pctl->gmac_dedicated_users++;
+	}
+	if (pin >= 20 && pin <= 25) {
+		if (old_function == 4 && function != 4)
+			pctl->sdio_dedicated_users--;
+		else if (old_function != 4 && function == 4)
+			pctl->sdio_dedicated_users++;
+	}
+	pctl->mux_function[pin] = function;
 
+	val = readl_relaxed(pctl->cnnt_pad_base + CNNT_PAD_CTRL);
+	if (pctl->gmac_dedicated_users)
+		val |= CNNT_PAD_GMAC_DEDICATED;
+	else
+		val &= ~CNNT_PAD_GMAC_DEDICATED;
+	if (pctl->sdio_dedicated_users)
+		val |= CNNT_PAD_SDIO_DEDICATED;
+	else
+		val &= ~CNNT_PAD_SDIO_DEDICATED;
+	writel_relaxed(val, pctl->cnnt_pad_base + CNNT_PAD_CTRL);
+
+	val = readl_relaxed(esp32s31_iomux_reg(pctl, pin));
+	val &= ~IOMUX_MCU_SEL;
+	val |= FIELD_PREP(IOMUX_MCU_SEL, function);
+	writel_relaxed(val, esp32s31_iomux_reg(pctl, pin));
+	raw_spin_unlock_irqrestore(&pctl->lock, flags);
+}
+
+static void esp32s31_pinmux_make_safe(struct esp32s31_pinctrl *pctl,
+				      unsigned int pin)
+{
+	u32 reg, val;
+	unsigned int signal;
+
+	reg = pin < 32 ? GPIO_ENABLE_W1TC : GPIO_ENABLE1_W1TC;
+	writel_relaxed(BIT(pin % 32), pctl->gpio_base + reg);
+
+	for (signal = 0; signal < 256; signal++) {
+		void __iomem *input = pctl->gpio_base + GPIO_FUNC_IN_BASE +
+				      signal * sizeof(u32);
+
+		val = readl_relaxed(input);
+		if ((val & GPIO_FUNC_IN_MATRIX) &&
+		    FIELD_GET(GPIO_FUNC_IN_SEL, val) == pin)
+			esp32s31_update_bits(pctl, input,
+				GPIO_FUNC_IN_SEL | GPIO_FUNC_IN_INV |
+				GPIO_FUNC_IN_MATRIX,
+				FIELD_PREP(GPIO_FUNC_IN_SEL,
+					   ESP32S31_MATRIX_CONST_ZERO) |
+				GPIO_FUNC_IN_MATRIX);
+	}
+
+	esp32s31_update_bits(pctl, esp32s31_out_sel_reg(pctl, pin),
+		GPIO_FUNC_OUT_SEL | GPIO_FUNC_OUT_INV | GPIO_FUNC_OUT_OEN_SEL |
+		GPIO_FUNC_OUT_OEN_INV,
+		FIELD_PREP(GPIO_FUNC_OUT_SEL, ESP32S31_MATRIX_GPIO_OUT) |
+		GPIO_FUNC_OUT_OEN_SEL);
+	esp32s31_update_bits(pctl, esp32s31_pin_reg(pctl, pin),
+		GPIO_PIN_INT_ENA | GPIO_PIN_PAD_DRIVER, 0);
+	esp32s31_set_iomux(pctl, pin, IOMUX_GPIO_FUNC);
 	esp32s31_update_bits(pctl, esp32s31_iomux_reg(pctl, pin),
-			       IOMUX_MCU_SEL, FIELD_PREP(IOMUX_MCU_SEL, function));
+		IOMUX_FUN_IE | IOMUX_FUN_PU | IOMUX_FUN_PD, 0);
+	reg = pin < 32 ? GPIO_STATUS_W1TC : GPIO_STATUS1_W1TC;
+	writel_relaxed(BIT(pin % 32), pctl->gpio_base + reg);
+}
+
+static int esp32s31_pinmux_free(struct pinctrl_dev *pctldev,
+				unsigned int pin)
+{
+	struct esp32s31_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
+
+	if (!esp32s31_valid_pin(pin))
+		return -EINVAL;
+	esp32s31_pinmux_make_safe(pctl, pin);
+	return 0;
+}
+
+static void esp32s31_pinmux_gpio_disable_free(struct pinctrl_dev *pctldev,
+					       struct pinctrl_gpio_range *range,
+					       unsigned int pin)
+{
+	struct esp32s31_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
+
+	if (esp32s31_valid_pin(pin))
+		esp32s31_pinmux_make_safe(pctl, pin);
 }
 
 static void esp32s31_set_matrix_output(struct esp32s31_pinctrl *pctl,
@@ -517,11 +634,13 @@ static int esp32s31_pinmux_gpio_request(struct pinctrl_dev *pctldev,
 }
 
 static const struct pinmux_ops esp32s31_pinmux_ops = {
+	.free = esp32s31_pinmux_free,
 	.get_functions_count = pinmux_generic_get_function_count,
 	.get_function_name = pinmux_generic_get_function_name,
 	.get_function_groups = pinmux_generic_get_function_groups,
 	.set_mux = esp32s31_pinmux_set_mux,
 	.gpio_request_enable = esp32s31_pinmux_gpio_request,
+	.gpio_disable_free = esp32s31_pinmux_gpio_disable_free,
 	.strict = true,
 };
 
@@ -630,6 +749,12 @@ static int esp32s31_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 			mask = IOMUX_FUN_IE;
 			val = arg ? IOMUX_FUN_IE : 0;
 			break;
+		case PIN_CONFIG_OUTPUT_ENABLE:
+			reg = pctl->gpio_base + (pin < 32 ?
+				(arg ? GPIO_ENABLE_W1TS : GPIO_ENABLE_W1TC) :
+				(arg ? GPIO_ENABLE1_W1TS : GPIO_ENABLE1_W1TC));
+			writel_relaxed(BIT(pin % 32), reg);
+			continue;
 		case PIN_CONFIG_INPUT_SCHMITT_ENABLE:
 			mask = IOMUX_HYS_SEL | IOMUX_HYS_EN;
 			val = IOMUX_HYS_SEL | (arg ? IOMUX_HYS_EN : 0);
@@ -979,6 +1104,12 @@ static int esp32s31_pinctrl_probe(struct platform_device *pdev)
 			       GPIO_CLOCK_GATE_EN, GPIO_CLOCK_GATE_EN);
 	esp32s31_update_bits(pctl, pctl->cnnt_pad_base + CNNT_PAD_CLOCK_GATE,
 			       CNNT_PAD_CLOCK_GATE_EN, CNNT_PAD_CLOCK_GATE_EN);
+	/* Linux starts with no dynamic GMAC/SDIO owner.  Do not inherit a
+	 * dedicated-pad selection left behind by the bootloader.
+	 */
+	esp32s31_update_bits(pctl, pctl->cnnt_pad_base + CNNT_PAD_CTRL,
+			       CNNT_PAD_GMAC_DEDICATED | CNNT_PAD_SDIO_DEDICATED,
+			       0);
 
 	pctl->pins = devm_kcalloc(dev, ESP32S31_GPIO_NR, sizeof(*pctl->pins),
 				  GFP_KERNEL);

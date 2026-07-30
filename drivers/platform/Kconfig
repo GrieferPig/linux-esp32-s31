@@ -1,4 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
+
+config ESP32S31_DT_OVERLAY
+	bool "ESP32-S31 transactional Device Tree overlay manager"
+	depends on SOC_ESP32S31
+	select OF_OVERLAY
+	help
+	  Exposes /dev/s31-overlay. A complete DTBO written to the device
+	  replaces the currently active overlay. Replacement is transactional:
+	  the previous overlay is restored if applying the new one fails.
+
 source "drivers/platform/mips/Kconfig"
 
 source "drivers/platform/loongarch/Kconfig"

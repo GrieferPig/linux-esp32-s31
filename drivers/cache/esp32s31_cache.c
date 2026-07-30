@@ -111,6 +111,23 @@ void esp32s31_cache_writeback(phys_addr_t paddr, size_t size)
 }
 EXPORT_SYMBOL_GPL(esp32s31_cache_writeback);
 
+void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
+{
+	unsigned long flags;
+	u32 addr, len;
+
+	if (unlikely(!esp32s31_cache_base) ||
+	    !esp32s31_cache_align_range(paddr, size, &addr, &len))
+		return;
+
+	/* External Flash aliases are served by I-cache; PSRAM data uses D-cache. */
+	raw_spin_lock_irqsave(&esp32s31_cache_lock, flags);
+	esp32s31_cache_issue(ESP32S31_CACHE_MAP_DCACHE | esp32s31_icache_map,
+			     addr, len, ESP32S31_CACHE_INVALIDATE);
+	raw_spin_unlock_irqrestore(&esp32s31_cache_lock, flags);
+}
+EXPORT_SYMBOL_GPL(esp32s31_cache_invalidate);
+
 static void esp32s31_cache_dma_invalidate(phys_addr_t paddr, size_t size)
 {
 	esp32s31_cache_range(paddr, size, ESP32S31_CACHE_INVALIDATE);

@@ -128,6 +128,15 @@ config ESP32S31_AXI_GDMA
 	select GENERIC_ALLOCATOR
 	help
 	  Enable the AXI general-purpose DMA controller found in the ESP32-S31.
+
+config ESP32S31_AHB_GDMA
+	tristate "Espressif ESP32-S31 AHB GDMA support"
+	depends on SOC_ESP32S31
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	select GENERIC_ALLOCATOR
+	help
+	  Enable all five memory-copy channel pairs in the S31 AHB GDMA.
 	  Each coupled TX/RX pair is exposed as one channel supporting memcpy,
 	  memset, slave scatter-gather and cyclic transfers.
 

@@ -235,6 +235,8 @@ struct dw_mci {
 	int			irq;
 
 	int			sdio_id0;
+	/* Physical card index for single-slot wrappers (normally zero). */
+	u8			slot_id;
 
 	struct timer_list       cmd11_timer;
 	struct timer_list       cto_timer;

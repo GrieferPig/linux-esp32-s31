@@ -18,6 +18,8 @@
 
 #include <asm/sbi.h>
 
+#include <linux/soc/espressif/esp32s31-cache.h>
+
 #define ESP_PARTITION_TABLE_OFFSET	0x8000
 #define ESP_PARTITION_TABLE_SIZE	0xc00
 #define ESP_PARTITION_ENTRY_SIZE	32
@@ -41,6 +43,7 @@ struct esp_partition_entry {
 
 struct esp32s31_flash {
 	void __iomem *base;
+	phys_addr_t phys_base;
 	struct mtd_info mtd;
 	struct mtd_partition *parts;
 	unsigned int nr_parts;
@@ -115,6 +118,8 @@ static int esp32s31_flash_write(struct mtd_info *mtd, loff_t to, size_t len,
 					     write_len);
 		if (ret)
 			break;
+		esp32s31_cache_invalidate(flash->phys_base + aligned_to,
+					 write_len);
 		to += bytes;
 		buf += bytes;
 		len -= bytes;
@@ -141,6 +146,8 @@ static int esp32s31_flash_erase(struct mtd_info *mtd, struct erase_info *instr)
 			instr->fail_addr = offset;
 			break;
 		}
+		esp32s31_cache_invalidate(flash->phys_base + offset,
+					 mtd->erasesize);
 		offset += mtd->erasesize;
 		len -= mtd->erasesize;
 		cond_resched();
@@ -226,6 +233,7 @@ static int esp32s31_flash_probe(struct platform_device *pdev)
 	flash->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(flash->base))
 		return PTR_ERR(flash->base);
+	flash->phys_base = res->start;
 
 	flash->mtd.type = MTD_NORFLASH;
 	flash->mtd.flags = MTD_CAP_NORFLASH;

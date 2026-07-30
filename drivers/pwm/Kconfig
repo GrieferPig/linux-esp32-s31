@@ -231,6 +231,30 @@ config PWM_EP93XX
 	  To compile this driver as a module, choose M here: the module
 	  will be called pwm-ep93xx.
 
+config PWM_ESP32S31_LEDC
+	tristate "Espressif ESP32-S31 LEDC PWM support"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  PWM framework support for both eight-channel LEDC groups in S31.
+	  Each pair of channels shares one hardware timer and therefore must
+	  use the same period while both channels are requested.
+
+config PWM_ESP32S31_MCPWM
+	tristate "Espressif ESP32-S31 MCPWM support"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  Basic PWM output support for all four S31 MCPWM groups.  Each group
+	  provides six outputs arranged as three two-output timer pairs.
+
+config PWM_ESP32S31_SDM
+	tristate "Espressif ESP32-S31 sigma-delta modulator support"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  Expose the eight GPIO sigma-delta channels through the PWM framework.
+	  A low-pass filter is needed to obtain an analog voltage.
+
 config PWM_FSL_FTM
 	tristate "Freescale FlexTimer Module (FTM) PWM support"
 	depends on HAS_IOMEM

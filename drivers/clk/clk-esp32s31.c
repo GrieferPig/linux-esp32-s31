@@ -123,7 +123,6 @@ struct esp32s31_clk_priv {
 	bool sdmmc_initialized;
 	bool emac_initialized;
 	bool uart_initialized[3];
-	bool wdt1_initialized;
 };
 
 enum esp32s31_clk_kind {
@@ -137,6 +136,7 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_UART1,
 	ESP32S31_CLK_KIND_UART2,
 	ESP32S31_CLK_KIND_WDT1,
+	ESP32S31_CLK_KIND_GENERIC,
 };
 
 struct esp32s31_clk {
@@ -144,6 +144,11 @@ struct esp32s31_clk {
 	struct esp32s31_clk_priv *priv;
 	enum esp32s31_clk_kind kind;
 	unsigned long fixed_rate;
+	u16 reg;
+	u32 enable_mask;
+	u32 reset_mask;
+	u32 force_norst_mask;
+	bool initialized;
 };
 
 #define to_esp32s31_clk(_hw) container_of(_hw, struct esp32s31_clk, hw)
@@ -302,9 +307,22 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 		break;
 	}
 	case ESP32S31_CLK_KIND_WDT1:
-		if (!priv->wdt1_initialized) {
+		if (!clk->initialized) {
 			esp32s31_wdt1_prepare(priv);
-			priv->wdt1_initialized = true;
+			clk->initialized = true;
+		}
+		break;
+	case ESP32S31_CLK_KIND_GENERIC:
+		if (!clk->initialized) {
+			esp32s31_rmw(priv->hp, clk->reg, clk->reset_mask,
+				     clk->enable_mask | clk->force_norst_mask);
+			if (clk->reset_mask) {
+				esp32s31_rmw(priv->hp, clk->reg, 0,
+					     clk->reset_mask);
+				esp32s31_rmw(priv->hp, clk->reg,
+					     clk->reset_mask, 0);
+			}
+			clk->initialized = true;
 		}
 		break;
 	case ESP32S31_CLK_KIND_FIXED:
@@ -443,6 +461,30 @@ static int esp32s31_register_clk(struct device *dev,
 	return 0;
 }
 
+static int esp32s31_register_gate(struct device *dev,
+				  struct esp32s31_clk_priv *priv,
+				  unsigned int id, const char *name,
+				  unsigned long rate, u16 reg,
+				  u32 enable_mask, u32 reset_mask,
+				  u32 force_norst_mask)
+{
+	struct esp32s31_clk *clk;
+	int ret;
+
+	ret = esp32s31_register_clk(dev, priv, id, name,
+				    ESP32S31_CLK_KIND_GENERIC, rate);
+	if (ret)
+		return ret;
+
+	clk = to_esp32s31_clk(priv->onecell->hws[id]);
+	clk->reg = reg;
+	clk->enable_mask = enable_mask;
+	clk->reset_mask = reset_mask;
+	clk->force_norst_mask = force_norst_mask;
+
+	return 0;
+}
+
 static int esp32s31_clk_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -545,6 +587,61 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_WDT1,
 				    "wdt1", ESP32S31_CLK_KIND_WDT1,
 				    ESP32S31_XTAL_RATE);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_WDT0, "wdt0",
+				     ESP32S31_XTAL_RATE, 0x114,
+				     BIT(0) | BIT(11), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_SYSTIMER,
+				     "systimer", ESP32S31_XTAL_RATE, 0x120,
+				     BIT(0) | BIT(4), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_AHB_GDMA,
+				     "ahb-gdma", ESP32S31_SYS_RATE, 0x7c,
+				     BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_LEDC0, "ledc0",
+				     ESP32S31_XTAL_RATE, 0x148,
+				     BIT(0) | BIT(5), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_LEDC1, "ledc1",
+				     ESP32S31_XTAL_RATE, 0x148,
+				     BIT(6) | BIT(11), BIT(7), BIT(8));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_MCPWM0, "mcpwm0",
+				     ESP32S31_SYS_RATE, 0x124,
+				     BIT(0) | BIT(5), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_MCPWM1, "mcpwm1",
+				     ESP32S31_SYS_RATE, 0x128,
+				     BIT(0) | BIT(5), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_MCPWM2, "mcpwm2",
+				     ESP32S31_SYS_RATE, 0x12c,
+				     BIT(0) | BIT(5), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_MCPWM3, "mcpwm3",
+				     ESP32S31_SYS_RATE, 0x130,
+				     BIT(0) | BIT(5), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_PCNT0, "pcnt0",
+				     ESP32S31_SYS_RATE, 0x138,
+				     BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_PCNT1, "pcnt1",
+				     ESP32S31_SYS_RATE, 0x138,
+				     BIT(3), BIT(4), BIT(5));
 	if (ret)
 		return ret;
 

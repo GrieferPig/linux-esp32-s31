@@ -69,6 +69,13 @@ EXPORT_SYMBOL_GPL(dw_mci_pltfm_pmops);
 
 static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
 {
+	u32 slot_id = 0;
+
+	of_property_read_u32(host->dev->of_node, "espressif,slot-id", &slot_id);
+	if (slot_id > 1)
+		return dev_err_probe(host->dev, -EINVAL,
+				     "invalid physical slot %u\n", slot_id);
+	host->slot_id = slot_id;
 	host->quirks |= DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT |
 			DW_MMC_QUIRK_LOST_IRQ_POLL;
 
