@@ -36,9 +36,9 @@
 			device_type = "cpu";
 			compatible = "espressif,esp32s31", "riscv";
 			reg = <1>;
-			riscv,isa = "rv32imabcn_zba_zbb";
+			riscv,isa = "rv32imafbcn_zba_zbb";
 			riscv,isa-base = "rv32i";
-			riscv,isa-extensions = "i", "m", "a", "zba", "zbb", "c",
+			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb", "c",
 					       "zicntr", "zicsr", "zifencei";
 			mmu-type = "riscv,sv32";
 			i-cache-block-size = <64>;

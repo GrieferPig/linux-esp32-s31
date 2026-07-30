@@ -86,10 +86,10 @@ CONFIG_SENSORS_ESP32S31_TSENS=y
 CONFIG_NR_CPUS=1
 CONFIG_THREAD_SIZE_ORDER=2
 CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
-# CONFIG_FPU is not set
+CONFIG_FPU=y
 
 # Kernel command line
-CONFIG_CMDLINE="earlycon=esp32s3uart,mmio32,0x2038a000 console=ttyS0,115200 root=/dev/mtdblock7 rootfstype=squashfs ro rootwait init=/init"
+CONFIG_CMDLINE="earlycon=esp32s31uart,mmio32,0x2038a000 console=ttyS0,115200 root=/dev/mtdblock7 rootfstype=squashfs ro rootwait init=/init"
 CONFIG_CMDLINE_FORCE=y
 
 # Built-in DTB (no external loader needed)

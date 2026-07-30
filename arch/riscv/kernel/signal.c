@@ -28,6 +28,44 @@ unsigned long signal_minsigstksz __ro_after_init;
 extern u32 __user_rt_sigreturn[2];
 static size_t riscv_v_sc_size __ro_after_init;
 
+#ifdef CONFIG_SOC_ESP32S31
+#define ESP32S31_EXT_SC_SIZE round_up(sizeof(struct __riscv_ctx_hdr) + \
+				      sizeof(struct __riscv_esp32s31_ext_state), 16)
+
+static long save_esp32s31_ext_state(void __user **sc_ext)
+{
+	struct __riscv_ctx_hdr __user *hdr = *sc_ext;
+	struct __riscv_esp32s31_ext_state __user *state =
+		(void __user *)(hdr + 1);
+	long err;
+
+	esp32s31_ext_save(current);
+	err = __copy_to_user(state, &current->thread.esp32s31_ext,
+			     sizeof(*state));
+	err |= clear_user((void __user *)hdr + sizeof(*hdr) + sizeof(*state),
+			  ESP32S31_EXT_SC_SIZE - sizeof(*hdr) - sizeof(*state));
+	err |= __put_user(RISCV_ESP32S31_EXT_MAGIC, &hdr->magic);
+	err |= __put_user(ESP32S31_EXT_SC_SIZE, &hdr->size);
+	if (unlikely(err))
+		return err;
+
+	*sc_ext += ESP32S31_EXT_SC_SIZE;
+	return 0;
+}
+
+static long restore_esp32s31_ext_state(void __user *sc_ext)
+{
+	long err;
+
+	err = __copy_from_user(&current->thread.esp32s31_ext, sc_ext,
+			       sizeof(current->thread.esp32s31_ext));
+	if (unlikely(err))
+		return err;
+	esp32s31_ext_restore(current);
+	return 0;
+}
+#endif
+
 #define DEBUG_SIG 0
 
 struct rt_sigframe {
@@ -43,11 +81,23 @@ static long restore_fp_state(struct pt_regs *regs,
 			     union __riscv_fp_state __user *sc_fpregs)
 {
 	long err;
+#ifdef CONFIG_SOC_ESP32S31
+	struct __riscv_f_ext_state state;
+	unsigned int i;
+
+	err = __copy_from_user(&state, &sc_fpregs->f, sizeof(state));
+	if (unlikely(err))
+		return err;
+	for (i = 0; i < ARRAY_SIZE(state.f); i++)
+		current->thread.fstate.f[i] = state.f[i];
+	current->thread.fstate.fcsr = state.fcsr;
+#else
 	struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
 
 	err = __copy_from_user(&current->thread.fstate, state, sizeof(*state));
 	if (unlikely(err))
 		return err;
+#endif
 
 	fstate_restore(current, regs);
 	return 0;
@@ -57,10 +107,21 @@ static long save_fp_state(struct pt_regs *regs,
 			  union __riscv_fp_state __user *sc_fpregs)
 {
 	long err;
+#ifdef CONFIG_SOC_ESP32S31
+	struct __riscv_f_ext_state state;
+	unsigned int i;
+
+	fstate_save(current, regs);
+	for (i = 0; i < ARRAY_SIZE(state.f); i++)
+		state.f[i] = current->thread.fstate.f[i];
+	state.fcsr = current->thread.fstate.fcsr;
+	err = __copy_to_user(&sc_fpregs->f, &state, sizeof(state));
+#else
 	struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
 
 	fstate_save(current, regs);
 	err = __copy_to_user(state, &current->thread.fstate, sizeof(*state));
+#endif
 	return err;
 }
 #else
@@ -195,6 +256,13 @@ static long restore_sigcontext(struct pt_regs *regs,
 
 			err = __restore_v_state(regs, sc_ext_ptr);
 			break;
+#ifdef CONFIG_SOC_ESP32S31
+		case RISCV_ESP32S31_EXT_MAGIC:
+			if (size != ESP32S31_EXT_SC_SIZE)
+				return -EINVAL;
+			err = restore_esp32s31_ext_state(sc_ext_ptr);
+			break;
+#endif
 		default:
 			return -EINVAL;
 		}
@@ -215,6 +283,9 @@ static size_t get_rt_frame_size(bool cal_all)
 		if (cal_all || riscv_v_vstate_query(task_pt_regs(current)))
 			total_context_size += riscv_v_sc_size;
 	}
+#ifdef CONFIG_SOC_ESP32S31
+	total_context_size += ESP32S31_EXT_SC_SIZE;
+#endif
 	/*
 	 * Preserved a __riscv_ctx_hdr for END signal context header if an
 	 * extension uses __riscv_extra_ext_header
@@ -286,6 +357,9 @@ static long setup_sigcontext(struct rt_sigframe __user *frame,
 	/* Save the vector state. */
 	if (has_vector() && riscv_v_vstate_query(regs))
 		err |= save_v_state(regs, (void __user **)&sc_ext_ptr);
+#ifdef CONFIG_SOC_ESP32S31
+	err |= save_esp32s31_ext_state((void __user **)&sc_ext_ptr);
+#endif
 	/* Write zero to fp-reserved space and check it on restore_sigcontext */
 	err |= __put_user(0, &sc->sc_extdesc.reserved);
 	/* And put END __riscv_ctx_hdr at the end. */

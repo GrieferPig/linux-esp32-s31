@@ -13,6 +13,7 @@
 #include <vdso/processor.h>
 
 #include <asm/ptrace.h>
+#include <asm/esp32s31_ext.h>
 
 #define arch_get_mmap_end(addr, len, flags)			\
 ({								\
@@ -101,6 +102,9 @@ struct thread_struct {
 	unsigned long sp;	/* Kernel mode stack */
 	unsigned long s[12];	/* s[0]: frame pointer */
 	struct __riscv_d_ext_state fstate;
+#ifdef CONFIG_SOC_ESP32S31
+	struct esp32s31_ext_state esp32s31_ext;
+#endif
 	unsigned long bad_cause;
 	u32 riscv_v_flags;
 	u32 vstate_ctrl;
