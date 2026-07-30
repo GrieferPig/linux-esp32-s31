@@ -866,11 +866,10 @@ void __init riscv_fill_hwcap(void)
 		}
 	}
 
-	/*
-	 * We don't support systems with F but without D, so mask those out
-	 * here.
-	 */
-	if ((elf_hwcap & COMPAT_HWCAP_ISA_F) && !(elf_hwcap & COMPAT_HWCAP_ISA_D)) {
+	/* ESP32-S31 implements F without D and has an F-only context path. */
+	if ((elf_hwcap & COMPAT_HWCAP_ISA_F) &&
+	    !(elf_hwcap & COMPAT_HWCAP_ISA_D) &&
+	    !IS_ENABLED(CONFIG_SOC_ESP32S31)) {
 		pr_info("This kernel does not support systems with F but not D\n");
 		elf_hwcap &= ~COMPAT_HWCAP_ISA_F;
 	}
