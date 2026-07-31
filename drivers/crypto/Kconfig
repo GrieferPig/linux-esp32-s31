@@ -16,8 +16,14 @@ config CRYPTO_DEV_ESP32S31
 	depends on SOC_ESP32S31 && OF
 	select CRYPTO_SKCIPHER
 	select CRYPTO_HASH
+	select CRYPTO_AKCIPHER
+	select CRYPTO_KPP
+	select CRYPTO_RSA
+	select CRYPTO_ECDH
 	help
-	  Enable the AES and SHA hardware accelerators in the ESP32-S31.
+	  Enable the AES, SHA, RSA/MPI and ECC hardware accelerators in the
+	  ESP32-S31.  RSA is exposed through the akcipher API and ECC point
+	  multiplication through the P-256 and P-384 ECDH KPP algorithms.
 
 source "drivers/crypto/allwinner/Kconfig"
 

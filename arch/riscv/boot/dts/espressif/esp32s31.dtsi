@@ -158,7 +158,8 @@
 
 		crypto: crypto@20508000 {
 			compatible = "espressif,esp32s31-crypto";
-			reg = <0x20508000 0x2000>, <0x20587058 0x4>;
+			/* AES, SHA, RSA/MPI and ECC are one HP crypto register island. */
+			reg = <0x20508000 0x4000>, <0x20587058 0x4>;
 			reg-names = "crypto", "clkrst";
 			dmas = <&axi_gdma 0 5>;
 			dma-names = "sha";
