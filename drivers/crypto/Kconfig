@@ -11,6 +11,14 @@ menuconfig CRYPTO_HW
 
 if CRYPTO_HW
 
+config CRYPTO_DEV_ESP32S31
+	tristate "Espressif ESP32-S31 crypto accelerators"
+	depends on SOC_ESP32S31 && OF
+	select CRYPTO_SKCIPHER
+	select CRYPTO_HASH
+	help
+	  Enable the AES and SHA hardware accelerators in the ESP32-S31.
+
 source "drivers/crypto/allwinner/Kconfig"
 
 config CRYPTO_DEV_PADLOCK

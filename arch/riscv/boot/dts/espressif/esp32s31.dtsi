@@ -156,6 +156,15 @@
 			status = "okay";
 		};
 
+		crypto: crypto@20508000 {
+			compatible = "espressif,esp32s31-crypto";
+			reg = <0x20508000 0x2000>, <0x20587058 0x4>;
+			reg-names = "crypto", "clkrst";
+			dmas = <&axi_gdma 0 5>;
+			dma-names = "sha";
+			status = "okay";
+		};
+
 		adc: adc@20815000 {
 			compatible = "espressif,esp32s31-adc";
 			reg = <0x20815000 0x400>, <0x20710020 0x4>;
