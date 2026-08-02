@@ -15,8 +15,8 @@
 
 	memory@50000000 {
 		device_type = "memory";
-		/* 15MB cached PSRAM; the top 1MB is reserved for OpenSBI. */
-		reg = <0x50000000 0x00F00000>;
+		/* Linux owns the complete 16-MiB cached PSRAM alias. */
+		reg = <0x50000000 0x01000000>;
 	};
 
 	aliases {

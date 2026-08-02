@@ -15,6 +15,8 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ioctl.h>
+#include <linux/ktime.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -56,6 +58,10 @@
 #define S31_SBI_HOSTED_TX		0
 #define S31_SBI_HOSTED_RX_ACK		1
 #define S31_SBI_HOSTED_H1_READY		2
+#define S31_HOSTED_IOC_CLOCK_TEST \
+	_IOWR('S', 0x31, struct s31_hosted_clock_test)
+#define S31_HOSTED_IOC_MEM_STATS \
+	_IOR('S', 0x32, struct s31_hosted_mem_stats)
 
 struct s31_hosted {
 	struct device *dev;
@@ -72,6 +78,9 @@ struct s31_hosted {
 	atomic_t irq_disabled;
 	struct completion pong;
 	struct completion selftest_done;
+	struct completion clock_start;
+	struct completion clock_stop;
+	struct completion mem_stats_done;
 	struct miscdevice serial_misc;
 	struct sk_buff_head serial_rx;
 	u8 *serial_reassembly;
@@ -81,7 +90,10 @@ struct s31_hosted {
 	wait_queue_head_t serial_wait;
 	struct mutex serial_rx_mutex;
 	struct mutex serial_tx_mutex;
+	struct mutex clock_mutex;
+	struct mutex mem_stats_mutex;
 	u32 generation;
+	u32 clock_cookie;
 	u32 capabilities_ext;
 	u32 rx_errors;
 	u32 tx_drops;
@@ -93,6 +105,8 @@ struct s31_hosted {
 	u8 chip_id;
 	bool selftest_ok;
 	bool hosted_ready;
+	struct s31_hosted_clock_test clock_test;
+	struct s31_hosted_mem_stats mem_stats;
 };
 
 static u16 s31_frame_checksum(const u8 *frame, size_t length)
@@ -490,6 +504,40 @@ static void s31_process_private(struct s31_hosted *hosted, const u8 *payload,
 	case S31_HOSTED_CTRL_RADIO_READY:
 		dev_info(hosted->dev, "hart0 radio transport ready\n");
 		break;
+	case S31_HOSTED_CTRL_CLOCK_START:
+	case S31_HOSTED_CTRL_CLOCK_STOP: {
+		const struct s31_hosted_clock_stamp *stamp;
+
+		stamp = (const void *)msg->data;
+		if (le32_to_cpu(stamp->cookie) != hosted->clock_test.cookie)
+			break;
+		if (msg->type == S31_HOSTED_CTRL_CLOCK_START) {
+			hosted->clock_test.freertos_start_us =
+				get_unaligned_le64(&stamp->freertos_us);
+			hosted->clock_test.linux_start_ns = ktime_get_raw_ns();
+			complete(&hosted->clock_start);
+		} else {
+			hosted->clock_test.freertos_end_us =
+				get_unaligned_le64(&stamp->freertos_us);
+			hosted->clock_test.linux_end_ns = ktime_get_raw_ns();
+			complete(&hosted->clock_stop);
+		}
+		break;
+	}
+	case S31_HOSTED_CTRL_MEM_STATS_RESPONSE: {
+		const struct s31_hosted_mem_stats *stats = (const void *)msg->data;
+
+		hosted->mem_stats.total_bytes =
+			get_unaligned_le32(&stats->total_bytes);
+		hosted->mem_stats.free_bytes =
+			get_unaligned_le32(&stats->free_bytes);
+		hosted->mem_stats.minimum_free_bytes =
+			get_unaligned_le32(&stats->minimum_free_bytes);
+		hosted->mem_stats.largest_free_block =
+			get_unaligned_le32(&stats->largest_free_block);
+		complete(&hosted->mem_stats_done);
+		break;
+	}
 	default:
 		dev_dbg(hosted->dev, "unknown private message %u\n", msg->type);
 		break;
@@ -720,11 +768,106 @@ static __poll_t s31_serial_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static long s31_serial_ioctl(struct file *file, unsigned int command,
+			     unsigned long argument)
+{
+	struct miscdevice *misc = file->private_data;
+	struct s31_hosted *hosted =
+		container_of(misc, struct s31_hosted, serial_misc);
+	struct s31_hosted_control_msg message = {
+		.type = S31_HOSTED_CTRL_CLOCK_START,
+		.length = sizeof(message),
+		.generation = hosted->generation,
+	};
+	struct s31_hosted_clock_stamp stamp = { 0 };
+	struct s31_hosted_clock_test request;
+	unsigned long timeout;
+	int ret;
+
+	if (command == S31_HOSTED_IOC_MEM_STATS) {
+		message.type = S31_HOSTED_CTRL_MEM_STATS_REQUEST;
+		ret = mutex_lock_interruptible(&hosted->mem_stats_mutex);
+		if (ret)
+			return ret;
+		reinit_completion(&hosted->mem_stats_done);
+		ret = s31_send_payload(hosted, S31_HOSTED_PRIV_IF, &message,
+				       sizeof(message), 0);
+		if (ret)
+			goto out_mem_stats;
+		timeout = wait_for_completion_interruptible_timeout(
+			&hosted->mem_stats_done, msecs_to_jiffies(2000));
+		if (!timeout)
+			ret = -ETIMEDOUT;
+		else if ((long)timeout < 0)
+			ret = (long)timeout;
+		else
+			ret = copy_to_user((void __user *)argument,
+					   &hosted->mem_stats,
+					   sizeof(hosted->mem_stats)) ?
+				-EFAULT : 0;
+out_mem_stats:
+		mutex_unlock(&hosted->mem_stats_mutex);
+		return ret;
+	}
+
+	if (command != S31_HOSTED_IOC_CLOCK_TEST)
+		return -ENOTTY;
+	if (copy_from_user(&request, (void __user *)argument, sizeof(request)))
+		return -EFAULT;
+	if (!request.duration_sec || request.duration_sec > 600)
+		return -EINVAL;
+
+	ret = mutex_lock_interruptible(&hosted->clock_mutex);
+	if (ret)
+		return ret;
+	memset(&hosted->clock_test, 0, sizeof(hosted->clock_test));
+	hosted->clock_test.duration_sec = request.duration_sec;
+	hosted->clock_test.cookie = ++hosted->clock_cookie;
+	if (!hosted->clock_test.cookie)
+		hosted->clock_test.cookie = ++hosted->clock_cookie;
+	stamp.cookie = cpu_to_le32(hosted->clock_test.cookie);
+	stamp.duration_sec = cpu_to_le32(request.duration_sec);
+	memcpy(message.data, &stamp, sizeof(stamp));
+	reinit_completion(&hosted->clock_start);
+	reinit_completion(&hosted->clock_stop);
+	ret = s31_send_payload(hosted, S31_HOSTED_PRIV_IF, &message,
+			       sizeof(message), 0);
+	if (ret)
+		goto out;
+	timeout = wait_for_completion_interruptible_timeout(
+		&hosted->clock_start, msecs_to_jiffies(2000));
+	if (!timeout) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	if ((long)timeout < 0) {
+		ret = (long)timeout;
+		goto out;
+	}
+	timeout = wait_for_completion_interruptible_timeout(
+		&hosted->clock_stop,
+		msecs_to_jiffies((request.duration_sec + 5) * 1000));
+	if (!timeout) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	if ((long)timeout < 0) {
+		ret = (long)timeout;
+		goto out;
+	}
+	ret = copy_to_user((void __user *)argument, &hosted->clock_test,
+			   sizeof(hosted->clock_test)) ? -EFAULT : 0;
+out:
+	mutex_unlock(&hosted->clock_mutex);
+	return ret;
+}
+
 static const struct file_operations s31_serial_fops = {
 	.owner = THIS_MODULE,
 	.read = s31_serial_read,
 	.write = s31_serial_write,
 	.poll = s31_serial_poll,
+	.unlocked_ioctl = s31_serial_ioctl,
 	.llseek = noop_llseek,
 };
 
@@ -954,10 +1097,15 @@ static int s31_hosted_probe(struct platform_device *pdev)
 	skb_queue_head_init(&hosted->serial_rx);
 	mutex_init(&hosted->serial_rx_mutex);
 	mutex_init(&hosted->serial_tx_mutex);
+	mutex_init(&hosted->clock_mutex);
+	mutex_init(&hosted->mem_stats_mutex);
 	init_waitqueue_head(&hosted->serial_wait);
 	atomic_set(&hosted->irq_disabled, 0);
 	init_completion(&hosted->pong);
 	init_completion(&hosted->selftest_done);
+	init_completion(&hosted->clock_start);
+	init_completion(&hosted->clock_stop);
+	init_completion(&hosted->mem_stats_done);
 	hosted->rx_frame = devm_kmalloc(&pdev->dev,
 					S31_HOSTED_SLOT_DATA_SIZE, GFP_KERNEL);
 	if (!hosted->rx_frame)
