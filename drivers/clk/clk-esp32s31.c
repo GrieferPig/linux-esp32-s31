@@ -9,6 +9,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -262,6 +263,18 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
 	struct esp32s31_clk_priv *priv = clk->priv;
 	unsigned long flags;
+
+	/*
+	 * UART0 is already the active OpenSBI/Linux early console.  Its source
+	 * does not match the fixed 40 MHz clock Linux uses, so it still needs the
+	 * reset and reconfiguration in esp32s31_uart_prepare().  First allow a
+	 * worst-case full 127-byte FIFO (plus the shift register) to drain at
+	 * 115200 baud; otherwise resetting the APB bank corrupts the console
+	 * handover line.  Do this outside priv->lock so interrupts remain enabled.
+	 */
+	if (clk->kind == ESP32S31_CLK_KIND_UART0 &&
+	    !READ_ONCE(priv->uart_initialized[0]))
+		mdelay(12);
 
 	spin_lock_irqsave(&priv->lock, flags);
 
