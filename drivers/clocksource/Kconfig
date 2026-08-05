@@ -651,6 +651,14 @@ config RISCV_TIMER
 	  is accessed via both the SBI and the rdcycle instruction.  This is
 	  required for all RISC-V systems.
 
+config ESP32S31_SYSTIMER_CLOCKSOURCE
+	bool "ESP32-S31 always-on SYSTIMER clocksource"
+	depends on SOC_ESP32S31 && RISCV && OF
+	select TIMER_OF
+	help
+	  Use the XTAL-derived ESP32-S31 SYSTIMER for Linux timekeeping.  Its
+	  fixed 16 MHz rate remains stable while the CPU PLL is reconfigured.
+
 config CLINT_TIMER
 	bool "CLINT Timer for the RISC-V platform" if COMPILE_TEST
 	depends on GENERIC_SCHED_CLOCK && RISCV

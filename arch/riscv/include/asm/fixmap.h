@@ -38,6 +38,8 @@ enum fixed_addresses {
 	FIX_TEXT_POKE0,
 	FIX_EARLYCON_MEM_BASE,
 #ifdef CONFIG_SOC_ESP32S31
+	/* Always-on SYSTIMER mapping used by the early clocksource. */
+	FIX_S31_SYSTIMER,
 	/*
 	 * The Hosted window starts at a 0xf80 page offset, so its 64 KiB
 	 * resource spans 17 pages.  Keeping it in the permanent fixmap avoids

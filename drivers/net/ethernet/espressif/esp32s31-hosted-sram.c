@@ -9,6 +9,7 @@
  */
 
 #include <linux/completion.h>
+#include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/fs.h>
@@ -25,6 +26,7 @@
 #include <linux/of_device.h>
 #include <linux/poll.h>
 #include <linux/platform_device.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <asm/fixmap.h>
@@ -36,7 +38,7 @@
 #define S31_HP_SYSTEM_CPU_INT_FROM_CPU_2	0x20586018U
 #define S31_HP_SYSTEM_CPU_INT_FROM_CPU_3	0x2058601cU
 #define S31_HOSTED_NAPI_WEIGHT		16
-#define S31_HOSTED_FIXMAP_PAGES		17
+#define S31_HOSTED_FIXMAP_PAGES		((S31_HOSTED_SRAM_SIZE + 0x1f7f) >> PAGE_SHIFT)
 #define S31_HOSTED_SELFTEST_ROUNDS	(S31_HOSTED_SLOT_COUNT + 1)
 #define S31_HOSTED_SELFTEST_SIZE	ETH_DATA_LEN
 #define S31_HOSTED_SERIAL_FRAGMENT	ETH_DATA_LEN
@@ -57,6 +59,23 @@
 	_IOWR('S', 0x31, struct s31_hosted_clock_test)
 #define S31_HOSTED_IOC_MEM_STATS \
 	_IOR('S', 0x32, struct s31_hosted_mem_stats)
+#define S31_HOSTED_IOC_WIFI_SLOT_SET \
+	_IOW('S', 0x33, struct s31_hosted_wifi_slot_request)
+#define S31_HOSTED_IOC_WIFI_SLOT_GET \
+	_IOWR('S', 0x34, struct s31_hosted_wifi_slot_request)
+#define S31_HOSTED_IOC_WIFI_STATE_SET \
+	_IOW('S', 0x35, struct s31_hosted_wifi_state_request)
+#define S31_HOSTED_IOC_WIFI_STATE_GET \
+	_IOR('S', 0x36, struct s31_hosted_wifi_state_request)
+
+static struct cpufreq_frequency_table s31_cpu_freq_table[] = {
+	{ .frequency = 53000 },
+	{ .frequency = 80000 },
+	{ .frequency = 160000 },
+	{ .frequency = 240000 },
+	{ .frequency = 320000 },
+	{ .frequency = CPUFREQ_TABLE_END },
+};
 
 struct s31_hosted {
 	struct device *dev;
@@ -76,6 +95,8 @@ struct s31_hosted {
 	struct completion clock_start;
 	struct completion clock_stop;
 	struct completion mem_stats_done;
+	struct completion wifi_cfg_done;
+	struct completion cpu_freq_done;
 	struct miscdevice serial_misc;
 	struct sk_buff_head serial_rx;
 	u8 *serial_reassembly;
@@ -87,6 +108,8 @@ struct s31_hosted {
 	struct mutex serial_tx_mutex;
 	struct mutex clock_mutex;
 	struct mutex mem_stats_mutex;
+	struct mutex wifi_cfg_mutex;
+	struct mutex cpu_freq_mutex;
 	u32 generation;
 	u32 clock_cookie;
 	u32 capabilities_ext;
@@ -102,7 +125,16 @@ struct s31_hosted {
 	bool hosted_ready;
 	struct s31_hosted_clock_test clock_test;
 	struct s31_hosted_mem_stats mem_stats;
+	struct s31_hosted_wifi_slot wifi_slot;
+	struct s31_hosted_wifi_state wifi_state;
+	u8 wifi_cfg_response_type;
+	u32 wifi_cfg_status;
+	u32 cpu_freq_status;
+	u32 cpu_freq_mhz;
+	u32 cpu_freq_floor_mhz;
 };
+
+static struct s31_hosted *s31_cpufreq_hosted;
 
 static u16 s31_frame_checksum(const u8 *frame, size_t length)
 {
@@ -303,10 +335,34 @@ static void __iomem *s31_hosted_fixmap_resource(struct platform_device *pdev,
 }
 
 static inline void __iomem *s31_ctrl_ptr(struct s31_hosted *hosted,
-					size_t offset)
+					 size_t offset)
 {
 	return hosted->shmem + offset;
 }
+
+static ssize_t transport_stats_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct s31_hosted *hosted = dev_get_drvdata(dev);
+
+	(void)attr;
+	return sysfs_emit(buf, "h0_irq_count=%u h0_rx_polls=%u\n",
+			readl(s31_ctrl_ptr(hosted, offsetof(
+				struct s31_hosted_control, h0_irq_count))),
+			readl(s31_ctrl_ptr(hosted, offsetof(
+				struct s31_hosted_control, h0_rx_polls))));
+}
+
+static DEVICE_ATTR_RO(transport_stats);
+
+static struct attribute *s31_hosted_attrs[] = {
+	&dev_attr_transport_stats.attr,
+	NULL,
+};
+
+static const struct attribute_group s31_hosted_attr_group = {
+	.attrs = s31_hosted_attrs,
+};
 
 static inline void __iomem *s31_ring_ptr(struct s31_hosted *hosted,
 					bool h0_to_h1, size_t offset)
@@ -509,6 +565,38 @@ static void s31_process_private(struct s31_hosted *hosted, const u8 *payload,
 	msg = (const void *)payload;
 	if (le32_to_cpu(msg->generation) != hosted->generation)
 		return;
+	if (msg->type == S31_HOSTED_CTRL_WIFI_SLOT_SET_RESPONSE ||
+	    msg->type == S31_HOSTED_CTRL_WIFI_SLOT_GET_RESPONSE ||
+	    msg->type == S31_HOSTED_CTRL_WIFI_STATE_SET_RESPONSE ||
+	    msg->type == S31_HOSTED_CTRL_WIFI_STATE_GET_RESPONSE) {
+		const struct s31_hosted_wifi_msg *wifi_msg = (const void *)payload;
+
+		hosted->wifi_cfg_status = le32_to_cpu(wifi_msg->status);
+		if ((msg->type == S31_HOSTED_CTRL_WIFI_SLOT_SET_RESPONSE ||
+		     msg->type == S31_HOSTED_CTRL_WIFI_SLOT_GET_RESPONSE) &&
+		    le16_to_cpu(wifi_msg->length) == sizeof(hosted->wifi_slot))
+			memcpy(&hosted->wifi_slot, wifi_msg->data,
+			       sizeof(hosted->wifi_slot));
+		else if ((msg->type == S31_HOSTED_CTRL_WIFI_STATE_SET_RESPONSE ||
+			  msg->type == S31_HOSTED_CTRL_WIFI_STATE_GET_RESPONSE) &&
+			 le16_to_cpu(wifi_msg->length) == sizeof(hosted->wifi_state))
+			memcpy(&hosted->wifi_state, wifi_msg->data,
+			       sizeof(hosted->wifi_state));
+		if (msg->type == hosted->wifi_cfg_response_type)
+			complete(&hosted->wifi_cfg_done);
+		return;
+	}
+	if (msg->type == S31_HOSTED_CTRL_CPU_FREQ_SET_RESPONSE) {
+		const struct s31_hosted_cpu_freq_msg *freq = (const void *)msg->data;
+
+		hosted->cpu_freq_status = le32_to_cpu(freq->status);
+		if (!hosted->cpu_freq_status) {
+			hosted->cpu_freq_mhz = le32_to_cpu(freq->actual_mhz);
+			hosted->cpu_freq_floor_mhz = le32_to_cpu(freq->target_mhz);
+		}
+		complete(&hosted->cpu_freq_done);
+		return;
+	}
 
 	switch (msg->type) {
 	case S31_HOSTED_CTRL_PONG:
@@ -786,6 +874,126 @@ static __poll_t s31_serial_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static int s31_wifi_cfg_exchange(struct s31_hosted *hosted,
+				 struct s31_hosted_wifi_msg *message,
+				 u8 response_type)
+{
+	unsigned long timeout;
+	int ret;
+
+	ret = mutex_lock_interruptible(&hosted->wifi_cfg_mutex);
+	if (ret)
+		return ret;
+	hosted->wifi_cfg_response_type = response_type;
+	hosted->wifi_cfg_status = 0;
+	reinit_completion(&hosted->wifi_cfg_done);
+	ret = s31_send_payload(hosted, S31_HOSTED_PRIV_IF, message,
+				       sizeof(*message), 0);
+	if (!ret) {
+		timeout = wait_for_completion_interruptible_timeout(
+			&hosted->wifi_cfg_done, msecs_to_jiffies(3000));
+		if (!timeout)
+			ret = -ETIMEDOUT;
+		else if ((long)timeout < 0)
+			ret = (long)timeout;
+		else if (hosted->wifi_cfg_status)
+			ret = -EREMOTEIO;
+	}
+	mutex_unlock(&hosted->wifi_cfg_mutex);
+	return ret;
+}
+
+static int s31_hosted_set_cpu_freq(struct s31_hosted *hosted,
+				   unsigned int khz)
+{
+	struct s31_hosted_control_msg message = {
+		.type = S31_HOSTED_CTRL_CPU_FREQ_SET,
+		.length = sizeof(message),
+		.generation = hosted->generation,
+	};
+	struct s31_hosted_cpu_freq_msg request = {
+		.target_mhz = khz / 1000,
+	};
+	unsigned long timeout;
+	int ret;
+
+	if (khz % 1000 || !hosted->hosted_ready)
+		return -EINVAL;
+	memcpy(message.data, &request, sizeof(request));
+	ret = mutex_lock_interruptible(&hosted->cpu_freq_mutex);
+	if (ret)
+		return ret;
+	/* Governors may request the same floor on every sampling tick.  The
+	 * transition is a remote RPC and needlessly reprogramming the PM policy
+	 * stalls the Linux CPU even when FreeRTOS is currently running faster. */
+	if (hosted->cpu_freq_floor_mhz == request.target_mhz) {
+		mutex_unlock(&hosted->cpu_freq_mutex);
+		return 0;
+	}
+	reinit_completion(&hosted->cpu_freq_done);
+	hosted->cpu_freq_status = ~0U;
+	ret = s31_send_payload(hosted, S31_HOSTED_PRIV_IF, &message,
+				       sizeof(message), 0);
+	if (!ret) {
+		timeout = wait_for_completion_interruptible_timeout(
+			&hosted->cpu_freq_done, msecs_to_jiffies(3000));
+		if (!timeout)
+			ret = -ETIMEDOUT;
+		else if ((long)timeout < 0)
+			ret = (long)timeout;
+		else if (hosted->cpu_freq_status)
+			ret = -EREMOTEIO;
+	}
+	mutex_unlock(&hosted->cpu_freq_mutex);
+	return ret;
+}
+
+static int s31_cpufreq_init(struct cpufreq_policy *policy)
+{
+	int ret;
+
+	if (policy->cpu != 0 || !s31_cpufreq_hosted)
+		return -ENODEV;
+	policy->freq_table = s31_cpu_freq_table;
+	ret = cpufreq_table_validate_and_sort(policy);
+	if (ret)
+		return ret;
+	/* Frequency changes cross the H0/H1 RPC boundary.  Report a coarse
+	 * transition interval so ondemand does not poll every scheduler tick. */
+	policy->cpuinfo.transition_latency = 100000000;
+	policy->cur = s31_cpufreq_hosted->cpu_freq_mhz * 1000;
+	return 0;
+}
+
+static int s31_cpufreq_target_index(struct cpufreq_policy *policy,
+					unsigned int index)
+{
+	unsigned int target = s31_cpu_freq_table[index].frequency;
+	int ret;
+
+	ret = s31_hosted_set_cpu_freq(s31_cpufreq_hosted, target);
+	if (!ret)
+		policy->cur = s31_cpufreq_hosted->cpu_freq_mhz * 1000;
+	return ret;
+}
+
+static unsigned int s31_cpufreq_get(unsigned int cpu)
+{
+	if (cpu != 0 || !s31_cpufreq_hosted)
+		return 0;
+	return s31_cpufreq_hosted->cpu_freq_mhz * 1000;
+}
+
+static struct cpufreq_driver s31_cpufreq_driver = {
+	.flags = CPUFREQ_NEED_INITIAL_FREQ_CHECK | CPUFREQ_CONST_LOOPS,
+	.verify = cpufreq_generic_frequency_table_verify,
+	.target_index = s31_cpufreq_target_index,
+	.get = s31_cpufreq_get,
+	.init = s31_cpufreq_init,
+	.attr = cpufreq_generic_attr,
+	.name = "esp32s31-idf",
+};
+
 static long s31_serial_ioctl(struct file *file, unsigned int command,
 			     unsigned long argument)
 {
@@ -799,6 +1007,9 @@ static long s31_serial_ioctl(struct file *file, unsigned int command,
 	};
 	struct s31_hosted_clock_stamp stamp = { 0 };
 	struct s31_hosted_clock_test request;
+	struct s31_hosted_wifi_msg wifi_message = { 0 };
+	struct s31_hosted_wifi_slot_request slot_request;
+	struct s31_hosted_wifi_state_request state_request;
 	unsigned long timeout;
 	int ret;
 
@@ -825,6 +1036,60 @@ static long s31_serial_ioctl(struct file *file, unsigned int command,
 				-EFAULT : 0;
 out_mem_stats:
 		mutex_unlock(&hosted->mem_stats_mutex);
+		return ret;
+	}
+
+	if (command == S31_HOSTED_IOC_WIFI_SLOT_SET ||
+	    command == S31_HOSTED_IOC_WIFI_SLOT_GET) {
+		if (copy_from_user(&slot_request, (void __user *)argument,
+				   sizeof(slot_request)))
+			return -EFAULT;
+		if (slot_request.slot >= S31_HOSTED_WIFI_SLOT_COUNT)
+			return -EINVAL;
+		wifi_message.type = command == S31_HOSTED_IOC_WIFI_SLOT_SET ?
+			S31_HOSTED_CTRL_WIFI_SLOT_SET : S31_HOSTED_CTRL_WIFI_SLOT_GET;
+		wifi_message.slot = slot_request.slot;
+		wifi_message.length = cpu_to_le16(sizeof(slot_request.config));
+		wifi_message.generation = cpu_to_le32(hosted->generation);
+		if (command == S31_HOSTED_IOC_WIFI_SLOT_SET)
+			memcpy(wifi_message.data, &slot_request.config,
+			       sizeof(slot_request.config));
+		ret = s31_wifi_cfg_exchange(hosted, &wifi_message,
+			command == S31_HOSTED_IOC_WIFI_SLOT_SET ?
+			S31_HOSTED_CTRL_WIFI_SLOT_SET_RESPONSE :
+			S31_HOSTED_CTRL_WIFI_SLOT_GET_RESPONSE);
+		if (!ret && command == S31_HOSTED_IOC_WIFI_SLOT_GET) {
+			slot_request.config = hosted->wifi_slot;
+			if (copy_to_user((void __user *)argument, &slot_request,
+					 sizeof(slot_request)))
+				ret = -EFAULT;
+		}
+		return ret;
+	}
+
+	if (command == S31_HOSTED_IOC_WIFI_STATE_SET ||
+	    command == S31_HOSTED_IOC_WIFI_STATE_GET) {
+		if (command == S31_HOSTED_IOC_WIFI_STATE_SET &&
+		    copy_from_user(&state_request, (void __user *)argument,
+				   sizeof(state_request)))
+			return -EFAULT;
+		wifi_message.type = command == S31_HOSTED_IOC_WIFI_STATE_SET ?
+			S31_HOSTED_CTRL_WIFI_STATE_SET : S31_HOSTED_CTRL_WIFI_STATE_GET;
+		wifi_message.length = cpu_to_le16(sizeof(state_request.state));
+		wifi_message.generation = cpu_to_le32(hosted->generation);
+		if (command == S31_HOSTED_IOC_WIFI_STATE_SET)
+			memcpy(wifi_message.data, &state_request.state,
+			       sizeof(state_request.state));
+		ret = s31_wifi_cfg_exchange(hosted, &wifi_message,
+			command == S31_HOSTED_IOC_WIFI_STATE_SET ?
+			S31_HOSTED_CTRL_WIFI_STATE_SET_RESPONSE :
+			S31_HOSTED_CTRL_WIFI_STATE_GET_RESPONSE);
+		if (!ret) {
+			state_request.state = hosted->wifi_state;
+			if (copy_to_user((void __user *)argument, &state_request,
+					 sizeof(state_request)))
+				ret = -EFAULT;
+		}
 		return ret;
 	}
 
@@ -1111,6 +1376,8 @@ static int s31_hosted_probe(struct platform_device *pdev)
 	mutex_init(&hosted->serial_tx_mutex);
 	mutex_init(&hosted->clock_mutex);
 	mutex_init(&hosted->mem_stats_mutex);
+	mutex_init(&hosted->wifi_cfg_mutex);
+	mutex_init(&hosted->cpu_freq_mutex);
 	init_waitqueue_head(&hosted->serial_wait);
 	atomic_set(&hosted->irq_disabled, 0);
 	init_completion(&hosted->pong);
@@ -1118,6 +1385,10 @@ static int s31_hosted_probe(struct platform_device *pdev)
 	init_completion(&hosted->clock_start);
 	init_completion(&hosted->clock_stop);
 	init_completion(&hosted->mem_stats_done);
+	init_completion(&hosted->wifi_cfg_done);
+	init_completion(&hosted->cpu_freq_done);
+	hosted->cpu_freq_mhz = 320;
+	hosted->cpu_freq_floor_mhz = 320;
 	hosted->rx_frame = devm_kmalloc(&pdev->dev,
 					S31_HOSTED_SLOT_DATA_SIZE, GFP_KERNEL);
 	if (!hosted->rx_frame)
@@ -1208,6 +1479,13 @@ static int s31_hosted_probe(struct platform_device *pdev)
 		schedule_work(&hosted->hci_open_work);
 
 	platform_set_drvdata(pdev, hosted);
+	ret = devm_device_add_group(&pdev->dev, &s31_hosted_attr_group);
+	if (ret)
+		dev_warn(&pdev->dev, "failed to expose transport stats: %d\n", ret);
+	s31_cpufreq_hosted = hosted;
+	ret = cpufreq_register_driver(&s31_cpufreq_driver);
+	if (ret)
+		dev_warn(&pdev->dev, "CPU frequency scaling unavailable: %d\n", ret);
 	/* Publish H1 readiness directly in the shared control block. */
 	writel(readl(s31_ctrl_ptr(hosted,
 				  offsetof(struct s31_hosted_control, state))) |
@@ -1226,11 +1504,17 @@ static int s31_hosted_probe(struct platform_device *pdev)
 	ret = s31_hosted_selftest(hosted);
 	if (ret)
 		dev_warn(&pdev->dev, "transport self-test failed: %d\n", ret);
-	else
+	else {
 		dev_info(&pdev->dev,
-			 "transport self-test passed: %u x %u-byte frames\n",
+			 "transport self-test passed: %u x %u-byte frames; "
+			 "h0 doorbell irq=%u rx-wake=%u\n",
 			 S31_HOSTED_SELFTEST_ROUNDS,
-			 S31_HOSTED_SELFTEST_SIZE);
+			 S31_HOSTED_SELFTEST_SIZE,
+			 readl(s31_ctrl_ptr(hosted, offsetof(
+				 struct s31_hosted_control, h0_irq_count))),
+			 readl(s31_ctrl_ptr(hosted, offsetof(
+				 struct s31_hosted_control, h0_rx_polls))));
+	}
 
 	dev_info(&pdev->dev,
 		 "SRAM transport generation %u, netdev %s, RPC /dev/%s, HCI %s, IRQ %d\n",
@@ -1242,6 +1526,11 @@ static int s31_hosted_probe(struct platform_device *pdev)
 static void s31_hosted_remove(struct platform_device *pdev)
 {
 	struct s31_hosted *hosted = platform_get_drvdata(pdev);
+
+	if (s31_cpufreq_hosted == hosted) {
+		cpufreq_unregister_driver(&s31_cpufreq_driver);
+		s31_cpufreq_hosted = NULL;
+	}
 
 	cancel_work_sync(&hosted->hci_open_work);
 	s31_hci_unregister(hosted);
