@@ -28,6 +28,7 @@
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <asm/fixmap.h>
+#include <asm/sbi.h>
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 
@@ -53,6 +54,10 @@
 #define S31_HOSTED_HOST_RAW_TP		0x46
 #define S31_HOSTED_HOST_THROTTLE_HIGH	0x47
 #define S31_HOSTED_HOST_THROTTLE_LOW	0x48
+#define S31_SBI_EXT_HOSTED		0x09000001UL
+#define S31_SBI_HOSTED_TX		0
+#define S31_SBI_HOSTED_RX_ACK		1
+#define S31_SBI_HOSTED_H1_READY		2
 #define S31_HOSTED_IOC_CLOCK_TEST \
 	_IOWR('S', 0x31, struct s31_hosted_clock_test)
 #define S31_HOSTED_IOC_MEM_STATS \
@@ -332,11 +337,7 @@ static int s31_send_frame(struct s31_hosted *hosted, void *frame,
 			  size_t length)
 {
 	struct s31_esp_payload_header *header = frame;
-	void __iomem *ring;
-	void __iomem *slot;
-	u32 producer;
-	u32 consumer;
-	u32 index;
+	struct sbiret sbi_ret;
 	unsigned long flags;
 
 	if (length < sizeof(*header) || length > S31_HOSTED_SLOT_DATA_SIZE)
@@ -347,36 +348,17 @@ static int s31_send_frame(struct s31_hosted *hosted, void *frame,
 		header->seq_num = cpu_to_le16(++hosted->tx_sequence);
 	header->checksum = 0;
 	header->checksum = cpu_to_le16(s31_frame_checksum(frame, length));
-
-	/* Linux owns the producer side of the H1->H0 ring. */
-	ring = s31_ring_ptr(hosted, false, 0);
-	producer = readl(ring + offsetof(struct s31_hosted_ring_state,
-					producer));
-	consumer = readl(ring + offsetof(struct s31_hosted_ring_state,
-					consumer));
-	if (producer - consumer >= S31_HOSTED_SLOT_COUNT) {
-		hosted->tx_drops++;
-		spin_unlock_irqrestore(&hosted->tx_lock, flags);
-		return -ENOSPC;
-	}
-
-	index = producer & (S31_HOSTED_SLOT_COUNT - 1);
-	slot = s31_slot_ptr(hosted, false, index);
-	memcpy_toio(slot + offsetof(struct s31_hosted_slot, data),
-			frame, length);
-	writew(length, slot + offsetof(struct s31_hosted_slot, length));
-	writeb(0, slot + offsetof(struct s31_hosted_slot, flags));
-	writeb(0, slot + offsetof(struct s31_hosted_slot, reserved));
-	wmb();
-	/* Publish sequence last, then commit the ring producer. */
-	writel(producer + 1,
-	       slot + offsetof(struct s31_hosted_slot, sequence));
-	wmb();
-	writel(producer + 1,
-	       ring + offsetof(struct s31_hosted_ring_state, producer));
-	wmb();
-	writel(1, hosted->db_h1_to_h0);
+	sbi_ret = sbi_ecall(S31_SBI_EXT_HOSTED, S31_SBI_HOSTED_TX,
+			    (unsigned long)frame, length, 0, 0, 0, 0);
 	spin_unlock_irqrestore(&hosted->tx_lock, flags);
+
+	if (sbi_ret.error) {
+		if (sbi_ret.error == -9) {
+			hosted->tx_drops++;
+			return -ENOSPC;
+		}
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -982,9 +964,11 @@ static int s31_hosted_poll(struct napi_struct *napi, int budget)
 
 			hosted->rx_errors += count;
 			hosted->ndev->stats.rx_errors += count;
-			writel(producer,
-			       ring + offsetof(struct s31_hosted_ring_state,
-					       consumer));
+			if (sbi_ecall(S31_SBI_EXT_HOSTED,
+				      S31_SBI_HOSTED_RX_ACK, count,
+				      0, 0, 0, 0, 0).error)
+				dev_err_ratelimited(hosted->dev,
+						    "failed to recover RX ring\n");
 			break;
 		}
 
@@ -1003,8 +987,12 @@ static int s31_hosted_poll(struct napi_struct *napi, int budget)
 		} else {
 			hosted->rx_errors++;
 		}
-		writel(consumer + 1,
-		       ring + offsetof(struct s31_hosted_ring_state, consumer));
+		if (sbi_ecall(S31_SBI_EXT_HOSTED, S31_SBI_HOSTED_RX_ACK,
+			      1, 0, 0, 0, 0, 0).error) {
+			dev_err_ratelimited(hosted->dev,
+					    "failed to acknowledge RX slot\n");
+			break;
+		}
 		work++;
 	}
 
@@ -1208,13 +1196,11 @@ static int s31_hosted_probe(struct platform_device *pdev)
 		schedule_work(&hosted->hci_open_work);
 
 	platform_set_drvdata(pdev, hosted);
-	/* Publish H1 readiness directly in the shared control block. */
-	writel(readl(s31_ctrl_ptr(hosted,
-				  offsetof(struct s31_hosted_control, state))) |
-		       S31_HOSTED_H1_READY,
-	       s31_ctrl_ptr(hosted,
-			     offsetof(struct s31_hosted_control, state)));
-	wmb();
+	ret = sbi_ecall(S31_SBI_EXT_HOSTED, S31_SBI_HOSTED_H1_READY,
+			0, 0, 0, 0, 0, 0).error;
+	if (ret)
+		dev_warn(&pdev->dev, "OpenSBI Hosted bridge unavailable: %d\n",
+			 ret);
 	if (readl(s31_ring_ptr(hosted, true,
 			       offsetof(struct s31_hosted_ring_state, producer))) !=
 	    readl(s31_ring_ptr(hosted, true,
