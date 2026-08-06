@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Read-only MTD access to the ESP32-S31 bootloader-provided Flash MMU alias.
+ * MTD access to the ESP32-S31 bootloader-provided Flash MMU window.
  *
  * The bootloader configures SPI1 Flash auto-suspend before handing off to
  * Linux. Write and erase use an OpenSBI M-mode proxy for the ROM APIs; any
@@ -30,6 +30,8 @@
 #define ESP32S31_SBI_EXT_FLASH		0x09000000
 #define ESP32S31_SBI_FLASH_WRITE	0
 #define ESP32S31_SBI_FLASH_ERASE	1
+#define ESP32S31_FLASH_XIP_BASE		0x40000000
+#define ESP32S31_FLASH_SIZE		0x01000000
 
 struct esp_partition_entry {
 	__le16 magic;
@@ -118,6 +120,7 @@ static int esp32s31_flash_write(struct mtd_info *mtd, loff_t to, size_t len,
 					     write_len);
 		if (ret)
 			break;
+		/* phys_base is the CPU-visible identity base, not a flash offset. */
 		esp32s31_cache_invalidate(flash->phys_base + aligned_to,
 					 write_len);
 		to += bytes;
@@ -230,6 +233,15 @@ static int esp32s31_flash_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "missing Flash MMU resource\n");
+	if (res->start != ESP32S31_FLASH_XIP_BASE ||
+	    resource_size(res) != ESP32S31_FLASH_SIZE)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "Flash MMU resource must be 0x%08x..0x%08x\n",
+				     ESP32S31_FLASH_XIP_BASE,
+				     ESP32S31_FLASH_XIP_BASE + ESP32S31_FLASH_SIZE);
 	flash->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(flash->base))
 		return PTR_ERR(flash->base);

@@ -498,10 +498,10 @@
 			};
 		};
 
-		/* Entire 16 MiB Flash, mapped by the bootloader at a non-XIP alias. */
-		flash: flash@41000000 {
+		/* Entire 16 MiB Flash, linearly mapped at the physical-offset alias. */
+		flash: flash@40000000 {
 			compatible = "espressif,esp32s31-flash-mtd";
-			reg = <0x41000000 0x01000000>;
+			reg = <0x40000000 0x01000000>;
 		};
 
 		usb_phy: phy@20380000 {
