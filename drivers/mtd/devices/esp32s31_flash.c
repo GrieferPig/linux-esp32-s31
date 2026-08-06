@@ -250,7 +250,8 @@ static int esp32s31_flash_probe(struct platform_device *pdev)
 	flash->mtd.type = MTD_NORFLASH;
 	flash->mtd.flags = MTD_CAP_NORFLASH;
 	flash->mtd.size = resource_size(res);
-	flash->mtd.erasesize = SZ_4K;
+	/* JFFS2 requires an 8 KiB minimum erase sector on this NOR. */
+	flash->mtd.erasesize = SZ_8K;
 	flash->mtd.writesize = 1;
 	flash->mtd.writebufsize = 1;
 	flash->mtd._read = esp32s31_flash_read;
