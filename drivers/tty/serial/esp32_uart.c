@@ -5,7 +5,10 @@
 #include <linux/clk.h>
 #include <linux/console.h>
 #include <linux/delay.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/kfifo.h>
 #include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -15,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/tty_flip.h>
 #include <asm/serial.h>
+#include "../../dma/esp32s31-ahb-gdma.h"
 
 #define DRIVER_NAME	"esp32-uart"
 #define DEV_NAME	"ttyS"
@@ -22,6 +26,33 @@
 
 #define ESP32_UART_TX_FIFO_SIZE	127
 #define ESP32_UART_RX_FIFO_SIZE	127
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+#define UHCI_CONF0		0x00
+#define UHCI_CONF1		0x14
+#define UHCI_ESCAPE_CONF	0x20
+#define UHCI_PKT_THRES		0x7c
+#define UHCI_LEN_EOF_EN		BIT(9)
+#define UHCI_UART_IDLE_EOF_EN	BIT(8)
+#define UHCI_CLK_EN		BIT(11)
+#define UHCI_TX_RST		BIT(0)
+#define UHCI_RX_RST		BIT(1)
+#define UHCI_UART_SEL_MASK	GENMASK(4, 2)
+#define UHCI_SYS_RST_EN		BIT(2)
+#define UHCI_DMA_RING_SLOTS	4U
+#define UHCI_DMA_PERIOD		1536U
+#define UHCI_DMA_RING_BYTES	(UHCI_DMA_RING_SLOTS * UHCI_DMA_PERIOD)
+/*
+ * TX slots are bigger than RX periods so a completion interrupt does not
+ * throttle the transmit path.  Keep one transaction active in hardware and
+ * one queued in software so console traffic cannot starve RX IRQ handling.
+ * As in ESP-IDF, each EOF callback mounts and starts the next transaction.
+ */
+#define UHCI_TX_SLOTS		2U
+#define UHCI_TX_PERIOD		2048U
+#define UHCI_TX_RING_BYTES	(UHCI_TX_SLOTS * UHCI_TX_PERIOD)
+#define UHCI_DMA_BUF_BYTES	(UHCI_TX_RING_BYTES + UHCI_DMA_RING_BYTES)
+#endif
 
 #define UART_FIFO_REG			0x00
 #define UART_INT_RAW_REG		0x04
@@ -46,6 +77,11 @@
 #define ESP32S3_UART_TXFIFO_CNT			GENMASK(25, 16)
 #define UART_TXFIFO_CNT_SHIFT			16
 #define UART_CONF0_REG			0x20
+#define UART_RXFIFO_RST			BIT(22)
+#define UART_TXFIFO_RST			BIT(23)
+#define UART_CLK_CONF_REG		0x88
+#define UART_TX_SCLK_EN			BIT(24)
+#define UART_RX_SCLK_EN			BIT(25)
 #define UART_PARITY				BIT(0)
 #define UART_PARITY_EN				BIT(1)
 #define UART_BIT_NUM				GENMASK(3, 2)
@@ -91,9 +127,41 @@
 	 ESP32S3_UART_SCLK_EN | \
 	 FIELD_PREP(ESP32S3_UART_SCLK_SEL, XTAL_CLK))
 
+struct esp32_port;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+struct esp32_uhci_dma_slot {
+	struct esp32_port *sport;
+	unsigned int index;
+	unsigned int len;
+	bool queued;
+};
+#endif
+
 struct esp32_port {
 	struct uart_port port;
 	struct clk *clk;
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	struct clk *uhci_clk;
+	void __iomem *uhci_base;
+	void __iomem *uhci_clkrst;
+	struct dma_chan *tx_dma;
+	struct dma_chan *rx_dma;
+	void __iomem *tx_buf;
+	void __iomem *rx_buf;
+	dma_addr_t tx_dma_addr;
+	dma_addr_t rx_dma_addr;
+	unsigned int tx_pending;
+	unsigned int rx_pending;
+	unsigned int rx_flip_short;
+	bool tx_dma_active;
+	bool rx_dma_active;
+	bool dma_started;
+	struct esp32_uhci_dma_slot tx_slots[UHCI_TX_SLOTS];
+	struct esp32_uhci_dma_slot rx_slots[UHCI_DMA_RING_SLOTS];
+	u8 rx_stage[UHCI_DMA_PERIOD];
+	struct kfifo console_fifo;
+#endif
 };
 
 struct esp32_uart_variant {
@@ -105,6 +173,7 @@ struct esp32_uart_variant {
 	const char *type;
 	bool has_clkconf;
 	bool needs_reg_update;
+	bool uhci_dma;
 };
 
 static const struct esp32_uart_variant esp32_variant = {
@@ -135,6 +204,18 @@ static const struct esp32_uart_variant esp32s31_variant = {
 	.needs_reg_update = true,
 };
 
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+static const struct esp32_uart_variant esp32s31_uhci_variant = {
+	.clkdiv_mask = ESP32S3_UART_CLKDIV,
+	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
+	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
+	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
+	.type = "ESP32-S31 UHCI UART",
+	.needs_reg_update = true,
+	.uhci_dma = true,
+};
+#endif
+
 static const struct of_device_id esp32_uart_dt_ids[] = {
 	{
 		.compatible = "esp,esp32-uart",
@@ -145,6 +226,9 @@ static const struct of_device_id esp32_uart_dt_ids[] = {
 	}, {
 		.compatible = "espressif,esp32s31-uart",
 		.data = &esp32s31_variant,
+	}, {
+		.compatible = "espressif,esp32s31-uhci-uart",
+		.data = &esp32s31_uhci_variant,
 	}, { /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, esp32_uart_dt_ids);
@@ -192,9 +276,284 @@ static u32 esp32_uart_rx_fifo_cnt(struct uart_port *port)
 	return (status & port_variant(port)->rxfifo_cnt_mask) >> UART_RXFIFO_CNT_SHIFT;
 }
 
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+static void esp32_uhci_rx_done(void *arg, const struct dmaengine_result *result);
+static void esp32_uhci_tx_done(void *arg);
+
+static void esp32_uhci_hw_init(struct esp32_port *sport)
+{
+	u32 val;
+
+	val = readl(sport->uhci_clkrst);
+	writel(val | UHCI_SYS_RST_EN, sport->uhci_clkrst);
+	writel(val & ~UHCI_SYS_RST_EN, sport->uhci_clkrst);
+	writel(UHCI_CLK_EN, sport->uhci_base + UHCI_CONF0);
+	writel(UHCI_CLK_EN | UHCI_UART_IDLE_EOF_EN |
+	       FIELD_PREP(UHCI_UART_SEL_MASK, sport->port.line),
+	       sport->uhci_base + UHCI_CONF0);
+	writel(0, sport->uhci_base + UHCI_CONF1);
+	writel(0, sport->uhci_base + UHCI_ESCAPE_CONF);
+	/* Keep the UART RX FIFO drained continuously; the idle-EOF (16 ms)
+	 * terminates each burst, so no length threshold is needed (IDF's UHCI
+	 * UART path enables only UHCI_RX_IDLE_EOF). */
+	writel(0, sport->uhci_base + UHCI_PKT_THRES);
+	/* IDF enables the UART core clocks in addition to the bus clock. */
+	val = esp32_uart_read(&sport->port, UART_CLK_CONF_REG);
+	esp32_uart_write(&sport->port, UART_CLK_CONF_REG,
+			 val | UART_TX_SCLK_EN | UART_RX_SCLK_EN);
+
+	/* UART0 is exclusively owned by UHCI after startup. */
+	esp32_uart_write(&sport->port, UART_INT_ENA_REG, 0);
+	esp32_uart_write(&sport->port, UART_INT_CLR_REG, 0xffffffff);
+	/* Drop any loader/PIO bytes before UHCI starts feeding the UART. */
+	val = esp32_uart_read(&sport->port, UART_CONF0_REG);
+	esp32_uart_write(&sport->port, UART_CONF0_REG,
+			 val | UART_RXFIFO_RST | UART_TXFIFO_RST);
+	esp32_uart_update(&sport->port);
+	esp32_uart_write(&sport->port, UART_CONF0_REG, val &
+			 ~(UART_RXFIFO_RST | UART_TXFIFO_RST));
+	esp32_uart_update(&sport->port);
+}
+
+static int esp32_uhci_prime_rx_ring_locked(struct esp32_port *sport)
+{
+	struct dma_async_tx_descriptor *desc;
+	dma_cookie_t cookie;
+	unsigned int i;
+
+	/*
+	 * IDF mounts the RX descriptors once as a circular link and re-arms
+	 * after every idle EOF with a plain gdma_start of the same ring.
+	 * dmaengine_prep_dma_cyclic gives us exactly that: the DMA driver
+	 * keeps the ring alive, counts the bytes of each burst and restarts
+	 * the link itself, so the UART driver never re-submits.
+	 */
+	desc = dmaengine_prep_dma_cyclic(sport->rx_dma, sport->rx_dma_addr,
+					 UHCI_DMA_RING_BYTES, UHCI_DMA_PERIOD,
+					 DMA_DEV_TO_MEM,
+					 DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc)
+		return -EIO;
+	desc->callback_result = esp32_uhci_rx_done;
+	desc->callback_param = sport;
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie))
+		return cookie;
+	for (i = 0; i < UHCI_DMA_RING_SLOTS; i++) {
+		sport->rx_slots[i].queued = true;
+		sport->rx_pending++;
+	}
+	sport->rx_dma_active = true;
+	dma_async_issue_pending(sport->rx_dma);
+	return 0;
+}
+
+static void esp32_uhci_rx_done(void *arg, const struct dmaengine_result *result)
+{
+	struct esp32_port *sport = arg;
+	struct uart_port *port = &sport->port;
+	struct tty_port *tty_port;
+	unsigned long flags;
+	unsigned int i, count, len, off, pos;
+	spin_lock_irqsave(&port->lock, flags);
+	/*
+	 * The DMA driver keeps a circular ring alive and reports, via the
+	 * residual, how many bytes the UHCI wrote since the previous
+	 * callback (per-node RX_DONE and idle-EOF events, IDF model).  Consume
+	 * exactly `len` bytes beginning at the driver's node-index position.
+	 */
+	len = result ? UHCI_DMA_RING_BYTES - result->residue : 0;
+	if (len > UHCI_DMA_RING_BYTES)
+		len = UHCI_DMA_RING_BYTES;
+	if (result) {
+		const struct esp32s31_ahb_rx_result *rxres =
+			container_of(result, struct esp32s31_ahb_rx_result, res);
+
+		pos = rxres->pos;
+	} else {
+		pos = 0;
+	}
+	if (sport->rx_pending)
+		sport->rx_pending = 0;
+	tty_port = port->state ? &port->state->port : NULL;
+	for (off = 0; off < len; ) {
+		unsigned int ring_pos = (pos + off) % UHCI_DMA_RING_BYTES;
+		unsigned int chunk = min_t(unsigned int, UHCI_DMA_PERIOD,
+					   len - off);
+
+		chunk = min(chunk, UHCI_DMA_RING_BYTES - ring_pos);
+
+		memcpy_fromio(sport->rx_stage,
+			      sport->rx_buf + ring_pos, chunk);
+		off += chunk;
+		if (!tty_port)
+			continue;
+		count = chunk;
+		if (unlikely(port->sysrq)) {
+			for (i = 0, count = 0; i < chunk; i++) {
+				if (uart_handle_sysrq_char(port,
+							   sport->rx_stage[i]))
+					continue;
+				sport->rx_stage[count++] = sport->rx_stage[i];
+			}
+		}
+		port->icount.rx += count;
+		if (count) {
+			size_t ins = tty_insert_flip_string(tty_port,
+						     sport->rx_stage,
+						     count);
+
+			if (ins != count)
+				sport->rx_flip_short += count - ins;
+		}
+	}
+	for (i = 0; i < UHCI_DMA_RING_SLOTS; i++)
+		sport->rx_slots[i].queued = false;
+	sport->rx_dma_active = sport->rx_pending != 0;
+	spin_unlock_irqrestore(&port->lock, flags);
+	if (tty_port)
+		tty_flip_buffer_push(tty_port);
+}
+
+static int esp32_uhci_submit_tx_slot_locked(struct esp32_port *sport,
+					struct esp32_uhci_dma_slot *slot)
+{
+	struct uart_port *port = &sport->port;
+	struct tty_port *tty_port = port->state ? &port->state->port : NULL;
+	struct dma_async_tx_descriptor *desc;
+	dma_cookie_t cookie;
+	unsigned int count;
+	bool console;
+	u8 *tail;
+
+	if (slot->queued || uart_tx_stopped(port))
+		return 0;
+	if (!kfifo_is_empty(&sport->console_fifo)) {
+		console = true;
+		count = kfifo_out_linear_ptr(&sport->console_fifo, &tail,
+					     UHCI_TX_PERIOD);
+	} else if (tty_port && !kfifo_is_empty(&tty_port->xmit_fifo)) {
+		console = false;
+		count = kfifo_out_linear_ptr(&tty_port->xmit_fifo, &tail,
+					     UHCI_TX_PERIOD);
+	} else {
+		return 0;
+	}
+	count = min_t(unsigned int, count, UHCI_TX_PERIOD);
+	memcpy_toio(sport->tx_buf + slot->index * UHCI_TX_PERIOD, tail, count);
+	desc = dmaengine_prep_slave_single(sport->tx_dma,
+					   sport->tx_dma_addr +
+					   slot->index * UHCI_TX_PERIOD,
+					   count, DMA_MEM_TO_DEV,
+					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc)
+		return -EIO;
+	slot->len = count;
+	desc->callback = esp32_uhci_tx_done;
+	desc->callback_param = slot;
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie))
+		return cookie;
+	/* The DMA engine has accepted the slot, so retire it from the source FIFO. */
+	if (console)
+		kfifo_skip_count(&sport->console_fifo, count);
+	else
+		uart_xmit_advance(port, count);
+	slot->queued = true;
+	sport->tx_pending++;
+	sport->tx_dma_active = true;
+	return 0;
+}
+
+static void esp32_uhci_submit_tx_locked(struct esp32_port *sport)
+{
+	unsigned int i;
+
+	for (i = 0; i < UHCI_TX_SLOTS; i++) {
+		if (sport->tx_pending >= UHCI_TX_SLOTS)
+			break;
+		if (esp32_uhci_submit_tx_slot_locked(sport,
+						      &sport->tx_slots[i]))
+			break;
+	}
+	if (sport->tx_pending)
+		dma_async_issue_pending(sport->tx_dma);
+}
+
+static void esp32_uhci_tx_done(void *arg)
+{
+	struct esp32_uhci_dma_slot *slot = arg;
+	struct esp32_port *sport = slot->sport;
+	struct uart_port *port = &sport->port;
+	unsigned long flags;
+
+	spin_lock_irqsave(&port->lock, flags);
+	if (!slot->queued) {
+		spin_unlock_irqrestore(&port->lock, flags);
+		return;
+	}
+	slot->queued = false;
+	if (sport->tx_pending)
+		sport->tx_pending--;
+	sport->tx_dma_active = sport->tx_pending != 0;
+	esp32_uhci_submit_tx_locked(sport);
+	if (port->state && kfifo_len(&port->state->port.xmit_fifo) < WAKEUP_CHARS)
+		uart_write_wakeup(port);
+	spin_unlock_irqrestore(&port->lock, flags);
+}
+
+static int esp32_uhci_dma_start(struct esp32_port *sport)
+{
+	struct dma_slave_config tx_cfg = {
+		.direction = DMA_MEM_TO_DEV,
+		.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
+		.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
+	};
+	struct dma_slave_config rx_cfg = {
+		.direction = DMA_DEV_TO_MEM,
+		.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
+		.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
+	};
+	int ret;
+	unsigned int i;
+
+	if (sport->dma_started)
+		return 0;
+
+	esp32_uhci_hw_init(sport);
+	ret = dmaengine_slave_config(sport->tx_dma, &tx_cfg);
+	if (!ret)
+		ret = dmaengine_slave_config(sport->rx_dma, &rx_cfg);
+	if (ret)
+		return ret;
+
+	/* Allow a completion racing the initial submissions to rearm its slot. */
+	sport->dma_started = true;
+	ret = esp32_uhci_prime_rx_ring_locked(sport);
+	if (ret) {
+		int error = ret;
+
+		sport->dma_started = false;
+		dmaengine_terminate_sync(sport->rx_dma);
+		sport->rx_pending = 0;
+		for (i = 0; i < UHCI_DMA_RING_SLOTS; i++)
+			sport->rx_slots[i].queued = false;
+		return error;
+	}
+	return 0;
+}
+#endif
+
 /* return TIOCSER_TEMT when transmitter is not busy */
 static unsigned int esp32_uart_tx_empty(struct uart_port *port)
 {
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+
+	if (port_variant(port)->uhci_dma)
+		return sport->tx_dma_active || esp32_uart_tx_fifo_cnt(port) ?
+			0 : TIOCSER_TEMT;
+#endif
 	return esp32_uart_tx_fifo_cnt(port) ? 0 : TIOCSER_TEMT;
 }
 
@@ -246,7 +605,21 @@ static unsigned int esp32_uart_get_mctrl(struct uart_port *port)
 
 static void esp32_uart_stop_tx(struct uart_port *port)
 {
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	unsigned int i;
 	u32 int_ena;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		esp32s31_ahb_terminate_direction(sport->tx_dma,
+						 DMA_MEM_TO_DEV);
+		sport->tx_pending = 0;
+		for (i = 0; i < UHCI_TX_SLOTS; i++)
+			sport->tx_slots[i].queued = false;
+		sport->tx_dma_active = false;
+		return;
+	}
+#endif
 
 	int_ena = esp32_uart_read(port, UART_INT_ENA_REG);
 	int_ena &= ~UART_TXFIFO_EMPTY_INT;
@@ -350,12 +723,34 @@ static irqreturn_t esp32_uart_int(int irq, void *dev_id)
 
 static void esp32_uart_start_tx(struct uart_port *port)
 {
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		esp32_uhci_submit_tx_locked(sport);
+		return;
+	}
+#endif
 	esp32_uart_transmit_buffer(port);
 }
 
 static void esp32_uart_stop_rx(struct uart_port *port)
 {
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	unsigned int i;
 	u32 int_ena;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		esp32s31_ahb_terminate_direction(sport->rx_dma,
+						 DMA_DEV_TO_MEM);
+		sport->rx_pending = 0;
+		for (i = 0; i < UHCI_DMA_RING_SLOTS; i++)
+			sport->rx_slots[i].queued = false;
+		sport->rx_dma_active = false;
+		return;
+	}
+#endif
 
 	int_ena = esp32_uart_read(port, UART_INT_ENA_REG);
 	int_ena &= ~UART_RXFIFO_FULL_INT;
@@ -371,6 +766,25 @@ static int esp32_uart_startup(struct uart_port *port)
 	ret = clk_prepare_enable(sport->clk);
 	if (ret)
 		return ret;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		if (!sport->dma_started) {
+			ret = clk_prepare_enable(sport->uhci_clk);
+			if (ret) {
+				clk_disable_unprepare(sport->clk);
+				return ret;
+			}
+			ret = esp32_uhci_dma_start(sport);
+			if (ret) {
+				clk_disable_unprepare(sport->uhci_clk);
+				clk_disable_unprepare(sport->clk);
+				return ret;
+			}
+		}
+		return ret;
+	}
+#endif
 
 	ret = request_irq(port->irq, esp32_uart_int, 0, DRIVER_NAME, port);
 	if (ret) {
@@ -397,6 +811,26 @@ static int esp32_uart_startup(struct uart_port *port)
 static void esp32_uart_shutdown(struct uart_port *port)
 {
 	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	unsigned int i;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		sport->dma_started = false;
+		dmaengine_terminate_sync(sport->tx_dma);
+		dmaengine_terminate_sync(sport->rx_dma);
+		sport->tx_pending = 0;
+		sport->rx_pending = 0;
+		for (i = 0; i < UHCI_TX_SLOTS; i++)
+			sport->tx_slots[i].queued = false;
+		for (i = 0; i < UHCI_DMA_RING_SLOTS; i++)
+			sport->rx_slots[i].queued = false;
+		sport->tx_dma_active = false;
+		sport->rx_dma_active = false;
+		clk_disable_unprepare(sport->uhci_clk);
+		clk_disable_unprepare(sport->clk);
+		return;
+	}
+#endif
 
 	esp32_uart_write(port, UART_INT_ENA_REG, 0);
 	free_irq(port->irq, port);
@@ -570,6 +1004,28 @@ static void esp32_uart_console_putchar(struct uart_port *port, u8 c)
 static void esp32_uart_string_write(struct uart_port *port, const char *s,
 				    unsigned int count)
 {
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		unsigned char ch;
+
+		if (!sport->dma_started)
+			return;
+		while (count--) {
+			if (*s == '\n' && kfifo_avail(&sport->console_fifo) > 1) {
+				ch = '\r';
+				kfifo_in(&sport->console_fifo, &ch, 1);
+			}
+			if (!kfifo_avail(&sport->console_fifo))
+				break;
+			ch = *s++;
+			kfifo_in(&sport->console_fifo, &ch, 1);
+		}
+		esp32_uhci_submit_tx_locked(sport);
+		return;
+	}
+#endif
 	uart_console_write(port, s, count, esp32_uart_console_putchar);
 }
 
@@ -622,7 +1078,27 @@ static int __init esp32_uart_console_setup(struct console *co, char *options)
 	if (options)
 		uart_parse_options(options, &baud, &parity, &bits, &flow);
 
-	return uart_set_options(&sport->port, co, baud, parity, bits, flow);
+	ret = uart_set_options(&sport->port, co, baud, parity, bits, flow);
+	if (ret)
+		goto err_uart_clk;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(&sport->port)->uhci_dma) {
+		ret = clk_prepare_enable(sport->uhci_clk);
+		if (ret)
+			goto err_uart_clk;
+		ret = esp32_uhci_dma_start(sport);
+		if (ret) {
+			clk_disable_unprepare(sport->uhci_clk);
+			goto err_uart_clk;
+		}
+	}
+#endif
+	return 0;
+
+err_uart_clk:
+	clk_disable_unprepare(sport->clk);
+	return ret;
 }
 
 static int esp32_uart_console_exit(struct console *co)
@@ -735,9 +1211,11 @@ static struct uart_driver esp32_uart_reg = {
 static int esp32_uart_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
+	const struct esp32_uart_variant *variant;
 	struct uart_port *port;
 	struct esp32_port *sport;
 	struct resource *res;
+	unsigned int i;
 	int ret;
 
 	sport = devm_kzalloc(&pdev->dev, sizeof(*sport), GFP_KERNEL);
@@ -757,43 +1235,126 @@ static int esp32_uart_probe(struct platform_device *pdev)
 	}
 
 	port->line = ret;
+	variant = device_get_match_data(&pdev->dev);
+	if (!variant)
+		return -EINVAL;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res)
-		return -ENODEV;
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (variant->uhci_dma) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "uart");
+		if (!res)
+			return -ENODEV;
+		port->mapbase = res->start;
+		port->membase = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(port->membase))
+			return PTR_ERR(port->membase);
+		sport->uhci_base = devm_platform_ioremap_resource_byname(pdev,
+									"uhci");
+		if (IS_ERR(sport->uhci_base))
+			return PTR_ERR(sport->uhci_base);
+		sport->uhci_clkrst = devm_platform_ioremap_resource_byname(pdev,
+									"clkrst");
+		if (IS_ERR(sport->uhci_clkrst))
+			return PTR_ERR(sport->uhci_clkrst);
+		sport->clk = devm_clk_get(&pdev->dev, "uart");
+		if (IS_ERR(sport->clk))
+			return PTR_ERR(sport->clk);
+		sport->uhci_clk = devm_clk_get(&pdev->dev, "bus");
+		if (IS_ERR(sport->uhci_clk))
+			return PTR_ERR(sport->uhci_clk);
+		sport->tx_dma = dma_request_chan(&pdev->dev, "tx");
+		if (IS_ERR(sport->tx_dma))
+			return PTR_ERR(sport->tx_dma);
+		/* AHB GDMA TX/RX are coupled to one hardware pair. */
+		sport->rx_dma = sport->tx_dma;
+		ret = kfifo_alloc(&sport->console_fifo, 4096, GFP_KERNEL);
+		if (ret)
+			goto err_dma;
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dma-buf");
+		if (!res || resource_size(res) < UHCI_DMA_BUF_BYTES) {
+			ret = -EINVAL;
+			goto err_dma;
+		}
+		sport->tx_buf = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(sport->tx_buf)) {
+			ret = PTR_ERR(sport->tx_buf);
+			goto err_dma;
+		}
+		sport->rx_buf = (u8 __iomem *)sport->tx_buf +
+			UHCI_TX_RING_BYTES;
+		sport->tx_dma_addr = res->start;
+		sport->rx_dma_addr = res->start + UHCI_TX_RING_BYTES;
+		for (i = 0; i < UHCI_TX_SLOTS; i++) {
+			sport->tx_slots[i].sport = sport;
+			sport->tx_slots[i].index = i;
+		}
+		for (i = 0; i < UHCI_DMA_RING_SLOTS; i++) {
+			sport->rx_slots[i].sport = sport;
+			sport->rx_slots[i].index = i;
+		}
+		port->irq = -1;
+	} else
+#endif
+	{
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res)
+			return -ENODEV;
 
-	port->mapbase = res->start;
-	port->membase = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(port->membase))
-		return PTR_ERR(port->membase);
+		port->mapbase = res->start;
+		port->membase = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(port->membase))
+			return PTR_ERR(port->membase);
 
-	sport->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(sport->clk))
-		return PTR_ERR(sport->clk);
+		sport->clk = devm_clk_get(&pdev->dev, NULL);
+		if (IS_ERR(sport->clk))
+			return PTR_ERR(sport->clk);
+		port->irq = platform_get_irq(pdev, 0);
+	}
 
 	port->uartclk = clk_get_rate(sport->clk);
 	port->dev = &pdev->dev;
 	port->type = PORT_GENERIC;
 	port->iotype = UPIO_MEM;
-	port->irq = platform_get_irq(pdev, 0);
 	port->ops = &esp32_uart_pops;
 	port->flags = UPF_BOOT_AUTOCONF;
 	port->has_sysrq = 1;
 	port->fifosize = ESP32_UART_TX_FIFO_SIZE;
-	port->private_data = (void *)device_get_match_data(&pdev->dev);
+	port->private_data = (void *)variant;
 
 	esp32_uart_ports[port->line] = sport;
 
 	platform_set_drvdata(pdev, port);
 
-	return uart_add_one_port(&esp32_uart_reg, port);
+	ret = uart_add_one_port(&esp32_uart_reg, port);
+	if (ret) {
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+		if (variant->uhci_dma)
+			goto err_dma;
+#endif
+	}
+	return ret;
+
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+err_dma:
+	kfifo_free(&sport->console_fifo);
+	dma_release_channel(sport->tx_dma);
+	return ret;
+#endif
 }
 
 static void esp32_uart_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = platform_get_drvdata(pdev);
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
 
 	uart_remove_one_port(&esp32_uart_reg, port);
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (port_variant(port)->uhci_dma) {
+		kfifo_free(&sport->console_fifo);
+		dma_release_channel(sport->tx_dma);
+		esp32_uart_ports[port->line] = NULL;
+	}
+#endif
 }
 
 

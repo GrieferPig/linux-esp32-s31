@@ -26,7 +26,8 @@
 #define ESP32S31_CLK_MCPWM3		21
 #define ESP32S31_CLK_PCNT0		22
 #define ESP32S31_CLK_PCNT1		23
+#define ESP32S31_CLK_UHCI		24
 
-#define ESP32S31_CLK_NR			24
+#define ESP32S31_CLK_NR			25
 
 #endif

@@ -16,14 +16,18 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_dma.h>
 #include <linux/platform_device.h>
+#include <linux/scatterlist.h>
 
 #include "virt-dma.h"
+#include "esp32s31-ahb-gdma.h"
 
 #define AHB_CHANNELS			5
 #define AHB_DESC_MAX			4095U
 #define AHB_DESC_SIZE			12U
 #define AHB_RX_INT(ch)			((ch) * 0x10)
+#define AHB_TX_INT(ch)			(0x50 + (ch) * 0x10)
 #define AHB_RX_RAW			0x00
 #define AHB_RX_ST			0x04
 #define AHB_RX_ENA			0x08
@@ -56,11 +60,14 @@
 #define AHB_RX_START			BIT(2)
 #define AHB_TX_STOP			BIT(0)
 #define AHB_TX_START			BIT(1)
+#define AHB_RX_DONE			BIT(0)
 #define AHB_RX_SUC_EOF			BIT(1)
 #define AHB_RX_ERR_EOF			BIT(2)
 #define AHB_RX_DESC_ERR			BIT(3)
 #define AHB_RX_DESC_EMPTY		BIT(4)
 #define AHB_RX_RESP_ERR			BIT(7)
+#define AHB_TX_DSCR_ERR			BIT(2)
+#define AHB_TX_RESP_ERR			BIT(6)
 #define AHB_RX_ERROR			(AHB_RX_ERR_EOF | AHB_RX_DESC_ERR | \
 					 AHB_RX_DESC_EMPTY | AHB_RX_RESP_ERR)
 #define AHB_MISC_RESET			BIT(0)
@@ -70,6 +77,7 @@
 #define AHB_DESC_EOF			BIT(30)
 #define AHB_DESC_OWNER			BIT(31)
 #define AHB_M2M_DUMMY			9
+#define AHB_RX_SUC_EOF_DESC		0x1c
 
 struct esp32s31_ahb_hw_desc {
 	__le32 control;
@@ -82,8 +90,12 @@ struct esp32s31_ahb_desc {
 	void __iomem *pool;
 	size_t pool_len;
 	size_t len;
+	unsigned int ndesc;
 	dma_addr_t tx_dma;
 	dma_addr_t rx_dma;
+	enum dma_transfer_direction direction;
+	struct esp32s31_ahb_rx_result rx_result;
+	bool cyclic;
 };
 
 struct esp32s31_ahb;
@@ -91,8 +103,17 @@ struct esp32s31_ahb;
 struct esp32s31_ahb_chan {
 	struct virt_dma_chan vc;
 	struct esp32s31_ahb *gdma;
-	struct esp32s31_ahb_desc *active;
+	struct esp32s31_ahb_desc *active_tx;
+	struct esp32s31_ahb_desc *active_rx;
+	struct esp32s31_ahb_desc *cyclic_rx;
+	u32 cyclic_generation;
+	unsigned int rx_node;
+	struct dma_slave_config config;
+	u32 request_id;
 	unsigned int id;
+	int rx_irq;
+	int tx_irq;
+	unsigned int users;
 };
 
 struct esp32s31_ahb {
@@ -130,21 +151,28 @@ static void esp32s31_ahb_free_desc(struct virt_dma_desc *vd)
 	kfree(desc);
 }
 
-static void esp32s31_ahb_reset(struct esp32s31_ahb_chan *chan)
+static void esp32s31_ahb_reset(struct esp32s31_ahb_chan *chan,
+			       enum dma_transfer_direction direction)
 {
 	u32 val;
 
-	writel(AHB_RX_STOP, ahb_ch_reg(chan, AHB_RX_LINK));
-	writel(AHB_TX_STOP, ahb_ch_reg(chan, AHB_TX_LINK));
-	writel(0, chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ENA);
-	writel(GENMASK(7, 0),
-	       chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_CLR);
-	val = readl(ahb_ch_reg(chan, AHB_RX_CONF0));
-	writel(val | AHB_RX_RST, ahb_ch_reg(chan, AHB_RX_CONF0));
-	writel(val & ~AHB_RX_RST, ahb_ch_reg(chan, AHB_RX_CONF0));
-	val = readl(ahb_ch_reg(chan, AHB_TX_CONF0));
-	writel(val | AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
-	writel(val & ~AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
+	if (direction == DMA_DEV_TO_MEM) {
+		writel(AHB_RX_STOP, ahb_ch_reg(chan, AHB_RX_LINK));
+		writel(0, chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ENA);
+		writel(GENMASK(7, 0),
+		       chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_CLR);
+		val = readl(ahb_ch_reg(chan, AHB_RX_CONF0));
+		writel(val | AHB_RX_RST, ahb_ch_reg(chan, AHB_RX_CONF0));
+		writel(val & ~AHB_RX_RST, ahb_ch_reg(chan, AHB_RX_CONF0));
+	} else {
+		writel(AHB_TX_STOP, ahb_ch_reg(chan, AHB_TX_LINK));
+		writel(0, chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
+		writel(GENMASK(7, 0),
+		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_CLR);
+		val = readl(ahb_ch_reg(chan, AHB_TX_CONF0));
+		writel(val | AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
+		writel(val & ~AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
+	}
 }
 
 static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
@@ -156,36 +184,97 @@ static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
 
 	writel(readl(chan->gdma->base + AHB_MODULE_CLK) | clk_mask,
 	       chan->gdma->base + AHB_MODULE_CLK);
-	esp32s31_ahb_reset(chan);
-	writel(AHB_RX_DESC_BURST | AHB_RX_MEM_TRANS,
-	       ahb_ch_reg(chan, AHB_RX_CONF0));
-	writel(AHB_CHECK_OWNER, ahb_ch_reg(chan, AHB_RX_CONF1));
-	writel(AHB_M2M_DUMMY, ahb_ch_reg(chan, AHB_RX_PERI_SEL));
-	writel(AHB_TX_AUTO_WRBACK | AHB_TX_EOF_MODE | AHB_TX_DESC_BURST,
-	       ahb_ch_reg(chan, AHB_TX_CONF0));
-	writel(AHB_CHECK_OWNER, ahb_ch_reg(chan, AHB_TX_CONF1));
-	writel(AHB_M2M_DUMMY, ahb_ch_reg(chan, AHB_TX_PERI_SEL));
+	/*
+	 * Do not reset a slave TX channel between adjacent descriptors.  The
+	 * TX EOF interrupt is configured for "data popped" mode, so the link
+	 * FSM is already parked and a new address/start is sufficient.  A
+	 * reset here races the UHCI handshake and can leave it unable to accept
+	 * another request after a few transfers.  ESP-IDF's uhci_do_transmit()
+	 * follows the same sequence: mount, set descriptor address, start.
+	 * Resets remain confined to terminate/recovery paths and cyclic RX EOF.
+	 */
+	if (desc->direction == DMA_MEM_TO_MEM)
+		esp32s31_ahb_reset(chan, desc->direction);
 	dma_wmb();
-	writel(lower_32_bits(desc->rx_dma), ahb_ch_reg(chan, AHB_RX_LINK_ADDR));
-	writel(lower_32_bits(desc->tx_dma), ahb_ch_reg(chan, AHB_TX_LINK_ADDR));
-	writel(AHB_RX_SUC_EOF | AHB_RX_ERROR,
-	       chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ENA);
-	writel(AHB_RX_START, ahb_ch_reg(chan, AHB_RX_LINK));
-	writel(AHB_TX_START, ahb_ch_reg(chan, AHB_TX_LINK));
+	if (desc->direction == DMA_DEV_TO_MEM ||
+	    desc->direction == DMA_MEM_TO_MEM) {
+		writel(AHB_RX_DESC_BURST |
+		       (desc->direction == DMA_MEM_TO_MEM ? AHB_RX_MEM_TRANS : 0),
+		       ahb_ch_reg(chan, AHB_RX_CONF0));
+		writel(AHB_CHECK_OWNER, ahb_ch_reg(chan, AHB_RX_CONF1));
+		writel(desc->direction == DMA_MEM_TO_MEM ? AHB_M2M_DUMMY : chan->request_id,
+		       ahb_ch_reg(chan, AHB_RX_PERI_SEL));
+		writel(lower_32_bits(desc->rx_dma), ahb_ch_reg(chan, AHB_RX_LINK_ADDR));
+		writel(AHB_RX_SUC_EOF | AHB_RX_ERROR,
+		       chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ENA);
+		writel(AHB_RX_START, ahb_ch_reg(chan, AHB_RX_LINK));
+	}
+	if (desc->direction == DMA_MEM_TO_DEV ||
+	    desc->direction == DMA_MEM_TO_MEM) {
+		writel(AHB_TX_AUTO_WRBACK | AHB_TX_EOF_MODE | AHB_TX_DESC_BURST,
+		       ahb_ch_reg(chan, AHB_TX_CONF0));
+		writel(AHB_CHECK_OWNER, ahb_ch_reg(chan, AHB_TX_CONF1));
+		writel(desc->direction == DMA_MEM_TO_MEM ? AHB_M2M_DUMMY : chan->request_id,
+		       ahb_ch_reg(chan, AHB_TX_PERI_SEL));
+		writel(lower_32_bits(desc->tx_dma), ahb_ch_reg(chan, AHB_TX_LINK_ADDR));
+		writel(BIT(1) | AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR,
+		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
+		writel(AHB_TX_START, ahb_ch_reg(chan, AHB_TX_LINK));
+	}
 }
 
 static void esp32s31_ahb_start_pending(struct esp32s31_ahb_chan *chan)
 {
 	struct virt_dma_desc *vd;
+	struct virt_dma_desc *next;
+	struct esp32s31_ahb_desc *desc;
 
-	if (chan->active)
-		return;
-	vd = vchan_next_desc(&chan->vc);
-	if (!vd)
-		return;
-	list_del(&vd->node);
-	chan->active = to_ahb_desc(vd);
-	esp32s31_ahb_start(chan, chan->active);
+	list_for_each_entry_safe(vd, next, &chan->vc.desc_issued, node) {
+		desc = to_ahb_desc(vd);
+		if (desc->direction == DMA_DEV_TO_MEM && chan->cyclic_rx)
+			continue;
+		if ((desc->direction == DMA_DEV_TO_MEM && chan->active_rx) ||
+		    (desc->direction == DMA_MEM_TO_DEV && chan->active_tx))
+			continue;
+		list_del(&vd->node);
+		if (desc->direction == DMA_DEV_TO_MEM)
+			chan->active_rx = desc;
+		else if (desc->direction == DMA_MEM_TO_DEV)
+			chan->active_tx = desc;
+		else
+			chan->active_tx = chan->active_rx = desc;
+		esp32s31_ahb_start(chan, desc);
+		if (chan->active_tx && chan->active_rx)
+			break;
+	}
+}
+
+/* start the persistent cyclic RX ring at the given node (IDF: gdma_start) */
+static void esp32s31_ahb_start_cyclic(struct esp32s31_ahb_chan *chan)
+{
+	struct esp32s31_ahb_desc *desc = chan->cyclic_rx;
+	u32 clk_mask = BIT(chan->id) | BIT(5 + chan->id) |
+		       BIT(10 + chan->id) | BIT(15 + chan->id) |
+		       BIT(20 + chan->id) | BIT(27) | BIT(28);
+
+	writel(readl(chan->gdma->base + AHB_MODULE_CLK) | clk_mask,
+	       chan->gdma->base + AHB_MODULE_CLK);
+	esp32s31_ahb_reset(chan, DMA_DEV_TO_MEM);
+	writel(AHB_RX_DESC_BURST, ahb_ch_reg(chan, AHB_RX_CONF0));
+	/*
+	 * Match ESP-IDF: RX circular links do not enable owner checking.  The
+	 * engine writes OWNER back after each node, and with owner checking set
+	 * a circular link stops when it reaches that node again.  Re-arming the
+	 * node while the link is live also races the descriptor prefetcher.
+	 */
+	writel(0, ahb_ch_reg(chan, AHB_RX_CONF1));
+	writel(chan->request_id, ahb_ch_reg(chan, AHB_RX_PERI_SEL));
+	writel(lower_32_bits(desc->rx_dma +
+			     chan->rx_node * AHB_DESC_SIZE),
+	       ahb_ch_reg(chan, AHB_RX_LINK_ADDR));
+	writel(AHB_RX_DONE | AHB_RX_SUC_EOF | AHB_RX_ERROR,
+	       chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ENA);
+	writel(AHB_RX_START, ahb_ch_reg(chan, AHB_RX_LINK));
 }
 
 static struct dma_async_tx_descriptor *
@@ -213,6 +302,7 @@ esp32s31_ahb_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	}
 	desc->pool = (void __iomem *)pool;
 	desc->len = len;
+	desc->direction = DMA_MEM_TO_MEM;
 	pool_dma = gen_pool_virt_to_phys(chan->gdma->pool, pool);
 	desc->tx_dma = pool_dma;
 	desc->rx_dma = pool_dma + count * AHB_DESC_SIZE;
@@ -246,39 +336,364 @@ esp32s31_ahb_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 
+static struct dma_async_tx_descriptor *
+esp32s31_ahb_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
+			   unsigned int sg_len,
+			   enum dma_transfer_direction direction,
+			   unsigned long flags, void *context)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+	struct esp32s31_ahb_desc *desc;
+	struct scatterlist *sg;
+	unsigned long pool;
+	dma_addr_t pool_dma;
+	size_t total = 0, remaining;
+	unsigned int count = 0, i, j;
+
+	if (!sg_len || (direction != DMA_MEM_TO_DEV &&
+		       direction != DMA_DEV_TO_MEM) ||
+	    chan->request_id >= 32)
+		return NULL;
+	for_each_sg(sgl, sg, sg_len, i) {
+		if (!sg_dma_len(sg) || upper_32_bits(sg_dma_address(sg)))
+			return NULL;
+		count += DIV_ROUND_UP(sg_dma_len(sg), AHB_DESC_MAX);
+		total += sg_dma_len(sg);
+	}
+	if (!count || !total)
+		return NULL;
+	desc = kzalloc(sizeof(*desc), GFP_NOWAIT);
+	if (!desc)
+		return NULL;
+	desc->pool_len = count * AHB_DESC_SIZE;
+	pool = gen_pool_alloc(chan->gdma->pool, desc->pool_len);
+	if (!pool) {
+		kfree(desc);
+		return NULL;
+	}
+	desc->pool = (void __iomem *)pool;
+	desc->len = total;
+	desc->ndesc = count;
+	desc->direction = direction;
+	pool_dma = gen_pool_virt_to_phys(chan->gdma->pool, pool);
+	if (direction == DMA_MEM_TO_DEV)
+		desc->tx_dma = pool_dma;
+	else
+		desc->rx_dma = pool_dma;
+	memset_io(desc->pool, 0, desc->pool_len);
+
+	j = 0;
+	for_each_sg(sgl, sg, sg_len, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		remaining = sg_dma_len(sg);
+		while (remaining) {
+			void __iomem *hw = desc->pool + j * AHB_DESC_SIZE;
+			size_t chunk = min_t(size_t, remaining, AHB_DESC_MAX);
+			dma_addr_t next = j + 1 == count ? 0 :
+				pool_dma + (j + 1) * AHB_DESC_SIZE;
+			u32 control = FIELD_PREP(AHB_DESC_BUF_SIZE, chunk) |
+				FIELD_PREP(AHB_DESC_DATA_LEN, chunk) |
+				AHB_DESC_OWNER;
+
+			if (j + 1 == count)
+				control |= AHB_DESC_EOF;
+			writel(control, hw);
+			writel(lower_32_bits(addr), hw + 4);
+			writel(lower_32_bits(next), hw + 8);
+			addr += chunk;
+			remaining -= chunk;
+			j++;
+		}
+	}
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+
+static struct dma_async_tx_descriptor *
+esp32s31_ahb_prep_dma_cyclic(struct dma_chan *dchan, dma_addr_t buf_addr,
+			     size_t buf_len, size_t period_len,
+			     enum dma_transfer_direction direction,
+			     unsigned long flags)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+	struct esp32s31_ahb_desc *desc;
+	unsigned long pool;
+	dma_addr_t pool_dma;
+	unsigned int count, i;
+
+	if (direction != DMA_DEV_TO_MEM || !buf_len || !period_len ||
+	    buf_len % period_len || period_len > AHB_DESC_MAX ||
+	    chan->request_id >= 32)
+		return NULL;
+	count = buf_len / period_len;
+	desc = kzalloc(sizeof(*desc), GFP_NOWAIT);
+	if (!desc)
+		return NULL;
+	desc->pool_len = count * AHB_DESC_SIZE;
+	pool = gen_pool_alloc(chan->gdma->pool, desc->pool_len);
+	if (!pool) {
+		kfree(desc);
+		return NULL;
+	}
+	desc->pool = (void __iomem *)pool;
+	desc->len = buf_len;
+	desc->ndesc = count;
+	desc->direction = direction;
+	desc->cyclic = true;
+	pool_dma = gen_pool_virt_to_phys(chan->gdma->pool, pool);
+	desc->rx_dma = pool_dma;
+	memset_io(desc->pool, 0, desc->pool_len);
+
+	/*
+	 * IDF mounts the RX descriptors once as a *circular* link
+	 * (GDMA_FINAL_LINK_TO_DEFAULT): the last descriptor points back to
+	 * the head, so the DMA never stops at the end of the ring and an
+	 * idle-EOF just marks the end of the current burst.  Normal EOF events
+	 * advance node_index without stopping the link; only an error remounts
+	 * and restarts the ring.
+	 */
+	for (i = 0; i < count; i++) {
+		void __iomem *hw = desc->pool + i * AHB_DESC_SIZE;
+		dma_addr_t next = pool_dma +
+			((i + 1) % count) * AHB_DESC_SIZE;
+		u32 control = FIELD_PREP(AHB_DESC_BUF_SIZE, period_len) |
+			      FIELD_PREP(AHB_DESC_DATA_LEN, period_len) |
+			      AHB_DESC_OWNER;
+
+		writel(control, hw);
+		writel(lower_32_bits(buf_addr + i * period_len), hw + 4);
+		writel(lower_32_bits(next), hw + 8);
+	}
+	/* UHCI idle-EOF writeback marks the burst's final descriptor. */
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+
 static irqreturn_t esp32s31_ahb_irq(int irq, void *data)
 {
 	struct esp32s31_ahb_chan *chan = data;
 	struct esp32s31_ahb_desc *desc;
+	struct esp32s31_ahb_rx_result rx_result;
+	struct dmaengine_desc_callback cb;
 	unsigned long flags;
 	u32 status;
+	u32 cyclic_generation;
+	bool tx = irq == chan->tx_irq;
 
-	status = readl(chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_ST);
+	status = readl(chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
+					     AHB_RX_INT(chan->id)) + AHB_RX_ST);
 	if (!status)
 		return IRQ_NONE;
-	writel(status, chan->gdma->base + AHB_RX_INT(chan->id) + AHB_RX_CLR);
+	writel(status, chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
+					     AHB_RX_INT(chan->id)) + AHB_RX_CLR);
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	desc = chan->active;
+	if (!tx && chan->cyclic_rx) {
+		/*
+		 * Persistent circular ring, IDF uhci_gdma_rx_callback_done
+		 * model with the node_index bookkeeping:
+		 *  - RX_DONE  (bit 0): a node filled without EOF.  Deliver the
+		 *    node (totally_received=false), advance node_index, and
+		 *    let the DMA keep running so a burst longer than the ring
+		 *    drains continuously instead of wrapping and losing data.
+		 *  - SUC_EOF  (bit 1): the UHCI idle-EOF landed.  Count bytes
+		 *    through the hardware-reported EOF node and keep the link live.
+		 */
+		struct esp32s31_ahb_rx_result *rxres;
+		unsigned int actual = 0, i, done = 0;
+		bool eof = !!(status & AHB_RX_SUC_EOF);
+		bool restart = !!(status & AHB_RX_ERROR);
+		u32 ctrl;
+
+		desc = chan->cyclic_rx;
+		cyclic_generation = chan->cyclic_generation;
+		rxres = &desc->rx_result;
+		if (status & AHB_RX_ERROR) {
+			rxres->res.result = DMA_TRANS_WRITE_FAILED;
+			eof = true;
+		} else {
+			rxres->res.result = DMA_TRANS_NOERROR;
+		}
+		rxres->eof = eof;
+		rxres->pos = chan->rx_node * (desc->len / desc->ndesc);
+		/*
+		 * Follow ESP-IDF's node_index model.  A non-EOF RX_DONE completes
+		 * exactly the current node.  At EOF, use the hardware's successful
+		 * EOF descriptor address instead of guessing from OWNER writeback.
+		 */
+		if (!eof) {
+			ctrl = readl(desc->pool +
+				     chan->rx_node * AHB_DESC_SIZE);
+			actual = FIELD_GET(AHB_DESC_DATA_LEN, ctrl);
+			done = 1;
+		} else if (status & AHB_RX_SUC_EOF) {
+			dma_addr_t eof_dma = readl(ahb_ch_reg(chan,
+							AHB_RX_SUC_EOF_DESC));
+
+			if (eof_dma >= desc->rx_dma &&
+			    eof_dma < desc->rx_dma + desc->pool_len &&
+			    !((eof_dma - desc->rx_dma) % AHB_DESC_SIZE)) {
+				unsigned int eof_node =
+					(eof_dma - desc->rx_dma) / AHB_DESC_SIZE;
+
+				for (i = 0; i < desc->ndesc; i++) {
+					unsigned int node = (chan->rx_node + i) %
+							   desc->ndesc;
+
+					ctrl = readl(desc->pool +
+						     node * AHB_DESC_SIZE);
+					actual += FIELD_GET(AHB_DESC_DATA_LEN,
+							    ctrl);
+					done++;
+					if (node == eof_node)
+						break;
+				}
+			}
+		}
+		rxres->res.residue = desc->len - actual;
+		dmaengine_desc_get_callback(&desc->vd.tx, &cb);
+		/* The descriptor may be terminated while its callback runs. */
+		rx_result = *rxres;
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		dmaengine_desc_callback_invoke(&cb, &rx_result.res);
+		spin_lock_irqsave(&chan->vc.lock, flags);
+		if (chan->cyclic_rx != desc ||
+		    chan->cyclic_generation != cyclic_generation) {
+			spin_unlock_irqrestore(&chan->vc.lock, flags);
+			return IRQ_HANDLED;
+		}
+		chan->rx_node = (chan->rx_node + done) % desc->ndesc;
+		if (restart) {
+			unsigned int k;
+
+			/*
+			 * Keep a normal UART idle EOF on the live circular link so the
+			 * next byte cannot arrive in a stop/reset window.  Reset and
+			 * remount only after a real DMA error.
+			 */
+			for (k = 0; k < desc->ndesc; k++) {
+				u32 size = FIELD_GET(AHB_DESC_BUF_SIZE,
+						     readl(desc->pool +
+							   k * AHB_DESC_SIZE));
+
+				writel(FIELD_PREP(AHB_DESC_BUF_SIZE, size) |
+				       FIELD_PREP(AHB_DESC_DATA_LEN, size) |
+				       AHB_DESC_OWNER,
+				       desc->pool + k * AHB_DESC_SIZE);
+			}
+			chan->rx_node = 0;
+			dma_wmb();
+			esp32s31_ahb_start_cyclic(chan);
+		}
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		return IRQ_HANDLED;
+	}
+	desc = tx ? chan->active_tx : chan->active_rx;
 	if (desc) {
-		chan->active = NULL;
-		if (status & AHB_RX_ERROR)
+		/*
+		 * RX one-shot links need an explicit stop before completion.  A TX
+		 * link is already parked at EOF and must remain untouched so the next
+		 * descriptor can be started directly from its completion callback.
+		 */
+		if (desc->direction == DMA_DEV_TO_MEM && !tx)
+			writel(AHB_RX_STOP, ahb_ch_reg(chan, AHB_RX_LINK));
+		if (desc->direction == DMA_MEM_TO_MEM)
+			chan->active_tx = chan->active_rx = NULL;
+		else if (tx)
+			chan->active_tx = NULL;
+		else
+			chan->active_rx = NULL;
+		if (status & (tx ? (AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR) :
+			       AHB_RX_ERROR))
 			desc->vd.tx_result.result = DMA_TRANS_WRITE_FAILED;
 		else
 			desc->vd.tx_result.result = DMA_TRANS_NOERROR;
-		desc->vd.tx_result.residue = 0;
-		vchan_cookie_complete(&desc->vd);
+		if (desc->direction == DMA_DEV_TO_MEM) {
+			unsigned int actual = 0, prev;
+			u32 ctrl;
+			int retry = 0, i;
+
+			for (;;) {
+				prev = actual;
+				actual = 0;
+				for (i = 0; i < desc->ndesc; i++) {
+					ctrl = readl(desc->pool +
+						    i * AHB_DESC_SIZE);
+					if (ctrl & AHB_DESC_OWNER)
+						break;
+					actual += FIELD_GET(AHB_DESC_DATA_LEN,
+							   ctrl);
+				}
+				if (actual == prev)
+					break;
+				if (++retry > 1000)
+					break;
+				cpu_relax();
+			}
+			desc->vd.tx_result.residue = desc->len - actual;
+			/*
+			 * Re-arm the ring before the UART RX FIFO overflows:
+			 * the tasklet is too slow when a burst is fragmented
+			 * by idle EOFs, so invoke the client callback in IRQ
+			 * context like IDF does in its gdma ISR.
+			 */
+			dmaengine_desc_get_callback(&desc->vd.tx, &cb);
+		} else {
+			desc->vd.tx_result.residue = 0;
+			/*
+			 * TX completions re-fill the UART TX FIFO.  Doing
+			 * that from the tasklet leaves a gap after every slot
+			 * and caps sustained throughput well below the link
+			 * rate; arm the next slot directly from the IRQ.
+			 */
+			dmaengine_desc_get_callback(&desc->vd.tx, &cb);
+		}
+		if (desc->direction != DMA_MEM_TO_MEM)
+			dma_cookie_complete(&desc->vd.tx);
+		if (desc->direction == DMA_MEM_TO_MEM) {
+			vchan_cookie_complete(&desc->vd);
+			desc = NULL;
+		}
 	}
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	if (desc) {
+		dmaengine_desc_callback_invoke(&cb, &desc->vd.tx_result);
+		vchan_vdesc_fini(&desc->vd);
+	}
+	spin_lock_irqsave(&chan->vc.lock, flags);
 	esp32s31_ahb_start_pending(chan);
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	return IRQ_HANDLED;
 }
 
+static int esp32s31_ahb_slave_config(struct dma_chan *dchan,
+				     struct dma_slave_config *config)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+
+	if (chan->request_id >= 32)
+		return -EINVAL;
+	memcpy(&chan->config, config, sizeof(*config));
+	return 0;
+}
+
 static void esp32s31_ahb_issue_pending(struct dma_chan *dchan)
 {
 	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+	struct virt_dma_desc *vd;
 	unsigned long flags;
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
+	list_for_each_entry(vd, &chan->vc.desc_submitted, node) {
+		struct esp32s31_ahb_desc *desc = to_ahb_desc(vd);
+
+		if (desc->cyclic && desc->direction == DMA_DEV_TO_MEM) {
+			if (chan->cyclic_rx)
+				break;
+			chan->cyclic_rx = desc;
+			chan->cyclic_generation++;
+			list_del(&vd->node);
+			esp32s31_ahb_start_cyclic(chan);
+			break;
+		}
+	}
 	if (vchan_issue_pending(&chan->vc))
 		esp32s31_ahb_start_pending(chan);
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
@@ -295,8 +710,10 @@ static enum dma_status esp32s31_ahb_tx_status(struct dma_chan *dchan,
 	if (status == DMA_COMPLETE || !state)
 		return status;
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	if (chan->active && chan->active->vd.tx.cookie == cookie)
-		dma_set_residue(state, chan->active->len);
+	if (chan->active_tx && chan->active_tx->vd.tx.cookie == cookie)
+		dma_set_residue(state, chan->active_tx->len);
+	if (chan->active_rx && chan->active_rx->vd.tx.cookie == cookie)
+		dma_set_residue(state, chan->active_rx->len);
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	return status;
 }
@@ -308,7 +725,14 @@ static int esp32s31_ahb_terminate_all(struct dma_chan *dchan)
 	LIST_HEAD(head);
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	if (chan->active)
+	if (chan->cyclic_rx) {
+		esp32s31_ahb_reset(chan, DMA_DEV_TO_MEM);
+		vchan_terminate_vdesc(&chan->cyclic_rx->vd);
+		chan->cyclic_rx = NULL;
+		chan->cyclic_generation++;
+		chan->rx_node = 0;
+	}
+	if (chan->active_tx || chan->active_rx)
 		dev_err(chan->gdma->dev,
 			"ch%u timeout: raw=%#x st=%#x rx_conf=%#x/%#x rx_link=%#x rx_addr=%#x tx_conf=%#x/%#x tx_link=%#x tx_addr=%#x tx_desc=%#x rx_desc=%#x\n",
 			chan->id,
@@ -322,17 +746,87 @@ static int esp32s31_ahb_terminate_all(struct dma_chan *dchan)
 			readl(ahb_ch_reg(chan, AHB_TX_CONF1)),
 			readl(ahb_ch_reg(chan, AHB_TX_LINK)),
 			readl(ahb_ch_reg(chan, AHB_TX_LINK_ADDR)),
-			readl(chan->active->pool),
-			readl(chan->active->pool + chan->active->pool_len / 2));
-	esp32s31_ahb_reset(chan);
-	if (chan->active) {
-		vchan_terminate_vdesc(&chan->active->vd);
-		chan->active = NULL;
+			readl(chan->active_tx ? chan->active_tx->pool : chan->active_rx->pool),
+			readl(chan->active_rx ? chan->active_rx->pool : chan->active_tx->pool));
+	if (chan->active_rx)
+		esp32s31_ahb_reset(chan, DMA_DEV_TO_MEM);
+	if (chan->active_tx)
+		esp32s31_ahb_reset(chan, DMA_MEM_TO_DEV);
+	if (chan->active_tx && chan->active_tx == chan->active_rx) {
+		vchan_terminate_vdesc(&chan->active_tx->vd);
+		chan->active_tx = chan->active_rx = NULL;
+	} else {
+		if (chan->active_tx) {
+			vchan_terminate_vdesc(&chan->active_tx->vd);
+			chan->active_tx = NULL;
+		}
+		if (chan->active_rx) {
+			vchan_terminate_vdesc(&chan->active_rx->vd);
+			chan->active_rx = NULL;
+		}
 	}
 	vchan_get_all_descriptors(&chan->vc, &head);
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	vchan_dma_desc_free_list(&chan->vc, &head);
 	return 0;
+}
+
+int esp32s31_ahb_terminate_direction(struct dma_chan *dchan,
+				     enum dma_transfer_direction direction)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+	struct virt_dma_desc *vd, *next;
+	struct esp32s31_ahb_desc *desc;
+	unsigned long flags;
+	LIST_HEAD(head);
+
+	if (direction != DMA_MEM_TO_DEV && direction != DMA_DEV_TO_MEM)
+		return -EINVAL;
+
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (direction == DMA_DEV_TO_MEM && chan->cyclic_rx) {
+		esp32s31_ahb_reset(chan, direction);
+		list_add_tail(&chan->cyclic_rx->vd.node, &head);
+		chan->cyclic_rx = NULL;
+		chan->cyclic_generation++;
+		chan->rx_node = 0;
+	}
+	if (direction == DMA_MEM_TO_DEV && chan->active_tx &&
+	    chan->active_tx->direction == direction) {
+		esp32s31_ahb_reset(chan, direction);
+		list_add_tail(&chan->active_tx->vd.node, &head);
+		chan->active_tx = NULL;
+	} else if (direction == DMA_DEV_TO_MEM && chan->active_rx &&
+		   chan->active_rx->direction == direction) {
+		esp32s31_ahb_reset(chan, direction);
+		list_add_tail(&chan->active_rx->vd.node, &head);
+		chan->active_rx = NULL;
+	}
+
+	list_for_each_entry_safe(vd, next, &chan->vc.desc_submitted, node) {
+		desc = to_ahb_desc(vd);
+		if (desc->direction == direction)
+			list_move_tail(&vd->node, &head);
+	}
+	list_for_each_entry_safe(vd, next, &chan->vc.desc_issued, node) {
+		desc = to_ahb_desc(vd);
+		if (desc->direction == direction)
+			list_move_tail(&vd->node, &head);
+	}
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+
+	vchan_dma_desc_free_list(&chan->vc, &head);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(esp32s31_ahb_terminate_direction);
+
+static void esp32s31_ahb_synchronize(struct dma_chan *dchan)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+
+	synchronize_irq(chan->rx_irq);
+	synchronize_irq(chan->tx_irq);
+	vchan_synchronize(&chan->vc);
 }
 
 static void esp32s31_ahb_free_resources(struct dma_chan *dchan)
@@ -341,6 +835,25 @@ static void esp32s31_ahb_free_resources(struct dma_chan *dchan)
 
 	esp32s31_ahb_terminate_all(dchan);
 	vchan_free_chan_resources(&chan->vc);
+	chan->request_id = U32_MAX;
+	chan->users = 0;
+}
+
+static struct dma_chan *esp32s31_ahb_of_xlate(struct of_phandle_args *spec,
+					       struct of_dma *ofdma)
+{
+	struct esp32s31_ahb *gdma = ofdma->of_dma_data;
+	struct esp32s31_ahb_chan *chan;
+
+	if (spec->args_count != 2 || spec->args[0] >= AHB_CHANNELS ||
+	    spec->args[1] >= 32)
+		return NULL;
+	chan = &gdma->chans[spec->args[0]];
+	if (chan->users >= 2)
+		return NULL;
+	chan->request_id = spec->args[1];
+	chan->users++;
+	return dma_get_slave_channel(&chan->vc.chan);
 }
 
 static int esp32s31_ahb_probe(struct platform_device *pdev)
@@ -397,14 +910,23 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	dma_dev->dev = dev;
 	INIT_LIST_HEAD(&dma_dev->channels);
 	dma_cap_set(DMA_MEMCPY, dma_dev->cap_mask);
+	dma_cap_set(DMA_SLAVE, dma_dev->cap_mask);
+	dma_cap_set(DMA_CYCLIC, dma_dev->cap_mask);
 	dma_dev->copy_align = DMAENGINE_ALIGN_1_BYTE;
-	dma_dev->directions = BIT(DMA_MEM_TO_MEM);
+	dma_dev->directions = BIT(DMA_MEM_TO_MEM) | BIT(DMA_MEM_TO_DEV) |
+			       BIT(DMA_DEV_TO_MEM);
+	dma_dev->src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE);
+	dma_dev->dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE);
 	dma_dev->residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
 	dma_dev->device_free_chan_resources = esp32s31_ahb_free_resources;
 	dma_dev->device_prep_dma_memcpy = esp32s31_ahb_prep_memcpy;
+	dma_dev->device_config = esp32s31_ahb_slave_config;
+	dma_dev->device_prep_slave_sg = esp32s31_ahb_prep_slave_sg;
+	dma_dev->device_prep_dma_cyclic = esp32s31_ahb_prep_dma_cyclic;
 	dma_dev->device_issue_pending = esp32s31_ahb_issue_pending;
 	dma_dev->device_tx_status = esp32s31_ahb_tx_status;
 	dma_dev->device_terminate_all = esp32s31_ahb_terminate_all;
+	dma_dev->device_synchronize = esp32s31_ahb_synchronize;
 
 	for (i = 0; i < AHB_CHANNELS; i++) {
 		struct esp32s31_ahb_chan *chan = &gdma->chans[i];
@@ -414,9 +936,18 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 			return irq;
 		chan->gdma = gdma;
 		chan->id = i;
+		chan->request_id = U32_MAX;
+		chan->rx_irq = irq;
 		chan->vc.desc_free = esp32s31_ahb_free_desc;
 		vchan_init(&chan->vc, dma_dev);
 		ret = devm_request_irq(dev, irq, esp32s31_ahb_irq, 0,
+				       dev_name(dev), chan);
+		if (ret)
+			return ret;
+		chan->tx_irq = platform_get_irq(pdev, AHB_CHANNELS + i);
+		if (chan->tx_irq < 0)
+			return chan->tx_irq;
+		ret = devm_request_irq(dev, chan->tx_irq, esp32s31_ahb_irq, 0,
 				       dev_name(dev), chan);
 		if (ret)
 			return ret;
@@ -424,8 +955,14 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	ret = dma_async_device_register(dma_dev);
 	if (ret)
 		return ret;
+	ret = of_dma_controller_register(dev->of_node, esp32s31_ahb_of_xlate,
+					 gdma);
+	if (ret) {
+		dma_async_device_unregister(dma_dev);
+		return ret;
+	}
 	platform_set_drvdata(pdev, gdma);
-	dev_info(dev, "AHB GDMA ready: 5 memcpy pairs, version %#x\n",
+	dev_info(dev, "AHB GDMA ready: 5 memcpy/slave pairs, version %#x\n",
 		 readl(gdma->base + AHB_DATE));
 	return 0;
 }
@@ -436,6 +973,7 @@ static void esp32s31_ahb_remove(struct platform_device *pdev)
 	unsigned int i;
 
 	dma_async_device_unregister(&gdma->dma_dev);
+	of_dma_controller_free(pdev->dev.of_node);
 	for (i = 0; i < AHB_CHANNELS; i++) {
 		esp32s31_ahb_terminate_all(&gdma->chans[i].vc.chan);
 		tasklet_kill(&gdma->chans[i].vc.task);

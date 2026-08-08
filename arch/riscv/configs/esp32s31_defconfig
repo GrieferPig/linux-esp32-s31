@@ -104,7 +104,7 @@ CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
 CONFIG_FPU=y
 
 # Kernel command line
-CONFIG_CMDLINE="earlycon=esp32s31uart,mmio32,0x2038a000 console=ttyS0,115200 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init"
+CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init"
 CONFIG_CMDLINE_FORCE=y
 
 # Built-in DTB (no external loader needed)
@@ -227,10 +227,9 @@ CONFIG_PRINTK_TIME=y
 # CONFIG_FTRACE is not set
 # CONFIG_RUNTIME_TESTING_MENU is not set
 
-# Earlycon + ESP32 UART
 CONFIG_SERIAL_EARLYCON=y
 CONFIG_SERIAL_ESP32=y
-CONFIG_SERIAL_ESP32_CONSOLE=y
+CONFIG_SERIAL_ESP32_UHCI=y
 
 CONFIG_INITRAMFS_SOURCE=""
 CONFIG_INITRAMFS_COMPRESSION_GZIP=y

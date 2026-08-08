@@ -617,6 +617,11 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 				     BIT(0), BIT(1), BIT(2));
 	if (ret)
 		return ret;
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_UHCI,
+				     "uhci", ESP32S31_SYS_RATE, 0x84,
+				     BIT(0) | BIT(1), BIT(2), BIT(3));
+	if (ret)
+		return ret;
 	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_LEDC0, "ledc0",
 				     ESP32S31_XTAL_RATE, 0x148,
 				     BIT(0) | BIT(5), BIT(1), BIT(2));

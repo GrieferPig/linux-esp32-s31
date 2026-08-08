@@ -5,7 +5,6 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gmac.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-sdmmc0.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-sdmmc1.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-pwm-counter.dtbo
-dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gdma.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-analog.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-timers.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart1.dtbo

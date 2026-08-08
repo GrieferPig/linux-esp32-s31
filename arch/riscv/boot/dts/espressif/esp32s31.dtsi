@@ -20,7 +20,7 @@
 	};
 
 	aliases {
-		serial0 = &uart0;
+		serial0 = &uhci0;
 		serial1 = &uart1;
 		serial2 = &uart2;
 		mmc0 = &sdmmc;
@@ -83,9 +83,9 @@
 
 		axi_gdma: dma-controller@20348000 {
 			compatible = "espressif,esp32s31-axi-gdma";
-			/* Topmost 32 KiB of IDF-usable HP SRAM, carved out by loader. */
+			/* 12 KiB descriptor pool in loader-reserved HP SRAM. */
 			reg = <0x20348000 0x1000>, <0x20587078 0x4>,
-			      <0x2f072f80 0x4000>;
+			      <0x2f072f80 0x3000>;
 			reg-names = "dma", "clkrst", "descriptors";
 			interrupt-parent = <&clic>;
 			interrupts = <33 48 IRQ_TYPE_LEVEL_HIGH>,
@@ -104,7 +104,7 @@
 
 		ahb_gdma: dma-controller@20343000 {
 			compatible = "espressif,esp32s31-ahb-gdma";
-			reg = <0x20343000 0x628>, <0x2f076f80 0x4000>;
+			reg = <0x20343000 0x628>, <0x2f075f80 0x1000>;
 			reg-names = "dma", "descriptors";
 			clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
 			interrupt-parent = <&clic>;
@@ -112,9 +112,33 @@
 				     <23 37 IRQ_TYPE_LEVEL_HIGH>,
 				     <24 38 IRQ_TYPE_LEVEL_HIGH>,
 				     <25 39 IRQ_TYPE_LEVEL_HIGH>,
-				     <26 40 IRQ_TYPE_LEVEL_HIGH>;
+				     <26 40 IRQ_TYPE_LEVEL_HIGH>,
+				     <27 41 IRQ_TYPE_LEVEL_HIGH>,
+				     <28 42 IRQ_TYPE_LEVEL_HIGH>,
+				     <29 43 IRQ_TYPE_LEVEL_HIGH>,
+				     <30 44 IRQ_TYPE_LEVEL_HIGH>,
+				     <31 45 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx0", "rx1", "rx2", "rx3", "rx4",
+					  "tx0", "tx1", "tx2", "tx3", "tx4";
+			#dma-cells = <2>;
 			dma-channels = <5>;
-			status = "disabled";
+			status = "okay";
+		};
+
+		uhci0: serial@20398000 {
+			compatible = "espressif,esp32s31-uhci-uart";
+			reg = <0x20398000 0x100>, <0x20587084 0x4>,
+			      <0x2038a000 0x1000>, <0x2f077000 0x2800>;
+			reg-names = "uhci", "clkrst", "uart", "dma-buf";
+			clocks = <&clkc ESP32S31_CLK_UHCI>,
+				 <&clkc ESP32S31_CLK_UART0>;
+			clock-names = "bus", "uart";
+			/* UHCI TX/RX must use the same coupled AHB GDMA pair. */
+			dmas = <&ahb_gdma 1 0>, <&ahb_gdma 1 0>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_default>;
+			status = "okay";
 		};
 
 		clkc: clock-controller@20587000 {
@@ -516,8 +540,8 @@
 
 		usb_otghs: usb@20300000 {
 			compatible = "espressif,esp32s31-dwc2", "snps,dwc2";
-			/* Final 64 bytes of IDF-usable HP SRAM, after GDMA pool. */
-			reg = <0x20300000 0x1000>, <0x2f07af80 0x40>;
+			/* 64-byte local-memory window after the GDMA descriptor pools. */
+			reg = <0x20300000 0x1000>, <0x2f076f80 0x40>;
 			reg-names = "core", "local-mem";
 			interrupt-parent = <&clic>;
 			interrupts = <39 99 IRQ_TYPE_LEVEL_HIGH>;
@@ -627,18 +651,6 @@
 			reg = <0x10a00000 0x20000>;
 			interrupt-controller;
 			espressif,num-interrupts = <48>;
-		};
-
-		uart0: serial@2038a000 {
-			compatible = "espressif,esp32s31-uart";
-			reg = <0x2038a000 0x1000>;
-			interrupt-parent = <&clic>;
-			interrupts = <32 9 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clkc ESP32S31_CLK_UART0>;
-			clock-frequency = <40000000>;
-			pinctrl-names = "default";
-			pinctrl-0 = <&uart0_default>;
-			status = "okay";
 		};
 
 		uart1: serial@2038b000 {
