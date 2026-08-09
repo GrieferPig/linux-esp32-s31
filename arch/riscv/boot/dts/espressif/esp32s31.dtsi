@@ -15,8 +15,22 @@
 
 	memory@50000000 {
 		device_type = "memory";
-		/* Linux owns the first 16-MiB - 64KiB of cached PSRAM alias. */
-		reg = <0x50000000 0x00FF0000>;
+		reg = <0x50000000 0x01000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		audio_reserved: audio@50fe0000 {
+			reg = <0x50fe0000 0x00010000>;
+		};
+
+		opensbi_reserved: opensbi@50ff0000 {
+			reg = <0x50ff0000 0x00010000>;
+			no-map;
+		};
 	};
 
 	aliases {
@@ -85,7 +99,7 @@
 			compatible = "espressif,esp32s31-axi-gdma";
 			/* 12 KiB descriptor pool in loader-reserved HP SRAM. */
 			reg = <0x20348000 0x1000>, <0x20587078 0x4>,
-			      <0x2f072f80 0x3000>;
+			      <0x2f072380 0x3000>;
 			reg-names = "dma", "clkrst", "descriptors";
 			interrupt-parent = <&clic>;
 			interrupts = <33 48 IRQ_TYPE_LEVEL_HIGH>,
@@ -104,7 +118,7 @@
 
 		ahb_gdma: dma-controller@20343000 {
 			compatible = "espressif,esp32s31-ahb-gdma";
-			reg = <0x20343000 0x628>, <0x2f075f80 0x1000>;
+			reg = <0x20343000 0x628>, <0x2f075380 0x1000>;
 			reg-names = "dma", "descriptors";
 			clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
 			interrupt-parent = <&clic>;
@@ -128,13 +142,16 @@
 		uhci0: serial@20398000 {
 			compatible = "espressif,esp32s31-uhci-uart";
 			reg = <0x20398000 0x100>, <0x20587084 0x4>,
-			      <0x2038a000 0x1000>, <0x2f077000 0x2800>;
+			      <0x2038a000 0x1000>, <0x2f076400 0x2800>;
 			reg-names = "uhci", "clkrst", "uart", "dma-buf";
 			clocks = <&clkc ESP32S31_CLK_UHCI>,
 				 <&clkc ESP32S31_CLK_UART0>;
 			clock-names = "bus", "uart";
-			/* UHCI TX/RX must use the same coupled AHB GDMA pair. */
-			dmas = <&ahb_gdma 1 0>, <&ahb_gdma 1 0>;
+			/*
+			 * FreeRTOS owns pairs 0-2 for I2S0 and the two ASRC lanes.
+			 * UHCI TX/RX must use the same otherwise-unclaimed pair.
+			 */
+			dmas = <&ahb_gdma 4 0>, <&ahb_gdma 4 0>;
 			dma-names = "tx", "rx";
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart0_default>;
@@ -541,7 +558,7 @@
 		usb_otghs: usb@20300000 {
 			compatible = "espressif,esp32s31-dwc2", "snps,dwc2";
 			/* 64-byte local-memory window after the GDMA descriptor pools. */
-			reg = <0x20300000 0x1000>, <0x2f076f80 0x40>;
+			reg = <0x20300000 0x1000>, <0x2f076380 0x40>;
 			reg-names = "core", "local-mem";
 			interrupt-parent = <&clic>;
 			interrupts = <39 99 IRQ_TYPE_LEVEL_HIGH>;
@@ -553,11 +570,24 @@
 
 		hosted_sram: wireless@2f06af80 {
 			compatible = "espressif,esp32s31-hosted-sram";
-			/* 32 KiB HP SRAM shared exclusively by hart0 and hart1. */
-			reg = <0x2f06af80 0x8000>;
+			/* Compact HP SRAM transport shared exclusively by both harts. */
+			reg = <0x2f06af80 0x7400>;
 			interrupt-parent = <&clic>;
 			/* CPU_INTR_FROM_CPU_2 source 67 -> free raw CLIC ID40. */
 			interrupts = <40 67 IRQ_TYPE_EDGE_RISING>;
+			status = "okay";
+		};
+
+		freertos_audio: audio@2f06b180 {
+			compatible = "espressif,esp32s31-freertos-audio";
+			reg = <0x2f06b180 0x00000400>,
+			      <0x50fe0000 0x0000c000>, <0x2058601c 0x4>,
+			      <0x20586014 0x4>;
+			reg-names = "control", "rings", "h1-to-h0", "h0-to-h1";
+			memory-region = <&audio_reserved>;
+			interrupt-parent = <&clic>;
+			/* CPU_INTR_FROM_CPU_1 source 66 -> raw CLIC ID41. */
+			interrupts = <41 66 IRQ_TYPE_EDGE_RISING>;
 			status = "okay";
 		};
 

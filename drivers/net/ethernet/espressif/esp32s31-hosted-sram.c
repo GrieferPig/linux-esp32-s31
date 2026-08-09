@@ -1225,6 +1225,7 @@ static int s31_hosted_poll(struct napi_struct *napi, int budget)
 	struct s31_hosted *hosted = container_of(napi, struct s31_hosted, napi);
 	void __iomem *ring = s31_ring_ptr(hosted, true, 0);
 	u8 *frame = hosted->rx_frame;
+	bool consumed = false;
 	int work = 0;
 
 	while (work < budget) {
@@ -1250,6 +1251,7 @@ static int s31_hosted_poll(struct napi_struct *napi, int budget)
 			writel(producer,
 			       ring + offsetof(struct s31_hosted_ring_state,
 					       consumer));
+			consumed = true;
 			break;
 		}
 
@@ -1270,7 +1272,13 @@ static int s31_hosted_poll(struct napi_struct *napi, int budget)
 		}
 		writel(consumer + 1,
 		       ring + offsetof(struct s31_hosted_ring_state, consumer));
+		consumed = true;
 		work++;
+	}
+	if (consumed) {
+		/* Publish consumer space before waking pending hart0 transmitters. */
+		wmb();
+		writel(1, hosted->db_h1_to_h0);
 	}
 
 	if (work < budget && napi_complete_done(napi, work)) {

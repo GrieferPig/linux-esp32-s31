@@ -181,6 +181,13 @@ CONFIG_BT_LE=y
 # CONFIG_BT_BNEP is not set
 CONFIG_RFKILL=y
 
+# PCM transport only; ES8311, I2S, ASRC and mixing remain on FreeRTOS.
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_PCM=y
+CONFIG_SND_DRIVERS=y
+CONFIG_SND_ESP32S31_AUDIO=y
+
 # Bootloader-mapped SPI Flash, exported as fixed writable MTD partitions
 CONFIG_MTD=y
 CONFIG_MTD_CHAR=y
