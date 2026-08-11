@@ -34,10 +34,8 @@ extern int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,
 				   void *task_handle, int core_id);
 
 #define S31_RADIO_IRAM_BASE	0x2f030000UL
-/* The loader explicitly carves out 0x2f030000..0x2f06af80 for radio and
- * 0x2f06af80..0x2f072380 for the obsolete hosted transport.  RADIO_WORLD_ONLY
- * lets Linux join their usable portions into one internal-SRAM heap.  Keep the
- * final 0xb80 bytes for the synchronous-trap stack; the AXI
+/* The loader carves out 0x2f030000..0x2f072380 exclusively for Linux radio.
+ * Keep the final 0xb80 bytes for the synchronous-trap stack; the AXI
  * descriptor reservation starts at 0x2f072380 and is never part of this pool. */
 #define S31_RADIO_IRAM_END	0x2f071800UL
 #define S31_RADIO_IRAM_SIZE	(S31_RADIO_IRAM_END - S31_RADIO_IRAM_BASE)

@@ -46,17 +46,6 @@ menuconfig SND_DRIVERS
   
 if SND_DRIVERS
 
-config SND_ESP32S31_AUDIO
-	bool "ESP32-S31 FreeRTOS shared-memory audio"
-	depends on SOC_ESP32S31
-	depends on ESP32S31_HOSTED_SRAM
-	select SND_PCM
-	help
-	  Expose one playback stream and one capture stream owned by the hart0
-	  FreeRTOS audio service as standard ALSA PCM devices. Linux only transfers
-	  PCM bytes through dedicated PSRAM rings; codec, mixing, and sample-rate
-	  conversion remain owned by the firmware audio service.
-
 config SND_PCSP
 	tristate "PC-Speaker support (READ HELP!)"
 	depends on PCSPKR_PLATFORM && X86 && HIGH_RES_TIMERS

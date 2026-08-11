@@ -3,8 +3,6 @@
 # Makefile for ALSA
 # Copyright (c) 2001 by Jaroslav Kysela <perex@perex.cz>
 #
-ccflags-$(CONFIG_SND_ESP32S31_AUDIO) += -I$(srctree)/../shared
-
 snd-dummy-y := dummy.o
 snd-aloop-y := aloop.o
 snd-mtpav-y := mtpav.o
@@ -13,7 +11,6 @@ snd-pcmtest-y := pcmtest.o
 snd-portman2x4-y := portman2x4.o
 snd-serial-u16550-y := serial-u16550.o
 snd-serial-generic-y := serial-generic.o
-snd-esp32s31-audio-y := esp32s31-audio.o
 snd-virmidi-y := virmidi.o
 
 # Toplevel Module Dependency
@@ -23,7 +20,6 @@ obj-$(CONFIG_SND_VIRMIDI) += snd-virmidi.o
 obj-$(CONFIG_SND_PCMTEST) += snd-pcmtest.o
 obj-$(CONFIG_SND_SERIAL_U16550) += snd-serial-u16550.o
 obj-$(CONFIG_SND_SERIAL_GENERIC) += snd-serial-generic.o
-obj-$(CONFIG_SND_ESP32S31_AUDIO) += snd-esp32s31-audio.o
 obj-$(CONFIG_SND_MTPAV) += snd-mtpav.o
 obj-$(CONFIG_SND_MTS64) += snd-mts64.o
 obj-$(CONFIG_SND_PORTMAN2X4) += snd-portman2x4.o
