@@ -90,4 +90,13 @@ config SOC_ESP32S31
 	  This enables support for the Espressif ESP32-S31 SoC.
 	  With MMU enabled the kernel runs in Supervisor mode behind OpenSBI.
 
+config ESP32S31_RADIO_SMODE
+	bool "ESP32-S31 S-mode radio runtime"
+	depends on SOC_ESP32S31 && MMU
+	help
+	  Prepare a private, identity-mapped address space for the ESP32-S31
+	  Wi-Fi, Bluetooth and PHY firmware libraries.  The mappings are present
+	  only in init_mm and are consumed by a dedicated kernel thread; user
+	  address spaces do not inherit them.
+
 endmenu # "SoC selection"

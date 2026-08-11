@@ -1411,6 +1411,25 @@ static void __init setup_vm_final(void)
 	if (IS_ENABLED(CONFIG_64BIT) || IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's closed radio libraries contain absolute references to the
+	 * modem/peripheral windows, internal SRAM and mask ROM.  Keep these
+	 * mappings in init_mm only.  Process page tables do not copy the lower
+	 * half; the dedicated radio kthread borrows init_mm when running blobs.
+	 */
+	create_pgd_mapping(swapper_pg_dir, 0x20000000, 0x20000000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20400000, 0x20400000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20800000, 0x20800000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x2f000000, 0x2f000000,
+			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
+	create_pgd_mapping(swapper_pg_dir, 0x2f800000, 0x2f800000,
+			   PGDIR_SIZE, PAGE_KERNEL_READ_EXEC);
+#endif
+
 #ifdef CONFIG_KASAN
 	kasan_swapper_init();
 #endif

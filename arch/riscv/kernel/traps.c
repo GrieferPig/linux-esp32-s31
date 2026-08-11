@@ -28,6 +28,7 @@
 #include <asm/csr.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
+#include <asm/smp.h>
 #include <asm/syscall.h>
 #include <asm/thread_info.h>
 #include <asm/vector.h>
@@ -170,6 +171,32 @@ DO_ERROR_INFO(do_trap_insn_fault,
 asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
 {
 	bool handled;
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's PM implementation has one otherwise harmless M-mode read of
+	 * mhartid in do_switch().  The radio objects now execute as part of the
+	 * S-mode kernel, where that CSR correctly traps.  Emulate the read from
+	 * Linux's logical-CPU-to-hart map instead of carrying a board-specific
+	 * binary patch in the closed object.  Match only CSRRS rd,mhartid,x0
+	 * (the canonical `csrr rd, mhartid` encoding), and never expose it to
+	 * userspace.
+	 */
+	if (!user_mode(regs)) {
+		u32 insn = READ_ONCE(*(u32 *)regs->epc);
+
+		if ((insn & 0xfffff07fU) == 0xf1402073U) {
+			unsigned int rd = (insn >> 7) & 0x1f;
+
+			if (rd)
+				((unsigned long *)regs)[rd] =
+					cpuid_to_hartid_map(raw_smp_processor_id());
+			regs->epc += sizeof(insn);
+			return;
+		}
+	}
+
+#endif
 
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);

@@ -52,6 +52,10 @@ CONFIG_SLUB_TINY=y
 CONFIG_ARCH_RV32I=y
 # CONFIG_ARCH_RV64I is not set
 CONFIG_SOC_ESP32S31=y
+CONFIG_ESP32S31_RADIO_SMODE=y
+CONFIG_ESP32S31_RADIO_SMODE_DRIVER=y
+CONFIG_ESP32S31_RADIO_BLOBS=y
+CONFIG_LD_DEAD_CODE_DATA_ELIMINATION=y
 CONFIG_ESP32S31_CLOCK=y
 CONFIG_CPU_FREQ=y
 CONFIG_CPU_FREQ_GOV_ONDEMAND=y
@@ -104,7 +108,7 @@ CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
 CONFIG_FPU=y
 
 # Kernel command line
-CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init"
+CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init clk_ignore_unused"
 CONFIG_CMDLINE_FORCE=y
 
 # Built-in DTB (no external loader needed)
