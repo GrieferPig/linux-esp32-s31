@@ -40,10 +40,27 @@ struct esp32s31_radio_wifi_ap {
 	u8 authmode;
 };
 
+struct esp32s31_radio_wifi_connect_params {
+	u8 ssid[32];
+	u8 ssid_length;
+	u8 bssid[6];
+	u8 channel;
+	u8 psk[32];
+	u8 password[64];
+	u8 password_length;
+	bool has_bssid;
+	bool has_psk;
+	bool has_password;
+};
+
 struct esp32s31_radio_wifi_ops {
 	void (*scan_complete)(void *context, int status,
 			      const struct esp32s31_radio_wifi_ap *aps,
 			      size_t count);
+	void (*connected)(void *context, int status, const u8 *bssid,
+			  u8 channel);
+	void (*disconnected)(void *context, u16 reason);
+	void (*receive)(void *context, const u8 *frame, size_t length);
 };
 
 /*
@@ -59,6 +76,11 @@ void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
 int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length);
 int esp32s31_radio_wifi_register(const struct esp32s31_radio_wifi_ops *ops,
 				 void *context);
+int esp32s31_radio_wifi_get_mac(u8 mac[6]);
 int esp32s31_radio_wifi_scan(void);
+int esp32s31_radio_wifi_connect(
+		const struct esp32s31_radio_wifi_connect_params *params);
+int esp32s31_radio_wifi_disconnect(u16 reason);
+int esp32s31_radio_wifi_send(const u8 *frame, size_t length);
 
 #endif /* _LINUX_ESP32S31_RADIO_H */

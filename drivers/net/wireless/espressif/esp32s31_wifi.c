@@ -14,6 +14,20 @@ struct s31_wifi {
 	struct net_device *netdev;
 	struct cfg80211_scan_request *scan_request;
 	struct delayed_work register_work;
+	u8 connect_ssid[IEEE80211_MAX_SSID_LEN];
+	u8 connect_ssid_len;
+	bool connect_privacy;
+	bool connecting;
+	bool connected;
+};
+
+static const u32 s31_cipher_suites[] = {
+	WLAN_CIPHER_SUITE_CCMP,
+};
+
+static const u32 s31_akm_suites[] = {
+	WLAN_AKM_SUITE_PSK,
+	WLAN_AKM_SUITE_SAE,
 };
 
 #define S31_CHANNEL(_ch, _freq) { \
@@ -68,6 +82,9 @@ static void s31_wifi_scan_complete(void *context, int status,
 
 		if (!ap->channel || ap->channel > ARRAY_SIZE(s31_channels))
 			continue;
+		pr_info("esp32s31-wifi: BSS %pM channel=%u authmode=%u ssid=%.*s\n",
+			ap->bssid, ap->channel, ap->authmode, ap->ssid_length,
+			ap->ssid);
 		channel = &s31_channels[ap->channel - 1];
 		ies[0] = WLAN_EID_SSID;
 		ies[1] = ap->ssid_length;
@@ -90,8 +107,83 @@ static void s31_wifi_scan_complete(void *context, int status,
 		status, count);
 }
 
+static void s31_wifi_connected(void *context, int status, const u8 *bssid,
+			       u8 channel)
+{
+	struct s31_wifi *wifi = context;
+	struct cfg80211_bss *bss = NULL;
+
+	if (!wifi->connecting)
+		return;
+	wifi->connecting = false;
+	wifi->connected = !status;
+	pr_info("esp32s31-wifi: association complete status=%d channel=%u\n",
+		status, channel);
+	if (!status) {
+		u8 ies[2 + IEEE80211_MAX_SSID_LEN];
+		u16 capability = WLAN_CAPABILITY_ESS;
+
+		if (wifi->connect_privacy)
+			capability |= WLAN_CAPABILITY_PRIVACY;
+		ies[0] = WLAN_EID_SSID;
+		ies[1] = wifi->connect_ssid_len;
+		memcpy(ies + 2, wifi->connect_ssid, wifi->connect_ssid_len);
+		if (channel && channel <= ARRAY_SIZE(s31_channels))
+			bss = cfg80211_inform_bss(wifi->wiphy,
+				&s31_channels[channel - 1],
+				CFG80211_BSS_FTYPE_UNKNOWN, bssid, 0,
+				capability, 100, ies,
+				wifi->connect_ssid_len + 2, 0, GFP_KERNEL);
+		netif_carrier_on(wifi->netdev);
+	}
+	/* __cfg80211_connect_result() uses links[0].bssid as the connected
+	 * address even when an exact BSS is supplied, so keep both populated. */
+	cfg80211_connect_bss(wifi->netdev, bssid, bss,
+		NULL, 0, NULL, 0,
+		status ? WLAN_STATUS_UNSPECIFIED_FAILURE : WLAN_STATUS_SUCCESS,
+		GFP_KERNEL, NL80211_TIMEOUT_UNSPECIFIED);
+}
+
+static void s31_wifi_disconnected(void *context, u16 reason)
+{
+	struct s31_wifi *wifi = context;
+
+	pr_info("esp32s31-wifi: disconnected reason=%u connecting=%u\n",
+		reason, wifi->connecting);
+	netif_carrier_off(wifi->netdev);
+	if (wifi->connecting) {
+		wifi->connecting = false;
+		cfg80211_connect_result(wifi->netdev, NULL, NULL, 0, NULL, 0,
+					WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
+	} else if (wifi->connected) {
+		wifi->connected = false;
+		cfg80211_disconnected(wifi->netdev, reason, NULL, 0, false,
+				      GFP_KERNEL);
+	}
+}
+
+static void s31_wifi_receive(void *context, const u8 *frame, size_t length)
+{
+	struct s31_wifi *wifi = context;
+	struct sk_buff *skb;
+
+	skb = netdev_alloc_skb_ip_align(wifi->netdev, length);
+	if (!skb) {
+		wifi->netdev->stats.rx_dropped++;
+		return;
+	}
+	memcpy(skb_put(skb, length), frame, length);
+	skb->protocol = eth_type_trans(skb, wifi->netdev);
+	wifi->netdev->stats.rx_packets++;
+	wifi->netdev->stats.rx_bytes += length;
+	netif_rx(skb);
+}
+
 static const struct esp32s31_radio_wifi_ops s31_radio_wifi_ops = {
 	.scan_complete = s31_wifi_scan_complete,
+	.connected = s31_wifi_connected,
+	.disconnected = s31_wifi_disconnected,
+	.receive = s31_wifi_receive,
 };
 
 static int s31_cfg_scan(struct wiphy *wiphy,
@@ -109,13 +201,85 @@ static int s31_cfg_scan(struct wiphy *wiphy,
 	return ret;
 }
 
+static int s31_cfg_connect(struct wiphy *wiphy, struct net_device *dev,
+			   struct cfg80211_connect_params *request)
+{
+	struct s31_wifi *wifi = wiphy_priv(wiphy);
+	struct esp32s31_radio_wifi_connect_params params = { };
+
+	(void)dev;
+	if (!request->ssid || !request->ssid_len || request->ssid_len > 32)
+		return -EINVAL;
+	if (wifi->connecting || wifi->connected)
+		return -EBUSY;
+	if (request->privacy && !request->crypto.psk &&
+	    !request->crypto.sae_pwd)
+		return -EOPNOTSUPP;
+	memcpy(params.ssid, request->ssid, request->ssid_len);
+	params.ssid_length = request->ssid_len;
+	memcpy(wifi->connect_ssid, request->ssid, request->ssid_len);
+	wifi->connect_ssid_len = request->ssid_len;
+	wifi->connect_privacy = request->privacy;
+	if (request->bssid) {
+		memcpy(params.bssid, request->bssid, ETH_ALEN);
+		params.has_bssid = true;
+	}
+	if (request->channel)
+		params.channel = ieee80211_frequency_to_channel(
+					request->channel->center_freq);
+	if (request->crypto.psk) {
+		memcpy(params.psk, request->crypto.psk, sizeof(params.psk));
+		params.has_psk = true;
+	}
+	if (request->crypto.sae_pwd) {
+		if (!request->crypto.sae_pwd_len ||
+		    request->crypto.sae_pwd_len > sizeof(params.password))
+			return -EINVAL;
+		memcpy(params.password, request->crypto.sae_pwd,
+		       request->crypto.sae_pwd_len);
+		params.password_length = request->crypto.sae_pwd_len;
+		params.has_password = true;
+	}
+	wifi->connecting = true;
+	{
+		int ret = esp32s31_radio_wifi_connect(&params);
+
+		if (!ret)
+			return 0;
+		wifi->connecting = false;
+		return ret;
+	}
+}
+
+static int s31_cfg_disconnect(struct wiphy *wiphy, struct net_device *dev,
+			      u16 reason)
+{
+	struct s31_wifi *wifi = wiphy_priv(wiphy);
+
+	(void)dev;
+	if (!wifi->connecting && !wifi->connected)
+		return 0;
+	return esp32s31_radio_wifi_disconnect(reason);
+}
+
 static const struct cfg80211_ops s31_cfg80211_ops = {
 	.scan = s31_cfg_scan,
+	.connect = s31_cfg_connect,
+	.disconnect = s31_cfg_disconnect,
 };
 
 static netdev_tx_t s31_wifi_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	dev->stats.tx_dropped++;
+	int ret = esp32s31_radio_wifi_send(skb->data, skb->len);
+
+	if (ret == -ENOSPC)
+		return NETDEV_TX_BUSY;
+	if (ret) {
+		dev->stats.tx_dropped++;
+	} else {
+		dev->stats.tx_packets++;
+		dev->stats.tx_bytes += skb->len;
+	}
 	dev_kfree_skb(skb);
 	return NETDEV_TX_OK;
 }
@@ -151,6 +315,7 @@ static void s31_wifi_register_workfn(struct work_struct *work)
 	struct s31_wifi *wifi = container_of(to_delayed_work(work),
 					       struct s31_wifi, register_work);
 	struct net_device *netdev;
+	u8 mac[ETH_ALEN];
 	int ret;
 
 	ret = esp32s31_radio_wifi_register(&s31_radio_wifi_ops, wifi);
@@ -164,7 +329,14 @@ static void s31_wifi_register_workfn(struct work_struct *work)
 	wifi->wiphy->max_scan_ssids = 4;
 	wifi->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wifi->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	wifi->wiphy->cipher_suites = s31_cipher_suites;
+	wifi->wiphy->n_cipher_suites = ARRAY_SIZE(s31_cipher_suites);
+	wifi->wiphy->akm_suites = s31_akm_suites;
+	wifi->wiphy->n_akm_suites = ARRAY_SIZE(s31_akm_suites);
 	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &s31_band_2ghz;
+	wiphy_ext_feature_set(wifi->wiphy,
+			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
+	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
 	ret = wiphy_register(wifi->wiphy);
 	if (ret)
 		return;
@@ -178,7 +350,14 @@ static void s31_wifi_register_workfn(struct work_struct *work)
 	wifi->wdev.netdev = netdev;
 	netdev->ieee80211_ptr = &wifi->wdev;
 	SET_NETDEV_DEV(netdev, wiphy_dev(wifi->wiphy));
-	eth_hw_addr_random(netdev);
+	ret = esp32s31_radio_wifi_get_mac(mac);
+	if (ret || !is_valid_ether_addr(mac)) {
+		pr_err("esp32s31-wifi: failed to read STA MAC: %d\n", ret);
+		free_netdev(netdev);
+		wifi->netdev = NULL;
+		return;
+	}
+	eth_hw_addr_set(netdev, mac);
 	/*
 	 * This worker runs outside a cfg80211 callback and does not hold either
 	 * RTNL or the wiphy mutex.  register_netdev() supplies the RTNL locking;
