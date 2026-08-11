@@ -8,6 +8,7 @@
 extern void s31_radio_stack_task(void *arg);
 extern void s31_radio_bt_enable_task(void *arg);
 extern int s31_radio_vhci_try_send(u8 *frame, u16 length);
+extern void s31_radio_wifi_scan_task(void *arg);
 extern void s31_rtos_init(void);
 extern void s31_rtos_schedule(void);
 extern void s31_rtos_tick(void);
@@ -21,6 +22,12 @@ void s31_radio_report_bt_init(int result);
 void s31_radio_report_bt_enable(int result);
 void s31_radio_vhci_send_available(void);
 int s31_radio_vhci_receive(u8 *frame, u16 length);
+void s31_radio_wifi_intr_configure(u32 source, u32 logical_intr, u32 priority);
+void s31_radio_wifi_intr_set_isr(u32 logical_intr, void (*handler)(void *),
+				 void *arg);
+void s31_radio_wifi_intr_mask(u32 mask, bool enable);
+void s31_radio_wifi_scan_complete(const struct esp32s31_radio_wifi_ap *aps,
+				  u16 count, int status);
 void s31_radio_heap_report(const char *stage);
 
 void *__wrap_heap_caps_malloc(size_t size, u32 caps);

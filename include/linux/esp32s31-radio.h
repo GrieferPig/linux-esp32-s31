@@ -29,6 +29,23 @@ struct esp32s31_radio_hci_ops {
 	void (*receive)(void *context, const u8 *frame, size_t length);
 };
 
+#define ESP32S31_RADIO_WIFI_MAX_APS	32
+
+struct esp32s31_radio_wifi_ap {
+	u8 bssid[6];
+	u8 ssid[32];
+	u8 ssid_length;
+	u8 channel;
+	s8 signal;
+	u8 authmode;
+};
+
+struct esp32s31_radio_wifi_ops {
+	void (*scan_complete)(void *context, int status,
+			      const struct esp32s31_radio_wifi_ap *aps,
+			      size_t count);
+};
+
 /*
  * This is intentionally the only public operation in the core's first
  * revision. Bluetooth HCI and cfg80211 add typed entry points here rather
@@ -40,5 +57,8 @@ int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
 void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
 				   void *context);
 int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length);
+int esp32s31_radio_wifi_register(const struct esp32s31_radio_wifi_ops *ops,
+				 void *context);
+int esp32s31_radio_wifi_scan(void);
 
 #endif /* _LINUX_ESP32S31_RADIO_H */
