@@ -3,6 +3,14 @@
 menu "Bluetooth device drivers"
 	depends on BT
 
+config BT_ESP32S31
+	bool "ESP32-S31 integrated Bluetooth controller"
+	depends on ESP32S31_RADIO_SMODE_DRIVER
+	depends on ESP32S31_RADIO_BLOBS
+	help
+	  Expose the ESP32-S31 Bluetooth controller through Linux's standard HCI
+	  core. The transport uses the typed serialized S-mode radio interface.
+
 config BT_INTEL
 	tristate
 	select REGMAP

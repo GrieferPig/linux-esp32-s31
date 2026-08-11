@@ -25,11 +25,20 @@ struct esp32s31_radio_health {
 	u32 heap_total;
 };
 
+struct esp32s31_radio_hci_ops {
+	void (*receive)(void *context, const u8 *frame, size_t length);
+};
+
 /*
  * This is intentionally the only public operation in the core's first
  * revision. Bluetooth HCI and cfg80211 add typed entry points here rather
  * than exposing raw ESP-IDF symbols or an arbitrary function-call gateway.
  */
 int esp32s31_radio_get_health(struct esp32s31_radio_health *health);
+int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
+				void *context);
+void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
+				   void *context);
+int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length);
 
 #endif /* _LINUX_ESP32S31_RADIO_H */

@@ -7,6 +7,7 @@
 /* Private link boundary between the Linux core and localized IDF payload. */
 extern void s31_radio_stack_task(void *arg);
 extern void s31_radio_bt_enable_task(void *arg);
+extern int s31_radio_vhci_try_send(u8 *frame, u16 length);
 extern void s31_rtos_init(void);
 extern void s31_rtos_schedule(void);
 extern void s31_rtos_tick(void);
@@ -18,6 +19,8 @@ extern int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,
 void s31_radio_report_wifi_init(int result);
 void s31_radio_report_bt_init(int result);
 void s31_radio_report_bt_enable(int result);
+void s31_radio_vhci_send_available(void);
+int s31_radio_vhci_receive(u8 *frame, u16 length);
 void s31_radio_heap_report(const char *stage);
 
 void *__wrap_heap_caps_malloc(size_t size, u32 caps);

@@ -237,6 +237,28 @@ enum s31_radio_command_type {
 	S31_RADIO_COMMAND_HEALTH,
 };
 
+/* H4 type plus Linux HCI_MAX_FRAME_SIZE (1028-byte ACL header/payload). */
+#define S31_HCI_FRAME_SIZE	1029
+#define S31_HCI_RX_SLOTS	16
+#define S31_HCI_TX_SLOTS	8
+
+struct s31_hci_frame {
+	u16 length;
+	u8 data[S31_HCI_FRAME_SIZE];
+};
+
+static struct s31_hci_frame s31_hci_rx[S31_HCI_RX_SLOTS];
+static struct s31_hci_frame s31_hci_tx[S31_HCI_TX_SLOTS];
+static unsigned int s31_hci_rx_head;
+static unsigned int s31_hci_rx_tail;
+static unsigned int s31_hci_tx_head;
+static unsigned int s31_hci_tx_tail;
+static DEFINE_SPINLOCK(s31_hci_lock);
+static const struct esp32s31_radio_hci_ops *s31_hci_ops;
+static void *s31_hci_context;
+static atomic_t s31_hci_rx_dropped = ATOMIC_INIT(0);
+static atomic_t s31_hci_tx_dropped = ATOMIC_INIT(0);
+
 struct s31_radio_command {
 	struct list_head node;
 	struct completion done;
@@ -607,6 +629,77 @@ static bool s31_radio_command_work_pending(void)
 	return pending;
 }
 
+static bool s31_radio_hci_tx_pending(void)
+{
+	return READ_ONCE(s31_hci_tx_head) != READ_ONCE(s31_hci_tx_tail);
+}
+
+void s31_radio_vhci_send_available(void)
+{
+	wake_up(&s31_radio_waitq);
+}
+
+int s31_radio_vhci_receive(u8 *frame, u16 length)
+{
+	unsigned long flags;
+	unsigned int next;
+
+	if (!frame || !length || length > S31_HCI_FRAME_SIZE)
+		return -EINVAL;
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	next = (s31_hci_rx_head + 1) % S31_HCI_RX_SLOTS;
+	if (next == s31_hci_rx_tail) {
+		atomic_inc(&s31_hci_rx_dropped);
+		spin_unlock_irqrestore(&s31_hci_lock, flags);
+		return -ENOSPC;
+	}
+	s31_hci_rx[s31_hci_rx_head].length = length;
+	memcpy(s31_hci_rx[s31_hci_rx_head].data, frame, length);
+	smp_store_release(&s31_hci_rx_head, next);
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	return 0;
+}
+
+/* Called only inside the serialized blob execution gate. */
+static void s31_radio_hci_process_tx(void)
+{
+	while (s31_hci_tx_tail != smp_load_acquire(&s31_hci_tx_head)) {
+		struct s31_hci_frame *frame = &s31_hci_tx[s31_hci_tx_tail];
+
+		if (s31_radio_vhci_try_send(frame->data, frame->length))
+			break;
+		s31_hci_tx_tail = (s31_hci_tx_tail + 1) % S31_HCI_TX_SLOTS;
+	}
+}
+
+/* This runs after the gate has restored Linux IRQ and FPU state. */
+static void s31_radio_hci_deliver_rx(void)
+{
+	for (;;) {
+		const struct esp32s31_radio_hci_ops *ops;
+		struct s31_hci_frame *frame;
+		void *context;
+		unsigned long flags;
+
+		spin_lock_irqsave(&s31_hci_lock, flags);
+		if (s31_hci_rx_tail == s31_hci_rx_head) {
+			spin_unlock_irqrestore(&s31_hci_lock, flags);
+			break;
+		}
+		ops = s31_hci_ops;
+		context = s31_hci_context;
+		frame = &s31_hci_rx[s31_hci_rx_tail];
+		if (!ops) {
+			spin_unlock_irqrestore(&s31_hci_lock, flags);
+			break;
+		}
+		spin_unlock_irqrestore(&s31_hci_lock, flags);
+
+		ops->receive(context, frame->data, frame->length);
+		s31_hci_rx_tail = (s31_hci_rx_tail + 1) % S31_HCI_RX_SLOTS;
+	}
+}
+
 static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 {
 	size_t free = gen_pool_avail(s31_radio_heap_pool);
@@ -685,6 +778,72 @@ int esp32s31_radio_get_health(struct esp32s31_radio_health *health)
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_get_health);
 
+int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
+				void *context)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!ops || !ops->receive)
+		return -EINVAL;
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
+		return -EAGAIN;
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	if (s31_hci_ops)
+		ret = -EBUSY;
+	else {
+		s31_hci_context = context;
+		smp_store_release(&s31_hci_ops, ops);
+	}
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	if (!ret)
+		wake_up(&s31_radio_waitq);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_register);
+
+void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
+				   void *context)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	if (s31_hci_ops == ops && s31_hci_context == context) {
+		s31_hci_ops = NULL;
+		s31_hci_context = NULL;
+	}
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_unregister);
+
+int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
+{
+	unsigned long flags;
+	unsigned int next;
+	struct s31_hci_frame *frame;
+
+	if (!data || length + 1 > S31_HCI_FRAME_SIZE)
+		return -EMSGSIZE;
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
+		return -ENODEV;
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	next = (s31_hci_tx_head + 1) % S31_HCI_TX_SLOTS;
+	if (next == s31_hci_tx_tail) {
+		atomic_inc(&s31_hci_tx_dropped);
+		spin_unlock_irqrestore(&s31_hci_lock, flags);
+		return -ENOSPC;
+	}
+	frame = &s31_hci_tx[s31_hci_tx_head];
+	frame->data[0] = packet_type;
+	memcpy(frame->data + 1, data, length);
+	frame->length = length + 1;
+	smp_store_release(&s31_hci_tx_head, next);
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	wake_up(&s31_radio_waitq);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_send);
+
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 static bool s31_radio_irq_route_live(int source)
 {
@@ -742,12 +901,14 @@ static int s31_radio_run_blob_pass(unsigned long kernel_sp, bool start_bt)
 		pr_info("esp32s31-radio: starting BT after IRQ route is live\n");
 	}
 	s31_radio_process_commands();
+	s31_radio_hci_process_tx();
 	s31_rtos_schedule();
 	atomic_inc(&s31_radio_worker_passes);
 
 	kernel_fpu_end();
 	local_irq_restore(irq_flags);
 	current->thread_info.kernel_sp = kernel_sp;
+	s31_radio_hci_deliver_rx();
 	return 0;
 }
 
@@ -892,6 +1053,7 @@ static int s31_radio_runtime_thread(void *unused)
 			atomic_read(&s31_tick_pending) ||
 			s31_radio_irq_work_pending() ||
 			s31_radio_command_work_pending() ||
+			s31_radio_hci_tx_pending() ||
 			(s31_radio_irq_route_live(127) && !s31_bt_enable_started),
 			time_before(jiffies, next_tick) ?
 				next_tick - jiffies : 1);
