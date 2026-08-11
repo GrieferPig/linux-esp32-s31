@@ -13,8 +13,10 @@ config ESP32S31_RADIO_SMODE_DRIVER
 	bool "ESP32-S31 S-mode radio runtime"
 	depends on ESP32S31_RADIO_SMODE
 	help
-	  Start the radio kernel thread, provide the ESP-IDF compatibility runtime,
-	  and dispatch the timer and modem interrupts delegated by OpenSBI.
+	  Start the serialized radio kernel thread, provide the ESP-IDF
+	  compatibility runtime, and dispatch the Linux-owned timer and modem
+	  interrupts. All blob entry points execute in the worker's protected
+	  ILP32F context; Linux front ends use typed radio-core requests.
 
 config ESP32S31_RADIO_BLOBS
 	bool "Link ESP-IDF Wi-Fi/Bluetooth firmware into the kernel"
