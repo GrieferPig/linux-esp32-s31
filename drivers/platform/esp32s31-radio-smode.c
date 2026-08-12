@@ -306,8 +306,8 @@ static bool s31_wifi_scan_inflight;
 static bool s31_wifi_scan_ready;
 
 #define S31_WIFI_FRAME_SIZE	1600
-#define S31_WIFI_RX_SLOTS	8
-#define S31_WIFI_TX_SLOTS	8
+#define S31_WIFI_RX_SLOTS	64
+#define S31_WIFI_TX_SLOTS	32
 
 struct s31_wifi_frame {
 	u16 length;
