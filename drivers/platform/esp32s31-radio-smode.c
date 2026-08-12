@@ -182,6 +182,29 @@ void _interrupt_handler(void)
 {
 }
 
+/* Define the modem peripheral register base addresses that the ESP-IDF
+ * modem clock HAL expects.  The peripherals.ld linker script provides
+ * these for the blob's relocatable link. */
+asm(".globl MODEM_SYSCON\n"
+    ".set MODEM_SYSCON, 0x20109C00\n"
+    ".globl MODEM_LPCON\n"
+    ".set MODEM_LPCON, 0x2010F000\n");
+
+/* Temperature sensor HAL stubs — the blob's RF calibration reads chip
+ * temperature for compensation but the HAL functions are undefined in
+ * the blob (they live in the soc_temperature component).  Return safe
+ * defaults so the calibration path doesn't crash on garbage pointers. */
+int temperature_sensor_hal_init(void *hal, void *cfg) { (void)hal; (void)cfg; return 0; }
+float temperature_sensor_hal_get_degree(void *hal, int *degree)
+{
+	(void)hal;
+	if (degree && (unsigned long)degree >= PAGE_SIZE)
+		*degree = 25;
+	return 25.0f;
+}
+void temperature_sensor_hal_i2c_saradc_reg_backup(void) { }
+void temperature_sensor_hal_i2c_saradc_reg_restore(void) { }
+
 const unsigned long _mtvt_table[48] = {
 	[0 ... 47] = (unsigned long)_interrupt_handler,
 };
@@ -644,6 +667,7 @@ void s31_radio_wifi_intr_mask(u32 mask, bool enable)
 static irqreturn_t s31_radio_hardirq(int irq, void *data)
 {
 	struct s31_idf_irq_registration *registration = data;
+	struct task_struct *worker;
 
 	/* The blob ISR is XIP code and may use the compatibility RTOS and FP.
 	 * Keep all of that out of hardirq context.  Holding the CLIC slot masked
@@ -653,7 +677,14 @@ static irqreturn_t s31_radio_hardirq(int irq, void *data)
 	WRITE_ONCE(registration->pending_since_ns, ktime_get_mono_fast_ns());
 	atomic_inc(&registration->hardirq_count);
 	atomic_set(&registration->callback_pending, 1);
-	wake_up(&s31_radio_waitq);
+	/* Wake the radio worker directly instead of going through the wait
+	 * queue: wake_up_process() on a SCHED_FIFO thread is a single
+	 * scheduler call compared to the spinlock + waiter iteration that
+	 * the waitq path carries.  The worker checks callback_pending after
+	 * each blob pass so no additional condition variable is needed. */
+	worker = READ_ONCE(s31_radio_worker);
+	if (worker)
+		wake_up_process(worker);
 	return IRQ_HANDLED;
 }
 

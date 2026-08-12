@@ -104,7 +104,7 @@ CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
 CONFIG_FPU=y
 
 # Kernel command line
-CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock5 rootfstype=squashfs ro rootwait init=/init clk_ignore_unused"
+CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init clk_ignore_unused"
 CONFIG_CMDLINE_FORCE=y
 
 # Built-in DTB (no external loader needed)
