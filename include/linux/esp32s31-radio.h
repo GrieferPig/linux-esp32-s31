@@ -23,6 +23,8 @@ struct esp32s31_radio_health {
 	u32 heap_used;
 	u32 heap_peak;
 	u32 heap_total;
+	u32 wifi_rx_dropped;
+	u32 wifi_tx_dropped;
 };
 
 struct esp32s31_radio_hci_ops {

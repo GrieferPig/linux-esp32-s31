@@ -4,6 +4,8 @@
 
 #include <linux/types.h>
 
+struct esp32s31_radio_wifi_ap;
+
 /* Private link boundary between the Linux core and localized IDF payload. */
 extern void s31_radio_stack_task(void *arg);
 extern void s31_radio_bt_enable_task(void *arg);
@@ -13,10 +15,37 @@ extern void s31_radio_wifi_connect_task(void *arg);
 extern void s31_radio_wifi_disconnect_task(void *arg);
 extern int s31_radio_wifi_read_mac(u8 *mac);
 extern int s31_radio_wifi_try_send(u8 *frame, u16 length);
+extern void s31_radio_wifi_guard_pp_state(void);
 extern void s31_rtos_init(void);
-extern void s31_rtos_schedule(void);
 extern void s31_rtos_tick(void);
+extern void s31_rtos_hard_tick(void);
+extern void s31_rtos_free(void *ptr);
 extern u32 s31_rtos_isr_depth;
+void *s31_linux_task_create(void (*entry)(void *), const char *name,
+				    u32 stack_size, void *stack_base,
+				    void *arg, u32 priority, void *cookie);
+void s31_linux_task_exit_current(void);
+int s31_linux_task_stop(void *task);
+void *s31_linux_current_cookie(void);
+void s31_linux_task_delay(u32 ticks);
+void *s31_linux_sync_create(void);
+void s31_linux_sync_destroy(void *sync);
+void s31_linux_sync_lock(void *sync);
+void s31_linux_sync_unlock(void *sync);
+u32 s31_linux_sync_sequence(void *sync);
+int s31_linux_sync_wait(void *sync, u32 sequence, u32 timeout);
+void s31_linux_sync_wake(void *sync);
+u32 s31_linux_critical_enter(void);
+void s31_linux_critical_exit(u32 flags);
+void s31_linux_critical_suspend(void);
+void s31_linux_critical_resume(void);
+void s31_linux_blob_enter(void);
+void s31_linux_blob_leave(void);
+void s31_linux_blob_suspend(void);
+void s31_linux_blob_resume(void);
+const char *s31_linux_blob_holder(void);
+void s31_linux_task_dump_all(void);
+extern void (*s31_blob_gate_wait_hook)(void);
 extern int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,
 				   u32 stack_size, void *arg, u32 priority,
 				   void *task_handle, int core_id);
@@ -24,6 +53,8 @@ extern int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,
 void s31_radio_report_wifi_init(int result);
 void s31_radio_report_bt_init(int result);
 void s31_radio_report_bt_enable(int result);
+void *s31_radio_sram_alloc(size_t size);
+void s31_radio_sram_free(void *ptr);
 void s31_radio_vhci_send_available(void);
 int s31_radio_vhci_receive(u8 *frame, u16 length);
 void s31_radio_wifi_intr_configure(u32 source, u32 logical_intr, u32 priority);
