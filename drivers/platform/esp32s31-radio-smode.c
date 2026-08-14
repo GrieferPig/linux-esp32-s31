@@ -25,6 +25,8 @@
 #include <linux/workqueue.h>
 #include <linux/esp32s31-radio.h>
 #include <asm/fpu.h>
+#include <asm/irq_regs.h>
+#include <asm/ptrace.h>
 
 #include "esp32s31-radio-internal.h"
 
@@ -417,7 +419,6 @@ struct s31_radio_timing_stats {
 	u64 tx_done_total_ns;
 	u64 tx_done_max_ns;
 	u64 last_isr_end_ns;
-	u64 last_tx_submit_ns;
 	u32 irq_samples;
 	u32 gate_samples;
 	u32 isr_samples;
@@ -426,12 +427,88 @@ struct s31_radio_timing_stats {
 	u32 tx_done_samples;
 };
 
+enum s31_tx_timing_kind {
+	S31_TX_OTHER,
+	S31_TX_IPV4,
+	S31_TX_DHCP,
+	S31_TX_ARP,
+	S31_TX_IPV6,
+	S31_TX_KIND_COUNT,
+};
+
+#define S31_TX_TIMING_SLOTS 32
+
+struct s31_tx_timing_sample {
+	u64 enqueue_ns;
+	u64 start_ns;
+	u64 return_ns;
+	u64 done_ns;
+	u32 sequence;
+	u16 length;
+	u8 kind;
+	int result;
+	bool returned;
+	bool done;
+	bool status;
+};
+
+static struct s31_tx_timing_sample s31_tx_samples[S31_TX_TIMING_SLOTS];
+static u32 s31_tx_sequence;
+static u32 s31_tx_head;
+static u32 s31_tx_tail;
+static u32 s31_tx_done_cursor;
+static DEFINE_SPINLOCK(s31_tx_timing_lock);
+
+static const char * const s31_tx_kind_name[S31_TX_KIND_COUNT] = {
+	[S31_TX_OTHER] = "other",
+	[S31_TX_IPV4] = "ipv4",
+	[S31_TX_DHCP] = "dhcp",
+	[S31_TX_ARP] = "arp",
+	[S31_TX_IPV6] = "ipv6",
+};
+
+static u8 s31_radio_tx_kind(const u8 *frame, u16 length)
+{
+	u16 ethertype;
+	u8 ihl;
+	u16 sport, dport;
+
+	if (!frame || length < ETH_HLEN)
+		return S31_TX_OTHER;
+	ethertype = ((u16)frame[12] << 8) | frame[13];
+	if (ethertype == ETH_P_ARP)
+		return S31_TX_ARP;
+	if (ethertype == ETH_P_IPV6)
+		return S31_TX_IPV6;
+	if (ethertype != ETH_P_IP || length < ETH_HLEN + 20)
+		return S31_TX_OTHER;
+	ihl = (frame[ETH_HLEN] & 0x0f) * 4;
+	if (ihl < 20 || length < ETH_HLEN + ihl + 8 ||
+	    frame[ETH_HLEN + 9] != 17)
+		return S31_TX_IPV4;
+	sport = ((u16)frame[ETH_HLEN + ihl] << 8) |
+		frame[ETH_HLEN + ihl + 1];
+	dport = ((u16)frame[ETH_HLEN + ihl + 2] << 8) |
+		frame[ETH_HLEN + ihl + 3];
+	if ((sport == 67 && dport == 68) || (sport == 68 && dport == 67))
+		return S31_TX_DHCP;
+	return S31_TX_IPV4;
+}
+
 static struct task_struct *s31_radio_worker;
 static struct s31_radio_timing_stats s31_timing;
 
 void s31_radio_timing_reset(void)
 {
+	unsigned long flags;
+
 	memset(&s31_timing, 0, sizeof(s31_timing));
+	spin_lock_irqsave(&s31_tx_timing_lock, flags);
+	memset(s31_tx_samples, 0, sizeof(s31_tx_samples));
+	s31_tx_head = 0;
+	s31_tx_tail = 0;
+	s31_tx_done_cursor = 0;
+	spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
 }
 
 static void s31_timing_add(u64 delta, u64 *total, u64 *maximum)
@@ -458,33 +535,97 @@ void s31_radio_timing_blob_enter(void)
 	WRITE_ONCE(s31_timing.last_isr_end_ns, 0);
 }
 
-void s31_radio_timing_tx_submit(u64 enqueue_ns, u64 start_ns, u64 end_ns)
+u32 s31_radio_timing_tx_begin(u64 enqueue_ns, u64 start_ns,
+			      const u8 *frame, u16 length)
 {
+	struct s31_tx_timing_sample *sample;
+	unsigned long flags;
+	u32 sequence;
+
 	if (start_ns >= enqueue_ns)
 		s31_timing_add(start_ns - enqueue_ns,
 			       &s31_timing.tx_enqueue_total_ns,
 			       &s31_timing.tx_enqueue_max_ns);
-	if (end_ns >= start_ns)
-		s31_timing_add(end_ns - start_ns, &s31_timing.tx_call_total_ns,
-			       &s31_timing.tx_call_max_ns);
 	s31_timing.tx_samples++;
-	WRITE_ONCE(s31_timing.last_tx_submit_ns, end_ns);
+	spin_lock_irqsave(&s31_tx_timing_lock, flags);
+	sequence = ++s31_tx_sequence;
+	if (!sequence)
+		sequence = ++s31_tx_sequence;
+	sample = &s31_tx_samples[s31_tx_head % S31_TX_TIMING_SLOTS];
+	memset(sample, 0, sizeof(*sample));
+	sample->enqueue_ns = enqueue_ns;
+	sample->start_ns = start_ns;
+	sample->sequence = sequence;
+	sample->length = length;
+	sample->kind = s31_radio_tx_kind(frame, length);
+	s31_tx_head++;
+	if (s31_tx_head - s31_tx_tail > S31_TX_TIMING_SLOTS)
+		s31_tx_tail = s31_tx_head - S31_TX_TIMING_SLOTS;
+	if (s31_tx_done_cursor < s31_tx_tail)
+		s31_tx_done_cursor = s31_tx_tail;
+	spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
+	return sequence;
 }
 
-void s31_radio_timing_tx_done(void)
+void s31_radio_timing_tx_return(u32 sequence, u64 end_ns, int result)
 {
-	u64 now = ktime_get_mono_fast_ns();
-	u64 then = READ_ONCE(s31_timing.last_tx_submit_ns);
+	struct s31_tx_timing_sample *sample;
+	unsigned long flags;
+	u32 i;
 
-	if (then && now >= then) {
-		s31_timing_add(now - then, &s31_timing.tx_done_total_ns,
-			       &s31_timing.tx_done_max_ns);
-		s31_timing.tx_done_samples++;
+	spin_lock_irqsave(&s31_tx_timing_lock, flags);
+	for (i = s31_tx_done_cursor; i < s31_tx_head; i++) {
+		sample = &s31_tx_samples[i % S31_TX_TIMING_SLOTS];
+		if (sample->sequence != sequence)
+			continue;
+		sample->return_ns = end_ns;
+		sample->result = result;
+		sample->returned = true;
+		if (end_ns >= sample->start_ns)
+			s31_timing_add(end_ns - sample->start_ns,
+				       &s31_timing.tx_call_total_ns,
+				       &s31_timing.tx_call_max_ns);
+		break;
 	}
+	spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
+}
+
+void s31_radio_timing_tx_done(bool status, const u8 *frame, u16 length)
+{
+	struct s31_tx_timing_sample *sample = NULL;
+	unsigned long flags;
+	u64 now = ktime_get_mono_fast_ns();
+	u32 i;
+
+	spin_lock_irqsave(&s31_tx_timing_lock, flags);
+	for (i = s31_tx_tail; i < s31_tx_head; i++) {
+		sample = &s31_tx_samples[i % S31_TX_TIMING_SLOTS];
+		if (!sample->done)
+			break;
+		sample = NULL;
+	}
+	if (sample) {
+		sample->done_ns = now;
+		sample->done = true;
+		sample->status = status;
+		if (sample->return_ns && now >= sample->return_ns) {
+			s31_timing_add(now - sample->return_ns,
+				       &s31_timing.tx_done_total_ns,
+				       &s31_timing.tx_done_max_ns);
+			s31_timing.tx_done_samples++;
+		}
+		s31_tx_done_cursor = i + 1;
+	}
+	spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
+
+	(void)frame;
+	(void)length;
 }
 
 static void s31_radio_timing_report(const char *stage)
 {
+	unsigned long flags;
+	u32 i;
 #define S31_AVG(total, count) ((count) ? div_u64((total), (count)) : 0)
 	pr_info("esp32s31-radio: timing %s irq->worker n=%u avg=%lluns max=%lluns; gate n=%u avg=%lluns max=%lluns; isr n=%u avg=%lluns max=%lluns\n",
 		stage, s31_timing.irq_samples,
@@ -504,6 +645,31 @@ static void s31_radio_timing_report(const char *stage)
 		s31_timing.tx_call_max_ns, s31_timing.tx_done_samples,
 		S31_AVG(s31_timing.tx_done_total_ns, s31_timing.tx_done_samples),
 		s31_timing.tx_done_max_ns);
+	spin_lock_irqsave(&s31_tx_timing_lock, flags);
+	i = s31_tx_tail;
+	spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
+	for (; ; i++) {
+		struct s31_tx_timing_sample sample;
+		u32 head;
+
+		spin_lock_irqsave(&s31_tx_timing_lock, flags);
+		head = s31_tx_head;
+		if (i < head)
+			sample = s31_tx_samples[i % S31_TX_TIMING_SLOTS];
+		spin_unlock_irqrestore(&s31_tx_timing_lock, flags);
+		if (i >= head)
+			break;
+
+		if (sample.kind != S31_TX_DHCP && sample.kind != S31_TX_ARP)
+			continue;
+		pr_info("esp32s31-radio: tx timing %s seq=%u kind=%s len=%u enqueue->worker=%lluns call=%lluns return->done=%lluns result=%d done=%u status=%u\n",
+			stage, sample.sequence, s31_tx_kind_name[sample.kind],
+			sample.length, sample.start_ns - sample.enqueue_ns,
+			sample.returned ? sample.return_ns - sample.start_ns : 0,
+			sample.done && sample.return_ns ?
+				sample.done_ns - sample.return_ns : 0,
+			sample.result, sample.done, sample.status);
+	}
 #undef S31_AVG
 }
 
@@ -582,6 +748,36 @@ static int s31_tick_virq;
 static atomic_t s31_tick_pending = ATOMIC_INIT(0);
 static atomic_t s31_tick_irq_count = ATOMIC_INIT(0);
 
+/* 100 Hz tick samples of the interrupted PC while the blob gate is held by
+ * current.  The blob runs on the SRAM exception stack, so current_pt_regs()
+ * is stale there; use get_irq_regs() from hardirq context instead. */
+#define S31_PC_SAMPLE_RING 128
+struct s31_pc_sample {
+	u32 tick;
+	u32 epc;
+	u32 ra;
+	u32 pid;
+};
+static struct s31_pc_sample s31_pc_sample_ring[S31_PC_SAMPLE_RING];
+static unsigned int s31_pc_sample_head;
+
+static void s31_pc_sample_record(void)
+{
+	struct pt_regs *regs = get_irq_regs();
+	struct s31_pc_sample *sample;
+	unsigned int idx;
+
+	if (!regs || !s31_linux_blob_held_by_current())
+		return;
+	idx = s31_pc_sample_head % S31_PC_SAMPLE_RING;
+	sample = &s31_pc_sample_ring[idx];
+	sample->tick = (u32)atomic_read(&s31_tick_irq_count);
+	sample->epc = instruction_pointer(regs);
+	sample->ra = regs->ra;
+	sample->pid = current->pid;
+	s31_pc_sample_head = idx + 1;
+}
+
 void s31_radio_report_wifi_init(int result)
 {
 	WRITE_ONCE(s31_wifi_init_result, result);
@@ -628,6 +824,7 @@ static irqreturn_t s31_tick_hardirq(int irq, void *data)
 	       s31_timg1 + S31_TIMG_T1_CONFIG);
 	atomic_inc(&s31_tick_irq_count);
 	atomic_inc(&s31_tick_pending);
+	s31_pc_sample_record();
 	wake_up(&s31_radio_waitq);
 	return IRQ_HANDLED;
 }
@@ -1002,6 +1199,44 @@ static bool s31_radio_irq_work_pending(void)
 	return false;
 }
 
+void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns,
+				      u64 exec_ns, u32 tick_start)
+{
+	static int print_count;
+	struct task_struct *worker = READ_ONCE(s31_radio_worker);
+	u32 tick_end = s31_linux_tick_count();
+	u32 tick_delta = tick_end - tick_start;
+	u32 head = READ_ONCE(s31_pc_sample_head);
+	u32 printed, i;
+
+	if (print_count >= 8)
+		return;
+	print_count++;
+
+	pr_info("esp32s31-radio: long gate release #%d reason=%u wall=%lluns exec=%lluns ticks=%u..%u delta=%u tick_pending=%d irq_work=%d worker_state=%ld gate_owner=%s pc_head=%u\n",
+		print_count, reason, wall_ns, exec_ns, tick_start, tick_end,
+		tick_delta, atomic_read(&s31_tick_pending),
+		s31_radio_irq_work_pending(),
+		worker ? (long)READ_ONCE(worker->__state) : -1L,
+		s31_linux_blob_holder() ?: "none", head);
+
+	if (!head)
+		return;
+	if (head > 64)
+		printed = 64;
+	else
+		printed = head;
+	for (i = 0; i < printed; i++) {
+		u32 idx = (head - printed + i) % S31_PC_SAMPLE_RING;
+		struct s31_pc_sample *sample = &s31_pc_sample_ring[idx];
+
+		pr_info("esp32s31-radio: pc[%02u] tick=%u pid=%u epc=%px ra=%px\n",
+			i, sample->tick, sample->pid,
+			(void *)(unsigned long)sample->epc,
+			(void *)(unsigned long)sample->ra);
+	}
+}
+
 static struct s31_idf_irq_registration *s31_radio_source_irq(int source)
 {
 	int i;
@@ -1172,10 +1407,13 @@ static void s31_radio_wifi_process_tx(void)
 
 		{
 			u64 start_ns = ktime_get_mono_fast_ns();
+			u32 sequence = s31_radio_timing_tx_begin(
+				frame->enqueue_ns, start_ns, frame->data,
+				frame->length);
 
 			ret = s31_radio_wifi_try_send(frame->data, frame->length);
-			s31_radio_timing_tx_submit(frame->enqueue_ns, start_ns,
-						   ktime_get_mono_fast_ns());
+			s31_radio_timing_tx_return(sequence,
+						   ktime_get_mono_fast_ns(), ret);
 		}
 		if (ret == -EAGAIN) {
 			s31_wifi_tx_retry_at = jiffies + 1;
@@ -1680,6 +1918,7 @@ static void s31_radio_health_workfn(struct work_struct *work)
 
 static int s31_radio_runtime_thread(void *unused)
 {
+	struct sched_param param = { .sched_priority = 98 };
 	void __iomem *rom;
 	unsigned long next_tick;
 	const unsigned long tick_period = max_t(unsigned long, 1,
@@ -1693,7 +1932,7 @@ static int s31_radio_runtime_thread(void *unused)
 	/* Wi-Fi MAC service latency is bounded in ESP-IDF by a priority-23 task.
 	 * Keep Linux userspace and ordinary kernel workers from delaying its ISR
 	 * bottom half during association and receive bursts. */
-	sched_set_fifo(current);
+	sched_setscheduler_nocheck(current, SCHED_FIFO, &param);
 	/* Low identity mappings intentionally exist only in init_mm. */
 	kthread_use_mm(&init_mm);
 	pr_info("esp32s31-radio: init_mm active\n");

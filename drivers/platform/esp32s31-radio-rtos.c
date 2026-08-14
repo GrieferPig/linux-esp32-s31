@@ -12,6 +12,7 @@
 #include <linux/math64.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
+#include <linux/sched/cputime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/thread_info.h>
@@ -115,8 +116,14 @@ struct s31_blob_context {
 	bool stack_switched;
 	bool irq_disabled;
 	u64 gate_acquired_ns;
+	u64 gate_exec_start_ns;
 	u32 gate_timing_generation;
+	u32 tick_acquired;
+	u32 last_wifi_event;
+	bool last_wifi_event_valid;
 };
+
+static struct s31_blob_context *s31_blob_context_current(void);
 
 struct s31_linux_task {
 	u32 magic;
@@ -160,22 +167,64 @@ static struct s31_linux_task *s31_task_list;
 static DEFINE_SPINLOCK(s31_task_list_lock);
 
 #define S31_GATE_TIMING_SLOTS 16
+#define S31_GATE_LONGEST_SAMPLES 8
+
+struct s31_gate_reason_timing {
+	u64 wall_total_ns;
+	u64 wall_max_ns;
+	u64 exec_total_ns;
+	u64 exec_max_ns;
+	u64 offcpu_total_ns;
+	u64 offcpu_max_ns;
+	u32 count;
+};
 
 struct s31_gate_timing_slot {
 	struct task_struct *thread;
 	char name[TASK_COMM_LEN];
 	u64 wait_total_ns;
 	u64 wait_max_ns;
-	u64 hold_total_ns;
-	u64 hold_max_ns;
 	u32 enters;
-	u32 holds;
+	struct s31_gate_reason_timing reason[S31_BLOB_RELEASE_COUNT];
+};
+
+struct s31_gate_long_sample {
+	char name[TASK_COMM_LEN];
+	u32 reason;
+	u64 wall_ns;
+	u64 exec_ns;
+	u64 offcpu_ns;
+	u32 last_wifi_event;
+	bool last_wifi_event_valid;
 };
 
 static DEFINE_SPINLOCK(s31_gate_timing_lock);
 static struct s31_gate_timing_slot s31_gate_timing[S31_GATE_TIMING_SLOTS];
+static struct s31_gate_long_sample
+	s31_gate_longest[S31_GATE_LONGEST_SAMPLES];
 static u32 s31_gate_timing_generation;
 static bool s31_gate_timing_enabled;
+
+static const char * const s31_gate_reason_name[S31_BLOB_RELEASE_COUNT] = {
+	[S31_BLOB_RELEASE_LEAVE] = "leave",
+	[S31_BLOB_RELEASE_TASK_DELAY] = "task-delay",
+	[S31_BLOB_RELEASE_TASK_YIELD] = "task-yield",
+	[S31_BLOB_RELEASE_QUEUE_SEND] = "queue-send",
+	[S31_BLOB_RELEASE_QUEUE_RECEIVE] = "queue-receive",
+	[S31_BLOB_RELEASE_SEMAPHORE_TAKE] = "semaphore-take",
+	[S31_BLOB_RELEASE_NOTIFY_TAKE] = "notify-take",
+	[S31_BLOB_RELEASE_NOTIFY_WAIT] = "notify-wait",
+	[S31_BLOB_RELEASE_EVENT_WAIT] = "event-wait",
+	[S31_BLOB_RELEASE_TASK_SUSPEND] = "task-suspend",
+};
+
+struct s31_gate_release_info {
+	bool valid;
+	u32 reason;
+	u64 wall_ns;
+	u64 exec_ns;
+	u32 tick_start;
+};
 
 static struct s31_gate_timing_slot *s31_gate_timing_slot_locked(void)
 {
@@ -204,10 +253,13 @@ static void s31_gate_timing_acquired(struct s31_blob_context *context,
 	unsigned long flags;
 	u64 wait_ns = acquired_ns - wait_start_ns;
 
+	context->tick_acquired = s31_linux_tick_count();
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	if (!s31_gate_timing_enabled) {
 		context->gate_timing_generation = 0;
 		context->gate_acquired_ns = 0;
+		context->gate_exec_start_ns = 0;
+		context->tick_acquired = 0;
 		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 		return;
 	}
@@ -217,27 +269,83 @@ static void s31_gate_timing_acquired(struct s31_blob_context *context,
 	slot->enters++;
 	context->gate_timing_generation = s31_gate_timing_generation;
 	context->gate_acquired_ns = acquired_ns;
+	context->gate_exec_start_ns = task_sched_runtime(current);
+	context->last_wifi_event_valid = false;
 	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 }
 
-static void s31_gate_timing_released(struct s31_blob_context *context)
+static void s31_gate_record_longest_locked(u32 reason, u64 wall_ns,
+					   u64 exec_ns, u64 offcpu_ns)
+{
+	struct s31_gate_long_sample *sample;
+	int i, pos = -1;
+
+	for (i = 0; i < S31_GATE_LONGEST_SAMPLES; i++) {
+		if (wall_ns > s31_gate_longest[i].wall_ns) {
+			pos = i;
+			break;
+		}
+	}
+	if (pos < 0)
+		return;
+	for (i = S31_GATE_LONGEST_SAMPLES - 1; i > pos; i--)
+		s31_gate_longest[i] = s31_gate_longest[i - 1];
+	sample = &s31_gate_longest[pos];
+	strscpy(sample->name, current->comm, sizeof(sample->name));
+	sample->reason = reason;
+	sample->wall_ns = wall_ns;
+	sample->exec_ns = exec_ns;
+	sample->offcpu_ns = offcpu_ns;
+	sample->last_wifi_event = s31_blob_context_current()->last_wifi_event;
+	sample->last_wifi_event_valid =
+		s31_blob_context_current()->last_wifi_event_valid;
+}
+
+static void s31_gate_timing_released(struct s31_blob_context *context,
+				     u32 reason,
+				     struct s31_gate_release_info *info)
 {
 	struct s31_gate_timing_slot *slot;
+	struct s31_gate_reason_timing *timing;
 	unsigned long flags;
 	u64 now = ktime_get_mono_fast_ns();
+	u64 exec_now = task_sched_runtime(current);
+	u64 wall_ns = 0, exec_ns = 0, offcpu_ns = 0;
+
+	if (info)
+		info->valid = false;
+	if (reason >= S31_BLOB_RELEASE_COUNT)
+		reason = S31_BLOB_RELEASE_LEAVE;
 
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	if (!s31_gate_timing_enabled || !context->gate_acquired_ns ||
 	    context->gate_timing_generation != s31_gate_timing_generation)
 		goto out;
+	wall_ns = now - context->gate_acquired_ns;
+	exec_ns = exec_now - context->gate_exec_start_ns;
+	offcpu_ns = wall_ns > exec_ns ? wall_ns - exec_ns : 0;
 	slot = s31_gate_timing_slot_locked();
-	slot->hold_total_ns += now - context->gate_acquired_ns;
-	slot->hold_max_ns = max(slot->hold_max_ns,
-				 now - context->gate_acquired_ns);
-	slot->holds++;
+	timing = &slot->reason[reason];
+	timing->wall_total_ns += wall_ns;
+	timing->wall_max_ns = max(timing->wall_max_ns, wall_ns);
+	timing->exec_total_ns += exec_ns;
+	timing->exec_max_ns = max(timing->exec_max_ns, exec_ns);
+	timing->offcpu_total_ns += offcpu_ns;
+	timing->offcpu_max_ns = max(timing->offcpu_max_ns, offcpu_ns);
+	timing->count++;
+	s31_gate_record_longest_locked(reason, wall_ns, exec_ns, offcpu_ns);
+	if (info) {
+		info->valid = true;
+		info->reason = reason;
+		info->wall_ns = wall_ns;
+		info->exec_ns = exec_ns;
+		info->tick_start = context->tick_acquired;
+	}
 out:
 	context->gate_acquired_ns = 0;
+	context->gate_exec_start_ns = 0;
 	context->gate_timing_generation = 0;
+	context->tick_acquired = 0;
 	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 }
 
@@ -247,6 +355,7 @@ void s31_linux_gate_timing_reset(void)
 
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	memset(s31_gate_timing, 0, sizeof(s31_gate_timing));
+	memset(s31_gate_longest, 0, sizeof(s31_gate_longest));
 	s31_gate_timing_generation++;
 	if (!s31_gate_timing_generation)
 		s31_gate_timing_generation++;
@@ -257,30 +366,72 @@ void s31_linux_gate_timing_reset(void)
 void s31_linux_gate_timing_report(const char *stage)
 {
 	unsigned long flags;
-	int i;
+	int i, reason;
 
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	s31_gate_timing_enabled = false;
 	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 
 	for (i = 0; i < S31_GATE_TIMING_SLOTS; i++) {
-		struct s31_gate_timing_slot slot;
+		char name[TASK_COMM_LEN];
+		u64 wait_total_ns, wait_max_ns;
+		u32 enters;
 
 		spin_lock_irqsave(&s31_gate_timing_lock, flags);
-		slot = s31_gate_timing[i];
+		strscpy(name, s31_gate_timing[i].name, sizeof(name));
+		wait_total_ns = s31_gate_timing[i].wait_total_ns;
+		wait_max_ns = s31_gate_timing[i].wait_max_ns;
+		enters = s31_gate_timing[i].enters;
 		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 
-		if (!slot.thread)
+		if (!name[0])
 			continue;
-		pr_info("esp32s31-radio: gate timing %s task=%s enter=%u wait_avg=%lluns wait_max=%lluns hold=%u hold_avg=%lluns hold_max=%lluns\n",
-			stage, slot.name, slot.enters,
-			slot.enters ? div_u64(slot.wait_total_ns,
-						 slot.enters) : 0,
-			slot.wait_max_ns, slot.holds,
-			slot.holds ? div_u64(slot.hold_total_ns,
-						 slot.holds) : 0,
-			slot.hold_max_ns);
+		pr_info("esp32s31-radio: gate timing %s task=%s enter=%u wait_avg=%lluns wait_max=%lluns\n",
+			stage, name, enters,
+			enters ? div_u64(wait_total_ns, enters) : 0,
+			wait_max_ns);
+		for (reason = 0; reason < S31_BLOB_RELEASE_COUNT; reason++) {
+			struct s31_gate_reason_timing timing;
+
+			spin_lock_irqsave(&s31_gate_timing_lock, flags);
+			timing = s31_gate_timing[i].reason[reason];
+			spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
+			if (!timing.count)
+				continue;
+			pr_info("esp32s31-radio: gate hold %s task=%s reason=%s count=%u wall_avg=%lluns wall_max=%lluns exec_avg=%lluns exec_max=%lluns offcpu_avg=%lluns offcpu_max=%lluns\n",
+				stage, name, s31_gate_reason_name[reason],
+				timing.count,
+				div_u64(timing.wall_total_ns, timing.count),
+				timing.wall_max_ns,
+				div_u64(timing.exec_total_ns, timing.count),
+				timing.exec_max_ns,
+				div_u64(timing.offcpu_total_ns, timing.count),
+				timing.offcpu_max_ns);
+		}
 	}
+	for (i = 0; i < S31_GATE_LONGEST_SAMPLES; i++) {
+		struct s31_gate_long_sample sample;
+
+		spin_lock_irqsave(&s31_gate_timing_lock, flags);
+		sample = s31_gate_longest[i];
+		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
+		if (!sample.wall_ns)
+			continue;
+		pr_info("esp32s31-radio: gate longest %s rank=%d task=%s reason=%s wall=%lluns exec=%lluns offcpu=%lluns last_event=%s%u\n",
+			stage, i + 1, sample.name,
+			s31_gate_reason_name[sample.reason], sample.wall_ns,
+			sample.exec_ns, sample.offcpu_ns,
+			sample.last_wifi_event_valid ? "" : "none/",
+			sample.last_wifi_event);
+	}
+}
+
+void s31_linux_trace_wifi_event(u32 event)
+{
+	struct s31_blob_context *context = s31_blob_context_current();
+
+	context->last_wifi_event = event;
+	context->last_wifi_event_valid = true;
 }
 
 /* Set by the radio worker while it waits for the blob gate.  The worker is
@@ -466,6 +617,20 @@ const char *s31_linux_blob_holder(void)
 	return owner->comm;
 }
 
+bool s31_linux_blob_held_by_current(void)
+{
+	struct task_struct *owner;
+
+	/* Callable from hard IRQ context: current is the interrupted task. */
+	owner = (struct task_struct *)(atomic_long_read(&s31_blob_mutex.owner) & ~7UL);
+	return owner == current;
+}
+
+uint64_t s31_linux_time_ns(void)
+{
+	return ktime_get_mono_fast_ns();
+}
+
 void s31_linux_task_dump_all(void)
 {
 	struct s31_linux_task *task;
@@ -536,7 +701,7 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 	spin_unlock(&s31_task_list_lock);
 	/* Preserve the FreeRTOS ordering: the init task is above operation tasks,
 	 * and all measured Wi-Fi tasks are real-time Linux threads. */
-	param.sched_priority = clamp_t(u32, 40 + priority, 1, 99);
+	param.sched_priority = clamp_t(u32, 70 + priority, 1, 97);
 	sched_setscheduler_nocheck(task->thread, SCHED_FIFO, &param);
 	wake_up_process(task->thread);
 	return task;
@@ -594,7 +759,7 @@ void s31_linux_task_delay(u32 ticks)
 		return;
 	}
 	timeout = s31_ticks_to_jiffies(ticks);
-	s31_linux_blob_suspend();
+	s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_DELAY);
 	set_current_state(TASK_INTERRUPTIBLE);
 	if (timeout == MAX_SCHEDULE_TIMEOUT)
 		schedule();
@@ -613,7 +778,7 @@ void s31_linux_task_yield(void)
 	/* FreeRTOS vTaskDelay(0) is an explicit scheduler yield.  cond_resched()
 	 * is insufficient for a runnable SCHED_FIFO task and cannot let another
 	 * payload enter while this task owns the serialized blob gate. */
-	s31_linux_blob_suspend();
+	s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_YIELD);
 	yield();
 	s31_linux_blob_resume();
 }
@@ -625,7 +790,7 @@ void s31_linux_task_set_priority(void *opaque, u32 priority)
 
 	if (!task || task->magic != S31_LINUX_TASK_MAGIC)
 		return;
-	param.sched_priority = clamp_t(u32, 40 + priority, 1, 99);
+	param.sched_priority = clamp_t(u32, 70 + priority, 1, 97);
 	sched_setscheduler_nocheck(task->thread, SCHED_FIFO, &param);
 }
 
@@ -668,7 +833,7 @@ u32 s31_linux_sync_sequence(void *opaque)
 	return sync ? atomic_read(&sync->sequence) : 0;
 }
 
-int32_t s31_linux_sync_wait(void *opaque, u32 sequence, u32 ticks)
+int32_t s31_linux_sync_wait(void *opaque, u32 sequence, u32 ticks, u32 reason)
 {
 	struct s31_linux_sync *sync = opaque;
 	int stop_generation = atomic_read(&s31_sync_stop_generation);
@@ -677,7 +842,7 @@ int32_t s31_linux_sync_wait(void *opaque, u32 sequence, u32 ticks)
 
 	if (!sync || !timeout)
 		return 0;
-	s31_linux_blob_suspend();
+	s31_linux_blob_suspend(reason);
 	ret = wait_event_interruptible_timeout(s31_sync_waitq,
 		atomic_read(&sync->sequence) != sequence ||
 		atomic_read(&s31_sync_stop_generation) != stop_generation ||
@@ -774,17 +939,18 @@ void s31_linux_blob_leave(void)
 {
 	struct s31_blob_context *context = s31_blob_context_current();
 
-	s31_gate_timing_released(context);
+	s31_gate_timing_released(context, S31_BLOB_RELEASE_LEAVE, NULL);
 	kernel_fpu_end();
 	s31_blob_restore_context(context);
 	s31_blob_set_active(false);
 	mutex_unlock(&s31_blob_mutex);
 }
 
-void s31_linux_blob_suspend(void)
+void s31_linux_blob_suspend(u32 reason)
 {
 	struct s31_blob_context *context = s31_blob_context_current();
 	struct s31_linux_task *task = s31_linux_current_task();
+	struct s31_gate_release_info release;
 
 	s31_payload_stack_measure(task);
 
@@ -793,7 +959,7 @@ void s31_linux_blob_suspend(void)
 	 * priority FIFO waiter preempt and spin forever on this raw lock. */
 	s31_linux_critical_suspend();
 	if (s31_blob_active()) {
-		s31_gate_timing_released(context);
+		s31_gate_timing_released(context, reason, &release);
 		if (task)
 			s31_payload_fp_save_area(task->fp_saved, &task->fp_valid);
 		else
@@ -803,6 +969,9 @@ void s31_linux_blob_suspend(void)
 		s31_blob_restore_context(context);
 		s31_blob_set_active(false);
 		mutex_unlock(&s31_blob_mutex);
+		/* Long-gate PC sampling is kept for future diagnostics, but the
+		 * automatic serial print is disabled: the holds were proven to be
+		 * ROM UART polling in esp_rom_printf(), not a scheduler bug. */
 	}
 }
 
