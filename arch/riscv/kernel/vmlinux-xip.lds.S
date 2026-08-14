@@ -47,8 +47,36 @@ SECTIONS
 		ENTRY_TEXT
 		IRQENTRY_TEXT
 		SOFTIRQENTRY_TEXT
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+		/* ESP-IDF marks latency-sensitive routines with target-specific IRAM
+		 * names.  They are executable code, so keep them in the XIP text image
+		 * instead of allowing orphan placement beside the SRAM data load. */
+		*esp32s31-radio-idf.o(.iram1 .iram1.* .wifi*iram* .coexiram .coexiram.*)
+#endif
 		_etext = .;
 	}
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	/* Consume every non-code radio payload section before the generic kernel
+	 * RO/RW collectors can place it in flash or external PSRAM. */
+	__s31_xip_after_text = .;
+	.s31_radio.data 0x2f030000 : AT(__s31_radio_data_load - KERNEL_LINK_ADDR) {
+		__s31_radio_data_start = .;
+		*esp32s31-radio-idf.o(
+			.rodata* .srodata*
+			.data* .sdata* .dram1*
+			.init_array* .tdata*)
+		. = ALIGN(8);
+		__s31_radio_data_end = .;
+	}
+	.s31_radio.bss (NOLOAD) : {
+		__s31_radio_bss_start = .;
+		*esp32s31-radio-idf.o(.bss* .sbss* .tbss* COMMON)
+		. = ALIGN(16);
+		__s31_radio_bss_end = .;
+	}
+	__s31_radio_static_end = .;
+	. = __s31_xip_after_text;
+#endif
 	RO_DATA(L1_CACHE_BYTES)
 	.srodata : {
 		*(.srodata*)
@@ -61,12 +89,28 @@ SECTIONS
 	}
 	_exiprom = .;			/* End of XIP ROM area */
 
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	/*
+	 * Store the initialized SRAM image directly after all ordinary XIP
+	 * read-only sections.  The radio driver copies it before the first blob
+	 * entry and clears the adjacent NOLOAD BSS.
+	 */
+	__s31_kernel_data_vma = ALIGN(SECTION_ALIGN);
+	__s31_radio_data_load = ALIGN(_exiprom, 8);
+#endif
+
 
 /*
  * From this point, stuff is considered writable and will be copied to RAM
  */
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	__data_loc = ALIGN(__s31_radio_data_load +
+		SIZEOF(.s31_radio.data), PAGE_SIZE);
+	. = __s31_kernel_data_vma;
+#else
 	__data_loc = ALIGN(PAGE_SIZE);		/* location in file */
 	. = ALIGN(SECTION_ALIGN);		/* location in memory */
+#endif
 
 #undef LOAD_OFFSET
 #define LOAD_OFFSET (KERNEL_LINK_ADDR + _sdata - __data_loc)

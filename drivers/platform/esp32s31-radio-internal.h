@@ -20,6 +20,7 @@ extern void s31_rtos_init(void);
 extern void s31_rtos_tick(void);
 extern void s31_rtos_hard_tick(void);
 extern void s31_rtos_free(void *ptr);
+extern void s31_rtos_task_release(void *cookie);
 extern u32 s31_rtos_isr_depth;
 void *s31_linux_task_create(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
@@ -28,6 +29,7 @@ void s31_linux_task_exit_current(void);
 int s31_linux_task_stop(void *task);
 void *s31_linux_current_cookie(void);
 void s31_linux_task_delay(u32 ticks);
+u32 s31_linux_tick_count(void);
 void *s31_linux_sync_create(void);
 void s31_linux_sync_destroy(void *sync);
 void s31_linux_sync_lock(void *sync);
@@ -43,6 +45,10 @@ void s31_linux_blob_enter(void);
 void s31_linux_blob_leave(void);
 void s31_linux_blob_suspend(void);
 void s31_linux_blob_resume(void);
+void s31_linux_gate_timing_reset(void);
+void s31_linux_gate_timing_report(const char *stage);
+void s31_linux_call_on_stack(void *stack, u32 stack_size,
+			     void (*entry)(void *), void *arg);
 const char *s31_linux_blob_holder(void);
 void s31_linux_task_dump_all(void);
 extern void (*s31_blob_gate_wait_hook)(void);
@@ -66,6 +72,10 @@ void s31_radio_wifi_scan_complete(const struct esp32s31_radio_wifi_ap *aps,
 void s31_radio_wifi_connected(const u8 *bssid, u8 channel, int status);
 void s31_radio_wifi_disconnected(u16 reason);
 int s31_radio_wifi_receive(u8 *frame, u16 length);
+void s31_radio_timing_blob_enter(void);
+void s31_radio_timing_reset(void);
+void s31_radio_timing_tx_submit(u64 enqueue_ns, u64 start_ns, u64 end_ns);
+void s31_radio_timing_tx_done(void);
 void s31_radio_heap_report(const char *stage);
 
 void *__wrap_heap_caps_malloc(size_t size, u32 caps);

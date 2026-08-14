@@ -200,7 +200,10 @@
 			reg-names = "crypto", "clkrst";
 			dmas = <&axi_gdma 0 5>;
 			dma-names = "sha";
-			status = "okay";
+			/* The closed Wi-Fi stack owns the same AES island (IDF source 55)
+			 * while associated.  Do not register an independent Linux Crypto
+			 * API owner until arbitration with the blob gate exists. */
+			status = "disabled";
 		};
 
 		adc: adc@20815000 {
