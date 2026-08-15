@@ -253,16 +253,20 @@ static void s31_gate_timing_acquired(struct s31_blob_context *context,
 	unsigned long flags;
 	u64 wait_ns = acquired_ns - wait_start_ns;
 
-	context->tick_acquired = s31_linux_tick_count();
-	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	if (!s31_gate_timing_enabled) {
+	/* The gate-hold histogram is diagnostic-only and proved the earlier
+	 * bottleneck (ROM UART polling in esp_rom_printf).  Its bookkeeping
+	 * (task_sched_runtime() + spin_lock_irqsave on every blob enter) is
+	 * measurable overhead in the hot path, so keep it compiled out of the
+	 * acquire/release fast path unless explicitly re-enabled. */
+	if (!READ_ONCE(s31_gate_timing_enabled)) {
 		context->gate_timing_generation = 0;
 		context->gate_acquired_ns = 0;
 		context->gate_exec_start_ns = 0;
 		context->tick_acquired = 0;
-		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 		return;
 	}
+	context->tick_acquired = s31_linux_tick_count();
+	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	slot = s31_gate_timing_slot_locked();
 	slot->wait_total_ns += wait_ns;
 	slot->wait_max_ns = max(slot->wait_max_ns, wait_ns);
@@ -308,8 +312,7 @@ static void s31_gate_timing_released(struct s31_blob_context *context,
 	struct s31_gate_timing_slot *slot;
 	struct s31_gate_reason_timing *timing;
 	unsigned long flags;
-	u64 now = ktime_get_mono_fast_ns();
-	u64 exec_now = task_sched_runtime(current);
+	u64 now, exec_now;
 	u64 wall_ns = 0, exec_ns = 0, offcpu_ns = 0;
 
 	if (info)
@@ -317,9 +320,18 @@ static void s31_gate_timing_released(struct s31_blob_context *context,
 	if (reason >= S31_BLOB_RELEASE_COUNT)
 		reason = S31_BLOB_RELEASE_LEAVE;
 
+	if (!READ_ONCE(s31_gate_timing_enabled) || !context->gate_acquired_ns) {
+		context->gate_acquired_ns = 0;
+		context->gate_exec_start_ns = 0;
+		context->gate_timing_generation = 0;
+		context->tick_acquired = 0;
+		return;
+	}
+	now = ktime_get_mono_fast_ns();
+	exec_now = task_sched_runtime(current);
+
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	if (!s31_gate_timing_enabled || !context->gate_acquired_ns ||
-	    context->gate_timing_generation != s31_gate_timing_generation)
+	if (context->gate_timing_generation != s31_gate_timing_generation)
 		goto out;
 	wall_ns = now - context->gate_acquired_ns;
 	exec_ns = exec_now - context->gate_exec_start_ns;
@@ -359,7 +371,9 @@ void s31_linux_gate_timing_reset(void)
 	s31_gate_timing_generation++;
 	if (!s31_gate_timing_generation)
 		s31_gate_timing_generation++;
-	s31_gate_timing_enabled = true;
+	/* Leave the histogram disabled: it was diagnostic for the UART-poll
+	 * hold and its per-enter bookkeeping now costs hot-path cycles. */
+	s31_gate_timing_enabled = false;
 	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 }
 

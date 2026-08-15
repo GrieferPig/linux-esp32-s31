@@ -176,7 +176,19 @@ static void s31_wifi_receive(void *context, const u8 *frame, size_t length)
 	skb->protocol = eth_type_trans(skb, wifi->netdev);
 	wifi->netdev->stats.rx_packets++;
 	wifi->netdev->stats.rx_bytes += length;
-	netif_rx(skb);
+	/* The radio worker delivers RX in ordinary process context after
+	 * releasing the blob gate, so process the frame inline instead of
+	 * round-tripping it through the per-CPU backlog and ksoftirqd.  This
+	 * avoids the ACK latency that otherwise throttles a single TCP flow. */
+	netif_receive_skb(skb);
+}
+
+static void s31_wifi_tx_wakeup(void *context)
+{
+	struct s31_wifi *wifi = context;
+
+	if (wifi && wifi->netdev)
+		netif_wake_queue(wifi->netdev);
 }
 
 static const struct esp32s31_radio_wifi_ops s31_radio_wifi_ops = {
@@ -184,6 +196,7 @@ static const struct esp32s31_radio_wifi_ops s31_radio_wifi_ops = {
 	.connected = s31_wifi_connected,
 	.disconnected = s31_wifi_disconnected,
 	.receive = s31_wifi_receive,
+	.tx_wakeup = s31_wifi_tx_wakeup,
 };
 
 static int s31_cfg_scan(struct wiphy *wiphy,

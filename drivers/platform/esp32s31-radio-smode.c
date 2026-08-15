@@ -41,6 +41,15 @@ typedef unsigned int (*s31_rom_cpu_freq_t)(void);
  * for the synchronous-trap stack; descriptors begin at 0x2f072380. */
 #define S31_RADIO_HEAP_END	0x2f071800UL
 #define S31_RADIO_EXC_STACK_TOP	0x2f072360UL
+/* Idle SRAM above the DMA reservations (ROM download-mode buffers tail +
+ * PRO-CPU startup stack), reclaimed as a second blob heap. */
+#define S31_RADIO_HEAP2_BASE	0x2f078c00UL
+#define S31_RADIO_HEAP2_END	0x2f07cfb0UL
+#define S31_RADIO_HEAP2_SIZE	(S31_RADIO_HEAP2_END - S31_RADIO_HEAP2_BASE)
+/* Parked factory-app FreeRTOS heap, reserved and cleared by the loader. */
+#define S31_RADIO_HEAP_LOW_BASE	0x2f018000UL
+#define S31_RADIO_HEAP_LOW_END	0x2f030000UL
+#define S31_RADIO_HEAP_LOW_SIZE	(S31_RADIO_HEAP_LOW_END - S31_RADIO_HEAP_LOW_BASE)
 
 extern char __s31_radio_data_start[];
 extern char __s31_radio_data_end[];
@@ -52,12 +61,20 @@ extern char __s31_radio_static_end[];
 static struct gen_pool *s31_radio_heap_pool;
 static size_t s31_radio_heap_peak;
 static void *s31_radio_heap_linux;
+static void *s31_radio_heap_low_linux;
+static void *s31_radio_heap2_linux;
 static unsigned long s31_radio_heap_base;
 static size_t s31_radio_heap_size;
 
 static void *s31_radio_sram_linux_alias(const void *ptr)
 {
-	return s31_radio_heap_linux + ((unsigned long)ptr - s31_radio_heap_base);
+	unsigned long p = (unsigned long)ptr;
+
+	if (p >= S31_RADIO_HEAP_LOW_BASE && p < S31_RADIO_HEAP_LOW_END)
+		return s31_radio_heap_low_linux + (p - S31_RADIO_HEAP_LOW_BASE);
+	if (p >= S31_RADIO_HEAP2_BASE && p < S31_RADIO_HEAP2_END)
+		return s31_radio_heap2_linux + (p - S31_RADIO_HEAP2_BASE);
+	return s31_radio_heap_linux + (p - s31_radio_heap_base);
 }
 
 struct s31_idf_alloc_header {
@@ -68,6 +85,32 @@ struct s31_idf_alloc_header {
 };
 
 #define S31_IDF_ALLOC_MAGIC	0x5333414c
+
+/* Live-allocation histogram for the internal SRAM heap.  Bucketed by request
+ * size so a periodic report can show exactly which buffer classes consume the
+ * bounded pool (RX esf_buf ~1848, TX ~1600, task stacks, queues, ...). */
+struct s31_heap_hist_bucket {
+	u32 live;
+	u32 peak;
+	size_t bytes;
+};
+#define S31_HEAP_HIST_BUCKETS 14
+static struct s31_heap_hist_bucket s31_heap_hist[S31_HEAP_HIST_BUCKETS];
+static atomic_t s31_idf_alloc_failures = ATOMIC_INIT(0);
+static const size_t s31_heap_hist_max[S31_HEAP_HIST_BUCKETS] = {
+	64, 128, 256, 512, 1024, 1536, 1600, 1848, 2048, 4096,
+	8192, 16384, 65536, SIZE_MAX
+};
+
+static int s31_heap_hist_index(size_t size)
+{
+	int i;
+
+	for (i = 0; i < S31_HEAP_HIST_BUCKETS - 1; i++)
+		if (size <= s31_heap_hist_max[i])
+			return i;
+	return S31_HEAP_HIST_BUCKETS - 1;
+}
 
 static void *s31_idf_alloc(size_t size, size_t alignment, bool zero, u32 caps)
 {
@@ -86,7 +129,8 @@ static void *s31_idf_alloc(size_t size, size_t alignment, bool zero, u32 caps)
 	if (!base)
 		return NULL;
 	s31_radio_heap_peak = max(s31_radio_heap_peak,
-		s31_radio_heap_size - gen_pool_avail(s31_radio_heap_pool));
+		gen_pool_size(s31_radio_heap_pool) -
+			gen_pool_avail(s31_radio_heap_pool));
 	ptr = PTR_ALIGN((u8 *)base + sizeof(*header), alignment);
 	header = ptr - sizeof(*header);
 	header->magic = S31_IDF_ALLOC_MAGIC;
@@ -95,6 +139,14 @@ static void *s31_idf_alloc(size_t size, size_t alignment, bool zero, u32 caps)
 	header->base = base;
 	if (zero)
 		memset(ptr, 0, size);
+	{
+		int b = s31_heap_hist_index(size);
+
+		s31_heap_hist[b].live++;
+		s31_heap_hist[b].peak = max(s31_heap_hist[b].peak,
+					    s31_heap_hist[b].live);
+		s31_heap_hist[b].bytes += size;
+	}
 	return ptr;
 }
 
@@ -102,9 +154,19 @@ void *__wrap_heap_caps_malloc(size_t size, u32 caps)
 {
 	void *ptr = s31_idf_alloc(size, sizeof(void *), false, caps);
 
-	if (!ptr)
-		pr_err("esp32s31-radio: heap malloc size=%zu caps=%#x failed\n",
-		       size, caps);
+	if (!ptr) {
+		/* An RX-buffer shortfall during an AMPDU burst emits one of
+		 * these per frame.  printk flushes the UART0 DMA console
+		 * synchronously from inside the blob gate, so an unbounded
+		 * burst stalls the Wi-Fi task behind 115200-baud output and
+		 * hangs the download.  Rate-limit it and keep a running
+		 * fail counter instead of a per-frame console write. */
+		atomic_inc(&s31_idf_alloc_failures);
+		pr_err_ratelimited("esp32s31-radio: heap malloc size=%zu caps=%#x failed\n",
+				   size, caps);
+		if (!(atomic_read(&s31_idf_alloc_failures) & 0xff))
+			s31_radio_heap_report("malloc-fail");
+	}
 	return ptr;
 }
 
@@ -118,6 +180,14 @@ void __wrap_heap_caps_free(void *ptr)
 	if (WARN_ON_ONCE(header->magic != S31_IDF_ALLOC_MAGIC))
 		return;
 	header->magic = 0;
+	{
+		int b = s31_heap_hist_index(header->size);
+
+		if (s31_heap_hist[b].live)
+			s31_heap_hist[b].live--;
+		s31_heap_hist[b].bytes -= min(s31_heap_hist[b].bytes,
+					      header->size);
+	}
 	gen_pool_free(s31_radio_heap_pool, (unsigned long)header->base,
 		      header->total);
 }
@@ -185,13 +255,30 @@ size_t __wrap_heap_caps_get_free_size(u32 caps)
 	return gen_pool_avail(s31_radio_heap_pool);
 }
 
+/* Wi-Fi RX/TX drop counters, read by the heap report for stall diagnostics. */
+static atomic_t s31_wifi_rx_dropped = ATOMIC_INIT(0);
+static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
+
 void s31_radio_heap_report(const char *stage)
 {
 	size_t free = gen_pool_avail(s31_radio_heap_pool);
+	size_t total = gen_pool_size(s31_radio_heap_pool);
+	int i;
 
-	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu\n",
-		stage, s31_radio_heap_size - free, s31_radio_heap_peak,
-		free, s31_radio_heap_size);
+	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d\n",
+		stage, total - free, s31_radio_heap_peak, free, total,
+		atomic_read(&s31_idf_alloc_failures),
+		atomic_read(&s31_wifi_rx_dropped),
+		atomic_read(&s31_wifi_tx_dropped));
+	if (stage[0] == 'p') {	/* periodic */
+		for (i = 0; i < S31_HEAP_HIST_BUCKETS; i++) {
+			if (!s31_heap_hist[i].live && !s31_heap_hist[i].peak)
+				continue;
+			pr_info("esp32s31-radio:   heap[%d] <=%zu live=%u peak=%u bytes=%zu\n",
+				i, s31_heap_hist_max[i], s31_heap_hist[i].live,
+				s31_heap_hist[i].peak, s31_heap_hist[i].bytes);
+		}
+	}
 }
 
 /* Every allocation that can be touched while the PHY/controller changes the
@@ -358,6 +445,7 @@ enum s31_radio_command_type {
 	S31_RADIO_COMMAND_WIFI_SCAN,
 	S31_RADIO_COMMAND_WIFI_CONNECT,
 	S31_RADIO_COMMAND_WIFI_DISCONNECT,
+	S31_RADIO_COMMAND_BT_ENABLE,
 };
 
 /* H4 type plus Linux HCI_MAX_FRAME_SIZE (1028-byte ACL header/payload). */
@@ -392,16 +480,39 @@ static bool s31_wifi_scan_ready;
 
 #define S31_WIFI_FRAME_SIZE	1600
 /* The IDF driver already owns its packet buffering.  These are only short
- * staging queues between serialized blob callbacks and the Linux net stack;
- * keep their SRAM footprint bounded so they cannot starve the blob heap. */
-#define S31_WIFI_RX_SLOTS	8
-#define S31_WIFI_TX_SLOTS	8
+ * staging queues between serialized blob callbacks and the Linux net stack.
+ * RX is now a zero-copy descriptor ring (12 B/slot), so it can be made deep
+ * enough to absorb a full rx_ba_win=64 AMPDU burst without the old 25.6 KiB
+ * data-ring cost. */
+#define S31_WIFI_RX_SLOTS	128
+/* The zero-copy RX freed ~25 KiB and .rodata is now XIP, so the TX ring can
+ * be deepened to absorb the ACK burst queued while the Wi-Fi task holds the
+ * gate for a full rx_ba_win=64 AMPDU batch. */
+#define S31_WIFI_TX_SLOTS	48
 
 struct s31_wifi_frame {
 	u16 length;
 	u64 enqueue_ns;
 	u8 data[S31_WIFI_FRAME_SIZE];
 };
+
+/* Zero-copy RX descriptor: the blob hands over its esf_buf instead of copying
+ * the frame into the ring.  `data` is the esf_buf payload pointer (HP-SRAM
+ * physical), `eb` is the esf_buf handle to recycle after the net stack has
+ * consumed the frame. */
+struct s31_wifi_rx_desc {
+	u16 length;
+	void *data;
+	void *eb;
+};
+
+/* esf_buf handles awaiting recycle.  Written by the worker after the net
+ * stack consumes a frame, drained inside the blob pass where the gate is
+ * held (single-threaded with the MAC RX allocator). */
+#define S31_WIFI_FREE_SLOTS	128
+static void *s31_wifi_free_ring[S31_WIFI_FREE_SLOTS];
+static unsigned int s31_wifi_free_head;
+static unsigned int s31_wifi_free_tail;
 
 struct s31_radio_timing_stats {
 	u64 irq_to_worker_total_ns;
@@ -673,15 +784,13 @@ static void s31_radio_timing_report(const char *stage)
 #undef S31_AVG
 }
 
-static struct s31_wifi_frame *s31_wifi_rx;
+static struct s31_wifi_rx_desc *s31_wifi_rx;
 static struct s31_wifi_frame *s31_wifi_tx;
 static unsigned int s31_wifi_rx_head;
 static unsigned int s31_wifi_rx_tail;
 static unsigned int s31_wifi_tx_head;
 static unsigned int s31_wifi_tx_tail;
 static unsigned long s31_wifi_tx_retry_at;
-static atomic_t s31_wifi_rx_dropped = ATOMIC_INIT(0);
-static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(s31_wifi_frame_lock);
 static struct esp32s31_radio_wifi_connect_params *s31_wifi_connect_params;
 static u16 *s31_wifi_disconnect_reason;
@@ -1199,6 +1308,30 @@ static bool s31_radio_irq_work_pending(void)
 	return false;
 }
 
+/* Print the most recent gate-held PC samples with symbol resolution.  The
+ * tick IRQ samples the interrupted PC whenever current holds the blob gate,
+ * so this is a cheap view of where the payload/worker spends long holds. */
+static void s31_pc_sample_dump(void)
+{
+	u32 head = READ_ONCE(s31_pc_sample_head);
+	u32 printed, i, start;
+
+	if (!head)
+		return;
+	printed = head > 32 ? 32 : head;
+	start = head - printed;
+	pr_info("esp32s31-radio: gate-held PC samples (last %u):\n", printed);
+	for (i = 0; i < printed; i++) {
+		u32 idx = (start + i) % S31_PC_SAMPLE_RING;
+		struct s31_pc_sample *sample = &s31_pc_sample_ring[idx];
+
+		pr_info("esp32s31-radio:   tick=%u pid=%u epc=%pS ra=%pS\n",
+			sample->tick, sample->pid,
+			(void *)(unsigned long)sample->epc,
+			(void *)(unsigned long)sample->ra);
+	}
+}
+
 void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns,
 				      u64 exec_ns, u32 tick_start)
 {
@@ -1291,6 +1424,11 @@ int s31_radio_vhci_receive(u8 *frame, u16 length)
 
 int s31_radio_wifi_receive(u8 *frame, u16 length)
 {
+	return s31_radio_wifi_receive_zerocopy(frame, NULL, length);
+}
+
+int s31_radio_wifi_receive_zerocopy(u8 *frame, void *eb, u16 length)
+{
 	unsigned long flags;
 	unsigned int next;
 	static unsigned int rx_count;
@@ -1309,7 +1447,8 @@ int s31_radio_wifi_receive(u8 *frame, u16 length)
 		return -ENOSPC;
 	}
 	s31_wifi_rx[s31_wifi_rx_head].length = length;
-	memcpy(s31_wifi_rx[s31_wifi_rx_head].data, frame, length);
+	s31_wifi_rx[s31_wifi_rx_head].data = frame;
+	s31_wifi_rx[s31_wifi_rx_head].eb = eb;
 	smp_store_release(&s31_wifi_rx_head, next);
 	spin_unlock_irqrestore(&s31_wifi_frame_lock, flags);
 	wake_up(&s31_radio_waitq);
@@ -1389,6 +1528,24 @@ void s31_radio_wifi_scan_complete(const struct esp32s31_radio_wifi_ap *aps,
 	wake_up(&s31_radio_waitq);
 }
 
+/* Defined in the radio payload (blob glue): recycles an esf_buf. */
+void s31_radio_wifi_free_rx_buffer(void *eb);
+
+/* Drain the RX esf_buf recycle queue.  Runs inside the blob pass with the
+ * gate held, so it is serialized with the MAC RX allocator and the Wi-Fi
+ * task. */
+static void s31_radio_wifi_free_pending(void)
+{
+	while (s31_wifi_free_tail != READ_ONCE(s31_wifi_free_head)) {
+		void *eb = s31_wifi_free_ring[s31_wifi_free_tail];
+
+		s31_wifi_free_ring[s31_wifi_free_tail] = NULL;
+		s31_wifi_free_tail = (s31_wifi_free_tail + 1) % S31_WIFI_FREE_SLOTS;
+		if (eb)
+			s31_radio_wifi_free_rx_buffer(eb);
+	}
+}
+
 static void s31_radio_wifi_deliver_scan(void)
 {
 	if (!s31_wifi_scan_ready || !s31_wifi_ops)
@@ -1434,6 +1591,11 @@ static bool s31_radio_wifi_tx_pending(void)
 	       time_after_eq(jiffies, READ_ONCE(s31_wifi_tx_retry_at));
 }
 
+static bool s31_radio_wifi_rx_pending(void)
+{
+	return READ_ONCE(s31_wifi_rx_head) != READ_ONCE(s31_wifi_rx_tail);
+}
+
 static void s31_radio_wifi_deliver_events(void)
 {
 	const struct esp32s31_radio_wifi_ops *ops = s31_wifi_ops;
@@ -1453,22 +1615,36 @@ static void s31_radio_wifi_deliver_events(void)
 		ops->disconnected(s31_wifi_context, s31_wifi_event_reason);
 	}
 	while (s31_wifi_rx_tail != smp_load_acquire(&s31_wifi_rx_head)) {
-		struct s31_wifi_frame *frame = &((struct s31_wifi_frame *)
+		struct s31_wifi_rx_desc *desc = &((struct s31_wifi_rx_desc *)
 			s31_radio_sram_linux_alias(s31_wifi_rx))[s31_wifi_rx_tail];
 
 		rx_frames_delivered++;
 		if (rx_frames_delivered <= 8)
 			pr_info("esp32s31-radio: RX frame #%u len=%u "
 				"delivered to cfg80211\n",
-				rx_frames_delivered, frame->length);
-		ops->receive(s31_wifi_context, frame->data, frame->length);
+				rx_frames_delivered, desc->length);
+		ops->receive(s31_wifi_context,
+			     s31_radio_sram_linux_alias(desc->data),
+			     desc->length);
 		s31_wifi_rx_tail = (s31_wifi_rx_tail + 1) % S31_WIFI_RX_SLOTS;
+		/* Queue the esf_buf for recycling; the blob pass drains it. */
+		if (desc->eb) {
+			unsigned int next =
+				(s31_wifi_free_head + 1) % S31_WIFI_FREE_SLOTS;
+
+			if (next != s31_wifi_free_tail)
+				s31_wifi_free_ring[s31_wifi_free_head] = desc->eb;
+			else
+				pr_warn_ratelimited("esp32s31-radio: RX free ring full\n");
+			s31_wifi_free_head = next;
+		}
 	}
 }
 
 static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 {
 	size_t free = gen_pool_avail(s31_radio_heap_pool);
+	size_t total = gen_pool_size(s31_radio_heap_pool);
 
 	health->state = atomic_read(&s31_radio_state);
 	health->wifi_init_result = READ_ONCE(s31_wifi_init_result);
@@ -1477,9 +1653,9 @@ static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 	health->tick_irqs = atomic_read(&s31_tick_irq_count);
 	health->worker_passes = atomic_read(&s31_radio_worker_passes);
 	health->commands_completed = atomic_read(&s31_radio_commands_completed);
-	health->heap_used = s31_radio_heap_size - free;
+	health->heap_used = total - free;
 	health->heap_peak = s31_radio_heap_peak;
-	health->heap_total = s31_radio_heap_size;
+	health->heap_total = total;
 	health->wifi_rx_dropped = atomic_read(&s31_wifi_rx_dropped);
 	health->wifi_tx_dropped = atomic_read(&s31_wifi_tx_dropped);
 }
@@ -1545,6 +1721,18 @@ static void s31_radio_process_commands(void)
 				command->result = -ENOMEM;
 			else
 				command->result = 0;
+			break;
+		case S31_RADIO_COMMAND_BT_ENABLE:
+#ifdef CONFIG_BT_ESP32S31
+			if (xTaskCreatePinnedToCore(s31_radio_bt_enable_task,
+						    "bt-enable", 8192, NULL, 22,
+						    NULL, 0) != 1)
+				command->result = -ENOMEM;
+			else
+				command->result = 0;
+#else
+			command->result = -EOPNOTSUPP;
+#endif
 			break;
 		default:
 			command->result = -EOPNOTSUPP;
@@ -1756,6 +1944,29 @@ int esp32s31_radio_wifi_disconnect(u16 reason)
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_disconnect);
 
+int esp32s31_radio_bt_enable(void)
+{
+#ifndef CONFIG_BT_ESP32S31
+	return -EOPNOTSUPP;
+#else
+	struct s31_radio_command command;
+
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
+		return -EAGAIN;
+	INIT_LIST_HEAD(&command.node);
+	init_completion(&command.done);
+	command.type = S31_RADIO_COMMAND_BT_ENABLE;
+	command.result = -EINPROGRESS;
+	spin_lock(&s31_radio_command_lock);
+	list_add_tail(&command.node, &s31_radio_commands);
+	spin_unlock(&s31_radio_command_lock);
+	wake_up(&s31_radio_waitq);
+	wait_for_completion(&command.done);
+	return command.result;
+#endif
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_bt_enable);
+
 int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
 {
 	unsigned long flags;
@@ -1766,6 +1977,9 @@ int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
 	spin_lock_irqsave(&s31_wifi_frame_lock, flags);
 	next = (s31_wifi_tx_head + 1) % S31_WIFI_TX_SLOTS;
 	if (next == s31_wifi_tx_tail) {
+		atomic_inc(&s31_wifi_tx_dropped);
+		pr_warn_ratelimited("esp32s31-radio: TX ring full, dropping frame len=%zu\n",
+				    length);
 		spin_unlock_irqrestore(&s31_wifi_frame_lock, flags);
 		return -ENOSPC;
 	}
@@ -1835,6 +2049,7 @@ static void s31_radio_run_blob_pass(void *opaque)
 	}
 	s31_radio_hci_process_tx();
 	s31_radio_wifi_process_tx();
+	s31_radio_wifi_free_pending();
 	atomic_inc(&s31_radio_worker_passes);
 	s31_linux_blob_leave();
 	/*
@@ -1855,6 +2070,18 @@ static int s31_radio_run_linux_pass(void)
 		.tick_events = atomic_xchg(&s31_tick_pending, 0),
 	};
 
+	/*
+	 * Drain the RX rings before acquiring the blob gate.  These only touch
+	 * Linux network-stack state (skb allocation, netif_rx) and must run in
+	 * ordinary Linux context.  Doing this first means a received frame is
+	 * handed to the net stack immediately after the RX callback wakes the
+	 * worker, instead of waiting for the worker to win the blob gate behind
+	 * a Wi-Fi task that can hold it for an entire AMPDU batch.
+	 */
+	s31_radio_hci_deliver_rx();
+	s31_radio_wifi_deliver_scan();
+	s31_radio_wifi_deliver_events();
+
 	if (s31_radio_worker_stack)
 		s31_linux_call_on_stack(s31_radio_worker_stack,
 					S31_RADIO_WORKER_STACK_SIZE,
@@ -1862,9 +2089,16 @@ static int s31_radio_run_linux_pass(void)
 	else
 		s31_radio_run_blob_pass(&args);
 
-	s31_radio_hci_deliver_rx();
-	s31_radio_wifi_deliver_scan();
-	s31_radio_wifi_deliver_events();
+	/*
+	 * The blob pass may have drained the TX ring.  If the net queue was
+	 * stopped because ndo_start_xmit saw the ring full, wake it now that
+	 * space is available again.  netif_wake_queue() is a no-op when the
+	 * queue is already running, so this is cheap in the common case.
+	 */
+	if (s31_wifi_ops && s31_wifi_ops->tx_wakeup &&
+	    (s31_wifi_tx_head + 1) % S31_WIFI_TX_SLOTS != s31_wifi_tx_tail)
+		s31_wifi_ops->tx_wakeup(s31_wifi_context);
+
 	return 0;
 }
 
@@ -1923,6 +2157,7 @@ static int s31_radio_runtime_thread(void *unused)
 	unsigned long next_tick;
 	const unsigned long tick_period = max_t(unsigned long, 1,
 							msecs_to_jiffies(10));
+	unsigned long next_heap_report;
 	bool hw_tick;
 	u32 identity_word, ioremap_word;
 	unsigned int cpu_mhz;
@@ -1974,9 +2209,15 @@ static int s31_radio_runtime_thread(void *unused)
 	pr_info("esp32s31-radio: Linux kthread task started\n");
 
 	next_tick = jiffies + tick_period;
+	next_heap_report = jiffies + 20 * HZ;
 	for (;;) {
 		s31_radio_sync_irq_registrations();
 		s31_radio_update_state();
+		if (time_after_eq(jiffies, next_heap_report)) {
+			s31_radio_heap_report("periodic");
+			s31_pc_sample_dump();
+			next_heap_report = jiffies + 20 * HZ;
+		}
 		if (!s31_radio_worker_stack &&
 		    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
 			s31_radio_worker_stack =
@@ -2014,7 +2255,8 @@ static int s31_radio_runtime_thread(void *unused)
 			s31_radio_irq_work_pending() ||
 			s31_radio_command_work_pending() ||
 				s31_radio_hci_tx_pending() ||
-				s31_radio_wifi_tx_pending(),
+				s31_radio_wifi_tx_pending() ||
+				s31_radio_wifi_rx_pending(),
 			time_before(jiffies, next_tick) ?
 				next_tick - jiffies : 1);
 		if (hw_tick)
@@ -2091,6 +2333,14 @@ static int __init s31_radio_runtime_init(void)
 					s31_radio_heap_size, MEMREMAP_WB);
 	if (!s31_radio_heap_linux)
 		return -ENOMEM;
+	s31_radio_heap_low_linux = memremap(S31_RADIO_HEAP_LOW_BASE,
+					    S31_RADIO_HEAP_LOW_SIZE, MEMREMAP_WB);
+	if (!s31_radio_heap_low_linux)
+		pr_warn("esp32s31-radio: cannot map low heap chunk\n");
+	s31_radio_heap2_linux = memremap(S31_RADIO_HEAP2_BASE,
+					 S31_RADIO_HEAP2_SIZE, MEMREMAP_WB);
+	if (!s31_radio_heap2_linux)
+		pr_warn("esp32s31-radio: cannot map heap2 chunk\n");
 	s31_radio_heap_pool = gen_pool_create(4, -1);
 	if (!s31_radio_heap_pool) {
 		memunmap(s31_radio_heap_linux);
@@ -2127,6 +2377,42 @@ static int __init s31_radio_runtime_init(void)
 	}
 	pr_info("esp32s31-radio: SRAM rings hci=%p/%p wifi=%p/%p\n",
 		s31_hci_rx, s31_hci_tx, s31_wifi_rx, s31_wifi_tx);
+	/*
+	 * Reclaim the parked factory app's idle upper-heap chunk as a second
+	 * blob-heap chunk.  It must be added only now: the Linux rings above
+	 * were just carved from the main chunk, so s31_radio_sram_linux_alias()
+	 * will never be handed a pointer that lives in this non-contiguous
+	 * chunk.  The blob's own heap_caps allocations touch it directly
+	 * through the init_mm identity mapping instead.
+	 */
+	ret = gen_pool_add(s31_radio_heap_pool, S31_RADIO_HEAP2_BASE,
+			   S31_RADIO_HEAP2_SIZE, -1);
+	if (ret) {
+		pr_warn("esp32s31-radio: cannot add SRAM heap2 %#x..%#x: %d\n",
+			S31_RADIO_HEAP2_BASE, S31_RADIO_HEAP2_END, ret);
+	} else {
+		pr_info("esp32s31-radio: added SRAM heap2 %#x..%#x (%zu bytes)\n",
+			S31_RADIO_HEAP2_BASE, S31_RADIO_HEAP2_END,
+			(size_t)S31_RADIO_HEAP2_SIZE);
+	}
+	/*
+	 * Reclaim the parked factory app's FreeRTOS heap as a third (low)
+	 * chunk.  The loader now reserves and zeroes it with a D-cache
+	 * writeback-invalidate, so unlike the earlier low-chunk experiment the
+	 * physical SRAM is clean before the MAC DMA touches any esf_buf that
+	 * lands here.  Still added after the rings so the Linux alias is never
+	 * asked to translate a pointer into this chunk.
+	 */
+	ret = gen_pool_add(s31_radio_heap_pool, S31_RADIO_HEAP_LOW_BASE,
+			   S31_RADIO_HEAP_LOW_SIZE, -1);
+	if (ret) {
+		pr_warn("esp32s31-radio: cannot add SRAM heap-low %#x..%#x: %d\n",
+			S31_RADIO_HEAP_LOW_BASE, S31_RADIO_HEAP_LOW_END, ret);
+	} else {
+		pr_info("esp32s31-radio: added SRAM heap-low %#x..%#x (%zu bytes)\n",
+			S31_RADIO_HEAP_LOW_BASE, S31_RADIO_HEAP_LOW_END,
+			(size_t)S31_RADIO_HEAP_LOW_SIZE);
+	}
 	task = kthread_create(s31_radio_watchdog_thread, NULL,
 			      "s31-radio-watchdog");
 	if (!IS_ERR(task))

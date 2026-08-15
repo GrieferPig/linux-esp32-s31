@@ -52,6 +52,9 @@ SECTIONS
 		 * names.  They are executable code, so keep them in the XIP text image
 		 * instead of allowing orphan placement beside the SRAM data load. */
 		*esp32s31-radio-idf.o(.iram1 .iram1.* .wifi*iram* .coexiram .coexiram.*)
+		/* The blob's read-only constants are XIP-able: keeping them out of
+		 * the small internal-SRAM heap frees ~82 KiB for RX/TX buffers. */
+		*esp32s31-radio-idf.o(.rodata* .srodata*)
 #endif
 		_etext = .;
 	}
@@ -62,7 +65,6 @@ SECTIONS
 	.s31_radio.data 0x2f030000 : AT(__s31_radio_data_load - KERNEL_LINK_ADDR) {
 		__s31_radio_data_start = .;
 		*esp32s31-radio-idf.o(
-			.rodata* .srodata*
 			.data* .sdata* .dram1*
 			.init_array* .tdata*)
 		. = ALIGN(8);

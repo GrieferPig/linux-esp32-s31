@@ -63,6 +63,7 @@ struct esp32s31_radio_wifi_ops {
 			  u8 channel);
 	void (*disconnected)(void *context, u16 reason);
 	void (*receive)(void *context, const u8 *frame, size_t length);
+	void (*tx_wakeup)(void *context);
 };
 
 /*
@@ -84,5 +85,6 @@ int esp32s31_radio_wifi_connect(
 		const struct esp32s31_radio_wifi_connect_params *params);
 int esp32s31_radio_wifi_disconnect(u16 reason);
 int esp32s31_radio_wifi_send(const u8 *frame, size_t length);
+int esp32s31_radio_bt_enable(void);
 
 #endif /* _LINUX_ESP32S31_RADIO_H */

@@ -19,6 +19,13 @@ static struct s31_hci s31_hci;
 
 static int s31_hci_open(struct hci_dev *hdev)
 {
+	int ret;
+
+	/* Powering on hci0 enables the integrated controller via the serialized
+	 * radio core. */
+	ret = esp32s31_radio_bt_enable();
+	if (ret && ret != -EALREADY)
+		return ret;
 	return 0;
 }
 

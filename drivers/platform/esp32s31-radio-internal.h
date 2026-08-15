@@ -91,6 +91,7 @@ void s31_radio_wifi_scan_complete(const struct esp32s31_radio_wifi_ap *aps,
 void s31_radio_wifi_connected(const u8 *bssid, u8 channel, int status);
 void s31_radio_wifi_disconnected(u16 reason);
 int s31_radio_wifi_receive(u8 *frame, u16 length);
+int s31_radio_wifi_receive_zerocopy(u8 *frame, void *eb, u16 length);
 void s31_radio_timing_blob_enter(void);
 void s31_radio_timing_reset(void);
 u32 s31_radio_timing_tx_begin(u64 enqueue_ns, u64 start_ns,
