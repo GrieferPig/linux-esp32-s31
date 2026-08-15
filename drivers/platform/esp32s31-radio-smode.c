@@ -258,6 +258,8 @@ size_t __wrap_heap_caps_get_free_size(u32 caps)
 /* Wi-Fi RX/TX drop counters, read by the heap report for stall diagnostics. */
 static atomic_t s31_wifi_rx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
+static atomic_t s31_wifi_rx_delivered = ATOMIC_INIT(0);
+static atomic_t s31_wifi_rx_freed = ATOMIC_INIT(0);
 
 void s31_radio_heap_report(const char *stage)
 {
@@ -265,11 +267,13 @@ void s31_radio_heap_report(const char *stage)
 	size_t total = gen_pool_size(s31_radio_heap_pool);
 	int i;
 
-	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d\n",
+	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d\n",
 		stage, total - free, s31_radio_heap_peak, free, total,
 		atomic_read(&s31_idf_alloc_failures),
 		atomic_read(&s31_wifi_rx_dropped),
-		atomic_read(&s31_wifi_tx_dropped));
+		atomic_read(&s31_wifi_tx_dropped),
+		atomic_read(&s31_wifi_rx_delivered),
+		atomic_read(&s31_wifi_rx_freed));
 	if (stage[0] == 'p') {	/* periodic */
 		for (i = 0; i < S31_HEAP_HIST_BUCKETS; i++) {
 			if (!s31_heap_hist[i].live && !s31_heap_hist[i].peak)
@@ -485,10 +489,9 @@ static bool s31_wifi_scan_ready;
  * enough to absorb a full rx_ba_win=64 AMPDU burst without the old 25.6 KiB
  * data-ring cost. */
 #define S31_WIFI_RX_SLOTS	128
-/* The zero-copy RX freed ~25 KiB and .rodata is now XIP, so the TX ring can
- * be deepened to absorb the ACK burst queued while the Wi-Fi task holds the
- * gate for a full rx_ba_win=64 AMPDU batch. */
-#define S31_WIFI_TX_SLOTS	48
+/* 32 slots is a BT+WiFi compromise: large enough for most ACK bursts, small
+ * enough that the blob heap still has room for the dynamic RX/TX pools. */
+#define S31_WIFI_TX_SLOTS	32
 
 struct s31_wifi_frame {
 	u16 length;
@@ -508,8 +511,14 @@ struct s31_wifi_rx_desc {
 
 /* esf_buf handles awaiting recycle.  Written by the worker after the net
  * stack consumes a frame, drained inside the blob pass where the gate is
- * held (single-threaded with the MAC RX allocator). */
-#define S31_WIFI_FREE_SLOTS	128
+ * held (single-threaded with the MAC RX allocator).
+ *
+ * Must be larger than S31_WIFI_RX_SLOTS: the worker can deliver a full
+ * zero-copy RX ring (128 ebs) before the next blob pass drains the recycle
+ * queue.  A full recycle ring used to silently advance the head and leak the
+ * queued esf_bufs; that leak exhausted the BT+WiFi heap during downloads.
+ */
+#define S31_WIFI_FREE_SLOTS	160
 static void *s31_wifi_free_ring[S31_WIFI_FREE_SLOTS];
 static unsigned int s31_wifi_free_head;
 static unsigned int s31_wifi_free_tail;
@@ -1541,8 +1550,10 @@ static void s31_radio_wifi_free_pending(void)
 
 		s31_wifi_free_ring[s31_wifi_free_tail] = NULL;
 		s31_wifi_free_tail = (s31_wifi_free_tail + 1) % S31_WIFI_FREE_SLOTS;
-		if (eb)
+		if (eb) {
 			s31_radio_wifi_free_rx_buffer(eb);
+			atomic_inc(&s31_wifi_rx_freed);
+		}
 	}
 }
 
@@ -1626,17 +1637,24 @@ static void s31_radio_wifi_deliver_events(void)
 		ops->receive(s31_wifi_context,
 			     s31_radio_sram_linux_alias(desc->data),
 			     desc->length);
+		atomic_inc(&s31_wifi_rx_delivered);
 		s31_wifi_rx_tail = (s31_wifi_rx_tail + 1) % S31_WIFI_RX_SLOTS;
 		/* Queue the esf_buf for recycling; the blob pass drains it. */
 		if (desc->eb) {
 			unsigned int next =
 				(s31_wifi_free_head + 1) % S31_WIFI_FREE_SLOTS;
 
-			if (next != s31_wifi_free_tail)
+			if (next != s31_wifi_free_tail) {
 				s31_wifi_free_ring[s31_wifi_free_head] = desc->eb;
-			else
+				s31_wifi_free_head = next;
+			} else {
+				/* With S31_WIFI_FREE_SLOTS > S31_WIFI_RX_SLOTS
+				 * this is unreachable.  Do not advance the head:
+				 * that would make the full ring look empty and
+				 * leak every queued esf_buf.
+				 */
 				pr_warn_ratelimited("esp32s31-radio: RX free ring full\n");
-			s31_wifi_free_head = next;
+			}
 		}
 	}
 }
