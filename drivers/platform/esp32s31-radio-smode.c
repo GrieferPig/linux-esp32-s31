@@ -2194,7 +2194,7 @@ static int s31_radio_runtime_thread(void *unused)
 		identity_word, cpu_mhz);
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
-	pr_info("esp32s31-radio: ILP32F Wi-Fi-only payload linked\n");
+	pr_info("esp32s31-radio: ILP32F Wi-Fi/BT payload linked\n");
 	hw_tick = s31_radio_tick_init() == 0;
 	if (!hw_tick)
 		pr_warn("esp32s31-radio: TIMG1/T1 unavailable, using jiffies tick\n");

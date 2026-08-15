@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/esp32s31-radio.h>
 #include <linux/init.h>
+#include <linux/printk.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 
@@ -72,6 +73,18 @@ static void s31_hci_receive(void *context, const u8 *frame, size_t length)
 
 	if (!radio->hdev || length < 2)
 		return;
+	/* The BTDM controller emits an unsolicited NOP command-complete
+	 * (04 0e 03 01 00 00) before the first host command is sent.  If we
+	 * forward it, the HCI core sees opcode 0 while a real command is
+	 * pending and logs "unexpected event for opcode 0x0000".  It is a
+	 * boot quirk, not a transport error; drop only that exact frame.
+	 */
+	if (length == 6 && frame[0] == 0x04 && frame[1] == 0x0e &&
+	    frame[2] == 0x03 && frame[3] == 0x01 &&
+	    frame[4] == 0x00 && frame[5] == 0x00) {
+		pr_info_once("esp32s31-hci: dropped unsolicited initial NOP complete\n");
+		return;
+	}
 	skb = bt_skb_alloc(length - 1, GFP_KERNEL);
 	if (!skb) {
 		radio->hdev->stat.err_rx++;
