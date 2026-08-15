@@ -260,6 +260,7 @@ static atomic_t s31_wifi_rx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_delivered = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_freed = ATOMIC_INIT(0);
+static atomic_t s31_wifi_tx_done = ATOMIC_INIT(0);
 
 void s31_radio_heap_report(const char *stage)
 {
@@ -267,13 +268,14 @@ void s31_radio_heap_report(const char *stage)
 	size_t total = gen_pool_size(s31_radio_heap_pool);
 	int i;
 
-	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d\n",
+	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d tx_done=%d\n",
 		stage, total - free, s31_radio_heap_peak, free, total,
 		atomic_read(&s31_idf_alloc_failures),
 		atomic_read(&s31_wifi_rx_dropped),
 		atomic_read(&s31_wifi_tx_dropped),
 		atomic_read(&s31_wifi_rx_delivered),
-		atomic_read(&s31_wifi_rx_freed));
+		atomic_read(&s31_wifi_rx_freed),
+		atomic_read(&s31_wifi_tx_done));
 	if (stage[0] == 'p') {	/* periodic */
 		for (i = 0; i < S31_HEAP_HIST_BUCKETS; i++) {
 			if (!s31_heap_hist[i].live && !s31_heap_hist[i].peak)
@@ -716,6 +718,8 @@ void s31_radio_timing_tx_done(bool status, const u8 *frame, u16 length)
 	unsigned long flags;
 	u64 now = ktime_get_mono_fast_ns();
 	u32 i;
+
+	atomic_inc(&s31_wifi_tx_done);
 
 	spin_lock_irqsave(&s31_tx_timing_lock, flags);
 	for (i = s31_tx_tail; i < s31_tx_head; i++) {
@@ -1583,7 +1587,7 @@ static void s31_radio_wifi_process_tx(void)
 			s31_radio_timing_tx_return(sequence,
 						   ktime_get_mono_fast_ns(), ret);
 		}
-		if (ret == -EAGAIN) {
+		if (ret == -EAGAIN || ret == 257) { /* 257 == ESP_ERR_NO_MEM */
 			s31_wifi_tx_retry_at = jiffies + 1;
 			break;
 		}
