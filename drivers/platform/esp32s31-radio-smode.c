@@ -261,6 +261,7 @@ static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_delivered = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_freed = ATOMIC_INIT(0);
 static atomic_t s31_wifi_tx_done = ATOMIC_INIT(0);
+static atomic_t s31_wifi_rx_cb = ATOMIC_INIT(0);
 
 void s31_radio_heap_report(const char *stage)
 {
@@ -268,14 +269,15 @@ void s31_radio_heap_report(const char *stage)
 	size_t total = gen_pool_size(s31_radio_heap_pool);
 	int i;
 
-	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d tx_done=%d\n",
+	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d tx_done=%d rx_cb=%d\n",
 		stage, total - free, s31_radio_heap_peak, free, total,
 		atomic_read(&s31_idf_alloc_failures),
 		atomic_read(&s31_wifi_rx_dropped),
 		atomic_read(&s31_wifi_tx_dropped),
 		atomic_read(&s31_wifi_rx_delivered),
 		atomic_read(&s31_wifi_rx_freed),
-		atomic_read(&s31_wifi_tx_done));
+		atomic_read(&s31_wifi_tx_done),
+		atomic_read(&s31_wifi_rx_cb));
 	if (stage[0] == 'p') {	/* periodic */
 		for (i = 0; i < S31_HEAP_HIST_BUCKETS; i++) {
 			if (!s31_heap_hist[i].live && !s31_heap_hist[i].peak)
@@ -491,9 +493,10 @@ static bool s31_wifi_scan_ready;
  * enough to absorb a full rx_ba_win=64 AMPDU burst without the old 25.6 KiB
  * data-ring cost. */
 #define S31_WIFI_RX_SLOTS	128
-/* 32 slots is a BT+WiFi compromise: large enough for most ACK bursts, small
- * enough that the blob heap still has room for the dynamic RX/TX pools. */
-#define S31_WIFI_TX_SLOTS	32
+/* 48 slots is needed for BT+WiFi on a busy 2.4G channel: the Griefer ACK
+ * burst filled the 32-slot ring and dropped TCP ACKs.  The blob heap still
+ * has ~95 KiB free with dynamic RX capped at 32. */
+#define S31_WIFI_TX_SLOTS	48
 
 struct s31_wifi_frame {
 	u16 length;
@@ -1448,6 +1451,7 @@ int s31_radio_wifi_receive_zerocopy(u8 *frame, void *eb, u16 length)
 
 	if (!frame || length < ETH_HLEN || length > S31_WIFI_FRAME_SIZE)
 		return -EINVAL;
+	atomic_inc(&s31_wifi_rx_cb);
 	rx_count++;
 	if (rx_count <= 4)
 		pr_info("esp32s31-radio: wifi_receive #%u len=%u\n",
