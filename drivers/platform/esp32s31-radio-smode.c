@@ -1979,6 +1979,13 @@ int esp32s31_radio_bt_enable(void)
 
 	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
 		return -EAGAIN;
+	/* The BTDM controller enable path is one-shot: a second enable from
+	 * bluetoothd/hci0 open would run esp_bt_controller_enable() again and
+	 * block in the blob.  If the payload already reported success, tell the
+	 * HCI open path that the controller is already enabled.
+	 */
+	if (READ_ONCE(s31_bt_enable_result) == 0)
+		return 0;
 	INIT_LIST_HEAD(&command.node);
 	init_completion(&command.done);
 	command.type = S31_RADIO_COMMAND_BT_ENABLE;
