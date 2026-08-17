@@ -98,4 +98,9 @@ config SOC_CANAAN_K210
 	help
 	  This enables support for Canaan Kendryte K210 SoC platform hardware.
 
+config ARCH_ESPRESSIF
+	bool "Espressif RISC-V SoCs"
+	help
+	  This enables support for Espressif RISC-V SoCs.
+
 endmenu # "SoC selection"
