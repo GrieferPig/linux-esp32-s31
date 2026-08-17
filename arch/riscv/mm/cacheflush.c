@@ -99,12 +99,42 @@ void flush_icache_mm(struct mm_struct *mm, bool local)
 #ifdef CONFIG_MMU
 void flush_icache_pte(struct mm_struct *mm, pte_t pte)
 {
-	struct folio *folio = page_folio(pte_page(pte));
+	unsigned long pfn = pte_pfn(pte);
+	struct folio *folio;
 
+#ifdef CONFIG_ESP32S31_CACHE
+	/*
+	 * ESP32-S31: the split, non-coherent SoC ICache/DCache are out of fence.i's
+	 * reach, so I-cache sync is delegated to OpenSBI. Flash XIP pages (no struct
+	 * page) are read-only/immutable and need no maintenance; only PSRAM/RAM exec
+	 * pages (possibly CPU-written before exec) need writeback-D + invalidate-I,
+	 * once per page (PG_dcache_clean).
+	 */
+	if (!pfn_valid(pfn))
+		return;
+
+	folio = page_folio(pfn_to_page(pfn));
+	if (!test_bit(PG_dcache_clean, &folio->flags.f)) {
+		esp32s31_flush_icache_range((phys_addr_t)pfn << PAGE_SHIFT, PAGE_SIZE);
+		set_bit(PG_dcache_clean, &folio->flags.f);
+	}
+#else
+	/*
+	 * Code executed in place from a device/XIP mapping has no struct page,
+	 * so page_folio() would deref the unpopulated vmemmap. Just flush the
+	 * I-cache for those PFNs.
+	 */
+	if (!pfn_valid(pfn)) {
+		flush_icache_mm(mm, false);
+		return;
+	}
+
+	folio = page_folio(pfn_to_page(pfn));
 	if (!test_bit(PG_dcache_clean, &folio->flags.f)) {
 		flush_icache_mm(mm, false);
 		set_bit(PG_dcache_clean, &folio->flags.f);
 	}
+#endif
 }
 #endif /* CONFIG_MMU */
 

@@ -8,9 +8,22 @@
 
 #include <linux/mm.h>
 
+#ifdef CONFIG_ESP32S31_CACHE
+void esp32s31_flush_icache(void);
+void esp32s31_flush_icache_range(phys_addr_t paddr, size_t size);
+#endif
+
 static inline void local_flush_icache_all(void)
 {
 	asm volatile ("fence.i" ::: "memory");
+#ifdef CONFIG_ESP32S31_CACHE
+	/*
+	 * fence.i has nothing to act on here: this SoC keeps no cache inside
+	 * the CPU IP, and its external ICache/Shared-DCache are split and
+	 * non-coherent. Delegate the real writeback-D + invalidate-I to OpenSBI.
+	 */
+	esp32s31_flush_icache();
+#endif
 }
 
 static inline void local_flush_icache_range(unsigned long start,
