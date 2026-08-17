@@ -1,3 +1,9 @@
+> **⚠️ Espressif Fork**: This repository is Espressif's downstream fork of the Linux kernel with support for ESP32S31.  
+> **⚠️ Developer Preview**: This branch (`integration/v6.18-esp32s31`) is currently in developer preview and is **not yet recommended for production use**.  
+> 📖 See [Espressif Documentation](Documentation/espressif/README.md) for branch strategy, chip support, and Espressif-specific information.
+
+---
+
 Linux kernel
 ============
 

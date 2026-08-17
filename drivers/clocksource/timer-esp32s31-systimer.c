@@ -167,7 +167,8 @@ static int __init systimer_init(struct device_node *np)
 	systimer.ce.features		= CLOCK_EVT_FEAT_ONESHOT;
 	/* Above riscv_timer's max rating (450 with Sstc): the systimer clockevent
 	 * MUST win, or the kernel falls back to the CLINT clockevent whose MTIME
-	 * freezes in WFI (FORCE_ON is intentionally not set) -> idle hang. */
+	 * freezes in WFI (FORCE_ON is intentionally not set) -> idle hang.
+	 */
 	systimer.ce.rating		= 500;
 	systimer.ce.set_next_event	= systimer_set_next_event;
 	systimer.ce.set_state_shutdown	= systimer_shutdown;
@@ -183,7 +184,8 @@ static int __init systimer_init(struct device_node *np)
 	}
 
 	/* min_delta well above the snapshot read+program latency so a one-shot
-	 * deadline can't be programmed already in the past. */
+	 * deadline can't be programmed already in the past.
+	 */
 	clockevents_config_and_register(&systimer.ce, rate, 0x10, 0x7fffffff);
 	pr_info("esp32s31-systimer: %u Hz clocksource+clockevent, irq %d\n", rate, irq);
 	return 0;

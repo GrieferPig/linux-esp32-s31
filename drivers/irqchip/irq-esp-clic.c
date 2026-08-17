@@ -159,7 +159,8 @@ static int esp_clic_domain_alloc(struct irq_domain *domain, unsigned int virq,
 
 		/* clear any pending bit latched by ROM/OpenSBI before this slot
 		 * gets a handler, so the first unmask doesn't take a spurious
-		 * interrupt. */
+		 * interrupt.
+		 */
 		writeb_relaxed(0, priv->base + CLIC_INTIP_OFF(src));
 		writeb_relaxed(CLIC_CTL_MAX_PRIO,
 			       priv->base + CLIC_INTCTL_OFF(src));

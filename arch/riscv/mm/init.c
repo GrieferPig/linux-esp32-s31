@@ -714,9 +714,9 @@ static void __meminit create_p4d_mapping(p4d_t *p4dp, uintptr_t va, phys_addr_t 
 #define create_pgd_next_mapping(__nextp, __va, __pa, __sz, __prot)	\
 	create_pte_mapping(__nextp, __va, __pa, __sz, __prot)
 #define fixmap_pgd_next		((uintptr_t)fixmap_pte)
-#define create_p4d_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while(0)
-#define create_pud_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while(0)
-#define create_pmd_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while(0)
+#define create_p4d_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while (0)
+#define create_pud_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while (0)
+#define create_pmd_mapping(__pmdp, __va, __pa, __sz, __prot) do {} while (0)
 #endif /* __PAGETABLE_PMD_FOLDED */
 
 void __meminit create_pgd_mapping(pgd_t *pgdp, uintptr_t va, phys_addr_t pa, phys_addr_t sz,

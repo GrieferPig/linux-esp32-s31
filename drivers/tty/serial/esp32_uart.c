@@ -85,7 +85,8 @@
 
 /* ESP32-S3+ keeps CLKDIV/CONF0/CONF1 in the APB clock domain; writes only take
  * effect in the UART core after pulsing REG_UPDATE and waiting for it to clear.
- * The original ESP32 has no such register (gated on has_clkconf below). */
+ * The original ESP32 has no such register (gated on has_clkconf below).
+ */
 #define UART_REG_UPDATE_REG		0x98
 #define UART_REG_UPDATE			BIT(0)
 
@@ -159,7 +160,8 @@ static u32 esp32_uart_read(struct uart_port *port, unsigned long reg)
 
 /* Latch APB-domain config writes (CLKDIV/CONF0/CONF1/CLK_CONF) into the UART
  * core. Without this, e.g. the RX-FIFO-full threshold never takes effect and
- * interrupt-driven RX is unreliable. No-op on the original ESP32. */
+ * interrupt-driven RX is unreliable. No-op on the original ESP32.
+ */
 static void esp32_uart_sync_regs(struct uart_port *port)
 {
 	if (!port_variant(port)->has_clkconf)

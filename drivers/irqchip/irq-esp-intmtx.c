@@ -43,7 +43,8 @@
 
 /* Largest ETS source we'll accept from DT. The matrix has ~100 sources
  * on the chip; cap at 127 here defensively — anything beyond
- * INTMTX_MAX_SRC writes off the documented window. */
+ * INTMTX_MAX_SRC writes off the documented window.
+ */
 #define INTMTX_MAX_SRC		127U
 
 struct esp_intmtx {
@@ -210,7 +211,8 @@ static int __init esp_intmtx_init(struct device_node *node,
 
 	/* Clear every source's slot routing so we start from a known
 	 * state — anything OpenSBI or the chip ROM left in place is
-	 * unmapped here. */
+	 * unmapped here.
+	 */
 	for (src = 0; src <= INTMTX_MAX_SRC; src++)
 		writel_relaxed(0, priv->base + INTMTX_SRC_REG(src));
 

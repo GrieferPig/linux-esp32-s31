@@ -15,9 +15,9 @@
 
 #define pr_fmt(fmt) "esp32s31-cache: " fmt
 
+#include <linux/cacheflush.h>
 #include <linux/init.h>
 #include <linux/printk.h>
-#include <asm/cacheflush.h>
 #include <asm/dma-noncoherent.h>
 #include <asm/sbi.h>
 
@@ -29,7 +29,8 @@
 #define S31_SBI_ICACHE_SYNC_RANGE	4
 
 /* The vendor extension ID is derived from mvendorid, matching OpenSBI's
- * sbi_ecall_vendor_id(). Cached on first use (one SBI call). */
+ * sbi_ecall_vendor_id(). Cached on first use (one SBI call).
+ */
 static unsigned long esp32s31_cache_extid(void)
 {
 	static unsigned long extid;
@@ -98,7 +99,8 @@ static int __init esp32s31_cache_init(void)
 	/* Probe the cache ecall with a REAL (non-zero) writeback over mapped
 	 * PSRAM, so this actually exercises the M-mode ROM Cache_WriteBack_Addr
 	 * call. A zero-size probe is a no-op and would hide an M-mode PMP/ROM
-	 * fault until the first real DMA sync. */
+	 * fault until the first real DMA sync.
+	 */
 	ret = sbi_ecall(esp32s31_cache_extid(), S31_SBI_CACHE_WBACK,
 			0x50000000UL, 64, 0, 0, 0, 0);
 	if (ret.error) {
