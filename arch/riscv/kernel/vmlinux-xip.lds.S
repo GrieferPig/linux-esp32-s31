@@ -66,7 +66,21 @@ SECTIONS
  * From this point, stuff is considered writable and will be copied to RAM
  */
 	__data_loc = ALIGN(PAGE_SIZE);		/* location in file */
+#ifdef CONFIG_32BIT
+	/*
+	 * rv32 Sv32: PGD entries are 4 MiB (PGDIR_SIZE).  Flash text and RAM
+	 * data must live in *different* PGD entries so both can be mapped
+	 * simultaneously — a single PGD megapage can only point to one
+	 * physical region.  PGDIR_SIZE alignment pushes _sdata into the next
+	 * 4 MiB slot; the gap exists only in VMA (the LMA in flash stays
+	 * compact).  This also lets va_pa_offset be set so the linear map
+	 * starts at _sdata's VA, eliminating the PSRAM-page shadow that
+	 * would otherwise make ~2 MiB of RAM inaccessible.
+	 */
+	. = ALIGN(1 << 22);			/* PGDIR_SIZE for Sv32 */
+#else
 	. = ALIGN(SECTION_ALIGN);		/* location in memory */
+#endif
 
 #undef LOAD_OFFSET
 #define LOAD_OFFSET (KERNEL_LINK_ADDR + _sdata - __data_loc)

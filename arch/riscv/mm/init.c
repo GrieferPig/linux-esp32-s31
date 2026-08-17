@@ -774,9 +774,13 @@ asmlinkage void __init __copy_data(void)
 {
 	void *from = (void *)(&__data_loc);
 	void *to = (void *)CONFIG_PHYS_RAM_BASE;
-	size_t sz = (size_t)((uintptr_t)(&_end) - (uintptr_t)(&_sdata));
+	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) -
+				   (uintptr_t)(&_sdata));
+	size_t bss_sz = (size_t)((uintptr_t)(&_end) -
+				  (uintptr_t)(&__bss_start));
 
-	memcpy(to, from, sz);
+	memcpy(to, from, data_sz);
+	memset(to + data_sz, 0, bss_sz);
 }
 #endif
 
@@ -1153,8 +1157,20 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * physical addresses (if the start of dram is different from the
 	 * kernel physical address start).
 	 */
-	kernel_map.va_pa_offset = IS_ENABLED(CONFIG_64BIT) ?
-				0UL : PAGE_OFFSET - kernel_map.phys_addr;
+	if (IS_ENABLED(CONFIG_64BIT))
+		kernel_map.va_pa_offset = 0UL;
+	else if (IS_ENABLED(CONFIG_XIP_KERNEL))
+		/*
+		 * rv32 XIP: align the linear map so it starts at _sdata's
+		 * VMA.  With _sdata PGDIR_SIZE-aligned this puts PSRAM's
+		 * linear map in PGD entries that don't collide with the
+		 * flash-text PGD entry, so no PSRAM pages lose their
+		 * linear-map VA.
+		 */
+		kernel_map.va_pa_offset =
+				kernel_map.va_kernel_xip_data_pa_offset;
+	else
+		kernel_map.va_pa_offset = PAGE_OFFSET - kernel_map.phys_addr;
 
 	memory_limit = KERN_VIRT_SIZE;
 
@@ -1219,7 +1235,12 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 #else
 	/* Setup trampoline PGD */
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
-			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#ifdef CONFIG_XIP_KERNEL
+			   kernel_map.xiprom,
+#else
+			   kernel_map.phys_addr,
+#endif
+			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
 #endif
 
 	/*
@@ -1358,7 +1379,8 @@ static void __init setup_vm_final(void)
 	create_linear_mapping_page_table();
 
 	/* Map the kernel */
-	if (IS_ENABLED(CONFIG_64BIT))
+	if (IS_ENABLED(CONFIG_64BIT) ||
+	    IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
 
 #ifdef CONFIG_KASAN

@@ -2,6 +2,12 @@
 #ifndef _ASM_RISCV_RUNTIME_CONST_H
 #define _ASM_RISCV_RUNTIME_CONST_H
 
+#ifdef CONFIG_XIP_KERNEL
+/* XIP: kernel text is in read-only flash — can't patch instructions.
+ * Fall back to the generic (variable-load) implementation. */
+#include <asm-generic/runtime-const.h>
+#else
+
 #include <asm/asm.h>
 #include <asm/alternative.h>
 #include <asm/cacheflush.h>
@@ -265,4 +271,5 @@ static inline void runtime_const_fixup(void (*fn)(void *, unsigned long),
 	}
 }
 
+#endif /* !CONFIG_XIP_KERNEL */
 #endif /* _ASM_RISCV_RUNTIME_CONST_H */
