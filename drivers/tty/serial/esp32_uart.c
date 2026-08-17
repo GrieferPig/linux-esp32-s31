@@ -83,6 +83,12 @@
 #define ESP32S3_UART_TX_RST_CORE		BIT(26)
 #define ESP32S3_UART_RX_RST_CORE		BIT(27)
 
+/* ESP32-S3+ keeps CLKDIV/CONF0/CONF1 in the APB clock domain; writes only take
+ * effect in the UART core after pulsing REG_UPDATE and waiting for it to clear.
+ * The original ESP32 has no such register (gated on has_clkconf below). */
+#define UART_REG_UPDATE_REG		0x98
+#define UART_REG_UPDATE			BIT(0)
+
 #define ESP32S3_UART_CLK_CONF_DEFAULT \
 	(ESP32S3_UART_RX_SCLK_EN | \
 	 ESP32S3_UART_TX_SCLK_EN | \
@@ -149,6 +155,18 @@ static void esp32_uart_write(struct uart_port *port, unsigned long reg, u32 v)
 static u32 esp32_uart_read(struct uart_port *port, unsigned long reg)
 {
 	return readl(port->membase + reg);
+}
+
+/* Latch APB-domain config writes (CLKDIV/CONF0/CONF1/CLK_CONF) into the UART
+ * core. Without this, e.g. the RX-FIFO-full threshold never takes effect and
+ * interrupt-driven RX is unreliable. No-op on the original ESP32. */
+static void esp32_uart_sync_regs(struct uart_port *port)
+{
+	if (!port_variant(port)->has_clkconf)
+		return;
+	esp32_uart_write(port, UART_REG_UPDATE_REG, UART_REG_UPDATE);
+	while (esp32_uart_read(port, UART_REG_UPDATE_REG) & UART_REG_UPDATE)
+		cpu_relax();
 }
 
 static u32 esp32_uart_tx_fifo_cnt(struct uart_port *port)
@@ -343,6 +361,7 @@ static int esp32_uart_startup(struct uart_port *port)
 	esp32_uart_write(port, UART_CONF1_REG,
 			 (1 << UART_RXFIFO_FULL_THRHD_SHIFT) |
 			 (1 << port_variant(port)->txfifo_empty_thrhd_shift));
+	esp32_uart_sync_regs(port);	/* latch the RX-FIFO-full threshold */
 	esp32_uart_write(port, UART_INT_CLR_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
 	esp32_uart_write(port, UART_INT_ENA_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
 	spin_unlock_irqrestore(&port->lock, flags);
@@ -381,6 +400,7 @@ static bool esp32_uart_set_baud(struct uart_port *port, u32 baud)
 
 		esp32_uart_write(port, UART_CLKDIV_REG,
 				 div | FIELD_PREP(UART_CLKDIV_FRAG, frag));
+		esp32_uart_sync_regs(port);
 		return true;
 	}
 
@@ -445,6 +465,7 @@ static void esp32_uart_set_termios(struct uart_port *port,
 
 	esp32_uart_write(port, UART_CONF0_REG, conf0);
 	esp32_uart_write(port, UART_CONF1_REG, conf1);
+	esp32_uart_sync_regs(port);
 
 	if (baud) {
 		esp32_uart_set_baud(port, baud);
