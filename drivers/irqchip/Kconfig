@@ -658,6 +658,32 @@ config STARFIVE_JH8100_INTC
 
 	  If you don't know what to do here, say Y.
 
+config ESP_CLIC
+	bool "Espressif ESP32-S31 CLIC S-mode irqchip"
+	depends on RISCV
+	select IRQ_DOMAIN_HIERARCHY
+	select RISCV_ESP_CLIC_TRAP_QUIRK
+	help
+	  Drive the S-mode view of the ESP32-S31's CLIC (0x10A00000)
+	  so Linux can take external peripheral interrupts. OpenSBI is
+	  responsible for delegating the CLIC external sources to S-mode
+	  at boot; this driver owns enable/mask/priority/trigger from
+	  there.
+
+	  If unsure, say N.
+
+config ESP_INTMTX
+	bool "Espressif ESP32-S31 INTMTX peripheral router"
+	depends on ESP_CLIC
+	select IRQ_DOMAIN_HIERARCHY
+	help
+	  Drive the ESP32-S31 INTMTX, which routes peripheral source
+	  lines to CLIC slots. Sits between peripheral drivers and
+	  irq-esp-clic in the irq-domain hierarchy and allocates CLIC
+	  slots on demand.
+
+	  If unsure, say N.
+
 config ACLINT_SSWI
 	bool "RISC-V ACLINT S-mode IPI Interrupt Controller"
 	depends on RISCV

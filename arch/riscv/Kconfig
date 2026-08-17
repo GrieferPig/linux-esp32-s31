@@ -366,6 +366,15 @@ config RISCV_NONSTANDARD_CACHE_OPS
 	  This enables function pointer support for non-standard noncoherent
 	  systems to handle cache management.
 
+config RISCV_ESP_CLIC_TRAP_QUIRK
+	bool
+	help
+	  CLIC-mode trap-handling quirks in entry.S for the Espressif
+	  ESP32-S31: 64-byte alignment of the trap vector (stvec.base[5:0]
+	  are hardware-forced to 0 in CLIC mode) and masking of the CLIC
+	  extension bits in scause. Selected by ESP_CLIC; no effect on other
+	  platforms.
+
 config AS_HAS_INSN
 	def_bool $(as-instr,.insn 0x100000f)
 

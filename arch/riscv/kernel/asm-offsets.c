@@ -126,6 +126,9 @@ void asm_offsets(void)
 	OFFSET(PT_STATUS, pt_regs, status);
 	OFFSET(PT_BADADDR, pt_regs, badaddr);
 	OFFSET(PT_CAUSE, pt_regs, cause);
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+	OFFSET(PT_CLIC_SCAUSE, pt_regs, clic_scause);
+#endif
 
 	OFFSET(SUSPEND_CONTEXT_REGS, suspend_context, regs);
 
