@@ -782,4 +782,13 @@ config NXP_STM_TIMER
           Enables the support for NXP System Timer Module found in the
           s32g NXP platform series.
 
+config ESP32S31_SYSTIMER
+	bool "Espressif ESP32-S31 systimer clocksource/clockevent"
+	depends on RISCV || COMPILE_TEST
+	select TIMER_OF
+	help
+	  Always-on, XTAL-fed (16 MHz) systimer used as the ESP32-S31's
+	  clocksource and clockevent, in preference to the CPU-clocked CLINT
+	  behind the SBI timer. Survives WFI and CPU-clock changes.
+
 endmenu

@@ -179,7 +179,16 @@ static int __init riscv_timer_init_common(void)
 		return error;
 	}
 
-	sched_clock_register(riscv_sched_clock, 64, riscv_timebase);
+	/*
+	 * ESP32-S31: rdtime/CSR_TIME is the CPU-clocked CLINT MTIME, which freezes
+	 * in WFI. Suppress this registration so the always-on systimer
+	 * (timer-esp32s31-systimer) can own sched_clock. sched_clock_register keeps
+	 * the HIGHER rate, so this 320 MHz one would otherwise win over the
+	 * systimer's 16 MHz and reject it -- hence the hard skip rather than relying
+	 * on rate arbitration.
+	 */
+	if (!IS_ENABLED(CONFIG_ESP32S31_SYSTIMER))
+		sched_clock_register(riscv_sched_clock, 64, riscv_timebase);
 
 	error = request_percpu_irq(riscv_clock_event_irq,
 				    riscv_timer_interrupt,
