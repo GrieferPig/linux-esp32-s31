@@ -730,10 +730,13 @@ asmlinkage void __init __copy_data(void)
 	void *from = (void *)(&__data_loc);
 	char *to = (char *)CONFIG_PHYS_RAM_BASE;
 	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) - (uintptr_t)(&_sdata));
-	size_t bss_sz = (size_t)((uintptr_t)(&_end) - (uintptr_t)(&__bss_start));
+	size_t bss_sz = (size_t)((uintptr_t)(&__bss_stop) - (uintptr_t)(&__bss_start));
+	size_t percpu_off = (size_t)((uintptr_t)(&__per_cpu_start) - (uintptr_t)(&_sdata));
+	size_t percpu_sz = (size_t)((uintptr_t)(&__per_cpu_end) - (uintptr_t)(&__per_cpu_start));
 
 	memcpy(to, from, data_sz);
 	memset(to + data_sz, 0, bss_sz);
+	memcpy(to + percpu_off, from + percpu_off, percpu_sz);
 }
 #endif
 
@@ -1228,6 +1231,17 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	create_pgd_mapping(early_pg_dir, FIXADDR_START,
 			   fixmap_pgd_next, PGDIR_SIZE, PAGE_TABLE);
 
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * Runtime page-table updates need a D-cache writeback before S31's
+	 * non-snooping Sv32 walker can observe them.  Pre-populate a permanent
+	 * fixmap for the cache controller while SATP is still disabled; head.S
+	 * publishes this PTE together with the rest of the bootstrap tables.
+	 */
+	create_pte_mapping(fixmap_pte, __fix_to_virt(FIX_S31_CACHE),
+			   ESP32S31_CACHE_PHYS_BASE, PAGE_SIZE, PAGE_KERNEL_IO);
+#endif
+
 #ifndef __PAGETABLE_PMD_FOLDED
 	/* Setup fixmap P4D and PUD */
 	if (pgtable_l5_enabled)
@@ -1269,6 +1283,21 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
 			   kernel_map.phys_addr, PGDIR_SIZE,
 			   PAGE_KERNEL_EXEC);
+#endif
+#endif
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31 only supports CLIC trap mode, whose synchronous exception entry
+	 * semantics cannot be used as the standard RISC-V SATP trampoline.
+	 * Keep the currently executing physical superpage mapped as well, then
+	 * head.S can explicitly jump to the virtual continuation.
+	 */
+#ifdef CONFIG_XIP_KERNEL
+	create_pgd_mapping(trampoline_pg_dir, kernel_map.xiprom,
+			   kernel_map.xiprom, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#else
+	create_pgd_mapping(trampoline_pg_dir, kernel_map.phys_addr,
+			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
 #endif
 #endif
 
@@ -1410,6 +1439,25 @@ static void __init setup_vm_final(void)
 	/* Map the kernel */
 	if (IS_ENABLED(CONFIG_64BIT) || IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's closed radio libraries contain absolute references to the
+	 * modem/peripheral windows, internal SRAM and mask ROM.  Keep these
+	 * mappings in init_mm only.  Process page tables do not copy the lower
+	 * half; the dedicated radio kthread borrows init_mm when running blobs.
+	 */
+	create_pgd_mapping(swapper_pg_dir, 0x20000000, 0x20000000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20400000, 0x20400000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20800000, 0x20800000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x2f000000, 0x2f000000,
+			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
+	create_pgd_mapping(swapper_pg_dir, 0x2f800000, 0x2f800000,
+			   PGDIR_SIZE, PAGE_KERNEL_READ_EXEC);
+#endif
 
 #ifdef CONFIG_KASAN
 	kasan_swapper_init();

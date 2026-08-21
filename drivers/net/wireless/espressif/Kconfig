@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config WLAN_VENDOR_ESPRESSIF
+	bool "Espressif wireless devices"
+	default y
+
+if WLAN_VENDOR_ESPRESSIF
+
+config ESP32S31_WIFI
+	bool "ESP32-S31 integrated fullmac Wi-Fi"
+	depends on ESP32S31_RADIO_SMODE_DRIVER && ESP32S31_RADIO_BLOBS
+	select CFG80211
+	help
+	  Expose the integrated ESP32-S31 Wi-Fi MAC/PHY through cfg80211.
+
+endif

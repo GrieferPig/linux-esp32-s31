@@ -28,6 +28,7 @@
 
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
+#include <asm/csr.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/numa.h>
@@ -187,11 +188,13 @@ int __cpu_up(unsigned int cpu, struct task_struct *tidle)
 	ret = start_secondary_cpu(cpu, tidle);
 	if (!ret) {
 		wait_for_completion_timeout(&cpu_running,
-					    msecs_to_jiffies(1000));
+					    msecs_to_jiffies(20000));
 
 		if (!cpu_online(cpu)) {
 			pr_crit("CPU%u: failed to come online\n", cpu);
 			ret = -EIO;
+		} else {
+			pr_info("S31 SMP: cpu%u online\n", cpu);
 		}
 	} else {
 		pr_crit("CPU%u: failed to start\n", cpu);
@@ -242,10 +245,15 @@ asmlinkage __visible void smp_callin(void)
 	local_flush_icache_all();
 	local_flush_tlb_all();
 	complete(&cpu_running);
+
 	/*
 	 * Disable preemption before enabling interrupts, so we don't try to
 	 * schedule a CPU that hasn't actually started yet.
 	 */
+	pr_info("S31 SMP: cpu%u enabling local IRQs sintstatus=%#lx\n",
+		curr_cpuid, csr_read(0xdb1));
 	local_irq_enable();
+	pr_info("S31 SMP: cpu%u local IRQs enabled, entering CPUHP idle sintstatus=%#lx\n",
+		curr_cpuid, csr_read(0xdb1));
 	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
 }

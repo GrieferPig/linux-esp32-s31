@@ -169,8 +169,12 @@ phys_addr_t linear_mapping_va_to_pa(unsigned long x);
 
 #define __va_to_pa_nodebug(x)	({						\
 	unsigned long _x = x;							\
-	is_linear_mapping(_x) ?							\
-		linear_mapping_va_to_pa(_x) : kernel_mapping_va_to_pa(_x);	\
+	(IS_ENABLED(CONFIG_XIP_KERNEL) &&					\
+	 (_x >= kernel_map.virt_addr &&					\
+	  _x < kernel_map.virt_addr + kernel_map.size)) ?			\
+		kernel_mapping_va_to_pa(_x) :					\
+		(is_linear_mapping(_x) ?					\
+			linear_mapping_va_to_pa(_x) : kernel_mapping_va_to_pa(_x));	\
 	})
 
 #ifdef CONFIG_DEBUG_VIRTUAL

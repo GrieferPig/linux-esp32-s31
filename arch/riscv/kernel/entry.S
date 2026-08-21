@@ -165,13 +165,9 @@ SYM_CODE_START(handle_exception)
 	REG_S s3, PT_BADADDR(sp)
 	REG_S s4, PT_CAUSE(sp)
 #ifdef CONFIG_SOC_ESP32S31
-	/*
-	 * Keep the CLIC return token out of Linux's logical cause field.  S31
-	 * can report SPIL=0xff at a privilege crossing; feeding that value back
-	 * to sret leaves SINTSTATUS.SIL at 0xff and blocks every level-0x3f
-	 * interrupt.  This controller is deliberately non-nested, so its only
-	 * valid software return level is the idle level (SPIL=0).
-	 */
+	/* Keep the hardware return token private and force the non-nested
+	 * supervisor return level to idle.  Native timer and IPI sources share
+	 * one CLIC slot per hart, so no valid S-mode nesting level is lost. */
 	li t0, 0xff00ffff
 	and t0, s4, t0
 	REG_S t0, PT_CAUSE_RAW(sp)
@@ -220,6 +216,8 @@ SYM_CODE_START(handle_exception)
 	li t0, 0xfff
 	and s4, s4, t0
 	REG_S s4, PT_CAUSE(sp)   /* Store masked cause so handlers see correct code */
+	/* Synchronous traps do not carry an interrupt return token. */
+	REG_S s4, PT_CAUSE_RAW(sp)
 #endif
 	slli t0, s4, RISCV_LGPTR
 	la t1, excp_vect_table

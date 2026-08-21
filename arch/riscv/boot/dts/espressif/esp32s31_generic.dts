@@ -11,6 +11,15 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+
+		opensbi-config {
+			compatible = "opensbi,config";
+			/* Keep the OpenSBI heap inside the final 64 KiB PSRAM page:
+			 * 0x50ff0000..0x51000000.  heap base is 0x50ff8000 after
+			 * the 32 KiB scratch/stack area, so 28 KiB stays in page.
+			 */
+			heap-size = <0x7000>;
+		};
 	};
 };
 

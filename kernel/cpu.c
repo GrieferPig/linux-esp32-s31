@@ -769,8 +769,17 @@ static void __cpuhp_kick_ap(struct cpuhp_cpu_state *st)
 	 */
 	smp_mb();
 	st->should_run = true;
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: BP waking cpu%u thread state=%d target=%d\n",
+			task_cpu(st->thread), st->state, st->target);
 	wake_up_process(st->thread);
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: BP waiting for cpu%u thread\n",
+			task_cpu(st->thread));
 	wait_for_ap_thread(st, st->bringup);
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: BP cpu%u thread complete\n",
+			task_cpu(st->thread));
 }
 
 static int cpuhp_kick_ap(int cpu, struct cpuhp_cpu_state *st,
@@ -794,7 +803,11 @@ static int bringup_wait_for_ap_online(unsigned int cpu)
 	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
 
 	/* Wait for the CPU to reach CPUHP_AP_ONLINE_IDLE */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u BP waiting for AP online-idle\n", cpu);
 	wait_for_ap_thread(st, true);
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u BP observed AP online-idle\n", cpu);
 	if (WARN_ON_ONCE((!cpu_online(cpu))))
 		return -ECANCELED;
 
@@ -1063,6 +1076,9 @@ static void cpuhp_thread_fun(unsigned int cpu)
 
 	if (WARN_ON_ONCE(!st->should_run))
 		return;
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u AP thread running state=%d target=%d\n",
+			cpu, st->state, st->target);
 
 	/*
 	 * ACQUIRE for the cpuhp_should_run() load of ->should_run. Ensures
@@ -1616,16 +1632,28 @@ void cpuhp_online_idle(enum cpuhp_state state)
 	if (state != CPUHP_AP_ONLINE_IDLE)
 		return;
 
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u AP online-idle entered\n",
+			smp_processor_id());
 	cpuhp_ap_update_sync_state(SYNC_STATE_ONLINE);
 
 	/*
 	 * Unpark the stopper thread before we start the idle loop (and start
 	 * scheduling); this ensures the stopper task is always available.
 	 */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u AP unparking stopper\n",
+			smp_processor_id());
 	stop_machine_unpark(smp_processor_id());
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u AP stopper unparked\n",
+			smp_processor_id());
 
 	st->state = CPUHP_AP_ONLINE_IDLE;
 	complete_ap_thread(st, true);
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		pr_info("S31 CPUHP: cpu%u AP online-idle complete\n",
+			smp_processor_id());
 }
 
 /* Requires cpu_add_remove_lock to be held */

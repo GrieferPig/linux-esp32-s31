@@ -4,6 +4,9 @@
 #
 
 obj-$(CONFIG_ESP32S31_DT_OVERLAY) += esp32s31-overlay.o
+obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio-smode.o
+obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio-rtos.o
+obj-$(CONFIG_ESP32S31_RADIO_BLOBS) += esp32s31-radio-idf.o
 
 obj-$(CONFIG_X86)		+= x86/
 obj-$(CONFIG_LOONGARCH)		+= loongarch/

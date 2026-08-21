@@ -28,6 +28,7 @@
 #include <asm/csr.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
+#include <asm/smp.h>
 #include <asm/syscall.h>
 #include <asm/thread_info.h>
 #include <asm/vector.h>
@@ -167,9 +168,62 @@ DO_ERROR_INFO(do_trap_insn_misaligned,
 DO_ERROR_INFO(do_trap_insn_fault,
 	SIGSEGV, SEGV_ACCERR, "instruction access fault");
 
+static bool esp32s31_hart0_pie_insn(struct pt_regs *regs)
+{
+	u32 insn;
+
+	if (!IS_ENABLED(CONFIG_ESP32S31_RADIO_SMODE))
+		return false;
+	if (raw_smp_processor_id() != 0 || !user_mode(regs))
+		return false;
+	if (get_user(insn, (u32 __user *)regs->epc))
+		return false;
+
+	/* ESP32-S31 PIE and HWLoop are only implemented on hart 1.
+	 * On hart 0 the same opcodes trap as illegal instructions.
+	 * PIE uses a vendor pattern (low bits 0b11011), while HWLoop
+	 * uses opcode 0x2b (custom-1).  The previous check that also
+	 * matched every standard R-type (opcode 0x33) would migrate
+	 * any normal add/mul that spuriously faults, creating a storm
+	 * under SMP load that starves CFS and trips RCU stalls.
+	 */
+	if ((insn & 0x7fU) == 0x2bU)
+		return true;
+	if ((insn & 0x1bU) == 0x1bU)
+		return true;
+
+	return false;
+}
+
 asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
 {
 	bool handled;
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's PM implementation has one otherwise harmless M-mode read of
+	 * mhartid in do_switch().  The radio objects now execute as part of the
+	 * S-mode kernel, where that CSR correctly traps.  Emulate the read from
+	 * Linux's logical-CPU-to-hart map instead of carrying a board-specific
+	 * binary patch in the closed object.  Match only CSRRS rd,mhartid,x0
+	 * (the canonical `csrr rd, mhartid` encoding), and never expose it to
+	 * userspace.
+	 */
+	if (!user_mode(regs)) {
+		u32 insn = READ_ONCE(*(u32 *)regs->epc);
+
+		if ((insn & 0xfffff07fU) == 0xf1402073U) {
+			unsigned int rd = (insn >> 7) & 0x1f;
+
+			if (rd)
+				((unsigned long *)regs)[rd] =
+					cpuid_to_hartid_map(raw_smp_processor_id());
+			regs->epc += sizeof(insn);
+			return;
+		}
+	}
+
+#endif
 
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
@@ -177,6 +231,18 @@ asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *re
 		local_irq_enable();
 
 		handled = riscv_v_first_use_handler(regs);
+
+		if (!handled && esp32s31_hart0_pie_insn(regs)) {
+			cpumask_t pie_cpus;
+
+			cpumask_clear(&pie_cpus);
+			cpumask_set_cpu(1, &pie_cpus);
+			if (cpu_online(1)) {
+				set_cpus_allowed_ptr(current, &pie_cpus);
+				set_tsk_need_resched(current);
+				handled = true;
+			}
+		}
 
 		local_irq_disable();
 

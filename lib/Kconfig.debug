@@ -1632,7 +1632,7 @@ config CSD_LOCK_WAIT_DEBUG
 	bool "Debugging for csd_lock_wait(), called from smp_call_function*()"
 	depends on DEBUG_KERNEL
 	depends on SMP
-	depends on 64BIT
+	depends on 64BIT || SOC_ESP32S31
 	default n
 	help
 	  This option enables debug prints when CPUs are slow to respond
@@ -1643,7 +1643,7 @@ config CSD_LOCK_WAIT_DEBUG
 config CSD_LOCK_WAIT_DEBUG_DEFAULT
 	bool "Default csd_lock_wait() debugging on at boot time"
 	depends on CSD_LOCK_WAIT_DEBUG
-	depends on 64BIT
+	depends on 64BIT || SOC_ESP32S31
 	default n
 	help
 	  This option causes the csdlock_debug= kernel boot parameter to

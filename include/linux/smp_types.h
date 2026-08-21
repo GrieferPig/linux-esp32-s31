@@ -61,7 +61,10 @@ struct __call_single_node {
 		unsigned int	u_flags;
 		atomic_t	a_flags;
 	};
-#ifdef CONFIG_64BIT
+#if defined(CONFIG_64BIT) || defined(CONFIG_CSD_LOCK_WAIT_DEBUG)
+	/* RV32 normally omits these to keep the node compact.  S31 enables them
+	 * only with CSD stall diagnostics so the waiting CPU can identify the
+	 * destination of a synchronous native-IPI request. */
 	u16 src, dst;
 #endif
 };

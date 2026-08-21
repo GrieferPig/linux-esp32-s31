@@ -13,7 +13,9 @@
 #include <linux/spinlock.h>
 
 #include <asm/cacheflush.h>
+#include <asm/csr.h>
 #include <asm/dma-noncoherent.h>
+#include <asm/fixmap.h>
 
 #include <linux/soc/espressif/esp32s31-cache.h>
 
@@ -37,6 +39,26 @@
 static void __iomem *esp32s31_cache_base;
 static u32 esp32s31_icache_map = ESP32S31_CACHE_MAP_ICACHE0;
 static DEFINE_RAW_SPINLOCK(esp32s31_cache_lock);
+
+static bool esp32s31_cache_ensure_base(void)
+{
+	if (likely(esp32s31_cache_base))
+		return true;
+
+	/*
+	 * setup_vm() calls the page-table helpers with SATP disabled, before the
+	 * bootstrap fixmap is usable.  Once SATP is enabled, the fixmap PTE built
+	 * by setup_vm() is already visible because head.S wrote back all early
+	 * tables.  This breaks the ioremap/page-table-writeback dependency cycle
+	 * before the cache driver's early_initcall can run.
+	 */
+	if (!csr_read(CSR_SATP))
+		return false;
+
+	esp32s31_cache_base =
+		(void __iomem *)__fix_to_virt(FIX_S31_CACHE);
+	return true;
+}
 
 static void esp32s31_cache_wait_done(void)
 {
@@ -91,7 +113,7 @@ static void esp32s31_cache_range(phys_addr_t paddr, size_t size, u32 op)
 	unsigned long flags;
 	u32 addr, len;
 
-	if (unlikely(!esp32s31_cache_base) ||
+	if (unlikely(!esp32s31_cache_ensure_base()) ||
 	    !esp32s31_cache_align_range(paddr, size, &addr, &len))
 		return;
 
@@ -115,14 +137,20 @@ void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
 {
 	unsigned long flags;
 	u32 addr, len;
+	u32 icache_map;
 
-	if (unlikely(!esp32s31_cache_base) ||
+	if (unlikely(!esp32s31_cache_ensure_base()) ||
 	    !esp32s31_cache_align_range(paddr, size, &addr, &len))
 		return;
 
-	/* External Flash aliases are served by I-cache; PSRAM data uses D-cache. */
+	/* External Flash aliases are served by I-cache; PSRAM data uses D-cache.
+	 * Both harts have a private I-cache: invalidate both on SMP so freshly
+	 * loaded userspace code is visible no matter which hart executes it. */
+	icache_map = IS_ENABLED(CONFIG_SMP) ?
+		(ESP32S31_CACHE_MAP_ICACHE0 | ESP32S31_CACHE_MAP_ICACHE1) :
+		esp32s31_icache_map;
 	raw_spin_lock_irqsave(&esp32s31_cache_lock, flags);
-	esp32s31_cache_issue(ESP32S31_CACHE_MAP_DCACHE | esp32s31_icache_map,
+	esp32s31_cache_issue(ESP32S31_CACHE_MAP_DCACHE | icache_map,
 			     addr, len, ESP32S31_CACHE_INVALIDATE);
 	raw_spin_unlock_irqrestore(&esp32s31_cache_lock, flags);
 }
@@ -142,15 +170,22 @@ void esp32s31_cache_sync_for_exec(phys_addr_t paddr, size_t size)
 {
 	unsigned long flags;
 	u32 addr, len;
+	u32 icache_map;
 
-	if (unlikely(!esp32s31_cache_base) ||
+	if (unlikely(!esp32s31_cache_ensure_base()) ||
 	    !esp32s31_cache_align_range(paddr, size, &addr, &len))
 		return;
 
+	/* Both harts have a private I-cache; invalidate both on SMP so freshly
+	 * mapped executable pages are coherent on either hart.  The D-cache is
+	 * shared, so one writeback covers both. */
+	icache_map = IS_ENABLED(CONFIG_SMP) ?
+		(ESP32S31_CACHE_MAP_ICACHE0 | ESP32S31_CACHE_MAP_ICACHE1) :
+		esp32s31_icache_map;
 	raw_spin_lock_irqsave(&esp32s31_cache_lock, flags);
 	esp32s31_cache_issue(ESP32S31_CACHE_MAP_DCACHE, addr, len,
 			     ESP32S31_CACHE_WRITEBACK);
-	esp32s31_cache_issue(esp32s31_icache_map, addr, len,
+	esp32s31_cache_issue(icache_map, addr, len,
 			     ESP32S31_CACHE_INVALIDATE);
 	raw_spin_unlock_irqrestore(&esp32s31_cache_lock, flags);
 }

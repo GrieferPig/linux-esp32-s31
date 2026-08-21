@@ -15,8 +15,18 @@
 
 	memory@50000000 {
 		device_type = "memory";
-		/* Linux owns the first 16-MiB - 64KiB of cached PSRAM alias. */
-		reg = <0x50000000 0x00FF0000>;
+		reg = <0x50000000 0x01000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		opensbi_reserved: opensbi@50ff0000 {
+			reg = <0x50ff0000 0x00010000>;
+			no-map;
+		};
 	};
 
 	aliases {
@@ -32,10 +42,10 @@
 		#size-cells = <0>;
 		timebase-frequency = <320000000>;
 
-		cpu0: cpu@1 {
+		cpu0: cpu@0 {
 			device_type = "cpu";
 			compatible = "espressif,esp32s31", "riscv";
-			reg = <1>;
+			reg = <0>;
 			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
@@ -55,9 +65,33 @@
 			};
 		};
 
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "espressif,esp32s31", "riscv";
+			reg = <1>;
+			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
+					       "zbc", "zbs", "c",
+					       "zicntr", "zicsr", "zifencei";
+			mmu-type = "riscv,sv32";
+			i-cache-block-size = <64>;
+			i-cache-sets = <256>;
+			i-cache-size = <32768>;
+			d-cache-block-size = <64>;
+			d-cache-sets = <512>;
+			d-cache-size = <65536>;
+			cpu1_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+
 		cpu-map {
 			cluster0 {
 				core0 { cpu = <&cpu0>; };
+				core1 { cpu = <&cpu1>; };
 			};
 		};
 	};
@@ -85,7 +119,7 @@
 			compatible = "espressif,esp32s31-axi-gdma";
 			/* 12 KiB descriptor pool in loader-reserved HP SRAM. */
 			reg = <0x20348000 0x1000>, <0x20587078 0x4>,
-			      <0x2f072f80 0x3000>;
+			      <0x2f072380 0x3000>;
 			reg-names = "dma", "clkrst", "descriptors";
 			interrupt-parent = <&clic>;
 			interrupts = <33 48 IRQ_TYPE_LEVEL_HIGH>,
@@ -104,7 +138,7 @@
 
 		ahb_gdma: dma-controller@20343000 {
 			compatible = "espressif,esp32s31-ahb-gdma";
-			reg = <0x20343000 0x628>, <0x2f075f80 0x1000>;
+			reg = <0x20343000 0x628>, <0x2f075380 0x1000>;
 			reg-names = "dma", "descriptors";
 			clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
 			interrupt-parent = <&clic>;
@@ -128,13 +162,16 @@
 		uhci0: serial@20398000 {
 			compatible = "espressif,esp32s31-uhci-uart";
 			reg = <0x20398000 0x100>, <0x20587084 0x4>,
-			      <0x2038a000 0x1000>, <0x2f077000 0x2800>;
+			      <0x2038a000 0x1000>, <0x2f076400 0x2800>;
 			reg-names = "uhci", "clkrst", "uart", "dma-buf";
 			clocks = <&clkc ESP32S31_CLK_UHCI>,
 				 <&clkc ESP32S31_CLK_UART0>;
 			clock-names = "bus", "uart";
-			/* UHCI TX/RX must use the same coupled AHB GDMA pair. */
-			dmas = <&ahb_gdma 1 0>, <&ahb_gdma 1 0>;
+			/*
+			 * FreeRTOS owns pairs 0-2 for I2S0 and the two ASRC lanes.
+			 * UHCI TX/RX must use the same otherwise-unclaimed pair.
+			 */
+			dmas = <&ahb_gdma 4 0>, <&ahb_gdma 4 0>;
 			dma-names = "tx", "rx";
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart0_default>;
@@ -187,7 +224,10 @@
 			reg-names = "crypto", "clkrst";
 			dmas = <&axi_gdma 0 5>;
 			dma-names = "sha";
-			status = "okay";
+			/* The closed Wi-Fi stack owns the same AES island (IDF source 55)
+			 * while associated.  Do not register an independent Linux Crypto
+			 * API owner until arbitration with the blob gate exists. */
+			status = "disabled";
 		};
 
 		adc: adc@20815000 {
@@ -541,23 +581,13 @@
 		usb_otghs: usb@20300000 {
 			compatible = "espressif,esp32s31-dwc2", "snps,dwc2";
 			/* 64-byte local-memory window after the GDMA descriptor pools. */
-			reg = <0x20300000 0x1000>, <0x2f076f80 0x40>;
+			reg = <0x20300000 0x1000>, <0x2f076380 0x40>;
 			reg-names = "core", "local-mem";
 			interrupt-parent = <&clic>;
 			interrupts = <39 99 IRQ_TYPE_LEVEL_HIGH>;
 			phys = <&usb_phy>;
 			phy-names = "usb2-phy";
 			dr_mode = "host";
-			status = "okay";
-		};
-
-		hosted_sram: wireless@2f06af80 {
-			compatible = "espressif,esp32s31-hosted-sram";
-			/* 32 KiB HP SRAM shared exclusively by hart0 and hart1. */
-			reg = <0x2f06af80 0x8000>;
-			interrupt-parent = <&clic>;
-			/* CPU_INTR_FROM_CPU_2 source 67 -> free raw CLIC ID40. */
-			interrupts = <40 67 IRQ_TYPE_EDGE_RISING>;
 			status = "okay";
 		};
 
