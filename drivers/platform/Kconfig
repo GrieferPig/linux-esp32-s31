@@ -12,6 +12,7 @@ config ESP32S31_DT_OVERLAY
 config ESP32S31_RADIO_SMODE_DRIVER
 	bool "ESP32-S31 S-mode radio runtime"
 	depends on ESP32S31_RADIO_SMODE
+	select FUTEX
 	help
 	  Start the serialized radio kernel thread, provide the ESP-IDF
 	  compatibility runtime, and dispatch the Linux-owned timer and modem

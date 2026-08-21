@@ -210,7 +210,7 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	REG_S	t1,  PT_BADADDR_OFFSET(sp)
 	csrr	t1, CSR_CAUSE
 	REG_S	t1,  PT_CAUSE_OFFSET(sp)
-	/* Non-nested S31 return token: never restore the 0xff SPIL sentinel. */
+	/* Timer and IPI share one slot, so the S-mode path is non-nested. */
 	li	t2, 0xff00ffff
 	and	t1, t1, t2
 	REG_S	t1,  PT_CAUSE_RAW_OFFSET(sp)
@@ -281,6 +281,8 @@ SYM_CODE_START(esp32s31_clic_trampoline)
 	li	t2, 0xfff
 	and	t0, t1, t2
 	REG_S	t0, PT_CAUSE_OFFSET(sp)   /* Store masked cause so handlers see correct code */
+	/* Synchronous traps do not carry an interrupt return token. */
+	REG_S	t0, PT_CAUSE_RAW_OFFSET(sp)
 	slli	t0, t0, RISCV_LGPTR
 	la	t1, esp32s31_clic_excp_vect_table
 	la	t2, esp32s31_clic_excp_vect_table_end

@@ -111,9 +111,19 @@ relocate_enable_mmu:
 	sub a1, a1, a2
 	add ra, ra, a1
 
-	/* Point stvec to virtual address of intruction after satp write */
+	/* Point stvec to virtual address of instruction after satp write */
 	la a2, 1f
 	add a2, a2, a1
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31 only implements CLIC trap mode.  Do not depend on an instruction
+	 * page fault returning through stvec for the MMU transition: keep the
+	 * virtual continuation in a3 and explicitly jump there after SATP is
+	 * enabled through the trampoline's identity mapping.
+	 */
+	mv a3, a2
+	ori a2, a2, 3
+#endif
 	csrw CSR_TVEC, a2
 
 	/* Compute satp for kernel page tables, but don't load it yet */
@@ -135,7 +145,13 @@ relocate_enable_mmu:
 	or a0, a0, a1
 	sfence.vma
 	csrw CSR_SATP, a0
+#ifdef CONFIG_SOC_ESP32S31
+	sfence.vma
+	jr a3
+	.balign 0x40
+#else
 .align 2
+#endif
 1:
 	/* Set trap vector to spin forever to help debug */
 	la a0, .Lsecondary_park
@@ -176,13 +192,17 @@ secondary_start_sbi:
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 
-	/* a0 contains the hartid & a1 contains boot data */
+	/* a0 contains the hartid & a1 contains boot data.  a1 is already the
+	 * physical address of the boot data, and the offsets are plain small
+	 * struct offsets.  Do not apply XIP_FIXUP_OFFSET here: that macro
+	 * converts a link-time kernel data address into a physical address,
+	 * but adding PHYS_RAM_BASE - _sdata to 0/4 corrupts the load address
+	 * and makes the secondary hart fault before it can enable the MMU.
+	 */
 	li a2, SBI_HART_BOOT_TASK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a2
 	add a2, a2, a1
 	REG_L tp, (a2)
 	li a3, SBI_HART_BOOT_STACK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a3
 	add a3, a3, a1
 	REG_L sp, (a3)
 
@@ -199,7 +219,11 @@ secondary_start_sbi:
 	call smp_callin
 #endif /* CONFIG_SMP */
 
-.align 2
+/* S31 CLIC normalizes stvec.BASE to 64-byte alignment and forces
+ * MODE=3.  Keep the park loop aligned so that the base written by
+ * "csrw stvec, .Lsecondary_park" really points at the wfi loop.
+ */
+.balign 0x40
 .Lsecondary_park:
 	/*
 	 * Park this hart if we:

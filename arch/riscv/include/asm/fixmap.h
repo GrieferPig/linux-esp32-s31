@@ -38,6 +38,8 @@ enum fixed_addresses {
 	FIX_TEXT_POKE0,
 	FIX_EARLYCON_MEM_BASE,
 #ifdef CONFIG_SOC_ESP32S31
+	/* Bootstrap mapping used to publish page-table writes to the Sv32 walker. */
+	FIX_S31_CACHE,
 	/* Always-on SYSTIMER mapping used by the early clocksource. */
 	FIX_S31_SYSTIMER,
 #endif

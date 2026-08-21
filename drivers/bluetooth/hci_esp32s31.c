@@ -144,6 +144,11 @@ static void s31_hci_register_work(struct work_struct *work)
 
 static int __init s31_hci_init(void)
 {
+	if (esp32s31_radio_is_disabled()) {
+		pr_info("esp32s31-hci: disabled with radio core\n");
+		return 0;
+	}
+
 	INIT_DELAYED_WORK(&s31_hci.register_work, s31_hci_register_work);
 	schedule_delayed_work(&s31_hci.register_work, 0);
 	return 0;

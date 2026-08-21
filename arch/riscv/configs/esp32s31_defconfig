@@ -96,15 +96,15 @@ CONFIG_SENSORS_ESP32S31_TSENS=y
 # CONFIG_ESP32S31_IRQ_MATRIX is not set
 # CONFIG_ESP32S31_PCR is not set
 
-# CONFIG_SMP is not set
-CONFIG_NR_CPUS=1
+CONFIG_SMP=y
+CONFIG_NR_CPUS=2
 CONFIG_ESP32S31_SYSTIMER_CLOCKSOURCE=y
 CONFIG_THREAD_SIZE_ORDER=2
 CONFIG_RISCV_SLOW_UNALIGNED_ACCESS=y
 CONFIG_FPU=y
 
 # Kernel command line
-CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init clk_ignore_unused"
+CONFIG_CMDLINE="console=ttyS0,115200n8 root=/dev/mtdblock6 rootfstype=squashfs ro rootwait init=/init clk_ignore_unused irqaffinity=0"
 CONFIG_CMDLINE_FORCE=y
 
 # Built-in DTB (no external loader needed)
@@ -255,3 +255,5 @@ CONFIG_SQUASHFS_DECOMP_SINGLE=y
 CONFIG_SQUASHFS_XZ=y
 CONFIG_SQUASHFS_ZLIB=y
 CONFIG_SQUASHFS_COMPILE_DECOMP_SINGLE=y
+CONFIG_PREEMPT_VOLUNTARY=y
+CONFIG_HZ_100=y

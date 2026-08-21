@@ -23,7 +23,7 @@
  *     accesses the OTHER core's registers (for cross-core IPI).
  *   - CLIC_INT_CONFIG register uses legacy layout:
  *       NMBITS  at bits [6:5] (RO, hardwired 0)
- *       MNLBITS at bits [4:1] (R/W, default 0, we set to 3)
+ *       MNLBITS at bits [4:1] (R/W, S31 keeps the reset value 0)
  *       NVBITS  at bit  [0]   (RO, hardwired 1)
  *   - Threshold at offset 0x8: byte in bits [31:24]
  *   - CLICINTCTL byte (offset 3 of per-int word):
@@ -42,13 +42,19 @@
 #include <linux/percpu.h>
 #include <linux/hardirq.h>
 #include <linux/smp.h>
+#include <linux/cpuhotplug.h>
+#include <linux/clocksource/esp32s31-systimer.h>
 #include <asm/csr.h>
 #include <asm/irq.h>
+#include <asm/irq_regs.h>
+#include <asm/ptrace.h>
+#include <asm/smp.h>
 
 int esp32s31_clic_set_priority(unsigned int irq, unsigned int level,
 			      unsigned int prio);
 void esp32s31_clic_handle_irq(struct pt_regs *regs);
 void esp32s31_clic_unexpected(struct pt_regs *regs);
+void esp32s31_clic_poll(void);
 
 /* ── CLIC register map ──────────────────────────────────────────── */
 
@@ -85,6 +91,7 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 
 /* ── Interrupt numbering ────────────────────────────────────────── */
 
+#define CLIC_S_SOFT_ID 1 /* S-mode software interrupt */
 #define CLIC_CLINT_SW_ID 3 /* CLINT M-mode software int */
 #define CLIC_CLINT_TIMER_ID 7 /* CLINT M-mode timer int    */
 #define CLIC_S_TIMER_ID 5 /* S-mode timer interrupt */
@@ -92,11 +99,28 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 #define CLIC_EXT_MAX_ID 47 /* Last external IRQ         */
 #define CLIC_NR_EXTERNAL 32 /* 16-47 inclusive           */
 #define CLIC_MAX_ID 47 /* Max interrupt ID          */
+#ifdef CONFIG_SOC_ESP32S31
+#define ESP32S31_IPI_TO_CPU1_ID 40
+#define ESP32S31_IPI_TO_CPU0_ID 41
+#define ESP32S31_IPI_TO_CPU0_SOURCE 65
+#define ESP32S31_IPI_TO_CPU1_SOURCE 66
+/* IDF interrupt-matrix source indices for SYSTIMER TARGET0/TARGET1. */
+#define ESP32S31_SYSTIMER_CPU0_SOURCE 33
+#define ESP32S31_SYSTIMER_CPU1_SOURCE 34
+#endif
 /* ── CLIC configuration constants ───────────────────────────────── */
 
 #define ESP32S31_CLICINTCTLBITS 3 /* Hardwired on S31 */
 #define ESP32S31_NR_LEVELS (1 << ESP32S31_CLICINTCTLBITS) /* 8 */
 #define ESP32S31_EXTERNAL_LEVEL 1
+/*
+ * S31's CLIC return state is only reliable in a non-nested configuration.
+ * Keep native S-mode IPIs at the same level as the timer and device
+ * interrupts.  In particular, a level-7 IPI can be accepted at the return
+ * boundary of an S-mode coprocessor SBI ecall and make the cross-privilege
+ * SIL=0xff sentinel persistent.
+ */
+#define ESP32S31_IPI_LEVEL ESP32S31_EXTERNAL_LEVEL
 #define ESP32S31_MAX_PRIORITY \
 	31 /* Max sub-priority (unused at CLICINTCTLBITS=3) */
 
@@ -104,7 +128,7 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 /*
  * CLIC_INT_CONFIG (offset 0x0), standardised across S31:
  *   NMBITS  at bits [6:5]  — RO, hardwired 0 (M-mode only)
- *   MNLBITS at bits [4:1]  — R/W, effective priority bits (we set 3)
+ *   MNLBITS at bits [4:1]  — R/W, effective priority bits
  *   NVBITS  at bit  [0]    — RO, hardwired 1 (vectoring supported)
  */
 #define CLIC_CFG_NMBITS_MASK 0x60 /* bits [6:5] */
@@ -124,6 +148,27 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 #endif
 #ifndef CSR_SINTTHRESH
 #define CSR_SINTTHRESH 0x147
+#endif
+#ifndef CSR_SINTSTATUS
+#define CSR_SINTSTATUS 0xdb1
+#endif
+#ifdef CONFIG_SOC_ESP32S31
+/*
+ * OpenOCD cannot read SINTSTATUS through abstract CSR access on S31.  Keep a
+ * small uncached-by-software flight recorder in normal kernel RAM so a halted
+ * board exposes the last interrupt state without adding printk timing noise.
+ */
+struct esp32s31_clic_debug {
+	u32 irq_entries;
+	u32 ipi_entries;
+	u32 ipi_sends;
+	u32 last_target;
+	u32 last_cause_raw;
+	u32 last_sstatus;
+	u32 last_sintstatus;
+};
+
+struct esp32s31_clic_debug esp32s31_clic_debug[NR_CPUS];
 #endif
 
 /* ── clicintctl[i] level encoding with CLICINTCTLBITS=3 ──────────── */
@@ -172,6 +217,11 @@ void esp32s31_clic_unexpected(struct pt_regs *regs);
 #define ESP32S31_INTMATRIX_PASS_LEVEL_SHIFT 8
 #define ESP32S31_INTMATRIX_PASS_LEVEL_MASK (0x3 << ESP32S31_INTMATRIX_PASS_LEVEL_SHIFT)
 #define ESP32S31_INTMATRIX_PASS_LEVEL_S (1 << ESP32S31_INTMATRIX_PASS_LEVEL_SHIFT)
+
+#define ESP32S31_IPI_DOORBELL_BASE 0x20586010
+#define ESP32S31_IPI_DOORBELL_SIZE 0x8
+#define ESP32S31_IPI_TO_CPU0_OFF 0x0
+#define ESP32S31_IPI_TO_CPU1_OFF 0x4
 #endif
 
 /* ── Per-CPU CLIC structure ─────────────────────────────────────── */
@@ -180,6 +230,7 @@ struct esp32s31_clic {
 	void __iomem *regs; /* ioremapped CLIC base (0x2080_0000) */
 #ifdef CONFIG_SOC_ESP32S31
 	void __iomem *intmatrix_regs;
+	void __iomem *ipi_doorbells;
 #endif
 	struct irq_domain *domain;
 	u32 num_interrupts;
@@ -188,6 +239,7 @@ struct esp32s31_clic {
 
 static DEFINE_PER_CPU(struct esp32s31_clic *, clic_per_cpu);
 static DEFINE_PER_CPU(raw_spinlock_t, clic_lock);
+static struct esp32s31_clic *esp32s31_clic_global;
 
 /* ── Register access helpers ────────────────────────────────────── */
 /*
@@ -213,6 +265,24 @@ static inline void clic_writeb(struct esp32s31_clic *clic, unsigned int irq_id,
 }
 
 /*
+ * Write a per-interrupt register for a specific hart.  The CLIC window is
+ * per-hart address-virtualised: the same address accesses the current hart's
+ * registers, while +ESP32S31_CLIC_DUALCORE_OFF accesses the other hart's
+ * registers.  Device interrupts target hart0; native IPIs select either hart.
+ */
+static inline void clic_writeb_hart(struct esp32s31_clic *clic, unsigned int irq_id,
+				    unsigned int byte_off, u8 val, int hart)
+{
+	void __iomem *addr = clic->regs +
+		(ESP32S31_CLIC_CTRL_BASE - ESP32S31_CLIC_BASE) +
+		(irq_id * ESP32S31_CLIC_INT_STRIDE) + byte_off;
+
+	if (hart != smp_processor_id())
+		addr += ESP32S31_CLIC_DUALCORE_OFF;
+	writeb(val, addr);
+}
+
+/*
  * Write the threshold register.  Same address for both cores — the
  * hardware virtualises.  To set the OTHER core's threshold, call
  * clic_write_other_threshold().
@@ -221,6 +291,125 @@ static inline void clic_write_threshold(struct esp32s31_clic *clic, u8 level)
 {
 	writel(CLIC_THRESH_MMIO(level), clic->regs + ESP32S31_CLIC_MINTTHRESH);
 }
+
+#ifdef CONFIG_SOC_ESP32S31
+static void esp32s31_clic_ipi_send(unsigned int cpu)
+{
+	struct esp32s31_clic *clic = READ_ONCE(esp32s31_clic_global);
+	struct esp32s31_clic_debug *debug;
+	unsigned int doorbell_off;
+
+	if (WARN_ON_ONCE(!clic || !clic->ipi_doorbells ||
+			 cpu >= clic->num_harts))
+		return;
+
+	debug = &esp32s31_clic_debug[smp_processor_id()];
+	WRITE_ONCE(debug->last_target, cpu);
+	WRITE_ONCE(debug->ipi_sends, READ_ONCE(debug->ipi_sends) + 1);
+	if (cpu == 1 && READ_ONCE(debug->ipi_sends) <= 4)
+		pr_info("S31 IPI: cpu%u send #%u to cpu1\n",
+			smp_processor_id(), READ_ONCE(debug->ipi_sends));
+
+	doorbell_off = cpu ? ESP32S31_IPI_TO_CPU1_OFF :
+			       ESP32S31_IPI_TO_CPU0_OFF;
+
+	/*
+	 * Publish the ipi_mux reason before asserting the level doorbell.
+	 * The doorbell is a write-1-set / write-0-clear level register: always
+	 * write 1 so a receiver that already cleared it (and consumed an older
+	 * reason) re-arms the level for the new reason.  ipi_mux_send_mask()
+	 * only writes the doorbell when the reason was previously clear, which
+	 * races with the receiver's clear and can lose an IPI forever.
+	 */
+	wmb();
+	writel(1, clic->ipi_doorbells + doorbell_off);
+}
+
+static int __init esp32s31_clic_ipi_init(void)
+{
+	int virq;
+
+	if (!IS_ENABLED(CONFIG_SMP))
+		return 0;
+
+	virq = ipi_mux_create(BITS_PER_BYTE, esp32s31_clic_ipi_send);
+	if (virq <= 0)
+		return virq < 0 ? virq : -ENOMEM;
+
+	riscv_ipi_set_virq_range(virq, BITS_PER_BYTE);
+	pr_info("CLIC: providing native S-mode IPIs through hardware doorbells\n");
+
+	return 0;
+}
+
+/* S31 can occasionally retain the active supervisor CLIC level after sret,
+ * leaving timer, IPI or device slots pending even with SIE set.  The
+ * architecture keeps both harts in IRQ-enabled idle polling, so drain all
+ * enabled native sources there without requiring another CLIC entry. */
+void esp32s31_clic_poll(void)
+{
+	struct esp32s31_clic *clic = this_cpu_read(clic_per_cpu);
+	struct esp32s31_clic_debug *debug;
+	struct pt_regs regs;
+	struct pt_regs *old_regs;
+	unsigned long flags;
+	unsigned int cpu = raw_smp_processor_id();
+	unsigned int doorbell_off;
+	unsigned int irq_id;
+	u32 external_pending = 0;
+	bool ipi_pending, timer_pending;
+
+	if (unlikely(!clic))
+		clic = READ_ONCE(esp32s31_clic_global);
+	if (unlikely(!clic || !clic->ipi_doorbells || cpu > 1))
+		return;
+
+	doorbell_off = cpu ? ESP32S31_IPI_TO_CPU1_OFF :
+			       ESP32S31_IPI_TO_CPU0_OFF;
+	local_irq_save(flags);
+	ipi_pending = readl(clic->ipi_doorbells + doorbell_off);
+	timer_pending = esp32s31_systimer_irq_pending(cpu);
+	for (irq_id = CLIC_EXT_MIN_ID; irq_id <= CLIC_EXT_MAX_ID; irq_id++) {
+		if ((cpu == 0 && irq_id == ESP32S31_IPI_TO_CPU0_ID) ||
+		    (cpu == 1 && irq_id == ESP32S31_IPI_TO_CPU1_ID))
+			continue;
+		if ((clic_readb(clic, irq_id, ESP32S31_CLIC_INT_IP) & 1) &&
+		    (clic_readb(clic, irq_id, ESP32S31_CLIC_INT_IE) & 1))
+			external_pending |= BIT(irq_id - CLIC_EXT_MIN_ID);
+	}
+	if (!ipi_pending && !timer_pending && !external_pending) {
+		local_irq_restore(flags);
+		return;
+	}
+
+	/*
+	 * The clockevent handler reaches tick_periodic(), which determines
+	 * whether the interrupted context was user mode through get_irq_regs().
+	 * This polling path has no hardware-created exception frame, so install a
+	 * minimal kernel-mode frame for the same lifetime as a normal hard IRQ.
+	 */
+	memset(&regs, 0, sizeof(regs));
+	regs.status = SR_SPP;
+	old_regs = set_irq_regs(&regs);
+	irq_enter();
+	if (ipi_pending) {
+		debug = &esp32s31_clic_debug[cpu];
+		WRITE_ONCE(debug->ipi_entries,
+			   READ_ONCE(debug->ipi_entries) + 1);
+		writel(0, clic->ipi_doorbells + doorbell_off);
+		ipi_mux_process();
+	}
+	if (timer_pending)
+		esp32s31_riscv_timer_poll();
+	for (irq_id = CLIC_EXT_MIN_ID; irq_id <= CLIC_EXT_MAX_ID; irq_id++) {
+		if (external_pending & BIT(irq_id - CLIC_EXT_MIN_ID))
+			generic_handle_domain_irq(clic->domain, irq_id);
+	}
+	irq_exit();
+	set_irq_regs(old_regs);
+	local_irq_restore(flags);
+}
+#endif
 
 /* ── irq_chip callbacks ─────────────────────────────────────────── */
 
@@ -231,7 +420,11 @@ static void esp32s31_clic_irq_mask(struct irq_data *d)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(lock, flags);
+#ifdef CONFIG_SOC_ESP32S31
+	clic_writeb_hart(clic, d->hwirq, ESP32S31_CLIC_INT_IE, 0, 0);
+#else
 	clic_writeb(clic, d->hwirq, ESP32S31_CLIC_INT_IE, 0);
+#endif
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
@@ -242,7 +435,11 @@ static void esp32s31_clic_irq_unmask(struct irq_data *d)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(lock, flags);
+#ifdef CONFIG_SOC_ESP32S31
+	clic_writeb_hart(clic, d->hwirq, ESP32S31_CLIC_INT_IE, 1, 0);
+#else
 	clic_writeb(clic, d->hwirq, ESP32S31_CLIC_INT_IE, 1);
+#endif
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
@@ -261,7 +458,11 @@ static void esp32s31_clic_irq_ack(struct irq_data *d)
 	 * handler has cleared it and the slot is unmasked.
 	 */
 	raw_spin_lock_irqsave(lock, flags);
+#ifdef CONFIG_SOC_ESP32S31
+	clic_writeb_hart(clic, hwirq, ESP32S31_CLIC_INT_IP, 0, 0);
+#else
 	clic_writeb(clic, hwirq, ESP32S31_CLIC_INT_IP, 0);
+#endif
 	raw_spin_unlock_irqrestore(lock, flags);
 }
 
@@ -325,15 +526,29 @@ static int esp32s31_clic_set_type(struct irq_data *d, unsigned int flow_type)
 static int esp32s31_clic_set_affinity(struct irq_data *d,
 				     const struct cpumask *mask_val, bool force)
 {
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * The S31 interrupt matrix routes every Linux peripheral to hart0,
+	 * and the boot command line pins IRQ affinity to CPU0.  Only accept
+	 * CPU0 as the affinity target and record that so the IRQ core never
+	 * tries to rebalance these interrupts to hart1.
+	 */
+	if (!cpumask_test_cpu(0, mask_val))
+		return -EINVAL;
+
+	irq_data_update_affinity(d, cpumask_of(0));
+	return IRQ_SET_MASK_OK_NOCOPY;
+#else
 	/*
 	 * CLIC is per-hart with address virtualisation.  Each hart
 	 * manages its own interrupt enables/pending via the same
 	 * register addresses.  Affinity changes require reprogramming
 	 * the Interrupt Matrix to steer the source to a different core's
 	 * CLIC input, then configuring the target core's CLIC registers.
-	 * Not currently implemented.
+	 * Not currently implemented for the M-mode/non-S31 path.
 	 */
 	return -EINVAL;
+#endif
 }
 
 /*
@@ -366,7 +581,7 @@ int esp32s31_clic_set_priority(unsigned int irq, unsigned int level,
 	if (IS_ENABLED(CONFIG_SOC_ESP32S31)) {
 		raw_spin_lock_irqsave(this_cpu_ptr(&clic_lock), flags);
 		clic_writeb(clic, d->hwirq, ESP32S31_CLIC_INT_CTL,
-			    CLICCTL_MAKE(ESP32S31_EXTERNAL_LEVEL,
+			    CLICCTL_MAKE(ESP32S31_IPI_LEVEL,
 					 ESP32S31_MAX_PRIORITY));
 		raw_spin_unlock_irqrestore(this_cpu_ptr(&clic_lock), flags);
 		return 0;
@@ -413,12 +628,10 @@ static void esp32s31_intc_clic_irq_mask(struct irq_data *d)
 	if (WARN_ON_ONCE(!esp32s31_sclic_regs))
 		return;
 
-	/*
-	 * Linux names the clock event as supervisor timer IRQ5, but S31's
-	 * physical compare is delivered directly on CLIC ID7.
-	 */
+	/* The timer shares the native IPI slot.  Clockevent shutdown disables
+	 * the comparator source itself; masking this slot would also lose IPIs. */
 	if (hwirq == CLIC_S_TIMER_ID)
-		hwirq = CLIC_CLINT_TIMER_ID;
+		return;
 
 	writeb(0, esp32s31_sclic_regs + ESP32S31_SCLIC_CTRL_OFF +
 		  (hwirq * ESP32S31_CLIC_INT_STRIDE) +
@@ -433,7 +646,7 @@ static void esp32s31_intc_clic_irq_unmask(struct irq_data *d)
 		return;
 
 	if (hwirq == CLIC_S_TIMER_ID)
-		hwirq = CLIC_CLINT_TIMER_ID;
+		return;
 
 	writeb(1, esp32s31_sclic_regs + ESP32S31_SCLIC_CTRL_OFF +
 		  (hwirq * ESP32S31_CLIC_INT_STRIDE) +
@@ -460,9 +673,10 @@ static struct irq_chip esp32s31_intc_chip = {
 /* ── IRQ domain operations ──────────────────────────────────────── */
 
 #ifdef CONFIG_SOC_ESP32S31
-static void esp32s31_intmatrix_route(struct esp32s31_clic *clic,
-				     unsigned int source,
-				     irq_hw_number_t hwirq)
+static void esp32s31_intmatrix_route_hart(struct esp32s31_clic *clic,
+					  unsigned int hart,
+					  unsigned int source,
+					  irq_hw_number_t hwirq)
 {
 	void __iomem *reg;
 	u32 val;
@@ -476,18 +690,45 @@ static void esp32s31_intmatrix_route(struct esp32s31_clic *clic,
 		return;
 	}
 
-	/*
-	 * Linux exposes physical hart1 as its single logical CPU0.  The S31
-	 * interrupt matrix is not address-virtualised, so route every Linux
-	 * peripheral through the core1 register bank.
-	 */
-	reg = clic->intmatrix_regs + ESP32S31_INTMATRIX_CORE_STRIDE + source * 4;
+	if (WARN_ON_ONCE(hart >= clic->num_harts))
+		return;
+
+	reg = clic->intmatrix_regs +
+		hart * ESP32S31_INTMATRIX_CORE_STRIDE + source * 4;
 	val = readl(reg);
 	val &= ~(ESP32S31_INTMATRIX_MAP_MASK |
 		 ESP32S31_INTMATRIX_PASS_LEVEL_MASK);
 	val |= (hwirq & ESP32S31_INTMATRIX_MAP_MASK) |
 	       ESP32S31_INTMATRIX_PASS_LEVEL_S;
 	writel(val, reg);
+}
+
+static void esp32s31_intmatrix_route(struct esp32s31_clic *clic,
+				     unsigned int source,
+				     irq_hw_number_t hwirq)
+{
+	/* Regular Linux device interrupts are pinned to hart0. */
+	esp32s31_intmatrix_route_hart(clic, 0, source, hwirq);
+}
+
+static void esp32s31_clic_ipi_hw_init(struct esp32s31_clic *clic)
+{
+	/*
+	 * Use the S31 IDF cross-core wiring: FROM_CPU_0 targets hart0 and
+	 * FROM_CPU_1 targets hart1.  As in the former FreeRTOS/Linux hosted
+	 * transport, each doorbell is a level source which the receiver clears.
+	 */
+	writel(0, clic->ipi_doorbells + ESP32S31_IPI_TO_CPU0_OFF);
+	writel(0, clic->ipi_doorbells + ESP32S31_IPI_TO_CPU1_OFF);
+	esp32s31_intmatrix_route_hart(clic, 1, ESP32S31_IPI_TO_CPU1_SOURCE,
+				      ESP32S31_IPI_TO_CPU1_ID);
+	esp32s31_intmatrix_route_hart(clic, 0, ESP32S31_IPI_TO_CPU0_SOURCE,
+				      ESP32S31_IPI_TO_CPU0_ID);
+	esp32s31_intmatrix_route_hart(clic, 0, ESP32S31_SYSTIMER_CPU0_SOURCE,
+				      ESP32S31_IPI_TO_CPU0_ID);
+	esp32s31_intmatrix_route_hart(clic, 1, ESP32S31_SYSTIMER_CPU1_SOURCE,
+				      ESP32S31_IPI_TO_CPU1_ID);
+
 }
 #endif
 
@@ -720,13 +961,31 @@ static void (*fallback_handle_irq)(struct pt_regs *);
 void esp32s31_clic_handle_irq(struct pt_regs *regs)
 {
 	struct esp32s31_clic *clic = this_cpu_read(clic_per_cpu);
+#ifdef CONFIG_SOC_ESP32S31
+	struct esp32s31_clic_debug *debug;
+	unsigned int cpu;
+#endif
 	unsigned long logical_cause;
 	unsigned long irq_id;
 
+	if (!clic) {
+		clic = esp32s31_clic_global;
+		if (clic)
+			per_cpu(clic_per_cpu, smp_processor_id()) = clic;
+	}
 	if (WARN_ON(!clic))
 		return;
 
 	logical_cause = regs->cause;
+
+#ifdef CONFIG_SOC_ESP32S31
+	cpu = smp_processor_id();
+	debug = &esp32s31_clic_debug[cpu];
+	WRITE_ONCE(debug->irq_entries, READ_ONCE(debug->irq_entries) + 1);
+	WRITE_ONCE(debug->last_cause_raw, regs->cause_raw);
+	WRITE_ONCE(debug->last_sstatus, csr_read(CSR_STATUS));
+	WRITE_ONCE(debug->last_sintstatus, csr_read(CSR_SINTSTATUS));
+#endif
 
 	/*
 	 * entry.S has already separated the raw CLIC return token from the
@@ -734,6 +993,38 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 	 * low CLIC ID are visible here.
 	 */
 	irq_id = regs->cause & 0xfff;
+
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_SMP)
+	if ((cpu == 1 && irq_id == ESP32S31_IPI_TO_CPU1_ID) ||
+	    (cpu == 0 && irq_id == ESP32S31_IPI_TO_CPU0_ID)) {
+		unsigned int doorbell_off = cpu ? ESP32S31_IPI_TO_CPU1_OFF :
+						 ESP32S31_IPI_TO_CPU0_OFF;
+
+		if (readl(clic->ipi_doorbells + doorbell_off)) {
+			WRITE_ONCE(debug->ipi_entries,
+				   READ_ONCE(debug->ipi_entries) + 1);
+			if (READ_ONCE(debug->ipi_entries) <= 4)
+				pr_info("S31 IPI: cpu%u entry #%u raw=%#lx sstatus=%#x sintstatus=%#x\n",
+					cpu, READ_ONCE(debug->ipi_entries),
+					regs->cause_raw,
+					READ_ONCE(debug->last_sstatus),
+					READ_ONCE(debug->last_sintstatus));
+
+			writel(0, clic->ipi_doorbells + doorbell_off);
+			ipi_mux_process();
+		}
+
+		/* TARGETx is wired to this same level slot.  Handling both sources in
+		 * one trap avoids a timer/IPI CLIC nesting boundary. */
+		if (esp32s31_systimer_irq_pending(cpu)) {
+			regs->cause = CAUSE_IRQ_FLAG | CLIC_S_TIMER_ID;
+			if (fallback_handle_irq)
+				fallback_handle_irq(regs);
+			regs->cause = logical_cause;
+		}
+		goto out;
+	}
+#endif
 
 	/*
 	 * Interrupt IDs below the first CLIC external source are standard local
@@ -748,8 +1039,15 @@ void esp32s31_clic_handle_irq(struct pt_regs *regs)
 		 * Clear its software IP latch with 0; unlike external edge slots,
 		 * writing 1 here prevents the next compare edge from being seen.
 		 */
-		u8 attr = clic_readb(clic, irq_id, ESP32S31_CLIC_INT_ATTR);
-		if (attr & CLIC_ATTR_TRIG_EDGE)
+		/*
+		 * ID7 is the S31 local compare source.  Its ATTR byte is not
+		 * consistently reflected through the S-mode CLIC window (the
+		 * hardware may report level mode even when OpenSBI programs the
+		 * machine-side source as edge-triggered).  Always clear the IP
+		 * latch before dispatching the timer event; this is harmless for
+		 * level mode and prevents a stale compare from retrapping forever.
+		 */
+		if (irq_id == CLIC_CLINT_TIMER_ID)
 			clic_writeb(clic, irq_id, ESP32S31_CLIC_INT_IP, 0);
 
 		/*
@@ -807,7 +1105,41 @@ void esp32s31_clic_unexpected(struct pt_regs *regs)
 
 /* ── Initialization ─────────────────────────────────────────────── */
 
-static void __init esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
+static void esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart);
+
+static int esp32s31_clic_cpu_starting(unsigned int cpu)
+{
+	if (!esp32s31_clic_global)
+		return 0;
+
+#ifdef CONFIG_SOC_ESP32S31
+	/* OpenSBI deliberately disconnects every interrupt-matrix source when a
+	 * hart starts, so stale IDF/radio routes (notably machine-mode ID21)
+	 * cannot cross into Linux.  The boot hart initially installs both Linux
+	 * routes, but hart1's copy is cleared again during HSM startup.  Rebuild
+	 * only the routes owned by this hart before enabling its local slots. */
+	if (cpu == 0) {
+		writel(0, esp32s31_clic_global->ipi_doorbells +
+			ESP32S31_IPI_TO_CPU0_OFF);
+		esp32s31_intmatrix_route_hart(esp32s31_clic_global, 0,
+			ESP32S31_IPI_TO_CPU0_SOURCE, ESP32S31_IPI_TO_CPU0_ID);
+		esp32s31_intmatrix_route_hart(esp32s31_clic_global, 0,
+			ESP32S31_SYSTIMER_CPU0_SOURCE, ESP32S31_IPI_TO_CPU0_ID);
+	} else if (cpu == 1) {
+		writel(0, esp32s31_clic_global->ipi_doorbells +
+			ESP32S31_IPI_TO_CPU1_OFF);
+		esp32s31_intmatrix_route_hart(esp32s31_clic_global, 1,
+			ESP32S31_IPI_TO_CPU1_SOURCE, ESP32S31_IPI_TO_CPU1_ID);
+		esp32s31_intmatrix_route_hart(esp32s31_clic_global, 1,
+			ESP32S31_SYSTIMER_CPU1_SOURCE, ESP32S31_IPI_TO_CPU1_ID);
+	}
+#endif
+
+	esp32s31_clic_init_hart(esp32s31_clic_global, cpu);
+	return 0;
+}
+
+static void esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
 {
 	int i;
 #ifdef CONFIG_SOC_ESP32S31
@@ -816,18 +1148,50 @@ static void __init esp32s31_clic_init_hart(struct esp32s31_clic *clic, int hart)
 	csr_write(CSR_SINTTHRESH, 0);
 
 	/*
-	 * ID7 is configured by OpenSBI as a direct S-mode timer at the same
-	 * fixed level as every external interrupt.  Do not overwrite it here.
+	 * OpenSBI owns the M-mode mcliccfg at 0x10800000 and leaves the CLIC
+	 * in its non-nested configuration.  This mapping starts at the S-mode CLIC
+	 * window (0x10a00000); offset zero is not a readable alias of mcliccfg
+	 * and returns zero, so do not use it to diagnose the machine setting.
 	 */
+	if (hart == 0)
+		pr_info("CLIC: native IPI level %u, device/timer level %u\n",
+			ESP32S31_IPI_LEVEL, ESP32S31_EXTERNAL_LEVEL);
 
-	for (i = CLIC_EXT_MIN_ID; i <= CLIC_EXT_MAX_ID; i++) {
-		clic_writeb(clic, i, ESP32S31_CLIC_INT_IP, 0);
-		clic_writeb(clic, i, ESP32S31_CLIC_INT_IE, 0);
-		clic_writeb(clic, i, ESP32S31_CLIC_INT_ATTR,
+	/* Disable the superseded cross-hart clicintip ID1 transport. */
+	clic_writeb(clic, CLIC_S_SOFT_ID, ESP32S31_CLIC_INT_IP, 0);
+	clic_writeb(clic, CLIC_S_SOFT_ID, ESP32S31_CLIC_INT_IE, 0);
+
+
+	/*
+	 * All device interrupts are routed to hart0 through the interrupt
+	 * matrix.  Only initialise the external CLIC slots on hart0; touching
+	 * hart1's slots here would leave a second, unused set of external
+	 * enables that is never serviced and makes SMP-time mask/unmask
+	 * behaviour ambiguous.
+	 */
+	if (hart == 0) {
+		for (i = CLIC_EXT_MIN_ID; i <= CLIC_EXT_MAX_ID; i++) {
+			clic_writeb(clic, i, ESP32S31_CLIC_INT_IP, 0);
+			clic_writeb(clic, i, ESP32S31_CLIC_INT_IE, 0);
+			clic_writeb(clic, i, ESP32S31_CLIC_INT_ATTR,
+				    mode_attr | CLIC_ATTR_TRIG_LEVEL);
+			clic_writeb(clic, i, ESP32S31_CLIC_INT_CTL,
+				    CLICCTL_MAKE(ESP32S31_EXTERNAL_LEVEL,
+						 ESP32S31_MAX_PRIORITY));
+		}
+	}
+
+	if (IS_ENABLED(CONFIG_SMP)) {
+		unsigned int ipi_id = hart ? ESP32S31_IPI_TO_CPU1_ID :
+					     ESP32S31_IPI_TO_CPU0_ID;
+
+		clic_writeb(clic, ipi_id, ESP32S31_CLIC_INT_IE, 0);
+		clic_writeb(clic, ipi_id, ESP32S31_CLIC_INT_ATTR,
 			    mode_attr | CLIC_ATTR_TRIG_LEVEL);
-		clic_writeb(clic, i, ESP32S31_CLIC_INT_CTL,
-			    CLICCTL_MAKE(ESP32S31_EXTERNAL_LEVEL,
+		clic_writeb(clic, ipi_id, ESP32S31_CLIC_INT_CTL,
+			    CLICCTL_MAKE(ESP32S31_IPI_LEVEL,
 					 ESP32S31_MAX_PRIORITY));
+		clic_writeb(clic, ipi_id, ESP32S31_CLIC_INT_IE, 1);
 	}
 
 	per_cpu(clic_per_cpu, hart) = clic;
@@ -985,6 +1349,16 @@ static int __init esp32s31_clic_probe(struct device_node *node,
 		ret = -ENOMEM;
 		goto err_unmap;
 	}
+
+	if (IS_ENABLED(CONFIG_SMP)) {
+		clic->ipi_doorbells = ioremap(ESP32S31_IPI_DOORBELL_BASE,
+					       ESP32S31_IPI_DOORBELL_SIZE);
+		if (!clic->ipi_doorbells) {
+			pr_err("CLIC: Failed to ioremap S31 IPI doorbells\n");
+			ret = -ENOMEM;
+			goto err_unmap;
+		}
+	}
 #endif
 
 	/*
@@ -1004,7 +1378,16 @@ static int __init esp32s31_clic_probe(struct device_node *node,
 		goto err_unmap;
 	}
 
-	/* Initialize hart 0 (boot CPU) */
+	/* Initialize hart 0 (boot CPU).  Pre-set the per-CPU pointer for
+	 * every possible hart as well: the first hart1 interrupt can arrive
+	 * before the CPUHP callback above has run, and a NULL clic pointer
+	 * in the IRQ handler would trigger WARN_ON(!clic) / ebreak.
+	 */
+	esp32s31_clic_global = clic;
+#ifdef CONFIG_SOC_ESP32S31
+	if (IS_ENABLED(CONFIG_SMP))
+		esp32s31_clic_ipi_hw_init(clic);
+#endif
 	esp32s31_clic_init_hart(clic, 0);
 
 #ifdef CONFIG_SOC_ESP32S31
@@ -1047,18 +1430,44 @@ static int __init esp32s31_clic_probe(struct device_node *node,
 	}
 #endif
 
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_IRQ_RISCV_SBI_IPI_STARTING,
+					"esp32s31_clic:online",
+					esp32s31_clic_cpu_starting, NULL);
+	if (ret) {
+		pr_err("CLIC: failed to register CPU startup callback: %d\n", ret);
+		goto err_unmap_sclic;
+	}
+
+#ifdef CONFIG_SOC_ESP32S31
+	ret = esp32s31_clic_ipi_init();
+	if (ret) {
+		pr_err("CLIC: failed to initialize native S-mode IPIs: %d\n", ret);
+		cpuhp_remove_state_nocalls(CPUHP_AP_IRQ_RISCV_SBI_IPI_STARTING);
+		goto err_unmap_sclic;
+	}
+#endif
+
 	pr_info("CLIC: initialized — %u interrupts, %u harts, vectored mode\n",
 		num_interrupts, num_harts);
 
 	return 0;
 
+err_unmap_sclic:
+#ifdef CONFIG_SOC_ESP32S31
+	iounmap(esp32s31_sclic_regs);
+	esp32s31_sclic_regs = NULL;
+#endif
 err_restore_handler:
 #ifdef CONFIG_SOC_ESP32S31
 	handle_arch_irq = fallback_handle_irq;
 	fallback_handle_irq = NULL;
 #endif
+	esp32s31_clic_global = NULL;
+	irq_domain_remove(clic->domain);
 err_unmap:
 #ifdef CONFIG_SOC_ESP32S31
+	if (clic->ipi_doorbells)
+		iounmap(clic->ipi_doorbells);
 	if (clic->intmatrix_regs)
 		iounmap(clic->intmatrix_regs);
 #endif

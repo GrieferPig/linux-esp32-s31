@@ -40,11 +40,16 @@ extern u32 s31_rtos_isr_depth;
 void *s31_linux_task_create(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
 				    void *arg, u32 priority, void *cookie);
+void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
+				     u32 stack_size, void *stack_base,
+				     void *arg, u32 priority, void *cookie);
 void s31_linux_task_exit_current(void);
 int s31_linux_task_stop(void *task);
 void *s31_linux_current_cookie(void);
 void s31_linux_task_delay(u32 ticks);
 u32 s31_linux_tick_count(void);
+uint64_t s31_linux_time_ns(void);
+void s31_linux_printf(const char *fmt, ...);
 void *s31_linux_sync_create(void);
 void s31_linux_sync_destroy(void *sync);
 void s31_linux_sync_lock(void *sync);

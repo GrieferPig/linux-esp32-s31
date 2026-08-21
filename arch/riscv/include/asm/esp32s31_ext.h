@@ -15,7 +15,7 @@ struct esp32s31_ext_state {
 	u32 pie[54];
 } __aligned(16);
 
-#ifdef CONFIG_SOC_ESP32S31
+#ifdef CONFIG_ESP32S31_COPROC_CONTEXT
 void esp32s31_ext_switch(struct task_struct *prev, struct task_struct *next);
 void esp32s31_ext_save(struct task_struct *task);
 void esp32s31_ext_restore(struct task_struct *task);

@@ -42,10 +42,10 @@
 		#size-cells = <0>;
 		timebase-frequency = <320000000>;
 
-		cpu0: cpu@1 {
+		cpu0: cpu@0 {
 			device_type = "cpu";
 			compatible = "espressif,esp32s31", "riscv";
-			reg = <1>;
+			reg = <0>;
 			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
@@ -65,9 +65,33 @@
 			};
 		};
 
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "espressif,esp32s31", "riscv";
+			reg = <1>;
+			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
+					       "zbc", "zbs", "c",
+					       "zicntr", "zicsr", "zifencei";
+			mmu-type = "riscv,sv32";
+			i-cache-block-size = <64>;
+			i-cache-sets = <256>;
+			i-cache-size = <32768>;
+			d-cache-block-size = <64>;
+			d-cache-sets = <512>;
+			d-cache-size = <65536>;
+			cpu1_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+
 		cpu-map {
 			cluster0 {
 				core0 { cpu = <&cpu0>; };
+				core1 { cpu = <&cpu1>; };
 			};
 		};
 	};

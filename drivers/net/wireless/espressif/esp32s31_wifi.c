@@ -391,6 +391,11 @@ static int __init s31_wifi_init(void)
 	struct wiphy *wiphy;
 	struct s31_wifi *wifi;
 
+	if (esp32s31_radio_is_disabled()) {
+		pr_info("esp32s31-wifi: disabled with radio core\n");
+		return 0;
+	}
+
 	wiphy = wiphy_new(&s31_cfg80211_ops, sizeof(*wifi));
 	if (!wiphy)
 		return -ENOMEM;

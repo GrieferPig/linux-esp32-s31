@@ -155,6 +155,30 @@ static inline void sync_kernel_mappings(pgd_t *pgd)
 	memcpy(pgd + USER_PTRS_PER_PGD,
 	       init_mm.pgd + USER_PTRS_PER_PGD,
 	       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * The ESP32-S31 radio payload and mask ROM live below PAGE_OFFSET in
+	 * physical address space.  Their identity mappings are installed in
+	 * swapper_pg_dir during setup_vm_final(), but the generic RISC-V
+	 * pgd_alloc() only copies the upper-half kernel mappings.  Copy these
+	 * platform low-window PGD entries as well so any kernel thread (not
+	 * just init_mm borrowers) can access HP SRAM and ROM while in S mode.
+	 */
+	{
+		static const unsigned long s31_platform_low_pgds[] = {
+			0x2f000000UL,
+			0x2f800000UL,
+		};
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(s31_platform_low_pgds); i++) {
+			unsigned long idx = pgd_index(s31_platform_low_pgds[i]);
+
+			pgd[idx] = init_mm.pgd[idx];
+		}
+	}
+#endif
 }
 
 static inline pgd_t *pgd_alloc(struct mm_struct *mm)

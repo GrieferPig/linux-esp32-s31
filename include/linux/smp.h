@@ -29,9 +29,16 @@ struct __call_single_data {
 #define CSD_INIT(_func, _info) \
 	(struct __call_single_data){ .func = (_func), .info = (_info), }
 
-/* Use __aligned() to avoid to use 2 cache lines for 1 csd */
+/* Use __aligned() to avoid to use 2 cache lines for 1 csd.  RV32 S31's
+ * optional CSD debug src/dst fields make the raw structure 20 bytes, which
+ * is not a valid GCC alignment.  Round the diagnostic-only type up to the
+ * next power of two. */
+#if defined(CONFIG_32BIT) && defined(CONFIG_CSD_LOCK_WAIT_DEBUG)
+typedef struct __call_single_data call_single_data_t __aligned(32);
+#else
 typedef struct __call_single_data call_single_data_t
 	__aligned(sizeof(struct __call_single_data));
+#endif
 
 #define INIT_CSD(_csd, _func, _info)		\
 do {						\

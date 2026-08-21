@@ -37,6 +37,30 @@ EXPORT_SYMBOL(__stack_chk_guard);
 
 extern asmlinkage void ret_from_fork(void);
 
+#ifdef CONFIG_SOC_ESP32S31
+extern void esp32s31_clic_poll(void);
+void arch_cpu_idle_poll(void);
+
+void arch_cpu_idle_poll(void)
+{
+	esp32s31_clic_poll();
+}
+
+void arch_cpu_idle_prepare(void)
+{
+	static bool polling_enabled;
+
+	/* S31 CLIC interrupts do not wake WFI while sstatus.SIE is clear, but
+	 * the generic idle loop deliberately enters WFI with local IRQs off.
+	 * Force its IRQ-enabled polling path so native IPIs cannot be stranded. */
+	if (!polling_enabled) {
+		polling_enabled = true;
+		cpu_idle_poll_ctrl(true);
+		pr_info("S31 idle: forcing IRQ-enabled polling (WFI cannot wake with SIE=0)\n");
+	}
+}
+#endif
+
 void noinstr arch_cpu_idle(void)
 {
 	cpu_do_idle();

@@ -66,6 +66,8 @@ struct esp32s31_radio_wifi_ops {
 	void (*tx_wakeup)(void *context);
 };
 
+bool esp32s31_radio_is_disabled(void);
+
 /*
  * This is intentionally the only public operation in the core's first
  * revision. Bluetooth HCI and cfg80211 add typed entry points here rather

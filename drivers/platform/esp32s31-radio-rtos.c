@@ -645,6 +645,15 @@ uint64_t s31_linux_time_ns(void)
 	return ktime_get_mono_fast_ns();
 }
 
+void s31_linux_printf(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	vprintk(fmt, args);
+	va_end(args);
+}
+
 void s31_linux_task_dump_all(void)
 {
 	struct s31_linux_task *task;
@@ -688,6 +697,7 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 {
 	struct s31_linux_task *task;
 	struct sched_param param = { };
+	bool realtime_task;
 
 	if (!entry || !stack_base)
 		return NULL;
@@ -713,10 +723,26 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 	task->next = s31_task_list;
 	s31_task_list = task;
 	spin_unlock(&s31_task_list_lock);
-	/* Preserve the FreeRTOS ordering: the init task is above operation tasks,
-	 * and all measured Wi-Fi tasks are real-time Linux threads. */
-	param.sched_priority = clamp_t(u32, 70 + priority, 1, 97);
-	sched_setscheduler_nocheck(task->thread, SCHED_FIFO, &param);
+	/* Radio hardware, IRQ callbacks and the serialized blob worker all run
+	 * on CPU0.  Keep every FreeRTOS compatibility task on that CPU as well. */
+	kthread_bind(task->thread, 0);
+	/* Wi-Fi and BTDM are both FreeRTOS priority 23 in the S31 IDF.  Giving
+	 * only BTDM real-time priority lets an active BLE scan run ahead of the Wi-Fi
+	 * MAC task indefinitely, leaving cfg80211 associated but unable to even
+	 * resolve the AP by ARP.  FreeRTOS time-slices equal-priority runnable
+	 * tasks, so SCHED_RR (not FIFO) preserves their native ordering. */
+	realtime_task = name && (!strcmp(name, "btdm") || !strcmp(name, "wifi"));
+	if (realtime_task) {
+		param.sched_priority = 80;
+		sched_setscheduler_nocheck(task->thread, SCHED_RR, &param);
+	} else {
+		sched_setscheduler_nocheck(task->thread, SCHED_NORMAL, &param);
+		set_user_nice(task->thread, 5);
+	}
+	pr_info("esp32s31-radio: task %s FreeRTOS-prio=%u Linux=%s/%d\n",
+		name && *name ? name : "s31-task", priority,
+		realtime_task ? "RR" : "CFS",
+		realtime_task ? param.sched_priority : 5);
 	wake_up_process(task->thread);
 	return task;
 }
@@ -804,8 +830,16 @@ void s31_linux_task_set_priority(void *opaque, u32 priority)
 
 	if (!task || task->magic != S31_LINUX_TASK_MAGIC)
 		return;
-	param.sched_priority = clamp_t(u32, 70 + priority, 1, 97);
-	sched_setscheduler_nocheck(task->thread, SCHED_FIFO, &param);
+	if (!strcmp(task->thread->comm, "btdm") ||
+	    !strcmp(task->thread->comm, "wifi")) {
+		param.sched_priority = 80;
+		sched_setscheduler_nocheck(task->thread, SCHED_RR, &param);
+	} else {
+		sched_setscheduler_nocheck(task->thread, SCHED_NORMAL, &param);
+		set_user_nice(task->thread, 5);
+	}
+	pr_info("esp32s31-radio: task %s priority update FreeRTOS=%u\n",
+		task->thread->comm, priority);
 }
 
 void *s31_linux_sync_create(void)

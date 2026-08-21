@@ -25,6 +25,9 @@
 #include <linux/of.h>
 #include <linux/limits.h>
 #include <clocksource/timer-riscv.h>
+#ifdef CONFIG_SOC_ESP32S31
+#include <linux/clocksource/esp32s31-systimer.h>
+#endif
 #include <asm/smp.h>
 #include <asm/cpufeature.h>
 #include <asm/sbi.h>
@@ -35,6 +38,11 @@ static bool riscv_timer_cannot_wake_cpu;
 
 static void riscv_clock_event_stop(void)
 {
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31)) {
+		esp32s31_systimer_stop();
+		return;
+	}
+
 	if (static_branch_likely(&riscv_sstc_available)) {
 		csr_write(CSR_STIMECMP, ULONG_MAX);
 		if (IS_ENABLED(CONFIG_32BIT))
@@ -47,6 +55,9 @@ static void riscv_clock_event_stop(void)
 static int riscv_clock_next_event(unsigned long delta,
 		struct clock_event_device *ce)
 {
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		return esp32s31_systimer_set_next_event(delta);
+
 	u64 next_tval = get_cycles64() + delta;
 
 	if (static_branch_likely(&riscv_sstc_available)) {
@@ -118,7 +129,10 @@ static int riscv_timer_starting_cpu(unsigned int cpu)
 		ce->features |= CLOCK_EVT_FEAT_C3STOP;
 	if (static_branch_likely(&riscv_sstc_available))
 		ce->rating = 450;
-	clockevents_config_and_register(ce, riscv_timebase, 100, ULONG_MAX);
+	clockevents_config_and_register(ce,
+		IS_ENABLED(CONFIG_SOC_ESP32S31) ? ESP32S31_SYSTIMER_RATE :
+						   riscv_timebase,
+		100, ULONG_MAX);
 
 	enable_percpu_irq(riscv_clock_event_irq,
 			  irq_get_trigger_type(riscv_clock_event_irq));
@@ -148,6 +162,13 @@ static irqreturn_t riscv_timer_interrupt(int irq, void *dev_id)
 
 	return IRQ_HANDLED;
 }
+
+#ifdef CONFIG_SOC_ESP32S31
+void esp32s31_riscv_timer_poll(void)
+{
+	riscv_timer_interrupt(riscv_clock_event_irq, NULL);
+}
+#endif
 
 static int __init riscv_timer_init_common(void)
 {

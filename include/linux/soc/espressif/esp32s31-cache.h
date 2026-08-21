@@ -2,6 +2,8 @@
 #ifndef __LINUX_SOC_ESPRESSIF_ESP32S31_CACHE_H
 #define __LINUX_SOC_ESPRESSIF_ESP32S31_CACHE_H
 
+#define ESP32S31_CACHE_PHYS_BASE	0x2c000000UL
+
 #ifndef __ASSEMBLY__
 
 #include <linux/types.h>

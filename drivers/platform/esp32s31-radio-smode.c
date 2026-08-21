@@ -19,11 +19,13 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/thread_info.h>
 #include <linux/timekeeping.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/esp32s31-radio.h>
+#include <asm/csr.h>
 #include <asm/fpu.h>
 #include <asm/irq_regs.h>
 #include <asm/ptrace.h>
@@ -34,6 +36,22 @@
 #define S31_ROM_CPU_FREQ	0x2f800040UL
 
 typedef unsigned int (*s31_rom_cpu_freq_t)(void);
+
+static bool s31_radio_disabled;
+
+static int __init s31_radio_disable_setup(char *value)
+{
+	if (value && !strcmp(value, "off"))
+		s31_radio_disabled = true;
+
+	return 0;
+}
+early_param("esp32s31_radio", s31_radio_disable_setup);
+
+bool esp32s31_radio_is_disabled(void)
+{
+	return s31_radio_disabled;
+}
 
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 /* The loader carves out 0x2f030000..0x2f072380 exclusively for Linux radio.
@@ -454,6 +472,7 @@ enum s31_radio_command_type {
 	S31_RADIO_COMMAND_WIFI_CONNECT,
 	S31_RADIO_COMMAND_WIFI_DISCONNECT,
 	S31_RADIO_COMMAND_BT_ENABLE,
+	S31_RADIO_COMMAND_TASK_CREATE,
 };
 
 /* H4 type plus Linux HCI_MAX_FRAME_SIZE (1028-byte ACL header/payload). */
@@ -827,6 +846,16 @@ struct s31_radio_command {
 		u8 *mac;
 		const struct esp32s31_radio_wifi_connect_params *connect;
 		u16 disconnect_reason;
+		struct {
+			void (*entry)(void *);
+			const char *name;
+			u32 stack_size;
+			void *stack_base;
+			void *arg;
+			u32 priority;
+			void *cookie;
+			void *linux_task;
+		} task_create;
 	};
 };
 
@@ -844,38 +873,11 @@ static void s31_radio_health_workfn(struct work_struct *work);
 static DECLARE_WORK(s31_radio_health_work, s31_radio_health_workfn);
 
 #define S31_IDF_INTR_DISABLED	BIT(5)
-#define S31_TICK_CLIC_HWIRQ	46
-#define S31_TIMG1_T1_SOURCE	29
-#define S31_TIMG1_BASE		0x20581000UL
-#define S31_HP_CLKRST_BASE	0x20587000UL
-#define S31_HP_CLKRST_TIMG1	0x11c
-#define S31_TIMG1_APB_CLK_EN	BIT(0)
-#define S31_TIMG1_T1_SRC_MASK	GENMASK(7, 6)
-#define S31_TIMG1_T1_CLK_EN	BIT(8)
-#define S31_TIMG_T1_CONFIG	0x24
-#define S31_TIMG_T1_ALARM_LO	0x34
-#define S31_TIMG_T1_ALARM_HI	0x38
-#define S31_TIMG_T1_LOAD_LO	0x3c
-#define S31_TIMG_T1_LOAD_HI	0x40
-#define S31_TIMG_T1_LOAD		0x44
-#define S31_TIMG_INT_ENA		0x70
-#define S31_TIMG_INT_CLR		0x7c
-#define S31_TIMG_T1_INT		BIT(1)
-#define S31_TIMG_T1_ALARM_EN	BIT(10)
-#define S31_TIMG_T1_DIV_RST	BIT(12)
-#define S31_TIMG_T1_DIVIDER(x)	((x) << 13)
-#define S31_TIMG_T1_AUTORELOAD	BIT(29)
-#define S31_TIMG_T1_INCREASE	BIT(30)
-#define S31_TIMG_T1_ENABLE	BIT(31)
-
-static void __iomem *s31_timg1;
-static int s31_tick_virq;
 static atomic_t s31_tick_pending = ATOMIC_INIT(0);
-static atomic_t s31_tick_irq_count = ATOMIC_INIT(0);
 
-/* 100 Hz tick samples of the interrupted PC while the blob gate is held by
- * current.  The blob runs on the SRAM exception stack, so current_pt_regs()
- * is stale there; use get_irq_regs() from hardirq context instead. */
+/* Gate-held PC samples were previously collected from the 100 Hz TIMG1
+ * hardirq.  That interrupt source has been removed; the ring is retained
+ * so the long-gate diagnostic path still compiles and prints empty state. */
 #define S31_PC_SAMPLE_RING 128
 struct s31_pc_sample {
 	u32 tick;
@@ -885,23 +887,6 @@ struct s31_pc_sample {
 };
 static struct s31_pc_sample s31_pc_sample_ring[S31_PC_SAMPLE_RING];
 static unsigned int s31_pc_sample_head;
-
-static void s31_pc_sample_record(void)
-{
-	struct pt_regs *regs = get_irq_regs();
-	struct s31_pc_sample *sample;
-	unsigned int idx;
-
-	if (!regs || !s31_linux_blob_held_by_current())
-		return;
-	idx = s31_pc_sample_head % S31_PC_SAMPLE_RING;
-	sample = &s31_pc_sample_ring[idx];
-	sample->tick = (u32)atomic_read(&s31_tick_irq_count);
-	sample->epc = instruction_pointer(regs);
-	sample->ra = regs->ra;
-	sample->pid = current->pid;
-	s31_pc_sample_head = idx + 1;
-}
 
 void s31_radio_report_wifi_init(int result)
 {
@@ -918,107 +903,16 @@ void s31_radio_report_bt_enable(int result)
 	WRITE_ONCE(s31_bt_enable_result, result);
 }
 
-static int s31_radio_map_clic_irq(unsigned int hwirq, unsigned int source)
-{
-	struct device_node *clic_node;
-	struct irq_fwspec fwspec = { };
-	int virq;
-
-	clic_node = of_find_compatible_node(NULL, NULL,
-					"espressif,esp32s31-clic");
-	if (!clic_node)
-		return 0;
-	fwspec.fwnode = of_node_to_fwnode(clic_node);
-	fwspec.param_count = 3;
-	fwspec.param[0] = hwirq;
-	fwspec.param[1] = source;
-	fwspec.param[2] = IRQ_TYPE_LEVEL_HIGH;
-	virq = irq_create_fwspec_mapping(&fwspec);
-	of_node_put(clic_node);
-	return virq;
-}
-
-static irqreturn_t s31_tick_hardirq(int irq, void *data)
-{
-	u32 config;
-
-	writel(S31_TIMG_T1_INT, s31_timg1 + S31_TIMG_INT_CLR);
-	/* ALARM_EN is self-clearing even in auto-reload mode. */
-	config = readl(s31_timg1 + S31_TIMG_T1_CONFIG);
-	writel(config | S31_TIMG_T1_ALARM_EN,
-	       s31_timg1 + S31_TIMG_T1_CONFIG);
-	atomic_inc(&s31_tick_irq_count);
-	atomic_inc(&s31_tick_pending);
-	s31_pc_sample_record();
-	wake_up(&s31_radio_waitq);
-	return IRQ_HANDLED;
-}
-
 u32 s31_linux_tick_count(void)
 {
-	return (u32)atomic_read(&s31_tick_irq_count);
-}
-
-static int s31_radio_tick_init(void)
-{
-	void __iomem *clkrst;
-	u32 config;
-	u32 clk_config;
-	int ret;
-
-	s31_timg1 = ioremap(S31_TIMG1_BASE, 0x100);
-	if (!s31_timg1)
-		return -ENOMEM;
-	s31_tick_virq = s31_radio_map_clic_irq(S31_TICK_CLIC_HWIRQ,
-						 S31_TIMG1_T1_SOURCE);
-	if (!s31_tick_virq) {
-		ret = -EINVAL;
-		goto err_unmap;
-	}
-	ret = request_irq(s31_tick_virq, s31_tick_hardirq, 0,
-			  "esp32s31-radio-tick", s31_timg1);
-	if (ret)
-		goto err_mapping;
-
-	clkrst = ioremap(S31_HP_CLKRST_BASE, 0x200);
-	if (!clkrst) {
-		ret = -ENOMEM;
-		goto err_irq;
-	}
-	clk_config = readl(clkrst + S31_HP_CLKRST_TIMG1);
-	clk_config &= ~S31_TIMG1_T1_SRC_MASK; /* XTAL, 40 MHz */
-	clk_config |= S31_TIMG1_APB_CLK_EN | S31_TIMG1_T1_CLK_EN;
-	writel(clk_config, clkrst + S31_HP_CLKRST_TIMG1);
-	iounmap(clkrst);
-
-	/* TIMG1 is already clocked by its watchdog device.  Divide the 40-MHz
-	 * APB clock to 1 kHz and alarm every 10 counts for a 100-Hz RTOS tick. */
-	writel(0, s31_timg1 + S31_TIMG_T1_CONFIG);
-	writel(readl(s31_timg1 + S31_TIMG_INT_ENA) | S31_TIMG_T1_INT,
-	       s31_timg1 + S31_TIMG_INT_ENA);
-	writel(S31_TIMG_T1_INT, s31_timg1 + S31_TIMG_INT_CLR);
-	writel(0, s31_timg1 + S31_TIMG_T1_LOAD_LO);
-	writel(0, s31_timg1 + S31_TIMG_T1_LOAD_HI);
-	writel(1, s31_timg1 + S31_TIMG_T1_LOAD);
-	writel(10, s31_timg1 + S31_TIMG_T1_ALARM_LO);
-	writel(0, s31_timg1 + S31_TIMG_T1_ALARM_HI);
-	config = S31_TIMG_T1_DIVIDER(40000) | S31_TIMG_T1_DIV_RST |
-		 S31_TIMG_T1_AUTORELOAD | S31_TIMG_T1_INCREASE |
-		 S31_TIMG_T1_ALARM_EN | S31_TIMG_T1_ENABLE;
-	writel(config, s31_timg1 + S31_TIMG_T1_CONFIG);
-	pr_info("esp32s31-radio: TIMG1/T1 tick routed to CLIC%d/IRQ%d at 100 Hz\n",
-		S31_TICK_CLIC_HWIRQ, s31_tick_virq);
-	return 0;
-
-err_irq:
-	free_irq(s31_tick_virq, s31_timg1);
-err_mapping:
-	irq_dispose_mapping(s31_tick_virq);
-	s31_tick_virq = 0;
-err_unmap:
-	iounmap(s31_timg1);
-	s31_timg1 = NULL;
-	return ret;
+	/* Linux jiffies is the radio world time base now.  The 100 Hz TIMG1
+	 * hardirq was removed so a blob-gate busy-wait cannot starve the tick
+	 * source: jiffies advances on the Linux scheduler tick independently.
+	 * jiffies starts at INITIAL_JIFFIES (near UINT_MAX on 32-bit); use the
+	 * elapsed count so the returned 10 ms tick matches milliseconds since
+	 * boot and wraps like the FreeRTOS TickType_t counter.
+	 */
+	return (u32)(jiffies_to_msecs((unsigned long)(jiffies - INITIAL_JIFFIES)) / 10U);
 }
 
 int __wrap_esp_intr_alloc(int source, int flags, void (*handler)(void *),
@@ -1324,6 +1218,16 @@ static bool s31_radio_irq_work_pending(void)
 	return false;
 }
 
+static bool s31_radio_irq_callback_pending(void)
+{
+	int i;
+
+	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++)
+		if (atomic_read(&s31_idf_irqs[i].callback_pending))
+			return true;
+	return false;
+}
+
 /* Print the most recent gate-held PC samples with symbol resolution.  The
  * tick IRQ samples the interrupted PC whenever current holds the blob gate,
  * so this is a cheap view of where the payload/worker spends long holds. */
@@ -1384,17 +1288,6 @@ void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns,
 			(void *)(unsigned long)sample->epc,
 			(void *)(unsigned long)sample->ra);
 	}
-}
-
-static struct s31_idf_irq_registration *s31_radio_source_irq(int source)
-{
-	int i;
-
-	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++)
-		if (s31_idf_irqs[i].allocated &&
-		    s31_idf_irqs[i].source == source)
-			return &s31_idf_irqs[i];
-	return NULL;
 }
 
 static bool s31_radio_command_work_pending(void)
@@ -1676,7 +1569,7 @@ static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 	health->wifi_init_result = READ_ONCE(s31_wifi_init_result);
 	health->bt_init_result = READ_ONCE(s31_bt_init_result);
 	health->bt_enable_result = READ_ONCE(s31_bt_enable_result);
-	health->tick_irqs = atomic_read(&s31_tick_irq_count);
+	health->tick_irqs = s31_linux_tick_count();
 	health->worker_passes = atomic_read(&s31_radio_worker_passes);
 	health->commands_completed = atomic_read(&s31_radio_commands_completed);
 	health->heap_used = total - free;
@@ -1686,7 +1579,9 @@ static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 	health->wifi_tx_dropped = atomic_read(&s31_wifi_tx_dropped);
 }
 
-/* Run only from the radio worker while the blob execution gate is held. */
+/* Run only from the radio worker, on its normal kernel stack.
+ * Individual cases acquire the blob gate if the payload entry needs it.
+ */
 static void s31_radio_process_commands(void)
 {
 	LIST_HEAD(commands);
@@ -1760,12 +1655,64 @@ static void s31_radio_process_commands(void)
 			command->result = -EOPNOTSUPP;
 #endif
 			break;
+		case S31_RADIO_COMMAND_TASK_CREATE:
+			command->task_create.linux_task = s31_linux_task_create(
+				command->task_create.entry,
+				command->task_create.name,
+				command->task_create.stack_size,
+				command->task_create.stack_base,
+				command->task_create.arg,
+				command->task_create.priority,
+				command->task_create.cookie);
+			command->result = command->task_create.linux_task ? 0 : -ENOMEM;
+			break;
 		default:
 			command->result = -EOPNOTSUPP;
 			break;
 		}
 		complete(&command->done);
 	}
+}
+
+/*
+ * s31_linux_task_create() calls this bridge when the caller is a compat
+ * task executing on its HP-SRAM payload stack.  kthread_create() puts its
+ * on-stack completion on that payload stack, and the freshly forked kthread
+ * can complete it from the secondary hart before kthread_bind() runs.  Queue
+ * the request to the radio worker instead; the worker creates the kthread on
+ * its normal kernel stack, binds it to hart0, and then completes this
+ * normal-memory command object.
+ */
+void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
+				     u32 stack_size, void *stack_base,
+				     void *arg, u32 priority, void *cookie)
+{
+	struct s31_radio_command *command;
+	void *linux_task;
+
+	command = kzalloc(sizeof(*command), GFP_KERNEL);
+	if (!command)
+		return NULL;
+	INIT_LIST_HEAD(&command->node);
+	init_completion(&command->done);
+	command->type = S31_RADIO_COMMAND_TASK_CREATE;
+	command->task_create.entry = entry;
+	command->task_create.name = name;
+	command->task_create.stack_size = stack_size;
+	command->task_create.stack_base = stack_base;
+	command->task_create.arg = arg;
+	command->task_create.priority = priority;
+	command->task_create.cookie = cookie;
+
+	spin_lock(&s31_radio_command_lock);
+	list_add_tail(&command->node, &s31_radio_commands);
+	spin_unlock(&s31_radio_command_lock);
+	wake_up(&s31_radio_waitq);
+
+	wait_for_completion(&command->done);
+	linux_task = command->task_create.linux_task;
+	kfree(command);
+	return linux_task;
 }
 
 /* Optional IDF tables are empty in the built-in radio payload. */
@@ -2040,10 +1987,18 @@ struct s31_radio_blob_pass_args {
 static void s31_radio_run_blob_pass(void *opaque)
 {
 	struct s31_radio_blob_pass_args *args = opaque;
+	struct sched_param rt_param = { .sched_priority = 90 };
+	struct sched_param cfs_param = { };
 	int tick_events = args->tick_events;
+	bool irq_pass = s31_radio_irq_callback_pending();
 	u64 gate_end_ns;
 	int i;
 
+	/* Match the native ordering only for interrupt service.  A permanent FIFO
+	 * worker can stay runnable on periodic/tick work and starve Linux; a CFS
+	 * worker can miss BLE LLL deadlines under a pinned CoreMark. */
+	if (irq_pass)
+		sched_setscheduler_nocheck(current, SCHED_FIFO, &rt_param);
 	args->worker_start_ns = ktime_get_mono_fast_ns();
 	s31_linux_blob_enter();
 	gate_end_ns = ktime_get_mono_fast_ns();
@@ -2085,16 +2040,19 @@ static void s31_radio_run_blob_pass(void *opaque)
 	s31_radio_wifi_free_pending();
 	atomic_inc(&s31_radio_worker_passes);
 	s31_linux_blob_leave();
+	if (irq_pass) {
+		sched_setscheduler_nocheck(current, SCHED_NORMAL, &cfs_param);
+		set_user_nice(current, 0);
+	}
 	/*
-	 * The compatibility tasks (Wi-Fi, sys_evt) are SCHED_FIFO kthreads
-	 * blocked on the blob mutex.  After releasing the gate, yield the
+	 * The compatibility tasks are blocked on the blob mutex; Wi-Fi and BTDM
+	 * use RR priority while sys_evt remains CFS.  After releasing the gate,
+	 * yield the
 	 * CPU so they can enter the gate, process their event queues, and
 	 * push received frames into the Linux ring buffers while the worker
 	 * is still running its post-gate delivery step.
 	 */
 	cond_resched();
-
-	s31_radio_process_commands();
 }
 
 static int s31_radio_run_linux_pass(void)
@@ -2114,6 +2072,14 @@ static int s31_radio_run_linux_pass(void)
 	s31_radio_hci_deliver_rx();
 	s31_radio_wifi_deliver_scan();
 	s31_radio_wifi_deliver_events();
+
+	/*
+	 * Command processing creates kthreads through kthread_create().  It
+	 * must run on the worker's normal kernel stack and, for task-create
+	 * requests, before the worker blocks on the blob gate: the compat task
+	 * that queued the request may itself be the gate holder.
+	 */
+	s31_radio_process_commands();
 
 	if (s31_radio_worker_stack)
 		s31_linux_call_on_stack(s31_radio_worker_stack,
@@ -2185,22 +2151,28 @@ static void s31_radio_health_workfn(struct work_struct *work)
 
 static int s31_radio_runtime_thread(void *unused)
 {
-	struct sched_param param = { .sched_priority = 98 };
+	struct sched_param param = { };
 	void __iomem *rom;
 	unsigned long next_tick;
+	/* 10 ms RTOS tick (CONFIG_HZ=100) for esp_timer/xTaskDelay. */
 	const unsigned long tick_period = max_t(unsigned long, 1,
-							msecs_to_jiffies(10));
-	unsigned long next_heap_report;
+						 msecs_to_jiffies(10));
 	bool hw_tick;
 	u32 identity_word, ioremap_word;
 	unsigned int cpu_mhz;
 	int ret;
 
 	pr_info("esp32s31-radio: worker entered\n");
-	/* Wi-Fi MAC service latency is bounded in ESP-IDF by a priority-23 task.
-	 * Keep Linux userspace and ordinary kernel workers from delaying its ISR
-	 * bottom half during association and receive bursts. */
-	sched_setscheduler_nocheck(current, SCHED_FIFO, &param);
+	/*
+	 * The radio worker uses ordinary SCHED_NORMAL nice 0
+	 * so it gets the lion's share of CPU time but does NOT starve init
+	 * or other SCHED_NORMAL processes.  With PREEMPT_NONE, SCHED_FIFO
+	 * would monopolise the CPU because schedule() always picks FIFO over
+	 * NORMAL.  The blob gate + cond_resched() in sync_unlock ensures
+	 * periodic yield points.
+	 */
+	sched_setscheduler_nocheck(current, SCHED_NORMAL, &param);
+	set_user_nice(current, 0);
 	/* Low identity mappings intentionally exist only in init_mm. */
 	kthread_use_mm(&init_mm);
 	pr_info("esp32s31-radio: init_mm active\n");
@@ -2228,9 +2200,12 @@ static int s31_radio_runtime_thread(void *unused)
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
 	pr_info("esp32s31-radio: ILP32F Wi-Fi/BT payload linked\n");
-	hw_tick = s31_radio_tick_init() == 0;
-	if (!hw_tick)
-		pr_warn("esp32s31-radio: TIMG1/T1 unavailable, using jiffies tick\n");
+	/* TIMG1 hardirq tick removed: use Linux jiffies as the FreeRTOS/esp_timer
+	 * time base.  Blocking already uses Linux sleep/wait; only xTaskGetTickCount
+	 * and esp_timer_get_time need a monotonic 10 ms tick, which jiffies gives.
+	 */
+	hw_tick = false;
+	pr_info("esp32s31-radio: using Linux jiffies tick\n");
 	pr_info("esp32s31-radio: initializing compatibility RTOS\n");
 	s31_rtos_init();
 	if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
@@ -2242,15 +2217,15 @@ static int s31_radio_runtime_thread(void *unused)
 	pr_info("esp32s31-radio: Linux kthread task started\n");
 
 	next_tick = jiffies + tick_period;
-	next_heap_report = jiffies + 20 * HZ;
 	for (;;) {
 		s31_radio_sync_irq_registrations();
 		s31_radio_update_state();
-		if (time_after_eq(jiffies, next_heap_report)) {
-			s31_radio_heap_report("periodic");
-			s31_pc_sample_dump();
-			next_heap_report = jiffies + 20 * HZ;
-		}
+		/*
+		 * Periodic heap/PC reports are intentionally disabled: the
+		 * printk flood slowed the serial console and disturbed
+		 * dual-core CoreMark measurements.  s31_radio_heap_report()
+		 * remains available for diagnostic stages.
+		 */
 		if (!s31_radio_worker_stack &&
 		    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
 			s31_radio_worker_stack =
@@ -2267,8 +2242,11 @@ static int s31_radio_runtime_thread(void *unused)
 		if (kthread_should_stop())
 			break;
 		if (!hw_tick && time_after_eq(jiffies, next_tick)) {
-			atomic_inc(&s31_tick_pending);
-			next_tick += tick_period;
+			unsigned long elapsed = jiffies - next_tick;
+			unsigned long ticks = elapsed / tick_period + 1;
+
+			atomic_add(ticks, &s31_tick_pending);
+			next_tick += ticks * tick_period;
 		}
 		ret = s31_radio_run_linux_pass();
 		if (ret) {
@@ -2276,12 +2254,13 @@ static int s31_radio_runtime_thread(void *unused)
 			goto failed;
 		}
 		/*
-		 * Let compatibility tasks (Wi-Fi, sys_evt) run between
-		 * passes while the blob gate is released.  They use the
-		 * gate to process event queues and push RX frames before
-		 * the worker re-enters for the next tick.
+		 * Unconditionally reschedule after every blob pass.  CFS
+		 * wake-up bonus resets the compat task's vruntime on every
+		 * sleep/wake cycle, making it lower than init's vruntime.
+		 * schedule() forces the scheduler to compare vruntimes and
+		 * pick init when the radio tasks have used their fair share.
 		 */
-		cond_resched();
+		schedule();
 		wait_event_interruptible_timeout(s31_radio_waitq,
 			kthread_should_stop() ||
 			atomic_read(&s31_tick_pending) ||
@@ -2292,8 +2271,7 @@ static int s31_radio_runtime_thread(void *unused)
 				s31_radio_wifi_rx_pending(),
 			time_before(jiffies, next_tick) ?
 				next_tick - jiffies : 1);
-		if (hw_tick)
-			next_tick = jiffies + tick_period;
+		/* next_tick is advanced in the fallback branch above. */
 	}
 	pr_info("esp32s31-radio: scheduler worker stopped\n");
 	goto out;
@@ -2319,10 +2297,17 @@ static int s31_radio_watchdog_thread(void *unused)
 	const char *last_holder = NULL;
 	unsigned long last_hold = 0;
 	unsigned long last_dump = 0;
-	struct sched_param param = { .sched_priority = 99 };
+	struct sched_param param = { };
 
 	(void)unused;
-	sched_setscheduler_nocheck(current, SCHED_FIFO, &param);
+	/* The watchdog dumps s31_linux_task objects that live in HP SRAM
+	 * physical addresses.  Use init_mm so those low identity mappings are
+	 * active on the watchdog thread as well; without it, task_dump_all()
+	 * faults on 0x2f01xxxx on hart0.
+	 */
+	kthread_use_mm(&init_mm);
+	sched_setscheduler_nocheck(current, SCHED_NORMAL, &param);
+	set_user_nice(current, 0);
 	while (!kthread_should_stop()) {
 		const char *holder = s31_linux_blob_holder();
 
@@ -2341,6 +2326,7 @@ static int s31_radio_watchdog_thread(void *unused)
 		}
 		ssleep(2);
 	}
+	kthread_unuse_mm(&init_mm);
 	return 0;
 }
 
@@ -2348,6 +2334,11 @@ static int __init s31_radio_runtime_init(void)
 {
 	struct task_struct *task;
 	int ret;
+
+	if (esp32s31_radio_is_disabled()) {
+		pr_info("esp32s31-radio: disabled by kernel command line\n");
+		return 0;
+	}
 
 	pr_info("esp32s31-radio: late init entered\n");
 
@@ -2448,11 +2439,13 @@ static int __init s31_radio_runtime_init(void)
 	}
 	task = kthread_create(s31_radio_watchdog_thread, NULL,
 			      "s31-radio-watchdog");
-	if (!IS_ERR(task))
+	if (!IS_ERR(task)) {
+		kthread_bind(task, 0);
 		wake_up_process(task);
-	else
+	} else {
 		pr_warn("esp32s31-radio: cannot create watchdog: %ld\n",
 			PTR_ERR(task));
+	}
 #endif
 
 	task = kthread_create(s31_radio_runtime_thread, NULL, "s31-radio");
@@ -2464,6 +2457,7 @@ static int __init s31_radio_runtime_init(void)
 	WRITE_ONCE(s31_radio_worker, task);
 	#endif
 	s31_blob_gate_wait_hook = s31_radio_gate_wait_sync;
+	kthread_bind(task, 0);
 	wake_up_process(task);
 	return 0;
 

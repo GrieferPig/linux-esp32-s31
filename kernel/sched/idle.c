@@ -49,6 +49,9 @@ static int __init cpu_idle_nopoll_setup(char *__unused)
 __setup("hlt", cpu_idle_nopoll_setup);
 #endif
 
+void arch_cpu_idle_poll(void);
+void __weak arch_cpu_idle_poll(void) { }
+
 static noinline int __cpuidle cpu_idle_poll(void)
 {
 	instrumentation_begin();
@@ -58,8 +61,10 @@ static noinline int __cpuidle cpu_idle_poll(void)
 
 	raw_local_irq_enable();
 	while (!tif_need_resched() &&
-	       (cpu_idle_force_poll || tick_check_broadcast_expired()))
+	       (cpu_idle_force_poll || tick_check_broadcast_expired())) {
+		arch_cpu_idle_poll();
 		cpu_relax();
+	}
 	raw_local_irq_disable();
 
 	ct_cpuidle_exit();

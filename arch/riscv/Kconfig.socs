@@ -90,6 +90,18 @@ config SOC_ESP32S31
 	  This enables support for the Espressif ESP32-S31 SoC.
 	  With MMU enabled the kernel runs in Supervisor mode behind OpenSBI.
 
+config ESP32S31_COPROC_CONTEXT
+	bool "ESP32-S31 HWLoop/PIE task context through SBI"
+	depends on SOC_ESP32S31
+	help
+	  Save and restore the stateful HWLoop and PIE extensions on task
+	  switches, fork and signal delivery.  The extension state CSRs are
+	  M-mode-only, so this requires a synchronous SBI ecall on every context
+	  switch.  On current S31 silicon those repeated privilege crossings can
+	  leave SINTSTATUS.SIL at 0xff and lock out all S-mode interrupts.  Keep
+	  this disabled for stable SMP and build normal userspace without the
+	  stateful extensions.  Enable it only for isolated extension testing.
+
 config ESP32S31_RADIO_SMODE
 	bool "ESP32-S31 S-mode radio runtime"
 	depends on SOC_ESP32S31 && MMU

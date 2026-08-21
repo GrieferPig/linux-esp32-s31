@@ -234,7 +234,8 @@ static bool csd_lock_wait_toolong(call_single_data_t *csd, u64 ts0, u64 *ts1, in
 	u64 ts2, ts_delta;
 	call_single_data_t *cpu_cur_csd;
 	unsigned int flags = READ_ONCE(csd->node.u_flags);
-	unsigned long long csd_lock_timeout_ns = csd_lock_timeout * NSEC_PER_MSEC;
+	unsigned long long csd_lock_timeout_ns =
+		(u64)csd_lock_timeout * NSEC_PER_MSEC;
 
 	if (!(flags & CSD_FLAG_LOCK)) {
 		if (!unlikely(*bug_id))
@@ -273,9 +274,9 @@ static bool csd_lock_wait_toolong(call_single_data_t *csd, u64 ts0, u64 *ts1, in
 	cpu_cur_csd = smp_load_acquire(&per_cpu(cur_csd, cpux)); /* Before func and info. */
 	/* How long since this CSD lock was stuck. */
 	ts_delta = ts2 - ts0;
-	pr_alert("csd: %s non-responsive CSD lock (#%d) on CPU#%d, waiting %lld ns for CPU#%02d %pS(%ps).\n",
+	pr_alert("csd: %s non-responsive CSD lock (#%d) on CPU#%d, waiting %lld ns for CPU#%02d %pS(%ps), func=%px info=%px.\n",
 		 firsttime ? "Detected" : "Continued", *bug_id, raw_smp_processor_id(), (s64)ts_delta,
-		 cpu, csd->func, csd->info);
+		 cpu, csd->func, csd->info, csd->func, csd->info);
 	(*nmessages)++;
 	if (firsttime)
 		atomic_inc(&n_csd_lock_stuck);
