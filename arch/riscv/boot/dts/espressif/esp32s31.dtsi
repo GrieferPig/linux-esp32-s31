@@ -500,7 +500,7 @@
 			reg = <0x20342000 0x1000>;
 			interrupt-parent = <&clic>;
 			/* raw CLIC interrupt, IDF ETS_SDIO_HOST_INTR_SOURCE */
-			interrupts = <16 3 IRQ_TYPE_EDGE_RISING>;
+			interrupts = <16 3 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc ESP32S31_CLK_SDMMC_BIU>,
 				 <&clkc ESP32S31_CLK_SDMMC_CIU>;
 			clock-names = "biu", "ciu";
