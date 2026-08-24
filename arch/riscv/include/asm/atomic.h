@@ -26,11 +26,31 @@
 
 static __always_inline int arch_atomic_read(const atomic_t *v)
 {
+#ifdef CONFIG_SOC_ESP32S31
+	atomic_t *rw = (atomic_t *)v;
+	int value;
+
+	__asm__ __volatile__("amoadd.w.aq %0, zero, %1"
+		: "=r" (value), "+A" (rw->counter)
+		:
+		: "memory");
+	return value;
+#else
 	return READ_ONCE(v->counter);
+#endif
 }
 static __always_inline void arch_atomic_set(atomic_t *v, int i)
 {
+#ifdef CONFIG_SOC_ESP32S31
+	int old;
+
+	__asm__ __volatile__("amoswap.w.aqrl %0, %2, %1"
+		: "=r" (old), "+A" (v->counter)
+		: "r" (i)
+		: "memory");
+#else
 	WRITE_ONCE(v->counter, i);
+#endif
 }
 
 #ifndef CONFIG_GENERIC_ATOMIC64

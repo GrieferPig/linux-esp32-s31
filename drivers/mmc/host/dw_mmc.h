@@ -128,6 +128,7 @@ struct dw_mci_dma_slave {
  * @cmd11_timer: Timer for SD3.0 voltage switch over scheme.
  * @cto_timer: Timer for broken command transfer over scheme.
  * @dto_timer: Timer for broken data transfer over scheme.
+ * @irq_poll_timer: Short S31 fallback timer for lost peripheral IRQ edges.
  *
  * Locking
  * =======
@@ -160,6 +161,7 @@ struct dw_mci_dma_slave {
 struct dw_mci {
 	spinlock_t		lock;
 	spinlock_t		irq_lock;
+	spinlock_t		irq_handler_lock;
 	void __iomem		*regs;
 	void __iomem		*fifo_reg;
 	u32			data_addr_override;
@@ -233,10 +235,13 @@ struct dw_mci {
 	int			irq;
 
 	int			sdio_id0;
+	/* Physical card index for single-slot wrappers (normally zero). */
+	u8			slot_id;
 
 	struct timer_list       cmd11_timer;
 	struct timer_list       cto_timer;
 	struct timer_list       dto_timer;
+	struct hrtimer		irq_poll_timer;
 
 #ifdef CONFIG_FAULT_INJECTION
 	struct fault_attr	fail_data_crc;
@@ -283,6 +288,8 @@ struct dw_mci_board {
 #define DW_MMC_QUIRK_EXTENDED_TMOUT            BIT(0)
 /* Force 32-bit access to the FIFO */
 #define DW_MMC_QUIRK_FIFO64_32                 BIT(1)
+#define DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT    BIT(2)
+#define DW_MMC_QUIRK_LOST_IRQ_POLL             BIT(3)
 
 #define DW_MMC_240A		0x240a
 #define DW_MMC_280A		0x280a

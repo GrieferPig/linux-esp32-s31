@@ -366,9 +366,20 @@ static pte_t fixmap_pte[PTRS_PER_PTE] __page_aligned_bss;
 
 pgd_t early_pg_dir[PTRS_PER_PGD] __initdata __aligned(PAGE_SIZE);
 
+#if defined(CONFIG_XIP_KERNEL) && defined(__PAGETABLE_PMD_FOLDED)
+static pte_t trampoline_pte[PTRS_PER_PTE] __page_aligned_bss;
+static pte_t early_pte[PTRS_PER_PTE] __initdata __aligned(PAGE_SIZE);
+#endif
+
 #ifdef CONFIG_XIP_KERNEL
 #define pt_ops			(*(struct pt_alloc_ops *)XIP_FIXUP(&pt_ops))
 #define trampoline_pg_dir      ((pgd_t *)XIP_FIXUP(trampoline_pg_dir))
+
+#ifdef __PAGETABLE_PMD_FOLDED
+#define trampoline_pte         ((pte_t *)XIP_FIXUP(trampoline_pte))
+#define early_pte              ((pte_t *)XIP_FIXUP(early_pte))
+#endif
+
 #define fixmap_pte             ((pte_t *)XIP_FIXUP(fixmap_pte))
 #define early_pg_dir           ((pgd_t *)XIP_FIXUP(early_pg_dir))
 #endif /* CONFIG_XIP_KERNEL */
@@ -773,14 +784,15 @@ extern char _xiprom[], _exiprom[], __data_loc;
 asmlinkage void __init __copy_data(void)
 {
 	void *from = (void *)(&__data_loc);
-	void *to = (void *)CONFIG_PHYS_RAM_BASE;
-	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) -
-				   (uintptr_t)(&_sdata));
-	size_t bss_sz = (size_t)((uintptr_t)(&_end) -
-				  (uintptr_t)(&__bss_start));
+	char *to = (char *)CONFIG_PHYS_RAM_BASE;
+	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) - (uintptr_t)(&_sdata));
+	size_t bss_sz = (size_t)((uintptr_t)(&__bss_stop) - (uintptr_t)(&__bss_start));
+	size_t percpu_off = (size_t)((uintptr_t)(&__per_cpu_start) - (uintptr_t)(&_sdata));
+	size_t percpu_sz = (size_t)((uintptr_t)(&__per_cpu_end) - (uintptr_t)(&__per_cpu_start));
 
 	memcpy(to, from, data_sz);
 	memset(to + data_sz, 0, bss_sz);
+	memcpy(to + percpu_off, from + percpu_off, percpu_sz);
 }
 #endif
 
@@ -945,6 +957,33 @@ retry:
 #endif
 
 #ifdef CONFIG_XIP_KERNEL
+static bool __init kernel_xip_uses_4k_leaf_mappings(void)
+{
+	return !IS_ENABLED(CONFIG_64BIT) &&
+	       !!(kernel_map.xiprom & (PGDIR_SIZE - 1));
+}
+
+#ifdef __PAGETABLE_PMD_FOLDED
+static void __init create_kernel_xip_pte_mapping(pgd_t *pgdir, pte_t *ptep)
+{
+	uintptr_t va, end_va;
+	uintptr_t pgd_idx = pgd_index(kernel_map.virt_addr);
+
+	BUG_ON(!kernel_xip_uses_4k_leaf_mappings());
+	BUG_ON(kernel_map.xiprom_sz > PGDIR_SIZE);
+
+	memset(ptep, 0, PAGE_SIZE);
+	pgdir[pgd_idx] = pfn_pgd(PFN_DOWN((uintptr_t)ptep), PAGE_TABLE);
+
+	end_va = kernel_map.virt_addr + kernel_map.xiprom_sz;
+	for (va = kernel_map.virt_addr; va < end_va; va += PAGE_SIZE)
+		create_pte_mapping(ptep, va,
+				   kernel_map.xiprom +
+				   (va - kernel_map.virt_addr),
+				   PAGE_SIZE, PAGE_KERNEL_EXEC);
+}
+#endif
+
 static void __init create_kernel_page_table(pgd_t *pgdir,
 					    __always_unused bool early)
 {
@@ -952,10 +991,24 @@ static void __init create_kernel_page_table(pgd_t *pgdir,
 
 	/* Map the flash resident part */
 	end_va = kernel_map.virt_addr + kernel_map.xiprom_sz;
-	for (va = kernel_map.virt_addr; va < end_va; va += PMD_SIZE)
-		create_pgd_mapping(pgdir, va,
-				   kernel_map.xiprom + (va - kernel_map.virt_addr),
-				   PMD_SIZE, PAGE_KERNEL_EXEC);
+	if (kernel_xip_uses_4k_leaf_mappings()) {
+#ifdef __PAGETABLE_PMD_FOLDED
+		if (early)
+			create_kernel_xip_pte_mapping(pgdir, early_pte);
+		else
+#endif
+			for (va = kernel_map.virt_addr; va < end_va; va += PAGE_SIZE)
+				create_pgd_mapping(pgdir, va,
+						   kernel_map.xiprom +
+						   (va - kernel_map.virt_addr),
+						   PAGE_SIZE, PAGE_KERNEL_EXEC);
+	} else {
+		for (va = kernel_map.virt_addr; va < end_va; va += PMD_SIZE)
+			create_pgd_mapping(pgdir, va,
+					   kernel_map.xiprom +
+					   (va - kernel_map.virt_addr),
+					   PMD_SIZE, PAGE_KERNEL_EXEC);
+	}
 
 	/* Map the data in RAM */
 	start_va = kernel_map.virt_addr + (uintptr_t)&_sdata - (uintptr_t)&_start;
@@ -1205,6 +1258,17 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	create_pgd_mapping(early_pg_dir, FIXADDR_START,
 			   fixmap_pgd_next, PGDIR_SIZE, PAGE_TABLE);
 
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * Runtime page-table updates need a D-cache writeback before S31's
+	 * non-snooping Sv32 walker can observe them.  Pre-populate a permanent
+	 * fixmap for the cache controller while SATP is still disabled; head.S
+	 * publishes this PTE together with the rest of the bootstrap tables.
+	 */
+	create_pte_mapping(fixmap_pte, __fix_to_virt(FIX_S31_CACHE),
+			   ESP32S31_CACHE_PHYS_BASE, PAGE_SIZE, PAGE_KERNEL_IO);
+#endif
+
 #ifndef __PAGETABLE_PMD_FOLDED
 	/* Setup fixmap P4D and PUD */
 	if (pgtable_l5_enabled)
@@ -1234,13 +1298,35 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 #endif
 #else
 	/* Setup trampoline PGD */
-	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
 #ifdef CONFIG_XIP_KERNEL
-			   kernel_map.xiprom,
+	if (kernel_xip_uses_4k_leaf_mappings())
+		create_kernel_xip_pte_mapping(trampoline_pg_dir,
+					      trampoline_pte);
+	else
+		create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
+				   kernel_map.xiprom, PGDIR_SIZE,
+				   PAGE_KERNEL_EXEC);
 #else
+	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
 			   kernel_map.phys_addr,
+			   PGDIR_SIZE,
+			   PAGE_KERNEL_EXEC);
 #endif
-			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#endif
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31 only supports CLIC trap mode, whose synchronous exception entry
+	 * semantics cannot be used as the standard RISC-V SATP trampoline.
+	 * Keep the currently executing physical superpage mapped as well, then
+	 * head.S can explicitly jump to the virtual continuation.
+	 */
+#ifdef CONFIG_XIP_KERNEL
+	create_pgd_mapping(trampoline_pg_dir, kernel_map.xiprom,
+			   kernel_map.xiprom, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#else
+	create_pgd_mapping(trampoline_pg_dir, kernel_map.phys_addr,
+			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#endif
 #endif
 
 	/*
@@ -1382,6 +1468,25 @@ static void __init setup_vm_final(void)
 	if (IS_ENABLED(CONFIG_64BIT) ||
 	    IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's closed radio libraries contain absolute references to the
+	 * modem/peripheral windows, internal SRAM and mask ROM.  Keep these
+	 * mappings in init_mm only.  Process page tables do not copy the lower
+	 * half; the dedicated radio kthread borrows init_mm when running blobs.
+	 */
+	create_pgd_mapping(swapper_pg_dir, 0x20000000, 0x20000000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20400000, 0x20400000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x20800000, 0x20800000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, 0x2f000000, 0x2f000000,
+			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
+	create_pgd_mapping(swapper_pg_dir, 0x2f800000, 0x2f800000,
+			   PGDIR_SIZE, PAGE_KERNEL_READ_EXEC);
+#endif
 
 #ifdef CONFIG_KASAN
 	kasan_swapper_init();

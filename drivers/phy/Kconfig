@@ -51,6 +51,16 @@ config PHY_SNPS_EUSB2
 	  Enable support for the USB high-speed SNPS eUSB2 phy on select
 	  SoCs. The PHY is usually paired with a Synopsys DWC3 USB controller.
 
+config PHY_ESP32S31_USB
+	bool "Espressif ESP32-S31 USB2 UTMI PHY"
+	depends on OF && SOC_ESP32S31
+	select GENERIC_PHY
+	help
+	  Enable the integrated USB2 high-speed UTMI PHY and the SoC-specific
+	  clock and reset glue used by the DesignWare USB2 controller on the
+	  Espressif ESP32-S31. This is required when using the on-chip DWC2
+	  controller in host mode.
+
 config PHY_XGENE
 	tristate "APM X-Gene 15Gbps PHY support"
 	depends on HAS_IOMEM && OF && (ARCH_XGENE || COMPILE_TEST)

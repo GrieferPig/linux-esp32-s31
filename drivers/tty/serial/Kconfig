@@ -1595,7 +1595,7 @@ config SERIAL_NUVOTON_MA35D1_CONSOLE
 
 config SERIAL_ESP32
 	tristate "Espressif ESP32 UART support"
-	depends on XTENSA_PLATFORM_ESP32 || (ARCH_ESPRESSIF && ARCH_RV32I) || (COMPILE_TEST && OF)
+	depends on XTENSA_PLATFORM_ESP32 || SOC_ESP32S31 || (COMPILE_TEST && OF)
 	select SERIAL_CORE
 	select SERIAL_CORE_CONSOLE
 	select SERIAL_EARLYCON
@@ -1606,9 +1606,19 @@ config SERIAL_ESP32
 	    earlycon=esp32s3uart,mmio32,0x60000000,115200n8,40000000
 	    earlycon=esp32uart,mmio32,0x3ff40000,115200n8
 
+config SERIAL_ESP32_UHCI
+	bool "ESP32-S31 UHCI UART DMA"
+	depends on SERIAL_ESP32
+	depends on ESP32S31_AHB_GDMA
+	depends on SOC_ESP32S31
+	select DMA_ENGINE
+	help
+	  Use the ESP32-S31 UHCI0 bridge and AHB-GDMA as the asynchronous
+	  TX/RX backend for the standard ttyS0 UART driver.
+
 config SERIAL_ESP32_ACM
 	tristate "Espressif ESP32 USB ACM gadget support"
-	depends on XTENSA_PLATFORM_ESP32 || (COMPILE_TEST && OF)
+	depends on XTENSA_PLATFORM_ESP32 || SOC_ESP32S31 || (COMPILE_TEST && OF)
 	select SERIAL_CORE
 	select SERIAL_CORE_CONSOLE
 	select SERIAL_EARLYCON

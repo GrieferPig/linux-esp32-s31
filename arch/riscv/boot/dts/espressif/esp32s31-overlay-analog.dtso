@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "analog";
+	espressif,resource-claims = "hp-int-source22";
+	espressif,gpio-claims = <6 7 8 9 10 11 12 13 14 15 16 17 18 19
+				   37 38 39 40
+				   42 43 44 45 46 47 48 49
+				   50 51 52 53 54 55 56 57>;
+};
+
+&adc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&adc_test>;
+	status = "okay";
+};
+
+&tsens {
+	status = "okay";
+};
+
+&touch {
+	pinctrl-names = "default";
+	pinctrl-0 = <&touch_test>;
+	status = "okay";
+};
+
+&comparator {
+	pinctrl-names = "default";
+	pinctrl-0 = <&comparator_test>;
+	status = "okay";
+};

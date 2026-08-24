@@ -1,3 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0
-
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31.dtb
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31_generic.dtb
+DTC_FLAGS_esp32s31_generic := -@
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gmac.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-sdmmc0.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-sdmmc1.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-pwm-counter.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-analog.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-timers.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart1.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart2.dtbo

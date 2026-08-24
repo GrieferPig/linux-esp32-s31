@@ -109,8 +109,13 @@ do {									\
 } while (0)
 
 #else
+# ifdef arch_spin_lock_init
+# define raw_spin_lock_init(lock) \
+	do { arch_spin_lock_init(&(lock)->raw_lock); } while (0)
+# else
 # define raw_spin_lock_init(lock)				\
 	do { *(lock) = __RAW_SPIN_LOCK_UNLOCKED(lock); } while (0)
+# endif
 #endif
 
 #define raw_spin_is_locked(lock)	arch_spin_is_locked(&(lock)->raw_lock)
@@ -338,11 +343,8 @@ do {								\
 
 #else
 
-# define spin_lock_init(_lock)			\
-do {						\
-	spinlock_check(_lock);			\
-	*(_lock) = __SPIN_LOCK_UNLOCKED(_lock);	\
-} while (0)
+# define spin_lock_init(_lock) \
+	raw_spin_lock_init(spinlock_check(_lock))
 
 #endif
 

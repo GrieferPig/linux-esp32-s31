@@ -22,6 +22,12 @@ config 88PM886_GPADC
 	  To compile this driver as a module, choose M here: the module will be
 	  called 88pm886-gpadc.
 
+config ESP32S31_ADC
+	tristate "Espressif ESP32-S31 SAR ADC"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  IIO direct conversion support for both eight-channel 17-bit SAR ADCs.
+
 config AB8500_GPADC
 	bool "ST-Ericsson AB8500 GPADC driver"
 	depends on AB8500_CORE && REGULATOR_AB8500

@@ -31,6 +31,21 @@ config DEBUG_PINCTRL
 	help
 	  Say Y here to add some extra checks and diagnostics to PINCTRL calls.
 
+config PINCTRL_ESP32S31
+	bool "Espressif ESP32-S31 pinctrl and GPIO controller"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on OF
+	select GPIOLIB
+	select GPIOLIB_IRQCHIP
+	select GENERIC_PINCTRL_GROUPS
+	select GENERIC_PINMUX_FUNCTIONS
+	select GENERIC_PINCONF
+	help
+	  Enable the combined IO_MUX, GPIO matrix, GPIO controller and GPIO
+	  interrupt driver for ESP32-S31.  The driver supports all bonded HP
+	  GPIO pads, native mux functions, arbitrary matrix input/output routes,
+	  pin bias, drive modes, input filtering and per-pin interrupts.
+
 config PINCTRL_AMD
 	bool "AMD GPIO pin control"
 	depends on HAS_IOMEM

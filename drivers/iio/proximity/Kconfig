@@ -21,6 +21,19 @@ endmenu
 
 menu "Proximity and distance sensors"
 
+config ESP32S31_TOUCH
+	tristate "Espressif ESP32-S31 capacitive touch sensor"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  IIO raw capacitance support for all 14 S31 touch pads.
+
+config ESP32S31_COMPARATOR
+	tristate "Espressif ESP32-S31 analog comparator"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  IIO rising/falling threshold events for the three-channel S31
+	  analog comparator (ZERO_DET).
+
 config CROS_EC_MKBP_PROXIMITY
 	tristate "ChromeOS EC MKBP Proximity sensor"
 	depends on CROS_EC

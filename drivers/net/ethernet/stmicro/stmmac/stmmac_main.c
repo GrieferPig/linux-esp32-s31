@@ -84,6 +84,124 @@ MODULE_PARM_DESC(phyaddr, "Physical device address");
 #define STMMAC_TX_XSK_AVAIL		16
 #define STMMAC_RX_FILL_BATCH		16
 
+#ifdef CONFIG_SOC_ESP32S31
+#define ESP32S31_PSRAM_CACHED_BASE	0x50000000UL
+#define ESP32S31_PSRAM_DIRECT_BASE	0xc0000000UL
+#define ESP32S31_PSRAM_SIZE		0x01000000UL
+
+/*
+ * Sv32 has no S31 memory-type PTE bits, so dma_alloc_coherent() cannot turn a
+ * normal 0x50000000 PSRAM mapping into an uncached mapping.  The SoC provides
+ * a hardware direct alias at 0xc0000000 for the same PSRAM storage.  Keep the
+ * cached address only for DMA map/free bookkeeping and use the direct alias
+ * for CPU descriptor ownership accesses.
+ */
+static void *stmmac_esp32s31_alloc_desc(struct stmmac_priv *priv, size_t size,
+					dma_addr_t *dma_addr, void **alloc)
+{
+	phys_addr_t phys, direct;
+	void __iomem *uncached;
+	void *cached;
+
+	if (!of_device_is_compatible(priv->device->of_node,
+				     "espressif,esp32s31-gmac"))
+		return dma_alloc_coherent(priv->device, size, dma_addr,
+					  GFP_KERNEL);
+
+	cached = kzalloc(size, GFP_KERNEL);
+	if (!cached)
+		return NULL;
+
+	phys = virt_to_phys(cached);
+	if (phys < ESP32S31_PSRAM_CACHED_BASE ||
+	    phys + size > ESP32S31_PSRAM_CACHED_BASE + ESP32S31_PSRAM_SIZE)
+		goto err_free;
+
+	*dma_addr = dma_map_single(priv->device, cached, size,
+				   DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(priv->device, *dma_addr))
+		goto err_free;
+
+	direct = ESP32S31_PSRAM_DIRECT_BASE +
+		 (phys - ESP32S31_PSRAM_CACHED_BASE);
+	uncached = ioremap(direct, size);
+	if (!uncached)
+		goto err_unmap;
+
+	*alloc = cached;
+	return (__force void *)uncached;
+
+err_unmap:
+	dma_unmap_single(priv->device, *dma_addr, size, DMA_BIDIRECTIONAL);
+err_free:
+	kfree(cached);
+	return NULL;
+}
+
+static void stmmac_esp32s31_free_desc(struct stmmac_priv *priv, size_t size,
+				      void *addr, dma_addr_t dma_addr,
+				      void *alloc)
+{
+	if (!alloc) {
+		dma_free_coherent(priv->device, size, addr, dma_addr);
+		return;
+	}
+
+	iounmap((void __iomem __force *)addr);
+	dma_unmap_single(priv->device, dma_addr, size, DMA_BIDIRECTIONAL);
+	kfree(alloc);
+}
+
+static void stmmac_esp32s31_set_rgmii_txc(struct stmmac_priv *priv, int speed)
+{
+	unsigned long rate;
+	int ret;
+
+	if (!of_device_is_compatible(priv->device->of_node,
+				     "espressif,esp32s31-gmac"))
+		return;
+	if (!priv->plat->clk_tx)
+		return;
+
+	switch (speed) {
+	case SPEED_1000:
+		rate = 125000000;
+		break;
+	case SPEED_100:
+		rate = 25000000;
+		break;
+	case SPEED_10:
+		rate = 2500000;
+		break;
+	default:
+		return;
+	}
+
+	ret = clk_set_rate(priv->plat->clk_tx, rate);
+	if (ret)
+		netdev_warn(priv->dev, "failed to set S31 RGMII TX clock: %d\n",
+			    ret);
+}
+
+#else
+static void *stmmac_esp32s31_alloc_desc(struct stmmac_priv *priv, size_t size,
+					dma_addr_t *dma_addr, void **alloc)
+{
+	return dma_alloc_coherent(priv->device, size, dma_addr, GFP_KERNEL);
+}
+
+static void stmmac_esp32s31_free_desc(struct stmmac_priv *priv, size_t size,
+				      void *addr, dma_addr_t dma_addr,
+				      void *alloc)
+{
+	dma_free_coherent(priv->device, size, addr, dma_addr);
+}
+
+static void stmmac_esp32s31_set_rgmii_txc(struct stmmac_priv *priv, int speed)
+{
+}
+#endif
+
 #define STMMAC_XDP_PASS		0
 #define STMMAC_XDP_CONSUMED	BIT(0)
 #define STMMAC_XDP_TX		BIT(1)
@@ -951,6 +1069,8 @@ static void stmmac_mac_link_up(struct phylink_config *config,
 
 	if (priv->plat->fix_mac_speed)
 		priv->plat->fix_mac_speed(priv->plat->bsp_priv, speed, mode);
+
+	stmmac_esp32s31_set_rgmii_txc(priv, speed);
 
 	if (!duplex)
 		ctrl &= ~priv->hw->link.duplex;
@@ -1943,13 +2063,16 @@ static void __free_dma_rx_desc_resources(struct stmmac_priv *priv,
 
 	/* Free DMA regions of consistent memory previously allocated */
 	if (!priv->extend_desc)
-		dma_free_coherent(priv->device, dma_conf->dma_rx_size *
-				  sizeof(struct dma_desc),
-				  rx_q->dma_rx, rx_q->dma_rx_phy);
+		stmmac_esp32s31_free_desc(priv, dma_conf->dma_rx_size *
+					 sizeof(struct dma_desc),
+					 rx_q->dma_rx, rx_q->dma_rx_phy,
+					 rx_q->dma_rx_alloc);
 	else
-		dma_free_coherent(priv->device, dma_conf->dma_rx_size *
-				  sizeof(struct dma_extended_desc),
-				  rx_q->dma_erx, rx_q->dma_rx_phy);
+		stmmac_esp32s31_free_desc(priv, dma_conf->dma_rx_size *
+					 sizeof(struct dma_extended_desc),
+					 rx_q->dma_erx, rx_q->dma_rx_phy,
+					 rx_q->dma_rx_alloc);
+	rx_q->dma_rx_alloc = NULL;
 
 	if (xdp_rxq_info_is_reg(&rx_q->xdp_rxq))
 		xdp_rxq_info_unreg(&rx_q->xdp_rxq);
@@ -2000,7 +2123,9 @@ static void __free_dma_tx_desc_resources(struct stmmac_priv *priv,
 
 	size *= dma_conf->dma_tx_size;
 
-	dma_free_coherent(priv->device, size, addr, tx_q->dma_tx_phy);
+	stmmac_esp32s31_free_desc(priv, size, addr, tx_q->dma_tx_phy,
+				 tx_q->dma_tx_alloc);
+	tx_q->dma_tx_alloc = NULL;
 
 	kfree(tx_q->tx_skbuff_dma);
 	kfree(tx_q->tx_skbuff);
@@ -2075,20 +2200,20 @@ static int __alloc_dma_rx_desc_resources(struct stmmac_priv *priv,
 		return -ENOMEM;
 
 	if (priv->extend_desc) {
-		rx_q->dma_erx = dma_alloc_coherent(priv->device,
+		rx_q->dma_erx = stmmac_esp32s31_alloc_desc(priv,
 						   dma_conf->dma_rx_size *
 						   sizeof(struct dma_extended_desc),
 						   &rx_q->dma_rx_phy,
-						   GFP_KERNEL);
+						   &rx_q->dma_rx_alloc);
 		if (!rx_q->dma_erx)
 			return -ENOMEM;
 
 	} else {
-		rx_q->dma_rx = dma_alloc_coherent(priv->device,
+		rx_q->dma_rx = stmmac_esp32s31_alloc_desc(priv,
 						  dma_conf->dma_rx_size *
 						  sizeof(struct dma_desc),
 						  &rx_q->dma_rx_phy,
-						  GFP_KERNEL);
+						  &rx_q->dma_rx_alloc);
 		if (!rx_q->dma_rx)
 			return -ENOMEM;
 	}
@@ -2174,8 +2299,8 @@ static int __alloc_dma_tx_desc_resources(struct stmmac_priv *priv,
 
 	size *= dma_conf->dma_tx_size;
 
-	addr = dma_alloc_coherent(priv->device, size,
-				  &tx_q->dma_tx_phy, GFP_KERNEL);
+	addr = stmmac_esp32s31_alloc_desc(priv, size, &tx_q->dma_tx_phy,
+					 &tx_q->dma_tx_alloc);
 	if (!addr)
 		return -ENOMEM;
 
@@ -2420,6 +2545,20 @@ static void stmmac_dma_operation_mode(struct stmmac_priv *priv)
 		txmode = tc;
 		rxmode = SF_DMA_MODE;
 	}
+
+#ifdef CONFIG_SOC_ESP32S31
+	if (of_device_is_compatible(priv->device->of_node,
+				    "espressif,esp32s31-gmac")) {
+		/*
+		 * S31 keeps the RX FIFO in threshold mode like ESP-IDF because
+		 * the DWMAC1000 RX FIFO is only 256 bytes.  TX still needs
+		 * store-and-forward when packet buffers live in PSRAM, otherwise
+		 * small software-checksummed packets can underflow or stall.
+		 */
+		txmode = SF_DMA_MODE;
+		rxmode = tc;
+	}
+#endif
 
 	/* configure all channels */
 	for (chan = 0; chan < rx_channels_count; chan++) {
@@ -4834,8 +4973,13 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
 		entry = STMMAC_GET_ENTRY(entry, priv->dma_conf.dma_rx_size);
 	}
 	rx_q->dirty_rx = entry;
-	rx_q->rx_tail_addr = rx_q->dma_rx_phy +
-			    (rx_q->dirty_rx * sizeof(struct dma_desc));
+	if (priv->extend_desc)
+		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
+				    (rx_q->dirty_rx *
+				     sizeof(struct dma_extended_desc));
+	else
+		rx_q->rx_tail_addr = rx_q->dma_rx_phy +
+				    (rx_q->dirty_rx * sizeof(struct dma_desc));
 	stmmac_set_rx_tail_ptr(priv, priv->ioaddr, rx_q->rx_tail_addr, queue);
 }
 
@@ -7164,6 +7308,26 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 		else
 			priv->plat->tx_coe = priv->dma_cap.tx_coe;
 
+		/*
+		 * S31's checksum insertion corrupts some TCP packets (notably
+		 * pure ACKs).  Its ESP-IDF HAL also avoids 32-beat AXI bursts
+		 * and keeps the DWMAC1000 in threshold mode because the RX FIFO
+		 * is only 256 bytes.  Mirror those DMA constraints here.
+		 */
+		if (of_device_is_compatible(priv->device->of_node,
+					    "espressif,esp32s31-gmac")) {
+			priv->plat->tx_coe = 0;
+			priv->plat->force_thresh_dma_mode = 1;
+			priv->plat->force_sf_dma_mode = 0;
+			priv->plat->dma_cfg->pbl = 16;
+			priv->plat->dma_cfg->txpbl = 0;
+			priv->plat->dma_cfg->rxpbl = 0;
+			priv->plat->dma_cfg->pblx8 = false;
+			priv->plat->dma_cfg->mixed_burst = true;
+			priv->plat->dma_cfg->aal = true;
+			priv->plat->dma_cfg->fixed_burst = false;
+		}
+
 		/* In case of GMAC4 rx_coe is from HW cap register. */
 		priv->plat->rx_coe = priv->dma_cap.rx_coe;
 
@@ -7171,6 +7335,10 @@ static int stmmac_hw_init(struct stmmac_priv *priv)
 			priv->plat->rx_coe = STMMAC_RX_COE_TYPE2;
 		else if (priv->dma_cap.rx_coe_type1)
 			priv->plat->rx_coe = STMMAC_RX_COE_TYPE1;
+
+		if (of_device_is_compatible(priv->device->of_node,
+					    "espressif,esp32s31-gmac"))
+			priv->plat->rx_coe = STMMAC_RX_COE_NONE;
 
 	} else {
 		dev_info(priv->device, "No HW DMA feature register supported\n");
@@ -7560,6 +7728,18 @@ int stmmac_dvr_probe(struct device *device,
 	}
 
 	ndev->features |= ndev->hw_features | NETIF_F_HIGHDMA;
+#ifdef CONFIG_SOC_ESP32S31
+	if (of_device_is_compatible(priv->device->of_node,
+				    "espressif,esp32s31-gmac")) {
+		netdev_features_t s31_bad_tx_csum;
+
+		s31_bad_tx_csum = NETIF_F_CSUM_MASK | NETIF_F_TSO |
+				   NETIF_F_TSO6 | NETIF_F_GSO_UDP_L4;
+		ndev->hw_features &= ~s31_bad_tx_csum;
+		ndev->features &= ~s31_bad_tx_csum;
+		priv->tso = false;
+	}
+#endif
 	ndev->watchdog_timeo = msecs_to_jiffies(watchdog);
 #ifdef STMMAC_VLAN_TAG_USED
 	/* Both mac100 and gmac support receive VLAN tag detection */

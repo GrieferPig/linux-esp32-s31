@@ -199,9 +199,16 @@ switch_mm_fast:
 
 static void set_mm_noasid(struct mm_struct *mm)
 {
-	/* Switch the page table and blindly nuke entire local TLB */
+	/* Switch the page table and blindly nuke the entire local TLB.
+	 *
+	 * Do not use the ASID-qualified form here.  ESP32-S31 is deliberately on
+	 * the no-ASID path because its TLB does not reliably tag translations by
+	 * SATP.ASID; qualifying sfence.vma with ASID 0 can therefore leave an old
+	 * userspace translation behind.  That was observed as a newly exec'd
+	 * BusyBox applet fetching another process's instructions at the same VA
+	 * after migration to CPU1. */
 	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
-	local_flush_tlb_all_asid(0);
+	local_flush_tlb_all();
 }
 
 static inline void set_mm(struct mm_struct *prev,
@@ -242,6 +249,19 @@ static int __init asids_init(void)
 	 * to remove unwanted TLB enteries.
 	 */
 	local_flush_tlb_all();
+
+	/*
+	 * ESP32-S31's SATP register retains nine ASID bits, but its per-hart TLB
+	 * does not reliably distinguish userspace translations by those bits.
+	 * The generic probe therefore produces a false positive, and an mm first
+	 * scheduled on CPU1 can reuse a stale translation from an older process.
+	 * Use the no-ASID path, which flushes the local TLB whenever switch_mm()
+	 * installs a different page table.
+	 */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31)) {
+		pr_info("ASID allocator disabled for ESP32-S31 TLB coherency\n");
+		return 0;
+	}
 
 	/* Pre-compute ASID details */
 	if (asid_bits) {

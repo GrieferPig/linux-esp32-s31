@@ -12,6 +12,7 @@ obj-$(CONFIG_OF)		+= devicetree.o
 obj-$(CONFIG_PINCTRL_AMD)	+= pinctrl-amd.o
 obj-$(CONFIG_PINCTRL_AMDISP)	+= pinctrl-amdisp.o
 obj-$(CONFIG_PINCTRL_APPLE_GPIO) += pinctrl-apple-gpio.o
+obj-$(CONFIG_PINCTRL_ESP32S31)	+= pinctrl-esp32s31.o
 obj-$(CONFIG_PINCTRL_ARTPEC6)	+= pinctrl-artpec6.o
 obj-$(CONFIG_PINCTRL_AS3722)	+= pinctrl-as3722.o
 obj-$(CONFIG_PINCTRL_AT91)	+= pinctrl-at91.o

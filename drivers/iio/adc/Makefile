@@ -9,6 +9,7 @@ obj-$(CONFIG_IIO_ADC_HELPER) += industrialio-adc.o
 obj-$(CONFIG_88PM886_GPADC) += 88pm886-gpadc.o
 obj-$(CONFIG_AB8500_GPADC) += ab8500-gpadc.o
 obj-$(CONFIG_AD_SIGMA_DELTA) += ad_sigma_delta.o
+obj-$(CONFIG_ESP32S31_ADC) += esp32s31-adc.o
 obj-$(CONFIG_AD4000) += ad4000.o
 obj-$(CONFIG_AD4030) += ad4030.o
 obj-$(CONFIG_AD4080) += ad4080.o

@@ -3,7 +3,6 @@
 # Makefile for ALSA
 # Copyright (c) 2001 by Jaroslav Kysela <perex@perex.cz>
 #
-
 snd-dummy-y := dummy.o
 snd-aloop-y := aloop.o
 snd-mtpav-y := mtpav.o

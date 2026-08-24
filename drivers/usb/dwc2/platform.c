@@ -26,6 +26,24 @@
 
 static const char dwc2_driver_name[] = "dwc2";
 
+static void dwc2_esp32s31_init(struct dwc2_hsotg *hsotg)
+{
+	u32 value;
+
+	if (!of_device_is_compatible(hsotg->dev->of_node,
+				     "espressif,esp32s31-dwc2"))
+		return;
+
+	/* Undo the low-power state installed by the S31 ROM/boot code. */
+	value = dwc2_readl(hsotg, GOTGCTL);
+	value &= ~GOTGCTL_BVALOEN;
+	dwc2_writel(hsotg, value, GOTGCTL);
+
+	value = dwc2_readl(hsotg, PCGCTL);
+	value &= ~PCGCTL_STOPPCLK;
+	dwc2_writel(hsotg, value, PCGCTL);
+}
+
 /*
  * Check the dr_mode against the module configuration and hardware
  * capabilities.
@@ -483,6 +501,8 @@ static int dwc2_driver_probe(struct platform_device *dev)
 	retval = dwc2_lowlevel_hw_enable(hsotg);
 	if (retval)
 		return retval;
+
+	dwc2_esp32s31_init(hsotg);
 
 	hsotg->needs_byte_swap = dwc2_check_core_endianness(hsotg);
 

@@ -50,6 +50,7 @@
 #define DW_MCI_SEND_STATUS	1
 #define DW_MCI_RECV_STATUS	2
 #define DW_MCI_DMA_THRESHOLD	16
+#define DW_MCI_S31_IRQ_POLL_NS	500000
 
 #define DW_MCI_FREQ_MAX	200000000	/* unit: HZ */
 #define DW_MCI_FREQ_MIN	100000		/* unit: HZ */
@@ -103,6 +104,51 @@ struct idmac_desc {
 
 /* Each descriptor can transfer up to 4KB of data in chained mode */
 #define DW_MCI_DESC_DATA_LENGTH	0x1000
+
+static bool dw_mci_idmac_desc_noncoherent(struct dw_mci *host)
+{
+	return host->quirks & DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT;
+}
+
+static bool dw_mci_lost_irq_poll(struct dw_mci *host)
+{
+	return host->quirks & DW_MMC_QUIRK_LOST_IRQ_POLL;
+}
+
+static void dw_mci_idmac_sync_for_cpu(struct dw_mci *host)
+{
+	if (dw_mci_idmac_desc_noncoherent(host))
+		dma_sync_single_for_cpu(host->dev, host->sg_dma,
+					DESC_RING_BUF_SZ, DMA_BIDIRECTIONAL);
+}
+
+static void dw_mci_idmac_sync_for_device(struct dw_mci *host)
+{
+	if (dw_mci_idmac_desc_noncoherent(host))
+		dma_sync_single_for_device(host->dev, host->sg_dma,
+					   DESC_RING_BUF_SZ, DMA_BIDIRECTIONAL);
+}
+
+static void dw_mci_idmac_sync_desc_for_cpu(struct dw_mci *host,
+					   const void *desc, size_t size)
+{
+	unsigned long offset;
+
+	if (!dw_mci_idmac_desc_noncoherent(host))
+		return;
+
+	offset = (const u8 *)desc - (const u8 *)host->sg_cpu;
+	dma_sync_single_range_for_cpu(host->dev, host->sg_dma, offset, size,
+				      DMA_BIDIRECTIONAL);
+}
+
+static void dw_mci_idmac_unmap(void *data)
+{
+	struct dw_mci *host = data;
+
+	dma_unmap_single(host->dev, host->sg_dma, DESC_RING_BUF_SZ,
+			 DMA_BIDIRECTIONAL);
+}
 
 #if defined(CONFIG_DEBUG_FS)
 static int dw_mci_req_show(struct seq_file *s, void *v)
@@ -408,6 +454,11 @@ static void dw_mci_start_command(struct dw_mci *host,
 
 	mci_writel(host, CMD, cmd_flags | SDMMC_CMD_START);
 
+	if (dw_mci_lost_irq_poll(host))
+		hrtimer_start(&host->irq_poll_timer,
+			      ns_to_ktime(DW_MCI_S31_IRQ_POLL_NS),
+			      HRTIMER_MODE_REL);
+
 	/* response expected command only */
 	if (cmd_flags & SDMMC_CMD_RESP_EXP)
 		dw_mci_set_cto(host);
@@ -501,24 +552,27 @@ static int dw_mci_idmac_init(struct dw_mci *host)
 {
 	int i;
 
+	/* dma_map_single() initially hands the ring to the device. */
+	dw_mci_idmac_sync_for_cpu(host);
+	memset(host->sg_cpu, 0, DESC_RING_BUF_SZ);
+
 	if (host->dma_64bit_address == 1) {
 		struct idmac_desc_64addr *p;
 		/* Number of descriptors in the ring buffer */
 		host->ring_size =
-			DESC_RING_BUF_SZ / sizeof(struct idmac_desc_64addr);
+			DESC_RING_BUF_SZ / (sizeof(struct idmac_desc_64addr) * 4);
 
 		/* Forward link the descriptor list */
 		for (i = 0, p = host->sg_cpu; i < host->ring_size - 1;
-								i++, p++) {
+								i++, p += 4) {
 			p->des6 = (host->sg_dma +
 					(sizeof(struct idmac_desc_64addr) *
-							(i + 1))) & 0xffffffff;
+							((i + 1) * 4))) & 0xffffffff;
 
 			p->des7 = (u64)(host->sg_dma +
 					(sizeof(struct idmac_desc_64addr) *
-							(i + 1))) >> 32;
+							((i + 1) * 4))) >> 32;
 			/* Initialize reserved and buffer size fields to "0" */
-			p->des0 = 0;
 			p->des1 = 0;
 			p->des2 = 0;
 			p->des3 = 0;
@@ -533,22 +587,25 @@ static int dw_mci_idmac_init(struct dw_mci *host)
 		struct idmac_desc *p;
 		/* Number of descriptors in the ring buffer */
 		host->ring_size =
-			DESC_RING_BUF_SZ / sizeof(struct idmac_desc);
+			DESC_RING_BUF_SZ / (sizeof(struct idmac_desc) * 4);
 
 		/* Forward link the descriptor list */
 		for (i = 0, p = host->sg_cpu;
 		     i < host->ring_size - 1;
-		     i++, p++) {
+		     i++, p += 4) {
 			p->des3 = cpu_to_le32(host->sg_dma +
-					(sizeof(struct idmac_desc) * (i + 1)));
-			p->des0 = 0;
+					(sizeof(struct idmac_desc) * ((i + 1) * 4)));
 			p->des1 = 0;
 		}
 
 		/* Set the last descriptor as the end-of-ring descriptor */
 		p->des3 = cpu_to_le32(host->sg_dma);
+		p->des1 = 0;
 		p->des0 = cpu_to_le32(IDMAC_DES0_ER);
 	}
+
+	/* Publish the chain before programming DBADDR/DBADDRL. */
+	dw_mci_idmac_sync_for_device(host);
 
 	dw_mci_idmac_reset(host);
 
@@ -591,7 +648,7 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 
 		u64 mem_addr = sg_dma_address(&data->sg[i]);
 
-		for ( ; length ; desc++) {
+		for ( ; length ; desc += 4) {
 			desc_len = (length <= DW_MCI_DESC_DATA_LENGTH) ?
 				   length : DW_MCI_DESC_DATA_LENGTH;
 
@@ -603,17 +660,30 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 			 * isn't still owned by IDMAC as IDMAC's write
 			 * ops and CPU's read ops are asynchronous.
 			 */
-			if (readl_poll_timeout_atomic(&desc->des0, val,
-						!(val & IDMAC_DES0_OWN),
-						10, 100 * USEC_PER_MSEC))
+			if (dw_mci_idmac_desc_noncoherent(host)) {
+				int retries = 10000;
+
+				do {
+					dw_mci_idmac_sync_desc_for_cpu(host, desc,
+								 sizeof(*desc));
+					val = READ_ONCE(desc->des0);
+					if (!(val & IDMAC_DES0_OWN))
+						break;
+					udelay(10);
+				} while (--retries);
+				if (!retries)
+					goto err_own_bit;
+			} else if (readl_poll_timeout_atomic(&desc->des0, val,
+						       !(val & IDMAC_DES0_OWN),
+						       10, 100 * USEC_PER_MSEC)) {
 				goto err_own_bit;
+			}
 
 			/*
 			 * Set the OWN bit and disable interrupts
 			 * for this descriptor
 			 */
-			desc->des0 = IDMAC_DES0_OWN | IDMAC_DES0_DIC |
-						IDMAC_DES0_CH;
+			desc->des0 = IDMAC_DES0_OWN | IDMAC_DES0_CH;
 
 			/* Buffer length */
 			IDMAC_64ADDR_SET_BUFFER1_SIZE(desc, desc_len);
@@ -633,15 +703,16 @@ static inline int dw_mci_prepare_desc64(struct dw_mci *host,
 	/* Set first descriptor */
 	desc_first->des0 |= IDMAC_DES0_FD;
 
-	/* Set last descriptor */
-	desc_last->des0 &= ~(IDMAC_DES0_CH | IDMAC_DES0_DIC);
+	/* Set last descriptor - keep CH set for chained mode */
+	desc_last->des0 &= ~IDMAC_DES0_DIC;
 	desc_last->des0 |= IDMAC_DES0_LD;
+
+	dw_mci_idmac_sync_for_device(host);
 
 	return 0;
 err_own_bit:
 	/* restore the descriptor chain as it's polluted */
 	dev_dbg(host->dev, "descriptor is still owned by IDMAC.\n");
-	memset(host->sg_cpu, 0, DESC_RING_BUF_SZ);
 	dw_mci_idmac_init(host);
 	return -EINVAL;
 }
@@ -663,7 +734,7 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 
 		u32 mem_addr = sg_dma_address(&data->sg[i]);
 
-		for ( ; length ; desc++) {
+		for ( ; length ; desc += 4) {
 			desc_len = (length <= DW_MCI_DESC_DATA_LENGTH) ?
 				   length : DW_MCI_DESC_DATA_LENGTH;
 
@@ -675,18 +746,31 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 			 * isn't still owned by IDMAC as IDMAC's write
 			 * ops and CPU's read ops are asynchronous.
 			 */
-			if (readl_poll_timeout_atomic(&desc->des0, val,
-						      IDMAC_OWN_CLR64(val),
-						      10,
-						      100 * USEC_PER_MSEC))
+			if (dw_mci_idmac_desc_noncoherent(host)) {
+				int retries = 10000;
+
+				do {
+					dw_mci_idmac_sync_desc_for_cpu(host, desc,
+								 sizeof(*desc));
+					val = le32_to_cpu(READ_ONCE(desc->des0));
+					if (!(val & IDMAC_DES0_OWN))
+						break;
+					udelay(10);
+				} while (--retries);
+				if (!retries)
+					goto err_own_bit;
+			} else if (readl_poll_timeout_atomic(&desc->des0, val,
+						       IDMAC_OWN_CLR64(val),
+						       10,
+						       100 * USEC_PER_MSEC)) {
 				goto err_own_bit;
+			}
 
 			/*
 			 * Set the OWN bit and disable interrupts
 			 * for this descriptor
 			 */
 			desc->des0 = cpu_to_le32(IDMAC_DES0_OWN |
-						 IDMAC_DES0_DIC |
 						 IDMAC_DES0_CH);
 
 			/* Buffer length */
@@ -706,16 +790,16 @@ static inline int dw_mci_prepare_desc32(struct dw_mci *host,
 	/* Set first descriptor */
 	desc_first->des0 |= cpu_to_le32(IDMAC_DES0_FD);
 
-	/* Set last descriptor */
-	desc_last->des0 &= cpu_to_le32(~(IDMAC_DES0_CH |
-				       IDMAC_DES0_DIC));
+	/* Set last descriptor - keep CH set for chained mode */
+	desc_last->des0 &= cpu_to_le32(~IDMAC_DES0_DIC);
 	desc_last->des0 |= cpu_to_le32(IDMAC_DES0_LD);
+
+	dw_mci_idmac_sync_for_device(host);
 
 	return 0;
 err_own_bit:
 	/* restore the descriptor chain as it's polluted */
 	dev_dbg(host->dev, "descriptor is still owned by IDMAC.\n");
-	memset(host->sg_cpu, 0, DESC_RING_BUF_SZ);
 	dw_mci_idmac_init(host);
 	return -EINVAL;
 }
@@ -1985,7 +2069,13 @@ static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
 			data->error = -EILSEQ;
 		}
 
-		dev_dbg(host->dev, "data error, status 0x%08x\n", status);
+		dev_err(host->dev,
+			"data error: mintsts=0x%08x idsts=0x%08x "
+			"rintsts=0x%08x hwstatus=0x%08x\n",
+			status,
+			mci_readl(host, IDSTS),
+			mci_readl(host, RINTSTS),
+			mci_readl(host, STATUS));
 
 		/*
 		 * After an error, there may be data lingering
@@ -2809,7 +2899,7 @@ static void dw_mci_handle_cd(struct dw_mci *host)
 		msecs_to_jiffies(host->pdata->detect_delay_ms));
 }
 
-static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+static irqreturn_t dw_mci_interrupt_once(int irq, void *dev_id)
 {
 	struct dw_mci *host = dev_id;
 	u32 pending;
@@ -2926,9 +3016,28 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
 	if (host->use_dma != TRANS_MODE_IDMAC)
 		return IRQ_HANDLED;
 
+	/*
+	 * ESP32-S31's SDIO_HOST matrix source remains asserted by the raw FIFO
+	 * request bits even though RXDR/TXDR are masked in INTMASK for IDMAC
+	 * operation.  IDMAC has already drained the FIFO; clear those stale raw
+	 * bits so the physical level interrupt can deassert.
+	 */
+	if (dw_mci_idmac_desc_noncoherent(host))
+		mci_writel(host, RINTSTS, SDMMC_INT_RXDR | SDMMC_INT_TXDR);
+
 	/* Handle IDMA interrupts */
 	if (host->dma_64bit_address == 1) {
 		pending = mci_readl(host, IDSTS64);
+		if (pending & (SDMMC_IDMAC_INT_FBE |
+			       SDMMC_IDMAC_INT_DU |
+			       SDMMC_IDMAC_INT_CES))
+			dev_err_ratelimited(host->dev,
+				"IDMAC error: idsts=0x%08x dscaddr=0x%08x "
+				"bufaddr=0x%08x dbaddr=0x%08x\n",
+				pending,
+				mci_readl(host, DSCADDR),
+				mci_readl(host, BUFADDR),
+				mci_readl(host, DBADDR));
 		if (pending & (SDMMC_IDMAC_INT_TI | SDMMC_IDMAC_INT_RI)) {
 			mci_writel(host, IDSTS64, SDMMC_IDMAC_INT_TI |
 							SDMMC_IDMAC_INT_RI);
@@ -2948,6 +3057,84 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
 	}
 
 	return IRQ_HANDLED;
+}
+
+/*
+ * On ESP32-S31, CMD_DONE and DATA_OVER can become pending back-to-back while
+ * the interrupt is being serviced.  Drain every enabled controller/IDMAC
+ * status before returning; the lost-edge poll uses this same serialized path.
+ */
+static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+{
+	struct dw_mci *host = dev_id;
+	u32 idsts, idinten;
+	unsigned long flags;
+	int budget = 32;
+
+	spin_lock_irqsave(&host->irq_handler_lock, flags);
+
+	do {
+		dw_mci_interrupt_once(irq, dev_id);
+
+		if (mci_readl(host, MINTSTS))
+			continue;
+
+		if (host->use_dma != TRANS_MODE_IDMAC)
+			break;
+
+		idinten = host->dma_64bit_address ?
+			  mci_readl(host, IDINTEN64) : mci_readl(host, IDINTEN);
+		idsts = host->dma_64bit_address ?
+			mci_readl(host, IDSTS64) : mci_readl(host, IDSTS);
+		if (!(idsts & idinten))
+			break;
+	} while (--budget);
+
+	if (!budget)
+		dev_warn_ratelimited(host->dev,
+				     "interrupt status did not quiesce\n");
+
+	spin_unlock_irqrestore(&host->irq_handler_lock, flags);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * The ESP32-S31 interrupt-matrix-to-CLIC edge can disappear while another
+ * peripheral interrupt is active even though DW-MSHC completion status is
+ * still asserted.  Poll only while an MMC request is active.  The normal IRQ
+ * remains the fast path; this timer merely drains status that survived a lost
+ * edge.
+ */
+static enum hrtimer_restart dw_mci_irq_poll_timer(struct hrtimer *timer)
+{
+	struct dw_mci *host = container_of(timer, struct dw_mci,
+					   irq_poll_timer);
+	u32 idsts = 0, idinten = 0;
+	u32 mintsts, rintsts;
+
+	if (!READ_ONCE(host->mrq))
+		return HRTIMER_NORESTART;
+
+	mintsts = mci_readl(host, MINTSTS);
+	rintsts = mci_readl(host, RINTSTS);
+
+	if (host->use_dma == TRANS_MODE_IDMAC) {
+		idinten = host->dma_64bit_address ?
+			  mci_readl(host, IDINTEN64) : mci_readl(host, IDINTEN);
+		idsts = host->dma_64bit_address ?
+			mci_readl(host, IDSTS64) : mci_readl(host, IDSTS);
+	}
+
+	if (mintsts || (idsts & idinten) ||
+	    (rintsts & (SDMMC_INT_RXDR | SDMMC_INT_TXDR)))
+		dw_mci_interrupt(host->irq, host);
+
+	if (!READ_ONCE(host->mrq))
+		return HRTIMER_NORESTART;
+
+	hrtimer_forward_now(timer, ns_to_ktime(DW_MCI_S31_IRQ_POLL_NS));
+	return HRTIMER_RESTART;
 }
 
 static int dw_mci_init_slot_caps(struct dw_mci_slot *slot)
@@ -3013,7 +3200,7 @@ static int dw_mci_init_slot(struct dw_mci *host)
 		return -ENOMEM;
 
 	slot = mmc_priv(mmc);
-	slot->id = 0;
+	slot->id = host->slot_id;
 	slot->sdio_id = host->sdio_id0 + slot->id;
 	slot->mmc = mmc;
 	slot->host = host;
@@ -3083,7 +3270,7 @@ static void dw_mci_cleanup_slot(struct dw_mci_slot *slot)
 
 static void dw_mci_init_dma(struct dw_mci *host)
 {
-	int addr_config;
+	int addr_config, ret;
 	struct device *dev = host->dev;
 
 	/*
@@ -3130,10 +3317,34 @@ static void dw_mci_init_dma(struct dw_mci *host)
 				 "IDMAC supports 32-bit address mode.\n");
 		}
 
-		/* Alloc memory for sg translation */
-		host->sg_cpu = dmam_alloc_coherent(host->dev,
-						   DESC_RING_BUF_SZ,
-						   &host->sg_dma, GFP_KERNEL);
+		/*
+		 * Sv32 has no PTE memory-type bits, so DMA_DIRECT_REMAP cannot
+		 * make dma_alloc_coherent() uncached on ESP32-S31.  Avoid the
+		 * resulting cached alias and use an explicitly synchronized
+		 * streaming mapping for the descriptor ring.
+		 */
+		if (dw_mci_idmac_desc_noncoherent(host)) {
+			host->sg_cpu = devm_kzalloc(dev, DESC_RING_BUF_SZ,
+						    GFP_KERNEL);
+			if (host->sg_cpu) {
+				host->sg_dma = dma_map_single(dev, host->sg_cpu,
+							      DESC_RING_BUF_SZ,
+							      DMA_BIDIRECTIONAL);
+				if (dma_mapping_error(dev, host->sg_dma)) {
+					host->sg_cpu = NULL;
+				} else {
+					ret = devm_add_action_or_reset(dev,
+							dw_mci_idmac_unmap, host);
+					if (ret)
+						host->sg_cpu = NULL;
+				}
+			}
+		} else {
+			host->sg_cpu = dmam_alloc_coherent(dev,
+							   DESC_RING_BUF_SZ,
+							   &host->sg_dma,
+							   GFP_KERNEL);
+		}
 		if (!host->sg_cpu) {
 			dev_err(host->dev,
 				"%s: could not alloc DMA memory\n",
@@ -3440,9 +3651,12 @@ int dw_mci_probe(struct dw_mci *host)
 	timer_setup(&host->cmd11_timer, dw_mci_cmd11_timer, 0);
 	timer_setup(&host->cto_timer, dw_mci_cto_timer, 0);
 	timer_setup(&host->dto_timer, dw_mci_dto_timer, 0);
+	hrtimer_setup(&host->irq_poll_timer, dw_mci_irq_poll_timer,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	spin_lock_init(&host->lock);
 	spin_lock_init(&host->irq_lock);
+	spin_lock_init(&host->irq_handler_lock);
 	INIT_LIST_HEAD(&host->queue);
 
 	dw_mci_init_fault(host);
@@ -3584,6 +3798,7 @@ EXPORT_SYMBOL(dw_mci_probe);
 void dw_mci_remove(struct dw_mci *host)
 {
 	dev_dbg(host->dev, "remove slot\n");
+	hrtimer_cancel(&host->irq_poll_timer);
 	if (host->slot)
 		dw_mci_cleanup_slot(host->slot);
 
@@ -3610,6 +3825,8 @@ EXPORT_SYMBOL(dw_mci_remove);
 int dw_mci_runtime_suspend(struct device *dev)
 {
 	struct dw_mci *host = dev_get_drvdata(dev);
+
+	hrtimer_cancel(&host->irq_poll_timer);
 
 	if (host->use_dma && host->dma_ops->exit)
 		host->dma_ops->exit(host);

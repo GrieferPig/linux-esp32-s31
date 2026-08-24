@@ -11,3 +11,6 @@ subdir-y += sophgo
 subdir-y += spacemit
 subdir-y += starfive
 subdir-y += thead
+
+DTC_FLAGS_espressif/esp32s31_generic := -@
+obj-$(CONFIG_BUILTIN_DTB) := $(addsuffix .dtb.o, $(CONFIG_BUILTIN_DTB_SOURCE))

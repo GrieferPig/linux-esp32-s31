@@ -108,16 +108,13 @@
 .endm
 
 
-/*
- * ESP32-S31 CLIC quirk: stvec.base bits[5:0] are hardware-forced to 0
- * (CLIC mode = 11, 64-byte alignment). Without this, the trap lands
- * up to 60 bytes BEFORE handle_exception, executing whatever
- * happens to live at that address. Mainline RISC-V handle_exception
- * is only 4-byte aligned. Gated by RISCV_ESP_CLIC_TRAP_QUIRK (selected
- * by ESP_CLIC) so other platforms keep the mainline alignment.
- */
-#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
-	.align 6
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * ESP32-S31 runs with stvec forced to CLIC mode, whose BASE field is
+	 * 64-byte aligned.  Keep the common Linux exception entry on that
+	 * boundary so synchronous traps do not land before handle_exception.
+	 */
+	.balign 64
 #endif
 SYM_CODE_START(handle_exception)
 	/*
@@ -187,6 +184,11 @@ SYM_CODE_START(handle_exception)
 	REG_S s2, PT_EPC(sp)
 	REG_S s3, PT_BADADDR(sp)
 	REG_S s4, PT_CAUSE(sp)
+#ifdef CONFIG_SOC_ESP32S31
+	/* Preserve the full hardware token; the official policy sanitizes it
+	 * immediately before every sret. */
+	REG_S s4, PT_CAUSE_RAW(sp)
+#endif
 	REG_S s5, PT_TP(sp)
 
 	/*
@@ -214,10 +216,24 @@ SYM_CODE_START(handle_exception)
 	bge s4, zero, 1f
 
 	/* Handle interrupts */
+#ifdef CONFIG_SOC_ESP32S31
+	/* Linux sees only the architectural interrupt bit and CLIC ID. */
+	li t0, 0xfff
+	and s4, s4, t0
+	li t0, CAUSE_IRQ_FLAG
+	or s4, s4, t0
+	REG_S s4, PT_CAUSE(sp)
+#endif
 	call do_irq
 	j ret_from_exception
 1:
 	/* Handle other exceptions */
+#ifdef CONFIG_SOC_ESP32S31
+	/* ESP32-S31 Hack: Mask CLIC implementation bits for exceptions */
+	li t0, 0xfff
+	and s4, s4, t0
+	REG_S s4, PT_CAUSE(sp)   /* Store masked cause so handlers see correct code */
+#endif
 	slli t0, s4, RISCV_LGPTR
 	la t1, excp_vect_table
 	la t2, excp_vect_table_end
@@ -292,33 +308,19 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	 */
 	REG_L  a2, PT_EPC(sp)
 	REG_SC x0, a2, PT_EPC(sp)
-
 	csrw CSR_STATUS, a0
 	csrw CSR_EPC, a2
 
-#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
-	/*
-	 * CLIC v0.9 (verified on this silicon): sret reloads the S in-service
-	 * interrupt level (sintstatus.sil) from scause.SPIL *only* when scause
-	 * is interrupt-type (bit31 set). If an interrupt handler's final sret
-	 * runs with an exception-type scause (a nested exception overwrote it),
-	 * sil is never lowered; with the strict level>sil delivery gate all
-	 * interrupts (incl. the timer tick) are blocked forever -> idle wedge.
-	 *
-	 * Force every trap exit to sret with an interrupt-type, SPIL=0 scause
-	 * (keeping the original exccode). This resets sil to the base level on
-	 * every return, which is always correct here: all CLIC interrupts run
-	 * at one level and handlers execute with SIE=0, so no context that
-	 * sret returns to legitimately needs sil > 0. t0/t1 are restored from
-	 * the stack below.
-	 */
-	REG_L t0, PT_CLIC_SCAUSE(sp)
-	li t1, 0x00ff0000	/* clear SPIL[23:16] only — scause.SPP/SPIE */
-	not t1, t1		/* mirror sstatus.SPP/SPIE and must be kept */
-	and t0, t0, t1		/* (they were saved at trap entry) */
-	li t1, 0x80000000	/* force interrupt-type so sret reloads sil */
-	or t0, t0, t1
-	csrw CSR_CAUSE, t0
+#ifdef CONFIG_SOC_ESP32S31
+	/* Match Espressif downstream: every exit looks interrupt-type to sret,
+	 * with SPIL cleared so the supervisor interrupt level returns to idle. */
+	REG_L a1, PT_CAUSE_RAW(sp)
+	li t0, 0x00ff0000
+	not t0, t0
+	and a1, a1, t0
+	li t0, CAUSE_IRQ_FLAG
+	or a1, a1, t0
+	csrw CSR_CAUSE, a1
 #endif
 
 	REG_L x1,  PT_RA(sp)

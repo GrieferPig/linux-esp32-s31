@@ -197,6 +197,18 @@ static int riscv_cpuinfo_starting(unsigned int cpu)
 	struct riscv_cpuinfo *ci = this_cpu_ptr(&riscv_cpuinfo);
 
 #if IS_ENABLED(CONFIG_RISCV_SBI)
+	/*
+	 * Both ESP32-S31 HP harts expose the same implementation IDs.  Querying
+	 * them again while the secondary CPUHP thread is starting performs three
+	 * otherwise unnecessary S-to-M SBI crossings and leaves that hart behind
+	 * the CLIC cross-privilege 0xff sentinel before its first IPI.  Reuse the
+	 * boot hart's already cached values and keep secondary startup in S-mode.
+	 */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31) && cpu) {
+		*ci = *per_cpu_ptr(&riscv_cpuinfo, 0);
+		return 0;
+	}
+
 	if (!ci->mvendorid)
 		ci->mvendorid = sbi_spec_is_0_1() ? 0 : sbi_get_mvendorid();
 	if (!ci->marchid)

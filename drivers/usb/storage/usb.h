@@ -130,6 +130,7 @@ struct us_data {
 	struct usb_sg_request	current_sg;	 /* scatter-gather req.  */
 	unsigned char		*iobuf;		 /* I/O buffer		 */
 	dma_addr_t		iobuf_dma;	 /* buffer DMA addresses */
+	bool			iobuf_dma_coherent;
 	struct task_struct	*ctl_thread;	 /* the control thread   */
 
 	/* mutual exclusion and synchronization structures */

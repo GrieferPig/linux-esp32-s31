@@ -41,6 +41,34 @@ EXPORT_SYMBOL(__stack_chk_guard);
 extern asmlinkage void ret_from_fork_kernel_asm(void);
 extern asmlinkage void ret_from_fork_user_asm(void);
 
+#ifdef CONFIG_SOC_ESP32S31
+extern void esp32s31_irq_poll(void);
+void arch_cpu_idle_poll(void);
+
+void arch_cpu_idle_poll(void)
+{
+	esp32s31_irq_poll();
+}
+
+void arch_cpu_idle_prepare(void)
+{
+	static bool polling_enabled;
+
+	/*
+	 * The generic idle loop enters arch_cpu_idle() with local IRQs disabled.
+	 * ESP32-S31 CLIC doorbells do not wake WFI in that state, which can strand
+	 * an SMP reschedule or TLB-shootdown IPI on an idle hart.  Keep the normal
+	 * IRQ-enabled polling idle loop.  The polling hook also drains a pending
+	 * native source if the CLIC cross-privilege sentinel blocks hardware entry.
+	 */
+	if (!polling_enabled) {
+		polling_enabled = true;
+		cpu_idle_poll_ctrl(true);
+		pr_info("S31 SMP: using IRQ-enabled idle polling\n");
+	}
+}
+#endif
+
 void noinstr arch_cpu_idle(void)
 {
 	cpu_do_idle();
@@ -188,6 +216,9 @@ void flush_thread(void)
 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SUPM))
 		envcfg_update_bits(current, ENVCFG_PMM, ENVCFG_PMM_PMLEN_0);
 #endif
+#ifdef CONFIG_SOC_ESP32S31
+	esp32s31_ext_reset(current);
+#endif
 }
 
 void arch_release_task_struct(struct task_struct *tsk)
@@ -200,6 +231,7 @@ void arch_release_task_struct(struct task_struct *tsk)
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 {
 	fstate_save(src, task_pt_regs(src));
+	esp32s31_ext_save(src);
 	*dst = *src;
 	/* clear entire V context, including datap for a new task */
 	memset(&dst->thread.vstate, 0, sizeof(struct __riscv_v_ext_state));

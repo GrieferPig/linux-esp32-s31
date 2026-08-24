@@ -103,4 +103,32 @@ config ARCH_ESPRESSIF
 	help
 	  This enables support for Espressif RISC-V SoCs.
 
+config SOC_ESP32S31
+	bool "Espressif ESP32-S31 SoC"
+	depends on ARCH_ESPRESSIF
+	select ESP32S31_CLIC
+	help
+	  This enables support for the Espressif ESP32-S31 SoC.
+	  With MMU enabled the kernel runs in Supervisor mode behind OpenSBI.
+
+config ESP32S31_COPROC_CONTEXT
+	bool "ESP32-S31 HWLoop/PIE task context through SBI"
+	depends on SOC_ESP32S31
+	help
+	  Save and restore the stateful HWLoop and PIE extensions on task
+	  switches, fork and signal delivery.  The extension state CSRs are
+	  M-mode-only, so this requires a synchronous SBI ecall on every context
+	  switch.  OpenSBI strips M-CLIC metadata when redirecting traps so an
+	  ecall cannot restore the cross-privilege SIL=0xff sentinel into S-mode.
+	  PIE state is saved only on hart 1; users of XespV must stay CPU1-bound.
+
+config ESP32S31_RADIO_SMODE
+	bool "ESP32-S31 S-mode radio runtime"
+	depends on SOC_ESP32S31 && MMU
+	help
+	  Prepare a private, identity-mapped address space for the ESP32-S31
+	  Wi-Fi, Bluetooth and PHY firmware libraries.  The mappings are present
+	  only in init_mm and are consumed by a dedicated kernel thread; user
+	  address spaces do not inherit them.
+
 endmenu # "SoC selection"

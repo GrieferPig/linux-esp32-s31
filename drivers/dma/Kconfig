@@ -126,6 +126,27 @@ config AXI_DMAC
 	  controller is often used in Analog Devices' reference designs for FPGA
 	  platforms.
 
+config ESP32S31_AXI_GDMA
+	tristate "Espressif ESP32-S31 AXI GDMA support"
+	depends on SOC_ESP32S31
+	depends on OF
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	select GENERIC_ALLOCATOR
+	help
+	  Enable the AXI general-purpose DMA controller found in the ESP32-S31.
+
+config ESP32S31_AHB_GDMA
+	tristate "Espressif ESP32-S31 AHB GDMA support"
+	depends on SOC_ESP32S31
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	select GENERIC_ALLOCATOR
+	help
+	  Enable all five memory-copy channel pairs in the S31 AHB GDMA.
+	  Each coupled TX/RX pair is exposed as one channel supporting memcpy,
+	  memset, slave scatter-gather and cyclic transfers.
+
 config BCM_SBA_RAID
 	tristate "Broadcom SBA RAID engine support"
 	depends on ARM64 || COMPILE_TEST

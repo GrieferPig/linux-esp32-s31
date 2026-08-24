@@ -7,23 +7,13 @@
 #define _ASM_RISCV_CACHEFLUSH_H
 
 #include <linux/mm.h>
-
-#ifdef CONFIG_ESP32S31_CACHE
-void esp32s31_flush_icache(void);
-void esp32s31_flush_icache_range(phys_addr_t paddr, size_t size);
-#endif
+#include <linux/soc/espressif/esp32s31-cache.h>
 
 static inline void local_flush_icache_all(void)
 {
 	asm volatile ("fence.i" ::: "memory");
-#ifdef CONFIG_ESP32S31_CACHE
-	/*
-	 * fence.i has nothing to act on here: this SoC keeps no cache inside
-	 * the CPU IP, and its external ICache/Shared-DCache are split and
-	 * non-coherent. Delegate the real writeback-D + invalidate-I to OpenSBI.
-	 */
-	esp32s31_flush_icache();
-#endif
+	/* S31's split external I/D caches are outside fence.i's reach. */
+	esp32s31_cache_sync_all_for_exec();
 }
 
 static inline void local_flush_icache_range(unsigned long start,
@@ -47,10 +37,15 @@ static inline void flush_dcache_page(struct page *page)
 	flush_dcache_folio(page_folio(page));
 }
 
-#define flush_icache_user_page(vma, pg, addr, len)	\
-do {							\
-	if (vma->vm_flags & VM_EXEC)			\
-		flush_icache_mm(vma->vm_mm, 0);		\
+/*
+ * RISC-V doesn't have an instruction to flush parts of the instruction cache,
+ * so instead we just flush the whole thing.
+ */
+#define flush_icache_user_page(vma, pg, addr, len)		\
+do {								\
+	if (vma->vm_flags & VM_EXEC) {				\
+		esp32s31_cache_sync_for_exec(page_to_phys(pg), PAGE_SIZE); \
+	}							\
 } while (0)
 
 #ifdef CONFIG_64BIT

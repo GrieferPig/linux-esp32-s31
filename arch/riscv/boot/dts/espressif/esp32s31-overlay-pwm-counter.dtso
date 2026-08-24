@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "pwm-counter";
+};
+
+&gpio {
+	ledc0_dynamic: ledc0-dynamic-pins {
+		ledc0-out {
+			espressif,route-name = "ledc0.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(20, 126, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	ledc1_dynamic: ledc1-dynamic-pins {
+		ledc1-out {
+			espressif,route-name = "ledc1.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(21, 230, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	mcpwm0_dynamic: mcpwm0-dynamic-pins {
+		mcpwm0-out {
+			espressif,route-name = "mcpwm0.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(22, 89, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	mcpwm1_dynamic: mcpwm1-dynamic-pins {
+		mcpwm1-out {
+			espressif,route-name = "mcpwm1.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(23, 95, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	mcpwm2_dynamic: mcpwm2-dynamic-pins {
+		mcpwm2-out {
+			espressif,route-name = "mcpwm2.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(24, 86, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	mcpwm3_dynamic: mcpwm3-dynamic-pins {
+		mcpwm3-out {
+			espressif,route-name = "mcpwm3.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(25, 113, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	sdm_dynamic: sdm-dynamic-pins {
+		sdm-out {
+			espressif,route-name = "sdm.out";
+			espressif,route-kind = "matrix-output";
+			pinmux = <ESP32S31_MATRIX_OUT(35, 72, 0)>;
+			drive-strength = <20>;
+		};
+	};
+	pcnt0_dynamic: pcnt0-dynamic-pins {
+		pcnt0-in {
+			espressif,route-name = "pcnt0.in";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(36, 141, 0)>;
+			input-enable;
+			bias-disable;
+		};
+	};
+	pcnt1_dynamic: pcnt1-dynamic-pins {
+		pcnt1-in {
+			espressif,route-name = "pcnt1.in";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(37, 204, 0)>;
+			input-enable;
+			bias-disable;
+		};
+	};
+};
+
+&ledc0 { pinctrl-names = "default"; pinctrl-0 = <&ledc0_dynamic>; status = "okay"; };
+&ledc1 { pinctrl-names = "default"; pinctrl-0 = <&ledc1_dynamic>; status = "okay"; };
+&mcpwm0 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm0_dynamic>; status = "okay"; };
+&mcpwm1 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm1_dynamic>; status = "okay"; };
+&mcpwm2 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm2_dynamic>; status = "okay"; };
+&mcpwm3 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm3_dynamic>; status = "okay"; };
+&sdm { pinctrl-names = "default"; pinctrl-0 = <&sdm_dynamic>; status = "okay"; };
+&pcnt0 { pinctrl-names = "default"; pinctrl-0 = <&pcnt0_dynamic>; status = "okay"; };
+&pcnt1 { pinctrl-names = "default"; pinctrl-0 = <&pcnt1_dynamic>; status = "okay"; };

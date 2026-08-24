@@ -51,6 +51,12 @@ static void riscv_intc_aia_irq(struct pt_regs *regs)
 
 static void riscv_intc_irq_mask(struct irq_data *d)
 {
+	/* ESP32-S31 uses CLIC memory-mapped enables for every active source.
+	 * The inactive sie/sieh CSRs trap on this revision; the CLIC child and
+	 * SMP-local layer own clicintie instead. */
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		return;
+
 	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
 		csr_clear(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
 	else
@@ -59,6 +65,9 @@ static void riscv_intc_irq_mask(struct irq_data *d)
 
 static void riscv_intc_irq_unmask(struct irq_data *d)
 {
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		return;
+
 	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
 		csr_set(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
 	else
@@ -184,6 +193,9 @@ static int __init riscv_intc_init_common(struct fwnode_handle *fn, struct irq_ch
 		pr_err("unable to add IRQ domain\n");
 		return -ENXIO;
 	}
+
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31))
+		riscv_intc_nr_irqs = 48;
 
 	if (riscv_isa_extension_available(NULL, SxAIA)) {
 		riscv_intc_nr_irqs = 64;

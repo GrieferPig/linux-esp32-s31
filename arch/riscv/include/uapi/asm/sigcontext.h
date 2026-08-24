@@ -10,6 +10,7 @@
 
 /* The Magic number for signal context frame header. */
 #define RISCV_V_MAGIC	0x53465457
+#define RISCV_ESP32S31_EXT_MAGIC	0x53333145
 #define END_MAGIC	0x0
 
 /* The size of END signal context header. */
@@ -19,6 +20,13 @@
 
 struct __sc_riscv_v_state {
 	struct __riscv_v_ext_state v_state;
+} __attribute__((aligned(16)));
+
+/* ESP32-S31 HWLoop and PIE state, matching the kernel/OpenSBI save area. */
+struct __riscv_esp32s31_ext_state {
+	__u32 hwloop[6];
+	__u32 reserved[2];
+	__u32 pie[54];
 } __attribute__((aligned(16)));
 
 /*

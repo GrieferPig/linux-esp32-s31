@@ -115,7 +115,8 @@ void flush_icache_pte(struct mm_struct *mm, pte_t pte)
 
 	folio = page_folio(pfn_to_page(pfn));
 	if (!test_bit(PG_dcache_clean, &folio->flags.f)) {
-		esp32s31_flush_icache_range((phys_addr_t)pfn << PAGE_SHIFT, PAGE_SIZE);
+		esp32s31_cache_sync_for_exec((phys_addr_t)pfn << PAGE_SHIFT,
+					    PAGE_SIZE);
 		set_bit(PG_dcache_clean, &folio->flags.f);
 	}
 #else

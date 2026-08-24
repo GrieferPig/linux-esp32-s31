@@ -23,7 +23,6 @@ struct sbiret __sbi_ecall(unsigned long arg0, unsigned long arg1,
 			  int fid, int ext)
 {
 	struct sbiret ret;
-
 	trace_sbi_call(ext, fid);
 
 	register uintptr_t a0 asm ("a0") = (uintptr_t)(arg0);

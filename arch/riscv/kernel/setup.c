@@ -361,8 +361,9 @@ void __init setup_arch(char **cmdline_p)
 	apply_boot_alternatives();
 	init_rt_signal_env();
 
-	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
-	    riscv_isa_extension_available(NULL, ZICBOM))
+	if ((IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
+	     riscv_isa_extension_available(NULL, ZICBOM)) ||
+	    IS_ENABLED(CONFIG_ESP32S31_CACHE))
 		riscv_noncoherent_supported();
 	riscv_set_dma_cache_alignment();
 

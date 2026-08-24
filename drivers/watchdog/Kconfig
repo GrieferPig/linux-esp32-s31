@@ -149,6 +149,14 @@ comment "Watchdog Device Drivers"
 
 # Architecture Independent
 
+config ESP32S31_WATCHDOG
+	tristate "Espressif ESP32-S31 timer-group watchdog"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	select WATCHDOG_CORE
+	help
+	  Support for the main watchdog timer in an ESP32-S31 timer group.
+	  The watchdog resets the complete SoC when its timeout expires.
+
 config SOFT_WATCHDOG
 	tristate "Software watchdog"
 	select WATCHDOG_CORE

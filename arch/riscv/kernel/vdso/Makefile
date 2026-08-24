@@ -28,6 +28,16 @@ ccflags-y := -fno-stack-protector
 ccflags-y += -DDISABLE_BRANCH_PROFILING
 ccflags-y += -fno-builtin
 
+# The vDSO is executed by ilp32 userspace; keep the soft-float ABI even
+# though the rest of the kernel is built with -mabi=ilp32f.  Only the
+# shared-object members need this; vdso.S (kernel-side wrapper) stays ilp32f.
+ccflags-y += -mabi=ilp32
+AFLAGS_rt_sigreturn.o += -mabi=ilp32
+AFLAGS_getcpu.o += -mabi=ilp32
+AFLAGS_flush_icache.o += -mabi=ilp32
+AFLAGS_sys_hwprobe.o += -mabi=ilp32
+AFLAGS_note.o += -mabi=ilp32
+
 ifneq ($(c-gettimeofday-y),)
   CFLAGS_vgettimeofday.o += -fPIC -include $(c-gettimeofday-y)
 endif

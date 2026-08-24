@@ -1269,6 +1269,7 @@ int ipi_send_single(unsigned int virq, unsigned int cpu);
 int ipi_send_mask(unsigned int virq, const struct cpumask *dest);
 
 void ipi_mux_process(void);
+bool ipi_mux_pending(void);
 int ipi_mux_create(unsigned int nr_ipi, void (*mux_send)(unsigned int cpu));
 
 #ifdef CONFIG_GENERIC_IRQ_MULTI_HANDLER

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "gmac";
+	espressif,resource-claims = "gmac-rgmii-pads";
+	espressif,gpio-claims = <5 6 8 9 10 11 12 13 14 15 16 17 18 19>;
+};
+
+&emac {
+	status = "okay";
+};

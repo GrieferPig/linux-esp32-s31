@@ -21,6 +21,15 @@ menuconfig HW_RANDOM
 
 if HW_RANDOM
 
+config HW_RANDOM_ESP32S31
+	tristate "Espressif ESP32-S31 true random number generator"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on HAS_IOMEM
+	default SOC_ESP32S31
+	help
+	  This driver provides kernel-side support for the true random number
+	  generator integrated in the Espressif ESP32-S31.
+
 config HW_RANDOM_TIMERIOMEM
 	tristate "Timer IOMEM HW Random Number Generator support"
 	depends on HAS_IOMEM

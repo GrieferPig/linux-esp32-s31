@@ -7,6 +7,11 @@
 #
 
 LDFLAGS_vmlinux := -z norelro
+ifeq ($(CONFIG_SOC_ESP32S31),y)
+	# ESP-IDF radio objects carry relaxation records produced by the ESP
+	# toolchain.  Keep the final kernel linker from rewriting those sequences.
+	LDFLAGS_vmlinux += --no-relax
+endif
 ifeq ($(CONFIG_RELOCATABLE),y)
 	LDFLAGS_vmlinux += -shared -Bsymbolic -z notext
 	KBUILD_CFLAGS += -fPIE
@@ -41,8 +46,8 @@ else
 	BITS := 32
 	UTS_MACHINE := riscv32
 
-	KBUILD_CFLAGS += -mabi=ilp32
-	KBUILD_AFLAGS += -mabi=ilp32
+	KBUILD_CFLAGS += -mabi=ilp32f
+	KBUILD_AFLAGS += -mabi=ilp32f
 	KBUILD_LDFLAGS += -melf32lriscv
 endif
 
@@ -81,9 +86,10 @@ riscv-march-$(CONFIG_TOOLCHAIN_HAS_ZACAS) := $(riscv-march-y)_zacas
 # Check if the toolchain supports Zabha
 riscv-march-$(CONFIG_TOOLCHAIN_HAS_ZABHA) := $(riscv-march-y)_zabha
 
-# Remove F,D,V from isa string for all. Keep extensions between "fd" and "v" by
-# matching non-v and non-multi-letter extensions out with the filter ([^v_]*)
-KBUILD_CFLAGS += -march=$(shell echo $(riscv-march-y) | sed -E 's/(rv32ima|rv64ima)fd([^v_]*)v?/\1\2/')
+# Remove D,V from isa string for all, keep F for the ilp32f ABI. Keep
+# extensions between "fd" and "v" by matching non-v and non-multi-letter
+# extensions out with the filter ([^v_]*)
+KBUILD_CFLAGS += -march=$(shell echo $(riscv-march-y) | sed -E 's/(rv32ima|rv64ima)fd([^v_]*)v?/\1f\2/')
 
 KBUILD_AFLAGS += -march=$(riscv-march-y)
 

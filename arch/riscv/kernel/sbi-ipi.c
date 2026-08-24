@@ -79,8 +79,10 @@ void __init sbi_ipi_init(void)
 	pr_info("providing IPIs using SBI IPI extension\n");
 
 	/*
-	 * Use the SBI remote fence extension to avoid
-	 * the extra context switch needed to handle IPIs.
+	 * Keep remote fences on the IPI path.  ESP32-S31 installs its native
+	 * S-mode IPI controller after this early fallback is initialized.  If
+	 * this key is enabled here, later remote fences continue to use the SBI
+	 * RFENCE extension and its M-mode IPI, which can leave the target CLIC
+	 * SIL at the cross-privilege 0xff sentinel and mask every S-mode IRQ.
 	 */
-	static_branch_enable(&riscv_sbi_for_rfence);
 }

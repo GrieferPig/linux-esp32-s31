@@ -418,6 +418,23 @@ static const char * const stmmac_gmac4_compats[] = {
 };
 
 /**
+ * stmmac_remove_config_dt - undo the effects of stmmac_probe_config_dt()
+ * @pdev: platform_device structure
+ * @plat: driver data platform structure
+ *
+ * Release resources claimed by stmmac_probe_config_dt().
+ */
+static void stmmac_remove_config_dt(struct platform_device *pdev,
+				    struct plat_stmmacenet_data *plat)
+{
+	clk_disable_unprepare(plat->stmmac_clk);
+	clk_disable_unprepare(plat->clk_tx);
+	clk_disable_unprepare(plat->pclk);
+	of_node_put(plat->phy_node);
+	of_node_put(plat->mdio_node);
+}
+
+/**
  * stmmac_probe_config_dt - parse device-tree driver parameters
  * @pdev: platform_device structure
  * @mac: MAC address to use
@@ -642,6 +659,13 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 	}
 	clk_prepare_enable(plat->pclk);
 
+	plat->clk_tx = devm_clk_get_optional(&pdev->dev, "tx");
+	if (IS_ERR(plat->clk_tx)) {
+		ret = plat->clk_tx;
+		goto error_tx_get;
+	}
+	clk_prepare_enable(plat->clk_tx);
+
 	/* Fall-back to main clock in case of no PTP ref is passed */
 	plat->clk_ptp_ref = devm_clk_get(&pdev->dev, "ptp_ref");
 	if (IS_ERR(plat->clk_ptp_ref)) {
@@ -670,6 +694,8 @@ stmmac_probe_config_dt(struct platform_device *pdev, u8 *mac)
 	return plat;
 
 error_hw_init:
+	clk_disable_unprepare(plat->clk_tx);
+error_tx_get:
 	clk_disable_unprepare(plat->pclk);
 error_pclk_get:
 	clk_disable_unprepare(plat->stmmac_clk);

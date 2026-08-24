@@ -67,6 +67,25 @@ const struct dev_pm_ops dw_mci_pltfm_pmops = {
 };
 EXPORT_SYMBOL_GPL(dw_mci_pltfm_pmops);
 
+static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
+{
+	u32 slot_id = 0;
+
+	of_property_read_u32(host->dev->of_node, "espressif,slot-id", &slot_id);
+	if (slot_id > 1)
+		return dev_err_probe(host->dev, -EINVAL,
+				     "invalid physical slot %u\n", slot_id);
+	host->slot_id = slot_id;
+	host->quirks |= DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT |
+			DW_MMC_QUIRK_LOST_IRQ_POLL;
+
+	return 0;
+}
+
+static const struct dw_mci_drv_data esp32s31_drv_data = {
+	.init		= dw_mci_esp32s31_priv_init,
+};
+
 static int dw_mci_socfpga_priv_init(struct dw_mci *host)
 {
 	struct device_node *np = host->dev->of_node;
@@ -101,6 +120,7 @@ static const struct dw_mci_drv_data socfpga_drv_data = {
 };
 
 static const struct of_device_id dw_mci_pltfm_match[] = {
+	{ .compatible = "espressif,esp32s31-dw-mshc", .data = &esp32s31_drv_data, },
 	{ .compatible = "snps,dw-mshc", },
 	{ .compatible = "altr,socfpga-dw-mshc", .data = &socfpga_drv_data, },
 	{ .compatible = "img,pistachio-dw-mshc", },

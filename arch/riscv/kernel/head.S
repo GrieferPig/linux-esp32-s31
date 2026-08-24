@@ -18,6 +18,37 @@
 #include "efi-header.S"
 
 __HEAD
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31's Sv32 page-table walker does not snoop the shared write-back
+	 * D-cache. setup_vm() creates the early tables in cached PSRAM, so make
+	 * them visible before loading SATP. The S31 cache operation must be
+	 * issued twice, matching the ESP-IDF ROM workaround.
+	 */
+	.macro ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
+		li t0, 0x2c000000
+		li t1, 0x10		/* CACHE_MAP_L1_DCACHE */
+		sw t1, 0xa0(t0)
+		li t1, CONFIG_PHYS_RAM_BASE
+		sw t1, 0xa4(t0)
+		li t1, 0x01000000
+		sw t1, 0xa8(t0)
+		fence ow, ow
+		li t1, 0x4		/* CACHE_WRITEBACK_ENA */
+		sw t1, 0x9c(t0)
+.Lcache_wb_wait1\@:
+		lw t2, 0x9c(t0)
+		andi t2, t2, 0x10
+		beqz t2, .Lcache_wb_wait1\@
+		sw t1, 0x9c(t0)
+.Lcache_wb_wait2\@:
+		lw t2, 0x9c(t0)
+		andi t2, t2, 0x10
+		beqz t2, .Lcache_wb_wait2\@
+		fence iorw, iorw
+	.endm
+#endif
+
 SYM_CODE_START(_start)
 	/*
 	 * Image header expected by Linux boot-loaders. The image header data
@@ -80,9 +111,19 @@ relocate_enable_mmu:
 	sub a1, a1, a2
 	add ra, ra, a1
 
-	/* Point stvec to virtual address of intruction after satp write */
+	/* Point stvec to virtual address of instruction after satp write */
 	la a2, 1f
 	add a2, a2, a1
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31 only implements CLIC trap mode.  Do not depend on an instruction
+	 * page fault returning through stvec for the MMU transition: keep the
+	 * virtual continuation in a3 and explicitly jump there after SATP is
+	 * enabled through the trampoline's identity mapping.
+	 */
+	mv a3, a2
+	ori a2, a2, 3
+#endif
 	csrw CSR_TVEC, a2
 
 	/* Compute satp for kernel page tables, but don't load it yet */
@@ -104,7 +145,13 @@ relocate_enable_mmu:
 	or a0, a0, a1
 	sfence.vma
 	csrw CSR_SATP, a0
+#ifdef CONFIG_SOC_ESP32S31
+	sfence.vma
+	jr a3
+	.balign 0x40
+#else
 .align 2
+#endif
 1:
 	/* Set trap vector to spin forever to help debug */
 	la a0, .Lsecondary_park
@@ -151,13 +198,17 @@ secondary_start_sbi:
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 
-	/* a0 contains the hartid & a1 contains boot data */
+	/* a0 contains the hartid & a1 contains boot data.  a1 is already the
+	 * physical address of the boot data, and the offsets are plain small
+	 * struct offsets.  Do not apply XIP_FIXUP_OFFSET here: that macro
+	 * converts a link-time kernel data address into a physical address,
+	 * but adding PHYS_RAM_BASE - _sdata to 0/4 corrupts the load address
+	 * and makes the secondary hart fault before it can enable the MMU.
+	 */
 	li a2, SBI_HART_BOOT_TASK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a2
 	add a2, a2, a1
 	REG_L tp, (a2)
 	li a3, SBI_HART_BOOT_STACK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a3
 	add a3, a3, a1
 	REG_L sp, (a3)
 
@@ -174,7 +225,11 @@ secondary_start_sbi:
 	call smp_callin
 #endif /* CONFIG_SMP */
 
-.align 2
+/* S31 CLIC normalizes stvec.BASE to 64-byte alignment and forces
+ * MODE=3.  Keep the park loop aligned so that the base written by
+ * "csrw stvec, .Lsecondary_park" really points at the wfi loop.
+ */
+.balign 0x40
 .Lsecondary_park:
 	/*
 	 * Park this hart if we:
@@ -189,6 +244,10 @@ secondary_start_sbi:
 .Lsetup_trap_vector:
 	/* Set trap vector to exception handler */
 	la a0, handle_exception
+#ifdef CONFIG_SOC_ESP32S31
+	/* ESP32-S31 uses CLIC mode, encoded in the low stvec bits. */
+	ori a0, a0, 3
+#endif
 	csrw CSR_TVEC, a0
 
 	/*
@@ -201,9 +260,16 @@ secondary_start_sbi:
 SYM_CODE_END(_start)
 
 SYM_CODE_START(_start_kernel)
+#ifdef CONFIG_SOC_ESP32S31
+	/* Keep S-mode interrupts off while the CLIC path is still firmware-owned. */
+	li t0, 2
+	csrc sstatus, t0
+#endif
 	/* Mask all interrupts */
+#ifndef CONFIG_SOC_ESP32S31
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
+#endif
 
 #ifdef CONFIG_RISCV_M_MODE
 	/* flush the instruction cache */
@@ -217,6 +283,9 @@ SYM_CODE_START(_start_kernel)
 	 * not implement PMPs, so we set up a quick trap handler to just skip
 	 * touching the PMPs on any trap.
 	 */
+
+	 /* Skip PMP configuration for bringup */
+#if !defined(CONFIG_SOC_ESP32S31)
 	la a0, .Lpmp_done
 	csrw CSR_TVEC, a0
 
@@ -226,6 +295,7 @@ SYM_CODE_START(_start_kernel)
 	csrw CSR_PMPCFG0, a0
 .align 2
 .Lpmp_done:
+#endif
 
 	/*
 	 * The hartid in a0 is expected later on, and we have no firmware
@@ -283,7 +353,7 @@ SYM_CODE_START(_start_kernel)
 	mv s1, a1
 	call __copy_data
 
-	/* Restore a0 & a1 copy */
+	/* Restore hart ID and DTB physical address */
 	mv a0, s0
 	mv a1, s1
 #endif
@@ -319,6 +389,9 @@ SYM_CODE_START(_start_kernel)
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 	call setup_vm
+#ifdef CONFIG_SOC_ESP32S31
+	ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
+#endif
 #ifdef CONFIG_MMU
 	la a0, early_pg_dir
 	XIP_FIXUP_OFFSET a0
