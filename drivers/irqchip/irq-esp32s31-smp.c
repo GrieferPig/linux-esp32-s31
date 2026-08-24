@@ -36,7 +36,6 @@
 #define ESP32S31_SYSTIMER_CPU1_SOURCE	34U
 
 static void __iomem *esp32s31_doorbells;
-static DEFINE_PER_CPU(bool, esp32s31_ipi_polling);
 
 static unsigned int esp32s31_doorbell_offset(unsigned int cpu)
 {
@@ -141,44 +140,6 @@ void esp32s31_irq_poll(void)
 		esp_clic_handle_pending(device_pending);
 	irq_exit();
 	set_irq_regs(old_regs);
-	local_irq_restore(flags);
-}
-
-/*
- * A synchronous S-mode trap can leave SIE disabled while Linux waits for a
- * contended raw spinlock.  If the other hart is synchronously waiting for a
- * call-function IPI (notably an instruction-cache fence), neither side can
- * make progress.  Drain only the native IPI here; timer and device IRQs retain
- * their normal ordering.  arch_spin_lock() invokes this only on its slow path.
- */
-void esp32s31_ipi_poll(void)
-{
-	struct pt_regs regs = { };
-	struct pt_regs *old_regs;
-	unsigned long flags;
-	unsigned int cpu = raw_smp_processor_id();
-	unsigned int off;
-
-	if (unlikely(!esp32s31_doorbells || cpu > 1 ||
-		     this_cpu_read(esp32s31_ipi_polling)))
-		return;
-	off = esp32s31_doorbell_offset(cpu);
-	if (!readl(esp32s31_doorbells + off))
-		return;
-
-	local_irq_save(flags);
-	this_cpu_write(esp32s31_ipi_polling, true);
-	regs.status = SR_SPP;
-	old_regs = set_irq_regs(&regs);
-	irq_enter();
-	do {
-		writel(0, esp32s31_doorbells + off);
-		ipi_mux_process();
-		smp_mb();
-	} while (readl(esp32s31_doorbells + off) || ipi_mux_pending());
-	irq_exit();
-	set_irq_regs(old_regs);
-	this_cpu_write(esp32s31_ipi_polling, false);
 	local_irq_restore(flags);
 }
 

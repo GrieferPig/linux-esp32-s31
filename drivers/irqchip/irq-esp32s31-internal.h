@@ -22,7 +22,6 @@ void esp_intmtx_unroute_local(unsigned int cpu, unsigned int source);
 
 int __init esp32s31_smp_irq_init(void);
 void esp32s31_irq_poll(void);
-void esp32s31_ipi_poll(void);
 u32 esp_clic_pending_mask(unsigned int cpu);
 void esp_clic_handle_pending(u32 pending);
 

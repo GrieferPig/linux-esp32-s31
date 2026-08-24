@@ -7,8 +7,6 @@
 #include <linux/atomic.h>
 #include <asm-generic/spinlock_types.h>
 
-void esp32s31_ipi_poll(void);
-
 /*
  * S31's AMO path and ordinary cached loads/stores are not coherent for the
  * lock word.  In particular, the generic ticket lock releases with a 16-bit
@@ -58,13 +56,13 @@ static __always_inline void arch_spin_lock_init(arch_spinlock_t *lock)
 
 static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
 {
-	unsigned int spins = 0;
-
-	while (esp32s31_spin_acquire(lock)) {
+	/* Never dispatch Linux IPIs while waiting for a raw lock. The generic
+	 * CALL_FUNC queue also carries scheduler TTWU callbacks, which can acquire
+	 * a runqueue lock and recurse into this path. Cross-hart fences use the
+	 * SBI RFENCE extension instead.
+	 */
+	while (esp32s31_spin_acquire(lock))
 		__asm__ __volatile__("nop");
-		if (unlikely(!(++spins & 0xff)))
-			esp32s31_ipi_poll();
-	}
 }
 
 static __always_inline bool arch_spin_trylock(arch_spinlock_t *lock)
