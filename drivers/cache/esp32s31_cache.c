@@ -79,8 +79,12 @@ EXPORT_SYMBOL_GPL(esp32s31_cache_writeback);
 
 void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
 {
-	/* This public helper is used after Flash MTD writes.  Invalidate both
-	 * external I-caches through the official executable-range operation. */
+	/* Flash is read through the shared external D-cache by MTD and may also
+	 * contain executable mappings.  Drop the data copy first, then both hart
+	 * I-caches, so the operation that just completed is immediately visible
+	 * without requiring a reboot.
+	 */
+	esp32s31_cache_op(S31_SBI_CACHE_INVAL, paddr, size);
 	esp32s31_cache_op(S31_SBI_ICACHE_SYNC_RANGE, paddr, size);
 }
 EXPORT_SYMBOL_GPL(esp32s31_cache_invalidate);

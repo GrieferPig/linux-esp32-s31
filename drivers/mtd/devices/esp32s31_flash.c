@@ -2,10 +2,9 @@
 /*
  * MTD access to the ESP32-S31 bootloader-provided Flash MMU window.
  *
- * Linux exposes this XIP window read-only.  The ROM write/erase helpers below
- * are retained for bring-up, but are deliberately not registered as MTD
- * operations: SPI1 auto-suspend alone does not coordinate a dual-hart Linux
- * XIP workload with ROM flash commands.
+ * Write and erase use an OpenSBI M-mode proxy for the ROM APIs.  The proxy
+ * parks the peer hart, runs the ROM operation from SRAM with auto-suspend
+ * disabled, then restores normal XIP operation before returning to Linux.
  */
 
 #include <linux/io.h>
@@ -173,11 +172,7 @@ static int esp32s31_flash_probe(struct platform_device *pdev)
 	flash->raw_offset = ESP32S31_FLASH_RAW_OFFSET;
 
 	flash->mtd.type = MTD_NORFLASH;
-	/* The kernel and OpenSBI execute in place from this same NOR.  Keep the
-	 * runtime MTD read-only, matching the official port's mtd-rom device:
-	 * a ROM program/erase operation can make either hart fault on its next
-	 * XIP instruction fetch even when flash auto-suspend is configured. */
-	flash->mtd.flags = MTD_CAP_ROM;
+	flash->mtd.flags = MTD_CAP_NORFLASH;
 	flash->mtd.size = resource_size(res);
 	/* JFFS2 requires an 8 KiB minimum erase sector on this NOR. */
 	flash->mtd.erasesize = SZ_8K;
@@ -197,7 +192,7 @@ static int esp32s31_flash_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret, "failed to register MTD device\n");
 
 	platform_set_drvdata(pdev, flash);
-	dev_info(&pdev->dev, "registered %llu KiB read-only XIP Flash MTD window\n",
+	dev_info(&pdev->dev, "registered %llu KiB writable XIP Flash MTD window\n",
 		 (unsigned long long)(flash->mtd.size / SZ_1K));
 	return 0;
 }
