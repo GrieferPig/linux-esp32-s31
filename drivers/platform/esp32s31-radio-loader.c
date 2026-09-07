@@ -15,7 +15,7 @@
 
 #include "esp32s31-radio-internal.h"
 
-#define S31_RADIO_FW_ABI_VERSION 2U
+#define S31_RADIO_FW_ABI_VERSION 1U
 #define S31_RADIO_FW_DEFAULT_NAME "esp32s31-radio-fw-v1.o"
 
 struct s31_fw_import {

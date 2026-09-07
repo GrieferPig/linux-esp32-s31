@@ -8,6 +8,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/cpu.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/mtd/mtd.h>
@@ -15,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 
 #include <asm/sbi.h>
 
@@ -35,6 +37,64 @@ struct esp32s31_flash {
 	u32 raw_offset;
 	struct mutex lock;
 };
+
+struct esp32s31_flash_peer_park {
+	atomic_t entered;
+	atomic_t release;
+	atomic_t exited;
+};
+
+static void esp32s31_flash_park_peer(void *data)
+{
+	struct esp32s31_flash_peer_park *park = data;
+
+	atomic_set_release(&park->entered, 1);
+	while (!atomic_read_acquire(&park->release))
+		cpu_relax();
+	atomic_set_release(&park->exited, 1);
+}
+
+static struct sbiret esp32s31_flash_ecall(unsigned long funcid, u32 address,
+					  const void *buffer, u32 length)
+{
+	struct esp32s31_flash_peer_park park;
+	struct sbiret ret;
+	int cpu, peer;
+	bool parked = false;
+
+	atomic_set(&park.entered, 0);
+	atomic_set(&park.release, 0);
+	atomic_set(&park.exited, 0);
+
+	/*
+	 * The PMU cannot reliably stall a hart which is transitioning through its
+	 * idle path.  Pin this caller and hold the other hart in active S-mode so
+	 * the OpenSBI ROM proxy can stall it before temporarily disabling XIP.
+	 */
+	cpus_read_lock();
+	cpu = get_cpu();
+	peer = cpu ^ 1;
+	if (peer < nr_cpu_ids && cpu_online(peer) &&
+	    !smp_call_function_single(peer, esp32s31_flash_park_peer,
+				      &park, false)) {
+		while (!atomic_read_acquire(&park.entered))
+			cpu_relax();
+		parked = true;
+	}
+
+	ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH, funcid, address,
+			buffer ? virt_to_phys((void *)buffer) : 0, length,
+			0, 0, 0);
+
+	if (parked) {
+		atomic_set_release(&park.release, 1);
+		while (!atomic_read_acquire(&park.exited))
+			cpu_relax();
+	}
+	put_cpu();
+	cpus_read_unlock();
+	return ret;
+}
 
 static int esp32s31_flash_read(struct mtd_info *mtd, loff_t from,
 				       size_t len, size_t *retlen, u_char *buf)
@@ -62,17 +122,16 @@ static int esp32s31_flash_rom_result(const char *operation, struct sbiret ret)
 
 static int esp32s31_flash_program(u32 address, const u32 *buffer, u32 length)
 {
-	struct sbiret ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH,
-		ESP32S31_SBI_FLASH_WRITE, address, virt_to_phys((void *)buffer), length,
-		0, 0, 0);
+	struct sbiret ret = esp32s31_flash_ecall(ESP32S31_SBI_FLASH_WRITE,
+						address, buffer, length);
 
 	return esp32s31_flash_rom_result("write", ret);
 }
 
 static int esp32s31_flash_erase_rom(u32 address, u32 length)
 {
-	struct sbiret ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH,
-		ESP32S31_SBI_FLASH_ERASE, address, 0, length, 0, 0, 0);
+	struct sbiret ret = esp32s31_flash_ecall(ESP32S31_SBI_FLASH_ERASE,
+						address, NULL, length);
 
 	return esp32s31_flash_rom_result("erase", ret);
 }

@@ -7,7 +7,7 @@
 
 struct device;
 
-#define ESP32S31_RADIO_CORE_ABI_VERSION	4U
+#define ESP32S31_RADIO_CORE_ABI_VERSION	1U
 
 enum esp32s31_radio_state {
 	ESP32S31_RADIO_OFFLINE,

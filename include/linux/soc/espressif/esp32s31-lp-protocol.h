@@ -12,7 +12,7 @@ typedef uint32_t s31_lp_u32;
 #define S31_LP_PACKED __attribute__((packed))
 #endif
 
-#define S31_LP_ABI_VERSION		2U
+#define S31_LP_ABI_VERSION		1U
 #define S31_LP_MESSAGE_MASK		0xffff0000U
 #define S31_LP_SEQUENCE_MASK		0x0000ffffU
 
