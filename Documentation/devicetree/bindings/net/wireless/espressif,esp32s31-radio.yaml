@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/wireless/espressif,esp32s31-radio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 integrated Wi-Fi and Bluetooth radio
+
+maintainers:
+  - S31 Linux contributors <s31-linux@localhost>
+
+description: |
+  Shared ESP32-S31 radio runtime with independently selectable Wi-Fi and
+  Bluetooth frontends. The parent and at least one child are enabled by a
+  board overlay before the integrated radio module is loaded.
+
+properties:
+  compatible:
+    const: espressif,esp32s31-radio
+
+  status: true
+
+  wifi:
+    type: object
+    additionalProperties: false
+    properties:
+      compatible:
+        const: espressif,esp32s31-wifi
+      status: true
+    required:
+      - compatible
+
+  bluetooth:
+    type: object
+    additionalProperties: false
+    properties:
+      compatible:
+        const: espressif,esp32s31-btdm
+      status: true
+    required:
+      - compatible
+
+required:
+  - compatible
+  - wifi
+  - bluetooth
+
+additionalProperties: false
+
+examples:
+  - |
+    radio {
+        compatible = "espressif,esp32s31-radio";
+        status = "okay";
+
+        wifi {
+            compatible = "espressif,esp32s31-wifi";
+            status = "okay";
+        };
+
+        bluetooth {
+            compatible = "espressif,esp32s31-btdm";
+            status = "disabled";
+        };
+    };

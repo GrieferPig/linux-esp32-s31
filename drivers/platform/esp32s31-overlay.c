@@ -5,12 +5,16 @@
 #include <linux/fs.h>
 #include <linux/gpio/driver.h>
 #include <linux/ioctl.h>
+#include <linux/irqdomain.h>
 #include <linux/libfdt.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
@@ -65,6 +69,63 @@ struct s31_overlay {
 static DEFINE_MUTEX(s31_overlay_lock);
 static LIST_HEAD(s31_overlays);
 static int s31_overlay_last_id;
+static bool s31_overlay_removing;
+
+/*
+ * platform_get_irq() mappings normally live for the life of a static DT
+ * node.  Runtime overlays repeatedly create and destroy platform devices,
+ * however, and the generic platform teardown does not dispose those
+ * mappings.  On S31 that eventually exhausts the finite INTMTX-to-CLIC slot
+ * pool.  Reclaim only devices synchronously removed by this manager, after
+ * their drivers and managed resources have gone away.
+ */
+static int s31_overlay_platform_notify(struct notifier_block *nb,
+				       unsigned long action, void *data)
+{
+	struct platform_device *pdev;
+	struct device_node *np;
+	int count, i, irq;
+
+	if (action != BUS_NOTIFY_REMOVED_DEVICE ||
+	    !READ_ONCE(s31_overlay_removing))
+		return NOTIFY_DONE;
+
+	pdev = to_platform_device(data);
+	np = pdev->dev.of_node;
+	if (!np)
+		return NOTIFY_DONE;
+
+	/*
+	 * of_device_alloc() only puts address ranges in pdev->resource[];
+	 * DT interrupts are mapped lazily by platform_get_irq().  Look them
+	 * up through the node while it is still alive.  Existing mappings are
+	 * returned unchanged.  If a driver never requested an IRQ, of_irq_get()
+	 * may create it here; disposing it immediately is still correct and
+	 * keeps the overlay lifecycle balanced.
+	 */
+	count = of_irq_count(np);
+	for (i = 0; i < count; i++) {
+		irq = of_irq_get(np, i);
+		if (irq > 0)
+			irq_dispose_mapping(irq);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block s31_overlay_platform_nb = {
+	.notifier_call = s31_overlay_platform_notify,
+};
+
+static int s31_of_overlay_remove(int *id)
+{
+	int ret;
+
+	WRITE_ONCE(s31_overlay_removing, true);
+	ret = of_overlay_remove(id);
+	WRITE_ONCE(s31_overlay_removing, false);
+	return ret;
+}
 
 static bool s31_valid_name(const char *name)
 {
@@ -245,7 +306,7 @@ static int s31_overlay_check_conflicts(struct s31_overlay *new,
 
 static int s31_overlay_remove_locked(struct s31_overlay *overlay)
 {
-	int ret = of_overlay_remove(&overlay->id);
+	int ret = s31_of_overlay_remove(&overlay->id);
 
 	if (ret)
 		return ret;
@@ -299,7 +360,7 @@ static ssize_t s31_overlay_write(struct file *file, const char __user *buf,
 		goto out_unlock;
 
 	if (old) {
-		ret = of_overlay_remove(&old->id);
+		ret = s31_of_overlay_remove(&old->id);
 		if (ret)
 			goto out_unlock;
 		list_del(&old->node);
@@ -319,7 +380,7 @@ static ssize_t s31_overlay_write(struct file *file, const char __user *buf,
 	}
 
 	if (new->id)
-		of_overlay_remove(&new->id);
+		s31_of_overlay_remove(&new->id);
 	if (old) {
 		rollback = of_overlay_fdt_apply(old->blob, old->blob_len,
 						&old->id, NULL);
@@ -408,7 +469,29 @@ static struct miscdevice s31_overlay_miscdev = {
 	.mode = 0600,
 };
 
-module_misc_device(s31_overlay_miscdev);
+static int __init s31_overlay_init(void)
+{
+	int ret;
+
+	ret = bus_register_notifier(&platform_bus_type,
+				    &s31_overlay_platform_nb);
+	if (ret)
+		return ret;
+	ret = misc_register(&s31_overlay_miscdev);
+	if (ret)
+		bus_unregister_notifier(&platform_bus_type,
+					&s31_overlay_platform_nb);
+	return ret;
+}
+module_init(s31_overlay_init);
+
+static void __exit s31_overlay_exit(void)
+{
+	misc_deregister(&s31_overlay_miscdev);
+	bus_unregister_notifier(&platform_bus_type,
+				&s31_overlay_platform_nb);
+}
+module_exit(s31_overlay_exit);
 
 MODULE_DESCRIPTION("ESP32-S31 multi-overlay loader and resource arbiter");
 MODULE_LICENSE("GPL");

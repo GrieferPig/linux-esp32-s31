@@ -6,6 +6,15 @@
 
 menu "Digital to analog converters"
 
+config ESP32S31_DAC
+	tristate "Espressif ESP32-S31 DAC"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  Support for both 12-bit low-power DAC outputs in ESP32-S31. Each
+	  channel is exposed through the IIO raw-output interface and remains
+	  powered down until userspace writes a value. The separate codec
+	  10-bit DAC path is not controlled by this driver.
+
 config AD3530R
 	tristate "Analog Devices AD3530R and Similar DACs driver"
 	depends on SPI

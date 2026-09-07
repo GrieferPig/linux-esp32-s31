@@ -111,6 +111,7 @@ struct thread_struct {
 	struct __riscv_d_ext_state fstate;
 #ifdef CONFIG_SOC_ESP32S31
 	struct esp32s31_ext_state esp32s31_ext;
+	bool esp32s31_ext_active;
 #endif
 	unsigned long bad_cause;
 	unsigned long envcfg;

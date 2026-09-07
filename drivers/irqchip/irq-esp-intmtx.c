@@ -30,6 +30,7 @@
 #include <linux/of_address.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/syscore_ops.h>
 
 #include "irq-esp32s31-internal.h"
 
@@ -62,6 +63,37 @@ struct esp_intmtx {
 };
 
 static struct esp_intmtx *intmtx;
+static u32 intmtx_saved[2][INTMTX_MAX_SRC + 1];
+
+static int esp_intmtx_syscore_suspend(void)
+{
+	unsigned int cpu, src;
+
+	if (!intmtx)
+		return 0;
+	for (cpu = 0; cpu < 2; cpu++)
+		for (src = 0; src <= INTMTX_MAX_SRC; src++)
+			intmtx_saved[cpu][src] = readl_relaxed(intmtx->base +
+				cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
+	return 0;
+}
+
+static void esp_intmtx_syscore_resume(void)
+{
+	unsigned int cpu, src;
+
+	if (!intmtx)
+		return;
+	for (cpu = 0; cpu < 2; cpu++)
+		for (src = 0; src <= INTMTX_MAX_SRC; src++)
+			writel_relaxed(intmtx_saved[cpu][src], intmtx->base +
+				cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
+}
+
+static struct syscore_ops esp_intmtx_syscore_ops = {
+	.suspend = esp_intmtx_syscore_suspend,
+	.resume = esp_intmtx_syscore_resume,
+};
 
 static int esp_intmtx_alloc_slot(struct esp_intmtx *priv)
 {
@@ -96,7 +128,6 @@ static struct irq_chip esp_intmtx_chip = {
 	.name		= "esp-intmtx",
 	.irq_mask	= irq_chip_mask_parent,
 	.irq_unmask	= irq_chip_unmask_parent,
-	.irq_eoi	= irq_chip_eoi_parent,
 	.irq_set_type	= irq_chip_set_type_parent,
 	.irq_set_affinity = esp_intmtx_set_affinity,
 	.flags		= IRQCHIP_SKIP_SET_WAKE,
@@ -277,6 +308,7 @@ static int __init esp_intmtx_init(struct device_node *node,
 		writel_relaxed(0, priv->base + INTMTX_SRC_REG(src));
 
 	intmtx = priv;
+	register_syscore_ops(&esp_intmtx_syscore_ops);
 
 	domain = irq_domain_create_hierarchy(parent_domain, 0,
 					     INTMTX_MAX_SRC + 1,

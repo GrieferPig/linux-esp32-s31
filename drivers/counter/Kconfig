@@ -92,6 +92,16 @@ config ESP32S31_SYSTEM_TIMERS
 	  Read-only Counter framework access to both SYSTIMER counters and
 	  both low-power RTC timer counters.
 
+config ESP32S31_GPTIMER
+	tristate "Espressif ESP32-S31 general-purpose timers"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	help
+	  Counter framework access to the two programmable 54-bit timers in
+	  each ESP32-S31 timer group. Count value, direction, enable state,
+	  and the 16-bit clock prescaler are configurable through sysfs.
+	  This exposes both timer groups while leaving alarm interrupts and
+	  capture routing under the ownership of dedicated kernel drivers.
+
 config MICROCHIP_TCB_CAPTURE
 	tristate "Microchip Timer Counter Capture driver"
 	depends on SOC_AT91SAM9 || SOC_SAM_V7 || COMPILE_TEST

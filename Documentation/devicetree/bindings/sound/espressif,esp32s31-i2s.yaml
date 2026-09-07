@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/espressif,esp32s31-i2s.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 I2S and TDM controller
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+properties:
+  compatible:
+    const: espressif,esp32s31-i2s
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  "#sound-dai-cells":
+    const: 0
+
+  espressif,external-card:
+    type: boolean
+    description: |
+      Register only the CPU DAI and DMA PCM component. A separate machine
+      driver, for example simple-audio-card, supplies the codec and link
+      format. Without this property the standalone dummy-codec card is used.
+
+  espressif,tx-slave:
+    type: boolean
+    description: |
+      Use external TX BCLK and WS for the standalone card. An external
+      machine driver's set_fmt operation overrides both direction roles.
+
+  dmas:
+    minItems: 2
+    maxItems: 2
+
+  dma-names:
+    items:
+      - const: tx
+      - const: rx
+
+  espressif,tx-pdm:
+    type: boolean
+    description: Select raw PDM framing for the transmit unit.
+
+  espressif,rx-pdm:
+    type: boolean
+    description: Select raw PDM framing for the receive unit.
+
+  espressif,loopback:
+    type: boolean
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - dmas
+  - dma-names
+
+additionalProperties: true
+...

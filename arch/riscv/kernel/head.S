@@ -15,39 +15,10 @@
 #include <asm/image.h>
 #include <asm/scs.h>
 #include <asm/xip_fixup.h>
+#include <asm/esp32s31_cache.h>
 #include "efi-header.S"
 
 __HEAD
-#ifdef CONFIG_SOC_ESP32S31
-	/*
-	 * S31's Sv32 page-table walker does not snoop the shared write-back
-	 * D-cache. setup_vm() creates the early tables in cached PSRAM, so make
-	 * them visible before loading SATP. The S31 cache operation must be
-	 * issued twice, matching the ESP-IDF ROM workaround.
-	 */
-	.macro ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
-		li t0, 0x2c000000
-		li t1, 0x10		/* CACHE_MAP_L1_DCACHE */
-		sw t1, 0xa0(t0)
-		li t1, CONFIG_PHYS_RAM_BASE
-		sw t1, 0xa4(t0)
-		li t1, 0x01000000
-		sw t1, 0xa8(t0)
-		fence ow, ow
-		li t1, 0x4		/* CACHE_WRITEBACK_ENA */
-		sw t1, 0x9c(t0)
-.Lcache_wb_wait1\@:
-		lw t2, 0x9c(t0)
-		andi t2, t2, 0x10
-		beqz t2, .Lcache_wb_wait1\@
-		sw t1, 0x9c(t0)
-.Lcache_wb_wait2\@:
-		lw t2, 0x9c(t0)
-		andi t2, t2, 0x10
-		beqz t2, .Lcache_wb_wait2\@
-		fence iorw, iorw
-	.endm
-#endif
 
 SYM_CODE_START(_start)
 	/*
@@ -168,7 +139,6 @@ relocate_enable_mmu:
 	 */
 	csrw CSR_SATP, a2
 	sfence.vma
-
 	ret
 #endif /* CONFIG_MMU */
 #ifdef CONFIG_SMP

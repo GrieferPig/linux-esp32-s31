@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
+obj-$(CONFIG_ESP32S31_DAC) += esp32s31-dac.o
 #
 # Makefile for industrial I/O DAC drivers
 #

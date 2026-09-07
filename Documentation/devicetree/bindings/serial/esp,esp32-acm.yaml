@@ -5,25 +5,32 @@
 $id: http://devicetree.org/schemas/serial/esp,esp32-acm.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: ESP32S3 ACM gadget controller
+title: Espressif fixed-function USB Serial/JTAG controller
 
 maintainers:
   - Max Filippov <jcmvbkbc@gmail.com>
 
 description:
-  Fixed function USB CDC-ACM gadget controller of the Espressif ESP32S3 SoC.
+  Fixed-function USB CDC-ACM gadget controller of the Espressif ESP32-S3 and
+  ESP32-S31 SoCs. The ESP32-S31 instance resides in the shared HPCNNT power
+  domain.
 
 allOf:
   - $ref: serial.yaml#
 
 properties:
   compatible:
-    const: esp,esp32s3-acm
+    enum:
+      - esp,esp32s3-acm
+      - espressif,esp32s31-usb-serial-jtag
 
   reg:
     maxItems: 1
 
   interrupts:
+    maxItems: 1
+
+  power-domains:
     maxItems: 1
 
 required:

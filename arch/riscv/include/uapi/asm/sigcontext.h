@@ -25,7 +25,8 @@ struct __sc_riscv_v_state {
 /* ESP32-S31 HWLoop and PIE state, matching the kernel/OpenSBI save area. */
 struct __riscv_esp32s31_ext_state {
 	__u32 hwloop[6];
-	__u32 reserved[2];
+	__u32 hwloop_state;
+	__u32 pie_state;
 	__u32 pie[54];
 } __attribute__((aligned(16)));
 

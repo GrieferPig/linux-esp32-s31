@@ -78,6 +78,7 @@ enum ctu_can_fd_can_registers {
 	CTUCANFD_YOLO_REG             = 0x90,
 	CTUCANFD_TIMESTAMP_LOW        = 0x94,
 	CTUCANFD_TIMESTAMP_HIGH       = 0x98,
+	CTUCANFD_TIMER_CFG            = 0xfe8,
 	CTUCANFD_TXTB1_DATA_1        = 0x100,
 	CTUCANFD_TXTB1_DATA_2        = 0x104,
 	CTUCANFD_TXTB1_DATA_20       = 0x14c,
@@ -119,6 +120,10 @@ enum ctu_can_fd_can_registers {
 #define REG_MODE_PEX BIT(24)
 #define REG_MODE_TBFBO BIT(25)
 #define REG_MODE_FDRF BIT(26)
+
+/* ESP32-S31 timer configuration register */
+#define REG_TIMER_CFG_CE BIT(0)
+#define REG_TIMER_CFG_UP_DN BIT(8)
 
 /*  STATUS registers */
 #define REG_STATUS_RXNE BIT(0)

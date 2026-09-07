@@ -670,6 +670,8 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
 	bool is_device_mode = dwc2_is_device_mode(dwc2);
+	bool is_esp32s31 = of_device_is_compatible(dev->of_node,
+						  "espressif,esp32s31-dwc2");
 	int ret = 0;
 
 	if (is_device_mode)
@@ -716,8 +718,23 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (dwc2->ll_hw_enabled &&
-	    (is_device_mode || dwc2_host_can_poweroff_phy(dwc2))) {
+	/*
+	 * APPWR suspend-to-RAM removes the S31 DWC2 and UTMI register context.
+	 * Quiesce the level IRQ before the HP logic domains disappear and force a
+	 * PHY/controller reset.  The HCD has already suspended the root hub, so a
+	 * cold port reconnect on resume is preferable to exposing stale state.
+	 */
+	if (is_esp32s31 && dwc2->ll_hw_enabled) {
+		disable_irq(dwc2->irq);
+		dwc2_disable_global_interrupts(dwc2);
+		ret = __dwc2_lowlevel_hw_disable(dwc2);
+		if (ret) {
+			enable_irq(dwc2->irq);
+			return ret;
+		}
+		dwc2->phy_off_for_suspend = true;
+	} else if (dwc2->ll_hw_enabled &&
+		   (is_device_mode || dwc2_host_can_poweroff_phy(dwc2))) {
 		ret = __dwc2_lowlevel_hw_disable(dwc2);
 		dwc2->phy_off_for_suspend = true;
 	}
@@ -746,12 +763,19 @@ static int dwc2_restore_critical_registers(struct dwc2_hsotg *hsotg)
 static int __maybe_unused dwc2_resume(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
+	bool is_esp32s31 = of_device_is_compatible(dev->of_node,
+						  "espressif,esp32s31-dwc2");
+	bool esp32s31_irq_disabled = is_esp32s31 &&
+				      dwc2->phy_off_for_suspend;
 	int ret = 0;
 
 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
 		ret = __dwc2_lowlevel_hw_enable(dwc2);
-		if (ret)
+		if (ret) {
+			if (esp32s31_irq_disabled)
+				enable_irq(dwc2->irq);
 			return ret;
+		}
 	}
 	dwc2->phy_off_for_suspend = false;
 
@@ -763,8 +787,11 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 	 */
 	if (!(dwc2_readl(dwc2, GUSBCFG) & GUSBCFG_TOUTCAL_MASK)) {
 		ret = dwc2_restore_critical_registers(dwc2);
-		if (ret)
+		if (ret) {
+			if (esp32s31_irq_disabled)
+				enable_irq(dwc2->irq);
 			return ret;
+		}
 	}
 
 	if (dwc2->params.activate_stm_id_vb_detection) {
@@ -801,6 +828,12 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 
 	if (dwc2_is_device_mode(dwc2))
 		ret = dwc2_hsotg_resume(dwc2);
+
+	if (esp32s31_irq_disabled) {
+		/* Forcing host mode after reset raises a stale MODEMIS status. */
+		dwc2_writel(dwc2, GINTSTS_MODEMIS, GINTSTS);
+		enable_irq(dwc2->irq);
+	}
 
 	return ret;
 }

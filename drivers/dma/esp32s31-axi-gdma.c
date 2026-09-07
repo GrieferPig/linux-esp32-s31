@@ -13,6 +13,7 @@
 #include <linux/genalloc.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
@@ -29,6 +30,7 @@
 #define ESP32S31_AXI_GDMA_CACHE_LINE	64U
 #define ESP32S31_AXI_GDMA_PATTERN_SIZE	512U
 #define ESP32S31_AXI_GDMA_PERIPH_MAX	5U
+#define ESP32S31_AXI_GDMA_PERIPH_DISCONNECT 0x3fU
 
 /* Cached and direct (uncached) views of the 16-MiB MSPI PSRAM window. */
 #define ESP32S31_PSRAM_CACHED_BASE	0x50000000U
@@ -255,25 +257,46 @@ static void esp32s31_axi_reset_pair(struct esp32s31_axi_chan *chan)
 static void esp32s31_axi_config_pair(struct esp32s31_axi_chan *chan,
 				     enum dma_transfer_direction direction)
 {
-	u32 periph = direction == DMA_MEM_TO_MEM ? 6 + chan->id : chan->request_id;
-	u32 burst_sel = __ffs(ESP32S31_AXI_GDMA_BURST_SIZE) - 3;
-	u32 rx_conf = FIELD_PREP(ESP32S31_AXI_RX_BURST_SIZE, burst_sel) |
-		      ESP32S31_AXI_RX_DSCR_BURST_EN;
+	u32 rx_periph = ESP32S31_AXI_GDMA_PERIPH_DISCONNECT;
+	u32 tx_periph = ESP32S31_AXI_GDMA_PERIPH_DISCONNECT;
+	u32 maxburst, width, burst_bytes;
+	u32 burst_sel;
+	u32 rx_conf;
 
-	if (direction == DMA_MEM_TO_MEM)
+	if (direction == DMA_DEV_TO_MEM) {
+		maxburst = chan->config.dst_maxburst;
+		width = chan->config.dst_addr_width;
+	} else {
+		maxburst = chan->config.src_maxburst;
+		width = chan->config.src_addr_width;
+	}
+	burst_bytes = maxburst && width ? maxburst * width :
+		ESP32S31_AXI_GDMA_BURST_SIZE;
+	burst_bytes = clamp_t(u32, rounddown_pow_of_two(burst_bytes), 8,
+			    ESP32S31_AXI_GDMA_BURST_SIZE);
+	burst_sel = __ffs(burst_bytes) - 3;
+	rx_conf = FIELD_PREP(ESP32S31_AXI_RX_BURST_SIZE, burst_sel) |
+		  ESP32S31_AXI_RX_DSCR_BURST_EN;
+
+	if (direction == DMA_MEM_TO_MEM) {
+		rx_periph = 6 + chan->id;
+		tx_periph = 6 + chan->id;
 		rx_conf |= ESP32S31_AXI_RX_MEM_TRANS_EN;
+	} else if (direction == DMA_DEV_TO_MEM) {
+		rx_periph = chan->request_id;
+	} else {
+		tx_periph = chan->request_id;
+	}
 
 	writel(rx_conf, esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_CONF0));
-	writel(ESP32S31_AXI_RX_CHECK_OWNER,
-	       esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_CONF1));
-	writel(periph, esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_PERI_SEL));
-	writel(ESP32S31_AXI_TX_AUTO_WRBACK | ESP32S31_AXI_TX_EOF_MODE |
+	writel(0, esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_CONF1));
+	writel(rx_periph, esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_PERI_SEL));
+	writel(ESP32S31_AXI_TX_EOF_MODE |
 	       FIELD_PREP(ESP32S31_AXI_TX_BURST_SIZE, burst_sel) |
 	       ESP32S31_AXI_TX_DSCR_BURST_EN,
 	       esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_CONF0));
-	writel(ESP32S31_AXI_TX_CHECK_OWNER,
-	       esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_CONF1));
-	writel(periph, esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_PERI_SEL));
+	writel(0, esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_CONF1));
+	writel(tx_periph, esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_PERI_SEL));
 }
 
 static void esp32s31_axi_stop_pair(struct esp32s31_axi_chan *chan)

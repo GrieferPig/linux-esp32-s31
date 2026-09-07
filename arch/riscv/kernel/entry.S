@@ -175,7 +175,7 @@ SYM_CODE_START(handle_exception)
 	csrr s3, CSR_TVAL
 	csrr s4, CSR_CAUSE
 #ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
-	REG_S s4, PT_CLIC_SCAUSE(sp)	/* raw scause (SPP/SPIL) for sret level restore */
+	REG_S s4, PT_CAUSE_RAW(sp)	/* raw scause (SPP/SPIL) for sret level restore */
 #endif
 	mask_clic_scause s4, t0	/* ESP32-S31: strip CLIC SPP/SPIL bits */
 	csrr s5, CSR_SCRATCH
@@ -184,11 +184,6 @@ SYM_CODE_START(handle_exception)
 	REG_S s2, PT_EPC(sp)
 	REG_S s3, PT_BADADDR(sp)
 	REG_S s4, PT_CAUSE(sp)
-#ifdef CONFIG_SOC_ESP32S31
-	/* Preserve the full hardware token; the official policy sanitizes it
-	 * immediately before every sret. */
-	REG_S s4, PT_CAUSE_RAW(sp)
-#endif
 	REG_S s5, PT_TP(sp)
 
 	/*
@@ -202,6 +197,14 @@ SYM_CODE_START(handle_exception)
 
 	/* Load the kernel shadow call stack pointer if coming from userspace */
 	scs_load_current_if_task_changed s5
+
+#ifdef CONFIG_SOC_ESP32S31
+	andi t0, s1, SR_SPP
+	bnez t0, .Lesp32s31_skip_ext_enter
+	move a0, sp
+	call esp32s31_ext_enter_kernel
+.Lesp32s31_skip_ext_enter:
+#endif
 
 #ifdef CONFIG_RISCV_ISA_V_PREEMPTIVE
 	move a0, sp
@@ -282,6 +285,10 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	 * Save TP into the scratch register , so we can find the kernel data
 	 * structures again.
 	 */
+#ifdef CONFIG_SOC_ESP32S31
+	move a0, sp
+	call esp32s31_ext_exit_user
+#endif
 	csrw CSR_SCRATCH, tp
 1:
 #ifdef CONFIG_RISCV_ISA_V_PREEMPTIVE

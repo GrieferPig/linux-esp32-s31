@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "PM Domains"
 
+config ESP32S31_PMU
+	bool "Espressif ESP32-S31 power domains"
+	depends on SOC_ESP32S31 && PM && OF
+	select PM_GENERIC_DOMAINS
+	help
+	  Register the ESP32-S31 PMU domains. CPU, flash/PSRAM and radio-owned
+	  domains remain on; HPCNNT runtime power-off is guarded by an explicit
+	  Device Tree opt-in until every connectivity consumer supports runtime PM.
+
 source "drivers/pmdomain/actions/Kconfig"
 source "drivers/pmdomain/amlogic/Kconfig"
 source "drivers/pmdomain/apple/Kconfig"

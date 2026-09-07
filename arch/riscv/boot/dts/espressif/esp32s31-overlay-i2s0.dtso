@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "i2s0";
+	espressif,resource-claims = "i2s0";
+};
+
+&ahb_gdma {
+	status = "okay";
+};
+
+&i2s0_default {
+	i2s-pins {
+		espressif,route-names = "i2s0.tx-bck-in", "i2s0.tx-ws-in",
+					 "i2s0.data-out";
+		espressif,route-kinds = "matrix-input", "matrix-input",
+					 "matrix-output";
+		pinmux = <ESP32S31_MATRIX_IN(42, 25, 0)>,
+			 <ESP32S31_MATRIX_IN(43, 27, 0)>,
+			 <ESP32S31_MATRIX_OUT(44, 28, 0)>;
+		drive-strength = <20>;
+		input-schmitt-enable;
+		input-debounce = <1>;
+	};
+};
+
+&gpio {
+	i2s0_capture: i2s0-capture-pins {
+		i2s-pins {
+			espressif,route-names = "i2s0.bck-in", "i2s0.ws-in",
+						 "i2s0.data-in";
+			espressif,route-kinds = "matrix-input", "matrix-input",
+						 "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(42, 29, 0)>,
+				 <ESP32S31_MATRIX_IN(43, 30, 0)>,
+				 <ESP32S31_MATRIX_IN(45, 28, 0)>;
+			bias-pull-up;
+			input-enable;
+			input-schmitt-enable;
+			input-debounce = <1>;
+		};
+	};
+};
+
+&i2s0 {
+	espressif,tx-slave;
+	pinctrl-names = "playback", "capture";
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-1 = <&i2s0_capture>;
+	status = "okay";
+};

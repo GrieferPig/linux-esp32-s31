@@ -4,9 +4,17 @@
 #
 
 obj-$(CONFIG_ESP32S31_DT_OVERLAY) += esp32s31-overlay.o
-obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio-smode.o
-obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio-rtos.o
-obj-$(CONFIG_ESP32S31_RADIO_BLOBS) += esp32s31-radio-idf.o
+obj-$(CONFIG_SOC_ESP32S31) += esp32s31-radio-loader-core.o
+obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio.o
+esp32s31-radio-y := esp32s31-radio-module.o \
+	esp32s31-radio-smode.o esp32s31-radio-rtos.o \
+	esp32s31-radio-loader.o esp32s31-radio-imports.o \
+	esp32s31-radio-wifi.o esp32s31-radio-btdm.o
+
+LDFLAGS_esp32s31-radio.o += --gc-sections \
+	-T $(src)/esp32s31-radio-core.lds --undefined=init_module \
+	--undefined=s31_radio_modinfo_anchor \
+	--undefined=s31_radio_timing_param_anchor
 
 obj-$(CONFIG_X86)		+= x86/
 obj-$(CONFIG_LOONGARCH)		+= loongarch/

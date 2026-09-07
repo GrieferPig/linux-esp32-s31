@@ -9,18 +9,24 @@
  */
 
 #include <linux/types.h>
+#include <linux/cpu.h>
 #include <linux/init.h>
 #include <linux/clocksource/esp32s31-systimer.h>
 #include <linux/cpuhotplug.h>
+#include <linux/export.h>
 #include <linux/io.h>
 #include <linux/irq.h>
+#include <linux/irqflags.h>
 #include <linux/hardirq.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/percpu.h>
+#include <linux/soc/espressif/esp32s31-pm.h>
 #include <linux/smp.h>
+#include <linux/string.h>
 
 #include <asm/irq_regs.h>
 #include <asm/ptrace.h>
+#include <asm/sbi.h>
 #include <asm/smp.h>
 
 #include "irq-esp32s31-internal.h"
@@ -35,7 +41,96 @@
 #define ESP32S31_SYSTIMER_CPU0_SOURCE	33U
 #define ESP32S31_SYSTIMER_CPU1_SOURCE	34U
 
+#define ESP32S31_SBI_EXT_CLIC		0x09000003UL
+#define ESP32S31_SBI_CLIC_MINTSTATUS	0
+#define ESP32S31_SBI_CLIC_MINTTHRESH	1
+#define ESP32S31_SBI_CLIC_MIP		2
+#define ESP32S31_SBI_CLIC_MIE		3
+#define ESP32S31_SBI_CLIC_WFI		4
+
 static void __iomem *esp32s31_doorbells;
+/* Keep real WFI command-line gated so older OpenSBI images fail safe. */
+static bool esp32s31_idle_requested;
+static bool esp32s31_idle_proxy_ready;
+
+static int __init esp32s31_idle_setup(char *str)
+{
+	esp32s31_idle_requested = !strcmp(str, "wfi");
+	return 0;
+}
+early_param("esp32s31_idle", esp32s31_idle_setup);
+
+bool noinstr esp32s31_sbi_idle_enabled(void)
+{
+	return esp32s31_idle_proxy_ready;
+}
+
+int esp32s31_sbi_idle_activate(void)
+{
+	long probe;
+
+	if (!esp32s31_idle_requested)
+		return -ENODEV;
+	/* OpenSBI owns one timer-group guard comparator per hart, so it can enter
+	 * WFI without using the shared CLINT alias or relying on delegated
+	 * interrupts to cross an M-mode WFI boundary.
+	 */
+	probe = sbi_probe_extension(ESP32S31_SBI_EXT_CLIC);
+	if (probe <= 0)
+		return -ENODEV;
+
+	/* Runtime timers are initialized before the cpuidle device initcall. */
+	esp32s31_idle_proxy_ready = true;
+	cpu_idle_poll_ctrl(false);
+	pr_info("esp32s31-smp: concurrent per-hart WFI enabled (M-mode guard)\n");
+	return 0;
+}
+
+void esp32s31_sbi_idle_deactivate(void)
+{
+	esp32s31_idle_proxy_ready = false;
+	cpu_idle_poll_ctrl(true);
+}
+
+static unsigned long esp32s31_clic_sbi_read(unsigned long funcid)
+{
+	struct sbiret ret;
+
+	ret = sbi_ecall(ESP32S31_SBI_EXT_CLIC, funcid,
+			0, 0, 0, 0, 0, 0);
+	return ret.error ? ~0UL : ret.value;
+}
+
+static void esp32s31_clic_log_state(unsigned int cpu)
+{
+	pr_info("esp32s31-smp: hart%u CLIC mintstatus=%#lx mintthresh=%#lx mip=%#lx mie=%#lx\n",
+		cpu,
+		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MINTSTATUS),
+		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MINTTHRESH),
+		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MIP),
+		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MIE));
+}
+
+void noinstr esp32s31_sbi_wfi(void)
+{
+	register unsigned long a0 asm("a0") = 0;
+	register unsigned long a1 asm("a1") = 0;
+	register unsigned long a2 asm("a2") = 0;
+	register unsigned long a3 asm("a3") = 0;
+	register unsigned long a4 asm("a4") = 0;
+	register unsigned long a5 asm("a5") = 0;
+	register unsigned long a6 asm("a6") = ESP32S31_SBI_CLIC_WFI;
+	register unsigned long a7 asm("a7") = ESP32S31_SBI_EXT_CLIC;
+
+	/* Restore the IRQ-disabled state expected by the cpuidle core. */
+	raw_local_irq_enable();
+	asm volatile("ecall"
+		     : "+r"(a0), "+r"(a1)
+		     : "r"(a2), "r"(a3), "r"(a4), "r"(a5),
+		       "r"(a6), "r"(a7)
+		     : "memory");
+	raw_local_irq_disable();
+}
 
 static unsigned int esp32s31_doorbell_offset(unsigned int cpu)
 {
@@ -142,6 +237,7 @@ void esp32s31_irq_poll(void)
 	set_irq_regs(old_regs);
 	local_irq_restore(flags);
 }
+EXPORT_SYMBOL_GPL(esp32s31_irq_poll);
 
 static int esp32s31_local_irq_starting(unsigned int cpu)
 {
@@ -152,6 +248,7 @@ static int esp32s31_local_irq_starting(unsigned int cpu)
 	esp_intmtx_route_local(cpu, esp32s31_ipi_source(cpu),
 				ESP32S31_CLIC_IPI_SLOT);
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, true);
+	esp32s31_clic_log_state(cpu);
 	return 0;
 }
 
@@ -168,6 +265,11 @@ int esp32s31_systimer_irq_starting(unsigned int cpu)
 	if (cpu > 1)
 		return -EINVAL;
 
+	/*
+	 * riscv_timer_starting_cpu() cleared stale state before registering the
+	 * clockevent.  Do not stop it here: registration may already have armed
+	 * the first event needed to start the kernel tick.
+	 */
 	esp_intmtx_route_local(cpu, esp32s31_timer_source(cpu),
 				ESP32S31_CLIC_TIMER_SLOT);
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_TIMER_SLOT, true);
@@ -189,7 +291,6 @@ int __init esp32s31_smp_irq_init(void)
 				      ESP32S31_IPI_DOORBELL_SIZE);
 	if (!esp32s31_doorbells)
 		return -ENOMEM;
-
 	ret = esp_clic_install_local(ESP32S31_CLIC_IPI_SLOT,
 				     esp32s31_ipi_chained, NULL);
 	if (ret)

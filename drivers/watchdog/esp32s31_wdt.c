@@ -12,11 +12,11 @@
 #include <linux/spinlock.h>
 #include <linux/watchdog.h>
 
-#define ESP32S31_WDT_CONFIG0		0x48
-#define ESP32S31_WDT_CONFIG1		0x4c
-#define ESP32S31_WDT_CONFIG2		0x50
-#define ESP32S31_WDT_FEED		0x60
-#define ESP32S31_WDT_WPROTECT		0x64
+#define ESP32S31_WDT_CONFIG0		0x00
+#define ESP32S31_WDT_CONFIG1		0x04
+#define ESP32S31_WDT_CONFIG2		0x08
+#define ESP32S31_WDT_FEED		0x18
+#define ESP32S31_WDT_WPROTECT		0x1c
 
 #define ESP32S31_WDT_WKEY		0x50d83aa1
 #define ESP32S31_WDT_PRESCALER		20000
@@ -192,7 +192,6 @@ static int esp32s31_wdt_probe(struct platform_device *pdev)
 	if (IS_ERR(priv->clk))
 		return dev_err_probe(dev, PTR_ERR(priv->clk),
 				     "failed to enable watchdog clock\n");
-
 	spin_lock_init(&priv->lock);
 
 	priv->wdd.info = &esp32s31_wdt_info;

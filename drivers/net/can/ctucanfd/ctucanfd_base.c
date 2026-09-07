@@ -25,8 +25,13 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/net_tstamp.h>
+#include <linux/of.h>
 #include <linux/skbuff.h>
+#include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/can/error.h>
@@ -339,9 +344,19 @@ static void ctucan_set_mode(struct ctucan_priv *priv, const struct can_ctrlmode 
 			(mode_reg | REG_MODE_FDE) :
 			(mode_reg & ~REG_MODE_FDE);
 
-	mode_reg = (mode->flags & CAN_CTRLMODE_PRESUME_ACK) ?
-			(mode_reg | REG_MODE_ACF) :
-			(mode_reg & ~REG_MODE_ACF);
+	if (priv->presume_ack_uses_stm) {
+		/* ESP32-S31 names the no-ACK self-test control STM.  ACF only
+		 * prevents this node from acknowledging received frames.
+		 */
+		mode_reg &= ~REG_MODE_ACF;
+		mode_reg = (mode->flags & CAN_CTRLMODE_PRESUME_ACK) ?
+				(mode_reg | REG_MODE_STM) :
+				(mode_reg & ~REG_MODE_STM);
+	} else {
+		mode_reg = (mode->flags & CAN_CTRLMODE_PRESUME_ACK) ?
+				(mode_reg | REG_MODE_ACF) :
+				(mode_reg & ~REG_MODE_ACF);
+	}
 
 	mode_reg = (mode->flags & CAN_CTRLMODE_FD_NON_ISO) ?
 			(mode_reg | REG_MODE_NISOFD) :
@@ -423,6 +438,14 @@ static int ctucan_chip_start(struct net_device *ndev)
 
 	/* Controller enters ERROR_ACTIVE on initial FCSI */
 	priv->can.state = CAN_STATE_STOPPED;
+
+	/* ESP32-S31 does not start the RX timestamp counter after a CAN reset.
+	 * Count upward at one tick per CAN core clock so the conversion in the RX
+	 * path remains tied to can.clock.freq.
+	 */
+	if (priv->presume_ack_uses_stm)
+		ctucan_write32(priv, CTUCANFD_TIMER_CFG,
+				REG_TIMER_CFG_CE | REG_TIMER_CFG_UP_DN);
 
 	/* Enable the controller */
 	mode_reg = ctucan_read32(priv, CTUCANFD_MODE);
@@ -644,9 +667,11 @@ static netdev_tx_t ctucan_start_xmit(struct sk_buff *skb, struct net_device *nde
  *
  * Note: Frame format word must be read separately and provided in 'ffw'.
  */
-static void ctucan_read_rx_frame(struct ctucan_priv *priv, struct canfd_frame *cf, u32 ffw)
+static u64 ctucan_read_rx_frame(struct ctucan_priv *priv,
+				struct canfd_frame *cf, u32 ffw)
 {
 	u32 idw;
+	u32 timestamp_low, timestamp_high;
 	unsigned int i;
 	unsigned int wc;
 	unsigned int len;
@@ -682,9 +707,9 @@ static void ctucan_read_rx_frame(struct ctucan_priv *priv, struct canfd_frame *c
 	if (unlikely(len > wc * 4))
 		len = wc * 4;
 
-	/* Timestamp - Read and throw away */
-	ctucan_read32(priv, CTUCANFD_RX_DATA);
-	ctucan_read32(priv, CTUCANFD_RX_DATA);
+	/* The RX FIFO stores a 64-bit timestamp after the identifier word. */
+	timestamp_low = ctucan_read32(priv, CTUCANFD_RX_DATA);
+	timestamp_high = ctucan_read32(priv, CTUCANFD_RX_DATA);
 
 	/* Data */
 	for (i = 0; i < len; i += 4) {
@@ -695,6 +720,20 @@ static void ctucan_read_rx_frame(struct ctucan_priv *priv, struct canfd_frame *c
 		ctucan_read32(priv, CTUCANFD_RX_DATA);
 		i += 4;
 	}
+
+	return ((u64)timestamp_high << 32) | timestamp_low;
+}
+
+static u64 ctucan_read_timestamp(struct ctucan_priv *priv)
+{
+	u32 high, high2, low;
+
+	do {
+		high = ctucan_read32(priv, CTUCANFD_TIMESTAMP_HIGH);
+		low = ctucan_read32(priv, CTUCANFD_TIMESTAMP_LOW);
+		high2 = ctucan_read32(priv, CTUCANFD_TIMESTAMP_HIGH);
+	} while (high != high2);
+	return ((u64)high << 32) | low;
 }
 
 /**
@@ -714,6 +753,7 @@ static int ctucan_rx(struct net_device *ndev)
 	struct canfd_frame *cf;
 	struct sk_buff *skb;
 	u32 ffw;
+	u64 frame_timestamp, now_timestamp, delta_ns, now_ns;
 
 	if (test_bit(CTUCANFD_FLAG_RX_FFW_BUFFERED, &priv->drv_flags)) {
 		ffw = priv->rxfrm_first_word;
@@ -736,7 +776,14 @@ static int ctucan_rx(struct net_device *ndev)
 		return 0;
 	}
 
-	ctucan_read_rx_frame(priv, cf, ffw);
+	frame_timestamp = ctucan_read_rx_frame(priv, cf, ffw);
+	if (READ_ONCE(priv->rx_hwtstamp_enabled)) {
+		now_timestamp = ctucan_read_timestamp(priv);
+		now_ns = ktime_get_real_ns();
+		delta_ns = mul_u64_u32_div(now_timestamp - frame_timestamp,
+					   NSEC_PER_SEC, priv->can.clock.freq);
+		skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(now_ns - delta_ns);
+	}
 
 	stats->rx_bytes += cf->len;
 	stats->rx_packets++;
@@ -1297,15 +1344,56 @@ static int ctucan_get_berr_counter(const struct net_device *ndev, struct can_ber
 	return 0;
 }
 
+static int ctucan_hwtstamp_ioctl(struct net_device *ndev, struct ifreq *ifr,
+				 int cmd)
+{
+	struct ctucan_priv *priv = netdev_priv(ndev);
+	struct hwtstamp_config config = { };
+
+	if (cmd == SIOCSHWTSTAMP) {
+		if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+			return -EFAULT;
+		if (config.tx_type != HWTSTAMP_TX_OFF ||
+		    (config.rx_filter != HWTSTAMP_FILTER_NONE &&
+		     config.rx_filter != HWTSTAMP_FILTER_ALL))
+			return -ERANGE;
+		if (config.rx_filter != HWTSTAMP_FILTER_NONE)
+			config.rx_filter = HWTSTAMP_FILTER_ALL;
+		WRITE_ONCE(priv->rx_hwtstamp_enabled,
+			   config.rx_filter == HWTSTAMP_FILTER_ALL);
+	} else if (cmd == SIOCGHWTSTAMP) {
+		config.tx_type = HWTSTAMP_TX_OFF;
+		config.rx_filter = READ_ONCE(priv->rx_hwtstamp_enabled) ?
+			HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+		-EFAULT : 0;
+}
+
+static int ctucan_get_ts_info(struct net_device *ndev,
+			      struct kernel_ethtool_ts_info *info)
+{
+	info->so_timestamping = SOF_TIMESTAMPING_RX_HARDWARE |
+				SOF_TIMESTAMPING_RAW_HARDWARE;
+	info->tx_types = BIT(HWTSTAMP_TX_OFF);
+	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) |
+			   BIT(HWTSTAMP_FILTER_ALL);
+	return 0;
+}
+
 static const struct net_device_ops ctucan_netdev_ops = {
 	.ndo_open	= ctucan_open,
 	.ndo_stop	= ctucan_close,
 	.ndo_start_xmit	= ctucan_start_xmit,
 	.ndo_change_mtu	= can_change_mtu,
+	.ndo_eth_ioctl	= ctucan_hwtstamp_ioctl,
 };
 
 static const struct ethtool_ops ctucan_ethtool_ops = {
-	.get_ts_info = ethtool_op_get_ts_info,
+	.get_ts_info = ctucan_get_ts_info,
 };
 
 int ctucan_suspend(struct device *dev)
@@ -1358,6 +1446,9 @@ int ctucan_probe_common(struct device *dev, void __iomem *addr, int irq, unsigne
 	INIT_LIST_HEAD(&priv->peers_on_pdev);
 	priv->ntxbufs = ntxbufs;
 	priv->dev = dev;
+	priv->presume_ack_uses_stm = dev->of_node &&
+		of_device_is_compatible(dev->of_node,
+					"espressif,esp32s31-twaifd");
 	priv->can.bittiming_const = &ctu_can_fd_bit_timing_max;
 	priv->can.fd.data_bittiming_const = &ctu_can_fd_bit_timing_data_max;
 	priv->can.do_set_mode = ctucan_do_set_mode;

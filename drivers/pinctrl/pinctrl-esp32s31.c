@@ -31,8 +31,7 @@
 
 #define ESP32S31_GPIO_NR		62
 #define ESP32S31_GPIO_VALID_MASK	(GENMASK_ULL(61, 0) & ~BIT_ULL(29) & \
-					 ~BIT_ULL(33) & ~BIT_ULL(34) & \
-					 ~BIT_ULL(41))
+						 ~BIT_ULL(41))
 
 /* GPIO register block. */
 #define GPIO_OUT		0x004
@@ -531,6 +530,8 @@ static void esp32s31_pinmux_gpio_disable_free(struct pinctrl_dev *pctldev,
 static void esp32s31_set_matrix_output(struct esp32s31_pinctrl *pctl,
 				       const struct esp32s31_pinmux_entry *entry)
 {
+	u32 enable_reg = entry->pin < 32 ? GPIO_ENABLE_W1TS :
+					       GPIO_ENABLE1_W1TS;
 	u32 mask = GPIO_FUNC_OUT_SEL | GPIO_FUNC_OUT_INV |
 		   GPIO_FUNC_OUT_OEN_SEL | GPIO_FUNC_OUT_OEN_INV;
 	u32 val = FIELD_PREP(GPIO_FUNC_OUT_SEL, entry->value);
@@ -545,6 +546,13 @@ static void esp32s31_set_matrix_output(struct esp32s31_pinctrl *pctl,
 	esp32s31_set_iomux(pctl, entry->pin, IOMUX_GPIO_FUNC);
 	esp32s31_update_bits(pctl, esp32s31_out_sel_reg(pctl, entry->pin),
 			       mask, val);
+
+	/*
+	 * Match esp_rom_gpio_connect_out_signal(): selecting a matrix source is
+	 * not sufficient by itself; the pad output path must also be enabled.
+	 * pinmux_free() returns it to input/high-Z when the state is released.
+	 */
+	writel_relaxed(BIT(entry->pin % 32), pctl->gpio_base + enable_reg);
 }
 
 static void esp32s31_set_matrix_input(struct esp32s31_pinctrl *pctl,
@@ -848,7 +856,9 @@ static int esp32s31_gpio_init_valid_mask(struct gpio_chip *gc,
 					 unsigned long *valid_mask,
 					 unsigned int ngpios)
 {
-	bitmap_from_u64(valid_mask, ESP32S31_GPIO_VALID_MASK);
+	/* Preserve gpio-reserved-ranges already applied by gpiolib. */
+	bitmap_clear(valid_mask, 29, 1);
+	bitmap_clear(valid_mask, 41, 1);
 	return 0;
 }
 

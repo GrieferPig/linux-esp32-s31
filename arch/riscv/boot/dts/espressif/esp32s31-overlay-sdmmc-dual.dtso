@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "sdmmc-dual";
+	espressif,resource-claims = "sdmmc-host";
+	espressif,gpio-claims = <20 21 22 23 24 25 35 36 37 38 39 40>;
+};
+
+&sdmmc {
+	espressif,slot-id = <0>;
+	espressif,num-slots = <2>;
+	espressif,param-name = "bus-width";
+	espressif,param-values = <1 4>;
+	pinctrl-0 = <&sdmmc0_default &sdmmc1_default>;
+	bus-width = <4>;
+	status = "okay";
+};

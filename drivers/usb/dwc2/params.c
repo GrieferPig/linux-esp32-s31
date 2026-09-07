@@ -55,6 +55,17 @@ static void dwc2_set_esp32s31_params(struct dwc2_hsotg *hsotg)
 	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
 	p->phy_utmi_width = 16;
 	p->host_dma = true;
+	/*
+	 * The core advertises partial power-down, but the S31 UTMI wrapper does
+	 * not latch HPRT0.SUSP through that sequence.  The generic restore path
+	 * then leaves a level interrupt asserted.  Keep the host controller and
+	 * PHY context live for bus-level suspend.  The S31 platform PM callback
+	 * performs a full PHY/controller reset when suspend-to-RAM powers down the
+	 * HP logic domains.
+	 */
+	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
+	/* PCGCCTL clock gating also loses the wrapper's forced-host state. */
+	p->no_clock_gating = true;
 	/* ESP-IDF uses SINGLE transfers when enabling this DWC2 AHB master. */
 	p->ahbcfg = GAHBCFG_HBSTLEN_SINGLE << GAHBCFG_HBSTLEN_SHIFT;
 	/*

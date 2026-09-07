@@ -2,6 +2,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/clk.h>
 #include <linux/console.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -9,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/serial_core.h>
 #include <linux/slab.h>
 #include <linux/tty_flip.h>
@@ -39,6 +41,8 @@
 static const struct of_device_id esp32s3_acm_dt_ids[] = {
 	{
 		.compatible = "esp,esp32s3-acm",
+	}, {
+		.compatible = "espressif,esp32s31-usb-serial-jtag",
 	}, { /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, esp32s3_acm_dt_ids);
@@ -53,6 +57,20 @@ static void esp32s3_acm_write(struct uart_port *port, unsigned long reg, u32 v)
 static u32 esp32s3_acm_read(struct uart_port *port, unsigned long reg)
 {
 	return readl(port->membase + reg);
+}
+
+static bool esp32s31_acm_port(struct uart_port *port)
+{
+	return of_device_is_compatible(port->dev->of_node,
+				       "espressif,esp32s31-usb-serial-jtag");
+}
+
+static void esp32s31_acm_enable_sram(struct uart_port *port)
+{
+	/* S31 gates the USB SRAM clock in the peripheral itself. */
+	if (esp32s31_acm_port(port))
+		writel(readl(port->membase + 0x48) | BIT(1),
+		       port->membase + 0x48);
 }
 
 static u32 esp32s3_acm_tx_fifo_free(struct uart_port *port)
@@ -213,9 +231,15 @@ static int esp32s3_acm_startup(struct uart_port *port)
 {
 	int ret;
 
-	ret = request_irq(port->irq, esp32s3_acm_int, 0, DRIVER_NAME, port);
-	if (ret)
+	ret = pm_runtime_resume_and_get(port->dev);
+	if (ret < 0)
 		return ret;
+
+	ret = request_irq(port->irq, esp32s3_acm_int, 0, DRIVER_NAME, port);
+	if (ret) {
+		pm_runtime_put_sync_suspend(port->dev);
+		return ret;
+	}
 	esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG,
 			  USB_SERIAL_JTAG_SERIAL_OUT_RECV_PKT_INT_ENA);
 
@@ -226,6 +250,7 @@ static void esp32s3_acm_shutdown(struct uart_port *port)
 {
 	esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG, 0);
 	free_irq(port->irq, port);
+	pm_runtime_put_sync_suspend(port->dev);
 }
 
 static void esp32s3_acm_set_termios(struct uart_port *port,
@@ -375,7 +400,9 @@ static int esp32s3_acm_probe(struct platform_device *pdev)
 	if (!port)
 		return -ENOMEM;
 
-	ret = of_alias_get_id(np, "serial");
+	ret = of_alias_get_id(np, "usbserial");
+	if (ret < 0)
+		ret = of_alias_get_id(np, "serial");
 	if (ret < 0) {
 		dev_err(&pdev->dev, "failed to get alias id, errno %d\n", ret);
 		return ret;
@@ -406,19 +433,56 @@ static int esp32s3_acm_probe(struct platform_device *pdev)
 	port->has_sysrq = 1;
 	port->fifosize = ESP32S3_ACM_TX_FIFO_SIZE;
 
+	esp32s31_acm_enable_sram(port);
+
 	esp32s3_acm_ports[port->line] = port;
 
 	platform_set_drvdata(pdev, port);
 
-	return uart_add_one_port(&esp32s3_acm_reg, port);
+	ret = uart_add_one_port(&esp32s3_acm_reg, port);
+	if (ret)
+		return ret;
+
+	/*
+	 * An unopened USB Serial/JTAG port must not keep HPCNNT powered.  A
+	 * configured console is deliberately left active because console writes
+	 * cannot sleep to resume a powered-down domain.
+	 */
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+	if (!uart_console(port))
+		pm_runtime_idle(&pdev->dev);
+
+	return 0;
 }
 
 static void esp32s3_acm_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = platform_get_drvdata(pdev);
 
+	pm_runtime_resume_and_get(&pdev->dev);
 	uart_remove_one_port(&esp32s3_acm_reg, port);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
 }
+
+static int esp32s3_acm_runtime_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int esp32s3_acm_runtime_resume(struct device *dev)
+{
+	struct uart_port *port = dev_get_drvdata(dev);
+
+	esp32s31_acm_enable_sram(port);
+	return 0;
+}
+
+static const struct dev_pm_ops esp32s3_acm_pm_ops = {
+	SET_RUNTIME_PM_OPS(esp32s3_acm_runtime_suspend,
+			   esp32s3_acm_runtime_resume, NULL)
+};
 
 
 static struct platform_driver esp32s3_acm_driver = {
@@ -427,6 +491,7 @@ static struct platform_driver esp32s3_acm_driver = {
 	.driver		= {
 		.name	= DRIVER_NAME,
 		.of_match_table	= esp32s3_acm_dt_ids,
+		.pm = &esp32s3_acm_pm_ops,
 	},
 };
 

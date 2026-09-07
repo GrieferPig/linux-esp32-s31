@@ -1406,6 +1406,10 @@ static void __dw_mci_start_request(struct dw_mci *host,
 	u32 cmdflags;
 
 	mrq = slot->mrq;
+	if (host->slot != slot) {
+		host->slot = slot;
+		dw_mci_setup_bus(slot, true);
+	}
 
 	host->mrq = mrq;
 
@@ -2893,10 +2897,15 @@ static void dw_mci_cmd_interrupt(struct dw_mci *host, u32 status)
 
 static void dw_mci_handle_cd(struct dw_mci *host)
 {
-	struct dw_mci_slot *slot = host->slot;
+	unsigned int i;
 
-	mmc_detect_change(slot->mmc,
-		msecs_to_jiffies(host->pdata->detect_delay_ms));
+	for (i = 0; i < host->num_slots; i++) {
+		struct dw_mci_slot *slot = host->slots[i];
+
+		if (slot)
+			mmc_detect_change(slot->mmc,
+				msecs_to_jiffies(host->pdata->detect_delay_ms));
+	}
 }
 
 static irqreturn_t dw_mci_interrupt_once(int irq, void *dev_id)
@@ -2904,6 +2913,7 @@ static irqreturn_t dw_mci_interrupt_once(int irq, void *dev_id)
 	struct dw_mci *host = dev_id;
 	u32 pending;
 	struct dw_mci_slot *slot = host->slot;
+	unsigned int i;
 
 	pending = mci_readl(host, MINTSTS); /* read-only mask reg */
 
@@ -3004,7 +3014,10 @@ static irqreturn_t dw_mci_interrupt_once(int irq, void *dev_id)
 			dw_mci_handle_cd(host);
 		}
 
-		if (pending & SDMMC_INT_SDIO(slot->sdio_id)) {
+		for (i = 0; i < host->num_slots; i++) {
+			slot = host->slots[i];
+			if (!slot || !(pending & SDMMC_INT_SDIO(slot->sdio_id)))
+				continue;
 			mci_writel(host, RINTSTS,
 				   SDMMC_INT_SDIO(slot->sdio_id));
 			__dw_mci_enable_sdio_irq(slot, 0);
@@ -3189,7 +3202,7 @@ static int dw_mci_init_slot_caps(struct dw_mci_slot *slot)
 	return 0;
 }
 
-static int dw_mci_init_slot(struct dw_mci *host)
+static int dw_mci_init_slot(struct dw_mci *host, unsigned int index)
 {
 	struct mmc_host *mmc;
 	struct dw_mci_slot *slot;
@@ -3200,11 +3213,13 @@ static int dw_mci_init_slot(struct dw_mci *host)
 		return -ENOMEM;
 
 	slot = mmc_priv(mmc);
-	slot->id = host->slot_id;
+	slot->id = host->slot_id + index;
 	slot->sdio_id = host->sdio_id0 + slot->id;
 	slot->mmc = mmc;
 	slot->host = host;
-	host->slot = slot;
+	host->slots[index] = slot;
+	if (!host->slot)
+		host->slot = slot;
 
 	mmc->ops = &dw_mci_ops;
 
@@ -3263,9 +3278,15 @@ static int dw_mci_init_slot(struct dw_mci *host)
 
 static void dw_mci_cleanup_slot(struct dw_mci_slot *slot)
 {
+	struct dw_mci *host = slot->host;
+	unsigned int index = slot->id - host->slot_id;
+
 	/* Debugfs stuff is cleaned up by mmc core */
 	mmc_remove_host(slot->mmc);
-	slot->host->slot = NULL;
+	if (index < ARRAY_SIZE(host->slots))
+		host->slots[index] = NULL;
+	if (host->slot == slot)
+		host->slot = NULL;
 }
 
 static void dw_mci_init_dma(struct dw_mci *host)
@@ -3555,21 +3576,26 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
 static void dw_mci_enable_cd(struct dw_mci *host)
 {
 	unsigned long irqflags;
+	unsigned int i;
 	u32 temp;
 
 	/*
-	 * No need for CD if all slots have a non-error GPIO
-	 * as well as broken card detection is found.
+	 * Enable controller card detection when at least one card port does not
+	 * use polling and does not have a dedicated GPIO.
 	 */
-	if (host->slot->mmc->caps & MMC_CAP_NEEDS_POLL)
-		return;
+	for (i = 0; i < host->num_slots; i++) {
+		struct dw_mci_slot *slot = host->slots[i];
 
-	if (mmc_gpio_get_cd(host->slot->mmc) < 0) {
+		if (!slot || slot->mmc->caps & MMC_CAP_NEEDS_POLL)
+			continue;
+		if (mmc_gpio_get_cd(slot->mmc) >= 0)
+			continue;
 		spin_lock_irqsave(&host->irq_lock, irqflags);
 		temp = mci_readl(host, INTMASK);
-		temp  |= SDMMC_INT_CD;
+		temp |= SDMMC_INT_CD;
 		mci_writel(host, INTMASK, temp);
 		spin_unlock_irqrestore(&host->irq_lock, irqflags);
+		break;
 	}
 }
 
@@ -3767,17 +3793,23 @@ int dw_mci_probe(struct dw_mci *host)
 		 "DW MMC controller at irq %d,%d bit host data width,%u deep fifo\n",
 		 host->irq, width, fifo_size);
 
-	/* We need at least one slot to succeed */
-	ret = dw_mci_init_slot(host);
-	if (ret) {
-		dev_dbg(host->dev, "slot %d init failed\n", i);
-		goto err_dmaunmap;
+	if (!host->num_slots)
+		host->num_slots = 1;
+	for (i = 0; i < host->num_slots; i++) {
+		ret = dw_mci_init_slot(host, i);
+		if (ret) {
+			dev_dbg(host->dev, "slot %d init failed\n", i);
+			goto err_slots;
+		}
 	}
-
 	/* Now that slots are all setup, we can enable card detect */
 	dw_mci_enable_cd(host);
 
 	return 0;
+
+err_slots:
+	while (i--)
+		dw_mci_cleanup_slot(host->slots[i]);
 
 err_dmaunmap:
 	if (host->use_dma && host->dma_ops->exit)
@@ -3797,10 +3829,13 @@ EXPORT_SYMBOL(dw_mci_probe);
 
 void dw_mci_remove(struct dw_mci *host)
 {
+	unsigned int i;
+
 	dev_dbg(host->dev, "remove slot\n");
 	hrtimer_cancel(&host->irq_poll_timer);
-	if (host->slot)
-		dw_mci_cleanup_slot(host->slot);
+	for (i = 0; i < host->num_slots; i++)
+		if (host->slots[i])
+			dw_mci_cleanup_slot(host->slots[i]);
 
 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
 	mci_writel(host, INTMASK, 0); /* disable all mmc interrupt first */
@@ -3822,6 +3857,20 @@ EXPORT_SYMBOL(dw_mci_remove);
 
 
 #ifdef CONFIG_PM
+static bool dw_mci_biu_needed(struct dw_mci *host)
+{
+	unsigned int i;
+
+	for (i = 0; i < host->num_slots; i++) {
+		struct dw_mci_slot *slot = host->slots[i];
+
+		if (slot && (mmc_host_can_gpio_cd(slot->mmc) ||
+			     !mmc_card_is_removable(slot->mmc)))
+			return true;
+	}
+	return false;
+}
+
 int dw_mci_runtime_suspend(struct device *dev)
 {
 	struct dw_mci *host = dev_get_drvdata(dev);
@@ -3833,9 +3882,7 @@ int dw_mci_runtime_suspend(struct device *dev)
 
 	clk_disable_unprepare(host->ciu_clk);
 
-	if (host->slot &&
-	    (mmc_host_can_gpio_cd(host->slot->mmc) ||
-	     !mmc_card_is_removable(host->slot->mmc)))
+	if (dw_mci_biu_needed(host))
 		clk_disable_unprepare(host->biu_clk);
 
 	return 0;
@@ -3846,10 +3893,9 @@ int dw_mci_runtime_resume(struct device *dev)
 {
 	int ret = 0;
 	struct dw_mci *host = dev_get_drvdata(dev);
+	unsigned int i;
 
-	if (host->slot &&
-	    (mmc_host_can_gpio_cd(host->slot->mmc) ||
-	     !mmc_card_is_removable(host->slot->mmc))) {
+	if (dw_mci_biu_needed(host)) {
 		ret = clk_prepare_enable(host->biu_clk);
 		if (ret)
 			return ret;
@@ -3885,15 +3931,22 @@ int dw_mci_runtime_resume(struct device *dev)
 	mci_writel(host, CTRL, SDMMC_CTRL_INT_ENABLE);
 
 
-	if (host->slot && host->slot->mmc->pm_flags & MMC_PM_KEEP_POWER)
-		dw_mci_set_ios(host->slot->mmc, &host->slot->mmc->ios);
+	for (i = 0; i < host->num_slots; i++) {
+		struct dw_mci_slot *slot = host->slots[i];
 
-	/* Force setup bus to guarantee available clock output */
+		if (!slot)
+			continue;
+		if (slot->mmc->pm_flags & MMC_PM_KEEP_POWER)
+			dw_mci_set_ios(slot->mmc, &slot->mmc->ios);
+		/* Force setup so each logical host is ready for its first request. */
+		host->slot = slot;
+		dw_mci_setup_bus(slot, true);
+		if (sdio_irq_claimed(slot->mmc))
+			__dw_mci_enable_sdio_irq(slot, 1);
+	}
+	/* Leave the controller and active pointer describing the same slot. */
+	host->slot = host->slots[0];
 	dw_mci_setup_bus(host->slot, true);
-
-	/* Re-enable SDIO interrupts. */
-	if (sdio_irq_claimed(host->slot->mmc))
-		__dw_mci_enable_sdio_irq(host->slot, 1);
 
 	/* Now that slots are all setup, we can enable card detect */
 	dw_mci_enable_cd(host);
@@ -3901,9 +3954,7 @@ int dw_mci_runtime_resume(struct device *dev)
 	return 0;
 
 err:
-	if (host->slot &&
-	    (mmc_host_can_gpio_cd(host->slot->mmc) ||
-	     !mmc_card_is_removable(host->slot->mmc)))
+	if (dw_mci_biu_needed(host))
 		clk_disable_unprepare(host->biu_clk);
 
 	return ret;

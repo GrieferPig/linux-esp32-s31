@@ -132,6 +132,7 @@ int snd_dmaengine_pcm_refine_runtime_hwparams(
  *  registration time.
  * @pcm_hardware: snd_pcm_hardware struct to be used for the PCM.
  * @prealloc_buffer_size: Size of the preallocated audio buffer.
+ * @buffer_type: ALSA DMA buffer type; zero selects SNDRV_DMA_TYPE_DEV_IRAM.
  *
  * Note: If both compat_request_channel and compat_filter_fn are set
  * compat_request_channel will be used to request the channel and
@@ -155,6 +156,7 @@ struct snd_dmaengine_pcm_config {
 
 	const struct snd_pcm_hardware *pcm_hardware;
 	unsigned int prealloc_buffer_size;
+	unsigned int buffer_type;
 };
 
 int snd_dmaengine_pcm_register(struct device *dev,

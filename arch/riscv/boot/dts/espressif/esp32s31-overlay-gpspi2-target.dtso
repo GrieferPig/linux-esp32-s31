@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "gpspi2-target";
+	espressif,resource-claims = "gpspi2";
+};
+
+&axi_gdma {
+	status = "okay";
+};
+
+&gpspi2_target {
+	spi-pins {
+		espressif,route-names = "gpspi2-target.sclk",
+					 "gpspi2-target.mosi",
+					 "gpspi2-target.miso",
+					 "gpspi2-target.cs0";
+		espressif,route-kinds = "matrix-input", "matrix-input",
+					 "matrix-output", "matrix-input";
+		pinmux = <ESP32S31_MATRIX_IN(43, 53, 0)>,
+			 <ESP32S31_MATRIX_IN(40, 55, 0)>,
+			 <ESP32S31_MATRIX_OUT(42, 54, 0)>,
+			 <ESP32S31_MATRIX_IN(44, 62, 0)>;
+	};
+};
+
+&gpspi2 {
+	spi-slave;
+	pinctrl-0 = <&gpspi2_target>;
+	status = "okay";
+
+	slave {
+		compatible = "rohm,dh2228fv";
+		spi-max-frequency = <10000000>;
+	};
+};

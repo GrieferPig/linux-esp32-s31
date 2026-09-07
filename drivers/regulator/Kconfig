@@ -1818,4 +1818,20 @@ config REGULATOR_QCOM_LABIBB
 	  boost regulator and IBB can be used as a negative boost regulator
 	  for LCD display panel.
 
+config REGULATOR_ESP32S31_GP_LDO
+	tristate "ESP32-S31 general-purpose LDO"
+	depends on ARCH_ESPRESSIF || COMPILE_TEST
+	help
+	  Expose the ESP32-S31 GP LDO voltage through the regulator framework.
+	  The hardware has no software enable control, so board constraints decide
+	  whether voltage changes are permitted.
+
+config REGULATOR_ESP32S31_ANA_I2C
+	bool "ESP32-S31 shared analog I2C power"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on REGULATOR
+	help
+	  Centralize the PMU power/reset sequence for the analog register-I2C
+	  fabric shared by SAR ADC, temperature sensor and radio calibration.
+
 endif

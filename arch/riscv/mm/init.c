@@ -1327,6 +1327,9 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.phys_addr,
 			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
 #endif
+	/* Keep UART0 reachable while the resume trampoline owns SATP. */
+	create_pgd_mapping(trampoline_pg_dir, 0x20000000, 0x20000000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
 #endif
 
 	/*
@@ -1335,6 +1338,11 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * in setup_vm_final() below.
 	 */
 	create_kernel_page_table(early_pg_dir, true);
+#ifdef CONFIG_SOC_ESP32S31
+	/* Temporary early-console mapping used by the SATP transition markers. */
+	create_pgd_mapping(early_pg_dir, 0x20000000, 0x20000000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+#endif
 
 	/* Setup early mapping for FDT early scan */
 	create_fdt_early_page_table(__fix_to_virt(FIX_FDT), dtb_pa);
@@ -1481,6 +1489,9 @@ static void __init setup_vm_final(void)
 	create_pgd_mapping(swapper_pg_dir, 0x20400000, 0x20400000,
 			   PGDIR_SIZE, PAGE_KERNEL_IO);
 	create_pgd_mapping(swapper_pg_dir, 0x20800000, 0x20800000,
+			   PGDIR_SIZE, PAGE_KERNEL_IO);
+	/* IDF cache maintenance uses absolute CACHE register addresses. */
+	create_pgd_mapping(swapper_pg_dir, 0x2c000000, 0x2c000000,
 			   PGDIR_SIZE, PAGE_KERNEL_IO);
 	create_pgd_mapping(swapper_pg_dir, 0x2f000000, 0x2f000000,
 			   PGDIR_SIZE, PAGE_KERNEL_EXEC);

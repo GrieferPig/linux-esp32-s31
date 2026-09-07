@@ -411,6 +411,14 @@ config SPI_EP93XX
 	  This enables using the Cirrus EP93xx SPI controller in master
 	  mode.
 
+config SPI_ESP32S31
+	tristate "Espressif ESP32-S31 GPSPI controller"
+	depends on ARCH_ESPRESSIF || COMPILE_TEST
+	depends on OF
+	help
+	  PIO master-mode support for the GPSPI2 and GPSPI3 controllers in
+	  Espressif ESP32-S31 SoCs. Transfers use the 64-byte hardware FIFO.
+
 config SPI_FALCON
 	bool "Falcon SPI controller support"
 	depends on SOC_FALCON

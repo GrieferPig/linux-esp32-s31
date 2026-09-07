@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "watchdogs";
+};
+
+&wdt0 { status = "okay"; };
+&wdt1 { status = "okay"; };
+&rtc_wdt { status = "okay"; };

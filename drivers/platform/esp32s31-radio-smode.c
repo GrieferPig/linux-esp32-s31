@@ -2,6 +2,7 @@
 /* ESP32-S31 S-mode Wi-Fi/Bluetooth runtime. */
 
 #include <linux/init.h>
+#include <linux/bitmap.h>
 #include <linux/completion.h>
 #include <linux/cpu.h>
 #include <linux/if_ether.h>
@@ -16,6 +17,8 @@
 #include <linux/list.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -26,12 +29,20 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/esp32s31-radio.h>
+#include <net/bluetooth/bluetooth.h>
+#include <net/bluetooth/hci.h>
 #include <asm/csr.h>
+#include <asm/esp32s31_ext.h>
 #include <asm/fpu.h>
 #include <asm/irq_regs.h>
 #include <asm/ptrace.h>
 
 #include "esp32s31-radio-internal.h"
+
+u64 s31_linux_wall_time_seconds(void)
+{
+	return ktime_get_real_seconds();
+}
 
 #ifdef CONFIG_SMP
 extern void esp32s31_irq_poll(void);
@@ -44,6 +55,7 @@ typedef unsigned int (*s31_rom_cpu_freq_t)(void);
 
 static bool s31_radio_disabled;
 
+#ifndef MODULE
 static int __init s31_radio_disable_setup(char *value)
 {
 	if (value && !strcmp(value, "off"))
@@ -52,17 +64,20 @@ static int __init s31_radio_disable_setup(char *value)
 	return 0;
 }
 early_param("esp32s31_radio", s31_radio_disable_setup);
+#endif
 
 bool esp32s31_radio_is_disabled(void)
 {
 	return s31_radio_disabled;
 }
+EXPORT_SYMBOL_GPL(esp32s31_radio_is_disabled);
 
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 /* The loader carves out 0x2f030000..0x2f072380 exclusively for Linux radio.
  * The linked blob data/BSS occupies the beginning. Keep the final 0xb80 bytes
  * for the synchronous-trap stack; descriptors begin at 0x2f072380. */
 #define S31_RADIO_HEAP_END	0x2f071800UL
+#define S31_RADIO_HEAP_BASE	0x2f030000UL
 #define S31_RADIO_EXC_STACK_TOP	0x2f072360UL
 /* Idle SRAM above the DMA reservations (ROM download-mode buffers tail +
  * PRO-CPU startup stack), reclaimed as a second blob heap. */
@@ -278,6 +293,7 @@ static atomic_t s31_wifi_tx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_delivered = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_freed = ATOMIC_INIT(0);
 static atomic_t s31_wifi_tx_done = ATOMIC_INIT(0);
+static atomic_t s31_wifi_tx_no_mem = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_cb = ATOMIC_INIT(0);
 static atomic_t s31_wifi_rx_direct_pending = ATOMIC_INIT(0);
 
@@ -287,11 +303,12 @@ void s31_radio_heap_report(const char *stage)
 	size_t total = gen_pool_size(s31_radio_heap_pool);
 	int i;
 
-	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d rx_del=%d rx_freed=%d tx_done=%d rx_cb=%d\n",
+	pr_info("esp32s31-radio: SRAM heap %s used=%zu peak=%zu free=%zu total=%zu allocfail=%d rx_drop=%d tx_drop=%d tx_no_mem=%d rx_del=%d rx_freed=%d tx_done=%d rx_cb=%d\n",
 		stage, total - free, s31_radio_heap_peak, free, total,
 		atomic_read(&s31_idf_alloc_failures),
 		atomic_read(&s31_wifi_rx_dropped),
 		atomic_read(&s31_wifi_tx_dropped),
+		atomic_read(&s31_wifi_tx_no_mem),
 		atomic_read(&s31_wifi_rx_delivered),
 		atomic_read(&s31_wifi_rx_freed),
 		atomic_read(&s31_wifi_tx_done),
@@ -343,6 +360,39 @@ void s31_radio_sram_free(void *ptr)
 	header->magic = 0;
 	gen_pool_free(s31_radio_heap_pool, (unsigned long)header,
 		      header->size + sizeof(*header));
+}
+
+static void s31_radio_heap_reset_chunk(struct gen_pool *pool,
+				       struct gen_pool_chunk *chunk, void *data)
+{
+	unsigned long bytes = chunk->end_addr - chunk->start_addr + 1;
+	unsigned long bits = bytes >> pool->min_alloc_order;
+
+	bitmap_zero(chunk->bits, bits);
+	atomic_long_set(&chunk->avail, bytes);
+}
+
+static void s31_radio_heap_destroy(void)
+{
+	size_t leaked;
+
+	if (!s31_radio_heap_pool)
+		return;
+	leaked = gen_pool_size(s31_radio_heap_pool) -
+		 gen_pool_avail(s31_radio_heap_pool);
+	if (leaked) {
+		/* ESP-IDF keeps process-lifetime queue, timer and controller objects
+		 * after its public deinit calls.  At this point every compatibility
+		 * task, worker and IRQ has been stopped, and this pool owns a dedicated
+		 * SRAM carveout, so reset the allocation bitmap as the hardware-domain
+		 * equivalent of releasing the complete firmware address space. */
+		pr_warn("esp32s31-radio: reclaiming %zu bytes retained by the stopped payload\n",
+			leaked);
+		gen_pool_for_each_chunk(s31_radio_heap_pool,
+					s31_radio_heap_reset_chunk, NULL);
+	}
+	gen_pool_destroy(s31_radio_heap_pool);
+	s31_radio_heap_pool = NULL;
 }
 
 void _interrupt_handler(void)
@@ -429,7 +479,7 @@ bool __wrap_esp_intr_ptr_in_isr_region(void *ptr)
 	/* ESP32-S31 executes the XIP kernel from its permanent 0xc0000000
 	 * mapping; core_kernel_text() does not include that architecture-specific
 	 * alias.  The radio payload's IRAM-attributed handlers live there. */
-	return core_kernel_text(addr) || addr >= PAGE_OFFSET;
+	return esp32s31_executable_address(addr);
 }
 
 struct s31_idf_irq_registration {
@@ -468,6 +518,7 @@ struct s31_idf_irq_registration {
 
 #define S31_RADIO_IRQ_SLOTS	7
 static struct s31_idf_irq_registration s31_idf_irqs[S31_RADIO_IRQ_SLOTS];
+static atomic_t s31_radio_pending_isrs = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(s31_radio_waitq);
 
 enum s31_radio_command_type {
@@ -476,13 +527,15 @@ enum s31_radio_command_type {
 	S31_RADIO_COMMAND_WIFI_SCAN,
 	S31_RADIO_COMMAND_WIFI_CONNECT,
 	S31_RADIO_COMMAND_WIFI_DISCONNECT,
+	S31_RADIO_COMMAND_WIFI_CONTROL,
 	S31_RADIO_COMMAND_BT_ENABLE,
 	S31_RADIO_COMMAND_BT_DISABLE,
+	S31_RADIO_COMMAND_SHUTDOWN,
 	S31_RADIO_COMMAND_TASK_CREATE,
 };
 
 /* H4 type plus Linux HCI_MAX_FRAME_SIZE (1028-byte ACL header/payload). */
-#define S31_HCI_FRAME_SIZE	1029
+#define S31_HCI_FRAME_SIZE	ESP32S31_RADIO_HCI_FRAME_MAX
 #define S31_HCI_RX_SLOTS	8
 #define S31_HCI_TX_SLOTS	4
 
@@ -502,6 +555,17 @@ static const struct esp32s31_radio_hci_ops *s31_hci_ops;
 static void *s31_hci_context;
 static atomic_t s31_hci_rx_dropped = ATOMIC_INIT(0);
 static atomic_t s31_hci_tx_dropped = ATOMIC_INIT(0);
+static atomic64_t s31_hci_acl_rx_packets = ATOMIC64_INIT(0);
+static atomic64_t s31_hci_acl_rx_bytes = ATOMIC64_INIT(0);
+static atomic64_t s31_hci_acl_tx_packets = ATOMIC64_INIT(0);
+static atomic64_t s31_hci_acl_tx_bytes = ATOMIC64_INIT(0);
+static atomic_t s31_acl_packet_type_events = ATOMIC_INIT(0);
+static u16 s31_acl_packet_type;
+static atomic_t s31_coex_cmd_completes = ATOMIC_INIT(0);
+static int s31_coex_last_status = -ENODATA;
+static u8 s31_coex_bt_status;
+static u8 s31_coex_pending_op;
+static u8 s31_coex_pending_status;
 static const struct esp32s31_radio_wifi_ops *s31_wifi_ops;
 static void *s31_wifi_context;
 static struct esp32s31_radio_wifi_ap
@@ -523,6 +587,7 @@ static bool s31_wifi_scan_ready;
 
 struct s31_wifi_frame {
 	u16 length;
+	u8 interface;
 	u64 enqueue_ns;
 	u8 data[S31_WIFI_FRAME_SIZE];
 };
@@ -540,6 +605,15 @@ struct s31_radio_timing_stats {
 	u64 isr_max_ns;
 	u64 isr_to_task_total_ns;
 	u64 isr_to_task_max_ns;
+	u64 blob_pass_total_ns;
+	u64 timer_tick_total_ns;
+	u64 hci_tx_total_ns;
+	u64 wifi_tx_total_ns;
+	u64 linux_pass_total_ns;
+	u64 hci_rx_total_ns;
+	u64 wifi_event_total_ns;
+	u64 command_total_ns;
+	u64 tx_wakeup_total_ns;
 	u64 tx_enqueue_total_ns;
 	u64 tx_enqueue_max_ns;
 	u64 tx_call_total_ns;
@@ -553,6 +627,12 @@ struct s31_radio_timing_stats {
 	u32 gate_samples;
 	u32 isr_samples;
 	u32 task_samples;
+	u32 blob_pass_samples;
+	u32 timer_tick_samples;
+	u32 hci_tx_samples;
+	u32 wifi_tx_samples;
+	u32 timer_due_immediate;
+	u32 linux_pass_samples;
 	u32 tx_samples;
 	u32 tx_done_samples;
 	u32 tcp_ack_samples;
@@ -571,7 +651,9 @@ enum s31_tx_timing_kind {
 	S31_TX_KIND_COUNT,
 };
 
-#define S31_TX_TIMING_SLOTS 32
+/* Timing collection is opt-in.  Keep one last transaction for diagnosis
+ * without reserving 1.5 KiB of BSS in every Wi-Fi- or BT-only deployment. */
+#define S31_TX_TIMING_SLOTS 1
 #define S31_RADIO_WORKER_NICE (-10)
 
 struct s31_tx_timing_sample {
@@ -650,6 +732,37 @@ static u8 s31_radio_tx_kind(const u8 *frame, u16 length)
 
 static struct task_struct *s31_radio_worker;
 static struct s31_radio_timing_stats s31_timing;
+static bool s31_radio_timing_enabled;
+/*
+ * Arm the sleeping combo worker at a low RT priority so a deferred radio IRQ
+ * can preempt ordinary CFS work as soon as wake_up_process() makes it
+ * runnable.  The worker drops back to CFS after exactly one serialized pass;
+ * keeping it RT while runnable would starve the closed Wi-Fi/BTDM tasks which
+ * share hart 0 in the Linux combo profile.
+ *
+ * Keep this opt-in until the board comparison has covered association, A2DP
+ * and sustained TCP traffic.  It can be toggled live without rebuilding the
+ * payload.
+ */
+static bool s31_radio_rt_wake;
+module_param_named(radio_rt_wake, s31_radio_rt_wake, bool, 0644);
+MODULE_PARM_DESC(radio_rt_wake,
+		 "wake the combo radio worker for one pass at RT priority");
+static int s31_radio_timing_set(const char *value,
+				const struct kernel_param *param);
+static const struct kernel_param_ops s31_radio_timing_ops = {
+	.set = s31_radio_timing_set,
+	.get = param_get_bool,
+};
+module_param_cb(radio_timing, &s31_radio_timing_ops,
+		&s31_radio_timing_enabled, 0644);
+MODULE_PARM_DESC(radio_timing,
+		 "collect radio timing diagnostics; writing 0 prints the snapshot");
+/* The unified module uses --gc-sections to discard the unused Wi-Fi/BT
+ * frontend.  Keep this parameter reachable from the module link so operators
+ * can opt back into timing diagnostics without carrying their hot-path cost. */
+const struct kernel_param *s31_radio_timing_param_anchor =
+	&__param_radio_timing;
 static void s31_radio_wifi_tx_capacity_available(void);
 
 void s31_radio_timing_reset(void)
@@ -675,6 +788,8 @@ void s31_radio_timing_blob_enter(void)
 {
 	u64 now, then;
 
+	if (!READ_ONCE(s31_radio_timing_enabled))
+		return;
 	if (current == READ_ONCE(s31_radio_worker))
 		return;
 	then = READ_ONCE(s31_timing.last_isr_end_ns);
@@ -697,6 +812,8 @@ u32 s31_radio_timing_tx_begin(u64 enqueue_ns, u64 start_ns,
 	u8 kind = s31_radio_tx_kind(frame, length);
 	u32 sequence;
 
+	if (!READ_ONCE(s31_radio_timing_enabled))
+		return 0;
 	if (start_ns >= enqueue_ns) {
 		s31_timing_add(start_ns - enqueue_ns,
 			       &s31_timing.tx_enqueue_total_ns,
@@ -735,6 +852,8 @@ void s31_radio_timing_tx_return(u32 sequence, u64 end_ns, int result)
 	unsigned long flags;
 	u32 i;
 
+	if (!sequence || !READ_ONCE(s31_radio_timing_enabled))
+		return;
 	spin_lock_irqsave(&s31_tx_timing_lock, flags);
 	for (i = s31_tx_done_cursor; i < s31_tx_head; i++) {
 		sample = &s31_tx_samples[i % S31_TX_TIMING_SLOTS];
@@ -756,10 +875,13 @@ void s31_radio_timing_tx_done(bool status, const u8 *frame, u16 length)
 {
 	struct s31_tx_timing_sample *sample = NULL;
 	unsigned long flags;
-	u64 now = ktime_get_mono_fast_ns();
+	u64 now;
 	u32 i;
 
 	atomic_inc(&s31_wifi_tx_done);
+	if (!READ_ONCE(s31_radio_timing_enabled))
+		goto capacity_available;
+	now = ktime_get_mono_fast_ns();
 
 	spin_lock_irqsave(&s31_tx_timing_lock, flags);
 	for (i = s31_tx_tail; i < s31_tx_head; i++) {
@@ -787,6 +909,7 @@ void s31_radio_timing_tx_done(bool status, const u8 *frame, u16 length)
 	 * than leaving a latency-sensitive TCP ACK parked until the next 10 ms
 	 * Linux jiffy.  The callback may run under the blob gate, so only publish
 	 * the deadline and wake the already pinned radio worker here. */
+capacity_available:
 	s31_radio_wifi_tx_capacity_available();
 
 	(void)frame;
@@ -825,6 +948,30 @@ static void s31_radio_timing_report(const char *stage)
 			s31_timing.tcp_ack_samples),
 		s31_timing.tcp_ack_enqueue_max_ns, s31_timing.tx_no_mem,
 		s31_timing.tx_done_wakes, s31_timing.tcp_ack_resched_kicks);
+	pr_info("esp32s31-radio: timing %s blob-pass n=%u avg=%lluns timer n=%u avg=%lluns hci n=%u avg=%lluns wifi n=%u avg=%lluns due-now=%u\n",
+		stage, s31_timing.blob_pass_samples,
+		S31_AVG(s31_timing.blob_pass_total_ns,
+			s31_timing.blob_pass_samples),
+		s31_timing.timer_tick_samples,
+		S31_AVG(s31_timing.timer_tick_total_ns,
+			s31_timing.timer_tick_samples),
+		s31_timing.hci_tx_samples,
+		S31_AVG(s31_timing.hci_tx_total_ns, s31_timing.hci_tx_samples),
+		s31_timing.wifi_tx_samples,
+		S31_AVG(s31_timing.wifi_tx_total_ns, s31_timing.wifi_tx_samples),
+		s31_timing.timer_due_immediate);
+	pr_info("esp32s31-radio: timing %s linux-pass n=%u avg=%lluns hci-rx avg=%lluns wifi-event avg=%lluns command avg=%lluns tx-wakeup avg=%lluns\n",
+		stage, s31_timing.linux_pass_samples,
+		S31_AVG(s31_timing.linux_pass_total_ns,
+			s31_timing.linux_pass_samples),
+		S31_AVG(s31_timing.hci_rx_total_ns,
+			s31_timing.linux_pass_samples),
+		S31_AVG(s31_timing.wifi_event_total_ns,
+			s31_timing.linux_pass_samples),
+		S31_AVG(s31_timing.command_total_ns,
+			s31_timing.linux_pass_samples),
+		S31_AVG(s31_timing.tx_wakeup_total_ns,
+			s31_timing.linux_pass_samples));
 	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
 		direct += atomic_read(&s31_idf_irqs[i].direct_count);
 		owner_drained +=
@@ -874,6 +1021,25 @@ static void s31_radio_timing_report(const char *stage)
 #undef S31_AVG
 }
 
+static int s31_radio_timing_set(const char *value,
+				const struct kernel_param *param)
+{
+	bool enabled;
+	bool previous;
+	int ret;
+
+	ret = kstrtobool(value, &enabled);
+	if (ret)
+		return ret;
+	previous = READ_ONCE(*(bool *)param->arg);
+	if (enabled && !previous)
+		s31_radio_timing_reset();
+	WRITE_ONCE(*(bool *)param->arg, enabled);
+	if (!enabled && previous)
+		s31_radio_timing_report("snapshot");
+	return 0;
+}
+
 static struct s31_wifi_rx_desc *s31_wifi_rx;
 static u8 *s31_wifi_rx_data;
 static struct s31_wifi_frame *s31_wifi_tx;
@@ -887,6 +1053,11 @@ static DEFINE_SPINLOCK(s31_wifi_tx_lock);
 static DECLARE_WAIT_QUEUE_HEAD(s31_wifi_rx_space_waitq);
 static struct esp32s31_radio_wifi_connect_params *s31_wifi_connect_params;
 static u16 *s31_wifi_disconnect_reason;
+static struct s31_wifi_control *s31_wifi_control_buffer;
+static DEFINE_MUTEX(s31_wifi_control_mutex);
+static DECLARE_COMPLETION(s31_wifi_control_done);
+static int s31_wifi_control_result;
+static bool s31_wifi_control_poisoned;
 static u8 s31_wifi_event_bssid[6];
 static u8 s31_wifi_event_channel;
 static u16 s31_wifi_event_reason;
@@ -922,6 +1093,7 @@ struct s31_radio_command {
 			void *arg;
 			u32 priority;
 			void *cookie;
+			s32 core_id;
 			void *linux_task;
 		} task_create;
 	};
@@ -931,6 +1103,7 @@ static LIST_HEAD(s31_radio_commands);
 static DEFINE_SPINLOCK(s31_radio_command_lock);
 static void *s31_radio_worker_stack;
 #define S31_RADIO_WORKER_STACK_SIZE 8192U
+static u32 s31_radio_features;
 static atomic_t s31_radio_state = ATOMIC_INIT(ESP32S31_RADIO_OFFLINE);
 static atomic_t s31_radio_worker_passes = ATOMIC_INIT(0);
 static atomic_t s31_radio_commands_completed = ATOMIC_INIT(0);
@@ -938,11 +1111,27 @@ static int s31_wifi_init_result = -EINPROGRESS;
 static int s31_bt_init_result = -EINPROGRESS;
 static int s31_bt_enable_result = -EINPROGRESS;
 static int s31_bt_disable_result = -EINPROGRESS;
+static int s31_shutdown_result = -EINPROGRESS;
+static DECLARE_COMPLETION(s31_shutdown_done);
 static void s31_radio_health_workfn(struct work_struct *work);
 static DECLARE_WORK(s31_radio_health_work, s31_radio_health_workfn);
 
 #define S31_IDF_INTR_DISABLED	BIT(5)
 static atomic_t s31_tick_pending = ATOMIC_INIT(0);
+
+static bool s31_radio_bt_batching_active(void)
+{
+	return s31_radio_features == S31_RADIO_FEATURE_BLUETOOTH &&
+	       READ_ONCE(s31_bt_enable_result) == 0;
+}
+
+bool s31_radio_payload_uses_fp(void)
+{
+	/* The pinned BTDM object region is integer-only.  Wi-Fi payload objects
+	 * still contain floating-point instructions and require full interrupted
+	 * FP state preservation around a nested native ISR. */
+	return READ_ONCE(s31_radio_features) & S31_RADIO_FEATURE_WIFI;
+}
 
 /* Gate-held PC samples were previously collected from the 100 Hz TIMG1
  * hardirq.  That interrupt source has been removed; the ring is retained
@@ -978,6 +1167,12 @@ void s31_radio_report_bt_disable(int result)
 	if (!result)
 		WRITE_ONCE(s31_bt_enable_result, -EHOSTDOWN);
 	wake_up(&s31_radio_waitq);
+}
+
+void s31_radio_report_shutdown(int result)
+{
+	WRITE_ONCE(s31_shutdown_result, result);
+	complete(&s31_shutdown_done);
 }
 
 u32 s31_linux_tick_count(void)
@@ -1176,61 +1371,6 @@ void s31_radio_wifi_intr_mask(u32 mask, bool enable)
 }
 
 /*
- * Native IDF critical sections prevent the Wi-Fi interrupt from arriving at
- * an unsafe lock-held point.  Linux must preserve that property without
- * globally clearing SIE (which would also suppress the scheduler tick, UART,
- * timer and IPI).  Temporarily add a disable depth only to installed radio
- * IRQs; the caller stores the returned token until its raw lock is released.
- *
- * All payload tasks and radio device IRQs are pinned to hart0 and the blob
- * gate serializes task-side callers, so a small bit token is sufficient.
- */
-u32 s31_radio_blob_irqs_mask(void)
-{
-	u32 mask = 0;
-	int i;
-
-	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
-		struct s31_idf_irq_registration *registration = &s31_idf_irqs[i];
-		int virq = READ_ONCE(registration->virq);
-
-		if (!virq || !READ_ONCE(registration->hw_enabled))
-			continue;
-		disable_irq_nosync(virq);
-		mask |= BIT(i);
-	}
-	return mask;
-}
-
-void s31_radio_blob_irqs_restore(u32 mask)
-{
-	unsigned long flags;
-	int i;
-
-	/* Balance every temporary disable before returning.  Keep local hard
-	 * IRQs off across the balance/re-mask pair so a source which the closed
-	 * driver logically disabled cannot enter in the middle. */
-	local_irq_save(flags);
-	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
-		struct s31_idf_irq_registration *registration = &s31_idf_irqs[i];
-		int virq;
-
-		if (!(mask & BIT(i)))
-			continue;
-		virq = READ_ONCE(registration->virq);
-		if (!virq)
-			continue;
-		enable_irq(virq);
-		if (!READ_ONCE(registration->enabled) &&
-		    READ_ONCE(registration->hw_enabled)) {
-			WRITE_ONCE(registration->hw_enabled, false);
-			disable_irq_nosync(virq);
-		}
-	}
-	local_irq_restore(flags);
-}
-
-/*
  * A hardirq can arrive while the current blob owner has published an unsafe
  * task-side point.  The hardirq then leaves the device IRQ explicitly disabled
  * and records one pending closed callback.  Do not wait for the radio worker:
@@ -1249,11 +1389,13 @@ bool s31_radio_blob_run_pending_isrs(void)
 	bool handled = false;
 	int i;
 
-	if (!s31_linux_blob_held_by_current() ||
+	if (!atomic_read(&s31_radio_pending_isrs) ||
+	    !s31_linux_blob_held_by_current() ||
 	    READ_ONCE(s31_rtos_isr_depth))
 		return false;
 
 	local_irq_save(flags);
+	atomic_set(&s31_radio_pending_isrs, 0);
 	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
 		struct s31_idf_irq_registration *registration =
 			&s31_idf_irqs[i];
@@ -1266,8 +1408,10 @@ bool s31_radio_blob_run_pending_isrs(void)
 		s31_rtos_isr_depth++;
 		registration->handler(registration->arg);
 		s31_rtos_isr_depth--;
-		atomic_inc(&registration->callback_count);
-		atomic_inc(&registration->owner_drained_count);
+		if (READ_ONCE(s31_radio_timing_enabled)) {
+			atomic_inc(&registration->callback_count);
+			atomic_inc(&registration->owner_drained_count);
+		}
 		handled = true;
 
 		/* Balance the explicit disable depth installed by the fallback
@@ -1277,11 +1421,10 @@ bool s31_radio_blob_run_pending_isrs(void)
 		if (virq && READ_ONCE(registration->enabled) &&
 		    !READ_ONCE(registration->hw_enabled)) {
 			WRITE_ONCE(registration->hw_enabled, true);
-			enable_irq(virq);
+				enable_irq(virq);
 		}
 	}
 	local_irq_restore(flags);
-
 	return handled;
 }
 
@@ -1297,21 +1440,29 @@ static irqreturn_t s31_radio_hardirq(int irq, void *data)
 {
 	struct s31_idf_irq_registration *registration = data;
 	struct task_struct *worker;
+	bool timing = READ_ONCE(s31_radio_timing_enabled);
 	int direct_result;
 	u64 entered_ns, handler_end_ns;
 
-	entered_ns = ktime_get_mono_fast_ns();
-	WRITE_ONCE(registration->pending_since_ns, entered_ns);
 	atomic_inc(&registration->hardirq_count);
+	entered_ns = 0;
+	if (timing) {
+		entered_ns = ktime_get_mono_fast_ns();
+		WRITE_ONCE(registration->pending_since_ns, entered_ns);
+	}
 	direct_result = s31_linux_blob_run_direct_isr(registration->handler,
 						      registration->arg);
 	if (direct_result == S31_DIRECT_ISR_HANDLED) {
-		handler_end_ns = ktime_get_mono_fast_ns();
-		registration->direct_total_ns += handler_end_ns - entered_ns;
-		registration->direct_max_ns = max(registration->direct_max_ns,
-						  handler_end_ns - entered_ns);
-		atomic_inc(&registration->direct_count);
-		atomic_inc(&registration->callback_count);
+		if (timing) {
+			handler_end_ns = ktime_get_mono_fast_ns();
+			registration->direct_total_ns +=
+				handler_end_ns - entered_ns;
+			registration->direct_max_ns =
+				max(registration->direct_max_ns,
+				    handler_end_ns - entered_ns);
+			atomic_inc(&registration->direct_count);
+			atomic_inc(&registration->callback_count);
+		}
 		atomic_set(&registration->callback_pending, 0);
 		/* The closed ISR may have logically masked its source.  In that case
 		 * retain an explicit disable depth across handle_level_irq()'s exit;
@@ -1325,33 +1476,36 @@ static irqreturn_t s31_radio_hardirq(int irq, void *data)
 	} else {
 		disable_irq_nosync(irq);
 		WRITE_ONCE(registration->hw_enabled, false);
-		atomic_inc(&registration->deferred_count);
-		switch (direct_result) {
-		case S31_DIRECT_ISR_DEFER_CONTEXT:
-			atomic_inc(&registration->defer_context_count);
-			break;
-		case S31_DIRECT_ISR_DEFER_OWNER:
-			atomic_inc(&registration->defer_owner_count);
-			break;
-		case S31_DIRECT_ISR_DEFER_UNSAFE:
-			atomic_inc(&registration->defer_unsafe_count);
-			break;
-		case S31_DIRECT_ISR_DEFER_NESTED:
-			atomic_inc(&registration->defer_nested_count);
-			break;
-		default:
-			break;
+		if (timing) {
+			atomic_inc(&registration->deferred_count);
+			switch (direct_result) {
+			case S31_DIRECT_ISR_DEFER_CONTEXT:
+				atomic_inc(&registration->defer_context_count);
+				break;
+			case S31_DIRECT_ISR_DEFER_OWNER:
+				atomic_inc(&registration->defer_owner_count);
+				break;
+			case S31_DIRECT_ISR_DEFER_UNSAFE:
+				atomic_inc(&registration->defer_unsafe_count);
+				break;
+			case S31_DIRECT_ISR_DEFER_NESTED:
+				atomic_inc(&registration->defer_nested_count);
+				break;
+			default:
+				break;
+			}
 		}
 		atomic_set(&registration->callback_pending, 1);
+		atomic_set(&s31_radio_pending_isrs, 1);
 	}
-	/*
-	 * The closed ISR acknowledges the hardware directly, but it can also make
-	 * compatibility tasks runnable or queue blob-internal follow-up work.  Wake
-	 * the serialized worker after both direct and deferred callbacks so that
-	 * this software tail cannot remain asleep behind an already-cleared IRQ.
-	 */
+	/* Keep initialization and Wi-Fi conservative.  Once a BT-only controller is
+	 * running, its direct ISR already acknowledges the source and wakes BTDM;
+	 * waking the Linux bridge for every incoming ACL packet only adds a second
+	 * scheduling pass.  HCI events wake the bridge from the VHCI callback, while
+	 * ACL payloads are drained by the bounded periodic pass below. */
 	worker = READ_ONCE(s31_radio_worker);
-	if (worker)
+	if (worker && (!s31_radio_bt_batching_active() ||
+		       direct_result != S31_DIRECT_ISR_HANDLED))
 		wake_up_process(worker);
 	return IRQ_HANDLED;
 }
@@ -1469,12 +1623,7 @@ static bool s31_radio_irq_work_pending(void)
 
 static bool s31_radio_irq_callback_pending(void)
 {
-	int i;
-
-	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++)
-		if (atomic_read(&s31_idf_irqs[i].callback_pending))
-			return true;
-	return false;
+	return atomic_read(&s31_radio_pending_isrs) != 0;
 }
 
 /* Print the most recent gate-held PC samples with symbol resolution.  The
@@ -1556,17 +1705,58 @@ static bool s31_radio_hci_tx_pending(void)
 
 void s31_radio_vhci_send_available(void)
 {
-	wake_up(&s31_radio_waitq);
+	/* The controller reports available credits even when the Linux HCI TX ring
+	 * is already empty.  Waking the serialized worker for those notifications
+	 * adds a full blob-gate pass to every active A2DP scheduling round. */
+	if (s31_radio_hci_tx_pending())
+		wake_up(&s31_radio_waitq);
 }
 
 int s31_radio_vhci_receive(u8 *frame, u16 length)
 {
+	const struct esp32s31_radio_hci_ops *ops;
+	void *context;
+	bool was_empty;
 	unsigned long flags;
 	unsigned int next;
+	u16 opcode = 0;
 
 	if (!frame || !length || length > S31_HCI_FRAME_SIZE)
 		return -EINVAL;
+	if (length >= 7 && frame[0] == HCI_EVENT_PKT &&
+	    frame[1] == HCI_EV_CMD_COMPLETE)
+		opcode = frame[4] | (frame[5] << 8);
+	else if (length >= 7 && frame[0] == HCI_EVENT_PKT &&
+		 frame[1] == HCI_EV_CMD_STATUS)
+		opcode = frame[5] | (frame[6] << 8);
+	if (opcode == HCI_OP_WRITE_CLASS_OF_DEV)
+		pr_info("esp32s31-radio: VHCI RX 0x0c24 event=0x%02x status=%u\n",
+			frame[1], frame[1] == HCI_EV_CMD_COMPLETE ? frame[6] :
+			frame[3]);
+	if (frame[0] == HCI_ACLDATA_PKT) {
+		atomic64_inc(&s31_hci_acl_rx_packets);
+		atomic64_add(length - 1, &s31_hci_acl_rx_bytes);
+	} else if (length >= 8 && frame[0] == HCI_EVENT_PKT &&
+		   frame[1] == 0x1d) {
+		WRITE_ONCE(s31_acl_packet_type, frame[6] | (frame[7] << 8));
+		atomic_inc(&s31_acl_packet_type_events);
+	} else if (length >= 7 && frame[0] == HCI_EVENT_PKT &&
+		   frame[1] == HCI_EV_CMD_COMPLETE && opcode == 0xfc82) {
+		int status = frame[6];
+
+		WRITE_ONCE(s31_coex_last_status, status);
+		atomic_inc(&s31_coex_cmd_completes);
+		if (!status) {
+			if (READ_ONCE(s31_coex_pending_op))
+				s31_coex_bt_status |=
+					READ_ONCE(s31_coex_pending_status);
+			else
+				s31_coex_bt_status &=
+					~READ_ONCE(s31_coex_pending_status);
+		}
+	}
 	spin_lock_irqsave(&s31_hci_lock, flags);
+	was_empty = s31_hci_rx_head == s31_hci_rx_tail;
 	next = (s31_hci_rx_head + 1) % S31_HCI_RX_SLOTS;
 	if (next == s31_hci_rx_tail) {
 		atomic_inc(&s31_hci_rx_dropped);
@@ -1576,7 +1766,16 @@ int s31_radio_vhci_receive(u8 *frame, u16 length)
 	s31_hci_rx[s31_hci_rx_head].length = length;
 	memcpy(s31_hci_rx[s31_hci_rx_head].data, frame, length);
 	smp_store_release(&s31_hci_rx_head, next);
+	ops = s31_hci_ops;
+	context = s31_hci_context;
 	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	if (was_empty && ops && ops->rx_ready)
+		ops->rx_ready(context);
+	/* Command, pairing and link-state events stay latency sensitive.  A2DP media
+	 * arrives as ACL data and is intentionally coalesced until the next bridge
+	 * pass when the controller is in the BT-only low-overhead mode. */
+	if (frame[0] == HCI_EVENT_PKT)
+		wake_up(&s31_radio_waitq);
 	return 0;
 }
 
@@ -1687,25 +1886,75 @@ void s31_radio_wifi_disconnected(u16 reason)
 /* Called only inside the serialized blob execution gate. */
 static void s31_radio_hci_process_tx(void)
 {
-#ifdef CONFIG_BT_ESP32S31
+#if IS_ENABLED(CONFIG_BT_ESP32S31)
+	bool freed = false;
+
 	while (s31_hci_tx_tail != smp_load_acquire(&s31_hci_tx_head)) {
 		struct s31_hci_frame *frame = &s31_hci_tx[s31_hci_tx_tail];
+		int coex_result;
+
+		/* Bluedroid uses 0xfc82 to pass A2DP streaming/paused bits to
+		 * libcoexist.  ESP32-S31's controller wrapper leaves that optional
+		 * VSC disabled, so route the exact IDF command to the same IDF status
+		 * API.  Older version-1 payloads without this optional export still
+		 * pass the command through to their controller unchanged. */
+		if (frame->length == 7 && frame->data[0] == HCI_COMMAND_PKT &&
+		    frame->data[1] == 0x82 && frame->data[2] == 0xfc &&
+		    frame->data[3] == 3 && frame->data[4] == 2) {
+			u8 complete[] = {
+				HCI_EVENT_PKT, HCI_EV_CMD_COMPLETE, 4, 1,
+				0x82, 0xfc, 0,
+			};
+
+			coex_result = s31_radio_coex_status(frame->data[4],
+							 frame->data[5],
+							 frame->data[6]);
+			if (coex_result != -EOPNOTSUPP) {
+				complete[6] = coex_result ? 0x12 : 0;
+				s31_radio_vhci_receive(complete, sizeof(complete));
+				s31_hci_tx_tail = (s31_hci_tx_tail + 1) %
+						   S31_HCI_TX_SLOTS;
+				freed = true;
+				continue;
+			}
+		}
 
 		if (s31_radio_vhci_try_send(frame->data, frame->length))
 			break;
 		s31_hci_tx_tail = (s31_hci_tx_tail + 1) % S31_HCI_TX_SLOTS;
+		freed = true;
 	}
+	/* The direct-HCI endpoint uses the same readiness edge for RX data and
+	 * newly available TX space.  Its callback only wakes the shared poll wait
+	 * queue, so this remains harmless for the kernel HCI frontend, whose
+	 * receive callback does not provide rx_ready(). */
+	if (freed && s31_hci_ops && s31_hci_ops->rx_ready)
+		s31_hci_ops->rx_ready(s31_hci_context);
 #endif
 }
 
 /* This runs after the gate has restored Linux IRQ and FPU state. */
+static bool s31_radio_hci_rx_pending(void)
+{
+	return READ_ONCE(s31_hci_rx_tail) != smp_load_acquire(&s31_hci_rx_head);
+}
+
 static void s31_radio_hci_deliver_rx(void)
 {
+	unsigned int budget = 8;
+
 	for (;;) {
 		const struct esp32s31_radio_hci_ops *ops;
 		struct s31_hci_frame *frame;
 		void *context;
 		unsigned long flags;
+
+		/* Continuous A2DP can keep the direct-HCI ring nonempty indefinitely.
+		 * Deliver a bounded batch, then return to the blob for Wi-Fi RX/TX and
+		 * coexist callbacks.  The worker wait predicate below immediately starts
+		 * another round while frames remain, so this is fairness, not throttling. */
+		if (!budget--)
+			break;
 
 		spin_lock_irqsave(&s31_hci_lock, flags);
 		if (s31_hci_rx_tail == s31_hci_rx_head) {
@@ -1716,7 +1965,7 @@ static void s31_radio_hci_deliver_rx(void)
 		context = s31_hci_context;
 		frame = &((struct s31_hci_frame *)
 			  s31_radio_sram_linux_alias(s31_hci_rx))[s31_hci_rx_tail];
-		if (!ops) {
+		if (!ops || !ops->receive) {
 			spin_unlock_irqrestore(&s31_hci_lock, flags);
 			break;
 		}
@@ -1759,18 +2008,29 @@ static void s31_radio_wifi_process_tx(void)
 		struct s31_wifi_frame *frame = &s31_wifi_tx[s31_wifi_tx_tail];
 		int ret;
 
-		{
+		if (READ_ONCE(s31_radio_timing_enabled)) {
 			u64 start_ns = ktime_get_mono_fast_ns();
 			u32 sequence = s31_radio_timing_tx_begin(
 				frame->enqueue_ns, start_ns, frame->data,
 				frame->length);
 
-			ret = s31_radio_wifi_try_send(frame->data, frame->length);
+			ret = s31_radio_wifi_try_send_interface(frame->interface, frame->data,
+							frame->length);
 			s31_radio_timing_tx_return(sequence,
 						   ktime_get_mono_fast_ns(), ret);
+		} else {
+			ret = s31_radio_wifi_try_send_interface(frame->interface, frame->data,
+							frame->length);
 		}
 		if (ret == -EAGAIN || ret == 257) { /* 257 == ESP_ERR_NO_MEM */
+			int retries = atomic_inc_return(&s31_wifi_tx_no_mem);
+
 			s31_timing.tx_no_mem++;
+			if (retries <= 8 || !(retries & 127))
+				pr_info("esp32s31-radio: Wi-Fi TX pool retry=%d ret=%d len=%u queued=%u\n",
+					retries, ret, frame->length,
+					(s31_wifi_tx_head + S31_WIFI_TX_SLOTS -
+					 s31_wifi_tx_tail) % S31_WIFI_TX_SLOTS);
 			s31_wifi_tx_retry_at = jiffies + 1;
 			return;
 		}
@@ -1874,6 +2134,11 @@ static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 {
 	size_t free = gen_pool_avail(s31_radio_heap_pool);
 	size_t total = gen_pool_size(s31_radio_heap_pool);
+	u32 radio_irqs = 0;
+	int i;
+
+	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++)
+		radio_irqs += atomic_read(&s31_idf_irqs[i].hardirq_count);
 
 	health->state = atomic_read(&s31_radio_state);
 	health->wifi_init_result = READ_ONCE(s31_wifi_init_result);
@@ -1887,6 +2152,19 @@ static void s31_radio_fill_health(struct esp32s31_radio_health *health)
 	health->heap_total = total;
 	health->wifi_rx_dropped = atomic_read(&s31_wifi_rx_dropped);
 	health->wifi_tx_dropped = atomic_read(&s31_wifi_tx_dropped);
+	health->radio_irqs = radio_irqs;
+	health->hci_rx_dropped = atomic_read(&s31_hci_rx_dropped);
+	health->hci_tx_dropped = atomic_read(&s31_hci_tx_dropped);
+	health->hci_acl_rx_packets = atomic64_read(&s31_hci_acl_rx_packets);
+	health->hci_acl_rx_bytes = atomic64_read(&s31_hci_acl_rx_bytes);
+	health->hci_acl_tx_packets = atomic64_read(&s31_hci_acl_tx_packets);
+	health->hci_acl_tx_bytes = atomic64_read(&s31_hci_acl_tx_bytes);
+	health->acl_packet_type_events =
+		atomic_read(&s31_acl_packet_type_events);
+	health->acl_packet_type = READ_ONCE(s31_acl_packet_type);
+	health->coex_cmd_completes = atomic_read(&s31_coex_cmd_completes);
+	health->coex_last_status = READ_ONCE(s31_coex_last_status);
+	health->coex_bt_status = READ_ONCE(s31_coex_bt_status);
 }
 
 /* Run only from the radio worker, on its normal kernel stack.
@@ -1953,8 +2231,13 @@ static void s31_radio_process_commands(void)
 			else
 				command->result = 0;
 			break;
+		case S31_RADIO_COMMAND_WIFI_CONTROL:
+			command->result = xTaskCreatePinnedToCore(
+				s31_radio_wifi_control_task, "wifi-control", 8192,
+				s31_wifi_control_buffer, 20, NULL, 0) == 1 ? 0 : -ENOMEM;
+			break;
 		case S31_RADIO_COMMAND_BT_ENABLE:
-#ifdef CONFIG_BT_ESP32S31
+#if IS_ENABLED(CONFIG_BT_ESP32S31)
 			if (xTaskCreatePinnedToCore(s31_radio_bt_enable_task,
 						    "bt-enable", 8192, NULL, 22,
 						    NULL, 0) != 1)
@@ -1966,7 +2249,7 @@ static void s31_radio_process_commands(void)
 #endif
 			break;
 		case S31_RADIO_COMMAND_BT_DISABLE:
-#ifdef CONFIG_BT_ESP32S31
+#if IS_ENABLED(CONFIG_BT_ESP32S31)
 			if (xTaskCreatePinnedToCore(s31_radio_bt_disable_task,
 						    "bt-disable", 4096, NULL, 22,
 						    NULL, 0) != 1)
@@ -1977,6 +2260,15 @@ static void s31_radio_process_commands(void)
 			command->result = -EOPNOTSUPP;
 #endif
 			break;
+		case S31_RADIO_COMMAND_SHUTDOWN:
+			if (xTaskCreatePinnedToCore(s31_radio_shutdown_task,
+						    "radio-shutdown", 8192,
+						    (void *)(uintptr_t)s31_radio_features,
+						    22, NULL, 0) != 1)
+				command->result = -ENOMEM;
+			else
+				command->result = 0;
+			break;
 		case S31_RADIO_COMMAND_TASK_CREATE:
 			command->task_create.linux_task = s31_linux_task_create(
 				command->task_create.entry,
@@ -1985,7 +2277,8 @@ static void s31_radio_process_commands(void)
 				command->task_create.stack_base,
 				command->task_create.arg,
 				command->task_create.priority,
-				command->task_create.cookie);
+				command->task_create.cookie,
+				command->task_create.core_id);
 			command->result = command->task_create.linux_task ? 0 : -ENOMEM;
 			break;
 		default:
@@ -2002,12 +2295,13 @@ static void s31_radio_process_commands(void)
  * on-stack completion on that payload stack, and the freshly forked kthread
  * can complete it from the secondary hart before kthread_bind() runs.  Queue
  * the request to the radio worker instead; the worker creates the kthread on
- * its normal kernel stack, binds it to hart0, and then completes this
+ * its normal kernel stack, preserves IDF's requested HP-core affinity, and
+ * then completes this
  * normal-memory command object.
  */
 void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
 				     u32 stack_size, void *stack_base,
-				     void *arg, u32 priority, void *cookie)
+				     void *arg, u32 priority, void *cookie, s32 core_id)
 {
 	struct s31_radio_command *command;
 	void *linux_task;
@@ -2025,6 +2319,7 @@ void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
 	command->task_create.arg = arg;
 	command->task_create.priority = priority;
 	command->task_create.cookie = cookie;
+	command->task_create.core_id = core_id;
 
 	spin_lock(&s31_radio_command_lock);
 	list_add_tail(&command->node, &s31_radio_commands);
@@ -2079,7 +2374,7 @@ int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
 	unsigned long flags;
 	int ret = 0;
 
-	if (!ops || !ops->receive)
+	if (!ops || (!ops->receive && !ops->rx_ready))
 		return -EINVAL;
 	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
 		return -EAGAIN;
@@ -2124,9 +2419,8 @@ int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
 	spin_lock_irqsave(&s31_hci_lock, flags);
 	next = (s31_hci_tx_head + 1) % S31_HCI_TX_SLOTS;
 	if (next == s31_hci_tx_tail) {
-		atomic_inc(&s31_hci_tx_dropped);
 		spin_unlock_irqrestore(&s31_hci_lock, flags);
-		return -ENOSPC;
+		return -EAGAIN;
 	}
 	frame = &((struct s31_hci_frame *)
 		  s31_radio_sram_linux_alias(s31_hci_tx))[s31_hci_tx_head];
@@ -2135,10 +2429,105 @@ int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
 	frame->length = length + 1;
 	smp_store_release(&s31_hci_tx_head, next);
 	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	if (packet_type == HCI_ACLDATA_PKT) {
+		atomic64_inc(&s31_hci_acl_tx_packets);
+		atomic64_add(length, &s31_hci_acl_tx_bytes);
+	} else if (packet_type == HCI_COMMAND_PKT && length >= 6 &&
+		   data[0] == 0x82 && data[1] == 0xfc && data[2] == 3 &&
+		   data[3] == 2) {
+		WRITE_ONCE(s31_coex_pending_op, data[4]);
+		WRITE_ONCE(s31_coex_pending_status, data[5]);
+	}
 	wake_up(&s31_radio_waitq);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_hci_send);
+
+bool esp32s31_radio_hci_tx_has_space(void)
+{
+	unsigned int head = smp_load_acquire(&s31_hci_tx_head);
+	unsigned int tail = READ_ONCE(s31_hci_tx_tail);
+
+	return (head + 1) % S31_HCI_TX_SLOTS != tail;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_tx_has_space);
+
+bool esp32s31_radio_hci_rx_pending(void)
+{
+	return smp_load_acquire(&s31_hci_rx_head) != READ_ONCE(s31_hci_rx_tail);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_rx_pending);
+
+int esp32s31_radio_hci_peek(const u8 **data, size_t *length)
+{
+	struct s31_hci_frame *frame;
+	unsigned int tail;
+	u16 frame_length;
+
+	if (!data || !length)
+		return -EINVAL;
+	tail = READ_ONCE(s31_hci_rx_tail);
+	if (tail == smp_load_acquire(&s31_hci_rx_head))
+		return -ENODATA;
+	frame = &((struct s31_hci_frame *)
+		  s31_radio_sram_linux_alias(s31_hci_rx))[tail];
+	frame_length = READ_ONCE(frame->length);
+	if (!frame_length || frame_length > S31_HCI_FRAME_SIZE)
+		return -EIO;
+	*data = frame->data;
+	*length = frame_length;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_peek);
+
+void esp32s31_radio_hci_consume(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	if (s31_hci_rx_tail != smp_load_acquire(&s31_hci_rx_head))
+		smp_store_release(&s31_hci_rx_tail,
+				  (s31_hci_rx_tail + 1) % S31_HCI_RX_SLOTS);
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_consume);
+
+int esp32s31_radio_hci_dequeue(u8 *data, size_t capacity)
+{
+	struct s31_hci_frame *frame;
+	unsigned long flags;
+	u16 length;
+
+	if (!data)
+		return -EINVAL;
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	if (s31_hci_rx_tail == smp_load_acquire(&s31_hci_rx_head)) {
+		spin_unlock_irqrestore(&s31_hci_lock, flags);
+		return -ENODATA;
+	}
+	frame = &((struct s31_hci_frame *)
+		  s31_radio_sram_linux_alias(s31_hci_rx))[s31_hci_rx_tail];
+	length = READ_ONCE(frame->length);
+	if (length > capacity) {
+		spin_unlock_irqrestore(&s31_hci_lock, flags);
+		return -EMSGSIZE;
+	}
+	memcpy(data, frame->data, length);
+	s31_hci_rx_tail = (s31_hci_rx_tail + 1) % S31_HCI_RX_SLOTS;
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+	return length;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_dequeue);
+
+void esp32s31_radio_hci_purge(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s31_hci_lock, flags);
+	s31_hci_rx_tail = s31_hci_rx_head;
+	spin_unlock_irqrestore(&s31_hci_lock, flags);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_purge);
 
 int esp32s31_radio_wifi_register(const struct esp32s31_radio_wifi_ops *ops,
 				 void *context)
@@ -2154,6 +2543,18 @@ int esp32s31_radio_wifi_register(const struct esp32s31_radio_wifi_ops *ops,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_register);
+
+void esp32s31_radio_wifi_unregister(const struct esp32s31_radio_wifi_ops *ops,
+				    void *context)
+{
+	if (READ_ONCE(s31_wifi_ops) == ops &&
+	    READ_ONCE(s31_wifi_context) == context) {
+		WRITE_ONCE(s31_wifi_ops, NULL);
+		WRITE_ONCE(s31_wifi_context, NULL);
+		synchronize_net();
+	}
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_unregister);
 
 int esp32s31_radio_wifi_get_mac(u8 mac[6])
 {
@@ -2241,7 +2642,7 @@ EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_disconnect);
 
 int esp32s31_radio_bt_enable(void)
 {
-#ifndef CONFIG_BT_ESP32S31
+#if !IS_ENABLED(CONFIG_BT_ESP32S31)
 	return -EOPNOTSUPP;
 #else
 	struct s31_radio_command command;
@@ -2271,7 +2672,7 @@ EXPORT_SYMBOL_GPL(esp32s31_radio_bt_enable);
 
 int esp32s31_radio_bt_disable(void)
 {
-#ifndef CONFIG_BT_ESP32S31
+#if !IS_ENABLED(CONFIG_BT_ESP32S31)
 	return -EOPNOTSUPP;
 #else
 	struct s31_radio_command command;
@@ -2301,13 +2702,16 @@ int esp32s31_radio_bt_disable(void)
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_bt_disable);
 
-int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
+int esp32s31_radio_wifi_send_interface(u8 interface, const u8 *frame, size_t length)
 {
 	unsigned long flags;
 	unsigned int next;
 	u8 kind;
 
-	if (!frame || length < ETH_HLEN || length > S31_WIFI_FRAME_SIZE)
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY || !s31_wifi_tx)
+		return -ENODEV;
+	if (interface > S31_WIFI_IF_AP || !frame || length < ETH_HLEN ||
+	    length > S31_WIFI_FRAME_SIZE)
 		return -EINVAL;
 	kind = s31_radio_tx_kind(frame, length);
 	spin_lock_irqsave(&s31_wifi_tx_lock, flags);
@@ -2321,7 +2725,9 @@ int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
 			s31_radio_sram_linux_alias(s31_wifi_tx))[s31_wifi_tx_head];
 
 		slot->length = length;
-		slot->enqueue_ns = ktime_get_mono_fast_ns();
+		slot->interface = interface;
+		slot->enqueue_ns = READ_ONCE(s31_radio_timing_enabled) ?
+			ktime_get_mono_fast_ns() : 0;
 		memcpy(slot->data, frame, length);
 	}
 	smp_store_release(&s31_wifi_tx_head, next);
@@ -2341,7 +2747,74 @@ int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_send_interface);
+
+int esp32s31_radio_wifi_send(const u8 *frame, size_t length)
+{
+	return esp32s31_radio_wifi_send_interface(S31_WIFI_IF_STA, frame, length);
+}
 EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_send);
+
+void s31_radio_wifi_control_complete(int result)
+{
+	WRITE_ONCE(s31_wifi_control_result, result ? -EIO : 0);
+	complete(&s31_wifi_control_done);
+}
+
+void s31_radio_wifi_receive_aux(u8 interface, const u8 *frame, u16 length,
+			      u8 channel, s8 signal)
+{
+	const struct esp32s31_radio_wifi_ops *ops = READ_ONCE(s31_wifi_ops);
+
+	if (ops && ops->receive_aux)
+		ops->receive_aux(s31_wifi_context, interface, frame, length, channel, signal);
+}
+
+void s31_radio_wifi_ap_station(const u8 *mac, bool joined)
+{
+	const struct esp32s31_radio_wifi_ops *ops = READ_ONCE(s31_wifi_ops);
+
+	if (ops && ops->ap_station)
+		ops->ap_station(s31_wifi_context, mac, joined);
+}
+
+int esp32s31_radio_wifi_control(const struct s31_wifi_control *control)
+{
+	struct s31_radio_command command = { .type = S31_RADIO_COMMAND_WIFI_CONTROL };
+	int ret;
+
+	mutex_lock(&s31_wifi_control_mutex);
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY ||
+	    !s31_wifi_control_buffer || s31_wifi_control_poisoned) {
+		ret = -ENODEV;
+		goto out;
+	}
+	memcpy(s31_radio_sram_linux_alias(s31_wifi_control_buffer), control, sizeof(*control));
+	reinit_completion(&s31_wifi_control_done);
+	INIT_LIST_HEAD(&command.node);
+	init_completion(&command.done);
+	spin_lock(&s31_radio_command_lock);
+	list_add_tail(&command.node, &s31_radio_commands);
+	spin_unlock(&s31_radio_command_lock);
+	wake_up(&s31_radio_waitq);
+	wait_for_completion(&command.done);
+	ret = command.result;
+	if (!ret && !wait_for_completion_timeout(&s31_wifi_control_done, 5 * HZ)) {
+		/* The task may still reference the SRAM request.  Never overwrite
+		 * it after timeout; teardown owns its eventual reclamation. */
+		s31_wifi_control_poisoned = true;
+		ret = -ETIMEDOUT;
+	} else if (!ret) {
+		ret = READ_ONCE(s31_wifi_control_result);
+	}
+	if (!s31_wifi_control_poisoned)
+		memzero_explicit(s31_radio_sram_linux_alias(s31_wifi_control_buffer),
+				 sizeof(*control));
+out:
+	mutex_unlock(&s31_wifi_control_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_control);
 
 bool esp32s31_radio_wifi_tx_has_space(void)
 {
@@ -2360,35 +2833,65 @@ EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_tx_has_space);
 struct s31_radio_blob_pass_args {
 	int tick_events;
 	u64 worker_start_ns;
+	u32 timer_wait_us;
+	bool rt_wake_armed;
 };
 
 static void s31_radio_run_blob_pass(void *opaque)
 {
 	struct s31_radio_blob_pass_args *args = opaque;
 	struct sched_param rt_param = { .sched_priority = 90 };
-	struct sched_param cfs_param = { };
 	int tick_events = args->tick_events;
 	bool irq_pass = s31_radio_irq_callback_pending();
-	u64 gate_end_ns;
+	u64 gate_end_ns, phase_ns, phase_end_ns;
 	int i;
 
 	/* Match the native ordering only for interrupt service.  A permanent FIFO
 	 * worker can stay runnable on periodic/tick work and starve Linux; a CFS
 	 * worker can miss BLE LLL deadlines under a pinned CoreMark. */
-	if (irq_pass)
-		sched_setscheduler_nocheck(current, SCHED_FIFO, &rt_param);
-	args->worker_start_ns = ktime_get_mono_fast_ns();
+	if (irq_pass && !args->rt_wake_armed)
+		esp32s31_sched_setscheduler(current, SCHED_FIFO,
+					   rt_param.sched_priority);
+	args->worker_start_ns = READ_ONCE(s31_radio_timing_enabled) ?
+		ktime_get_mono_fast_ns() : 0;
 	s31_linux_blob_enter();
-	gate_end_ns = ktime_get_mono_fast_ns();
-	if (gate_end_ns >= args->worker_start_ns) {
+	gate_end_ns = READ_ONCE(s31_radio_timing_enabled) ?
+		ktime_get_mono_fast_ns() : 0;
+	if (args->worker_start_ns && gate_end_ns >= args->worker_start_ns) {
 		s31_timing_add(gate_end_ns - args->worker_start_ns,
 			       &s31_timing.worker_gate_total_ns,
 			       &s31_timing.worker_gate_max_ns);
 		s31_timing.gate_samples++;
 	}
-	while (tick_events-- > 0)
+	/* Linux jiffies is the task tick, and the local esp_timer shim compares
+	 * absolute monotonic deadlines and advances missed periodic deadlines in a
+	 * single scan.  Repeating that scan for every elapsed 10 ms slice cannot
+	 * dispatch additional callbacks; it only walks the same timer list again. */
+	/* The IDF coexist scheduler uses roughly 1 ms esp_timer periods, while the
+	 * compatibility RTOS clock intentionally stays at HZ=100.  In a combo
+	 * profile the radio IRQ/HCI activity already wakes this serialized worker
+	 * several times per RTOS tick; poll absolute esp_timer deadlines on those
+	 * passes as well so a BT phase cannot occupy an entire 10 ms Linux tick.
+	 * s31_rtos_tick() does not advance time in S-mode -- it only dispatches due
+	 * monotonic timers -- so this preserves xTaskGetTickCount semantics. */
+	if (tick_events > 0 ||
+	    (s31_radio_features & (S31_RADIO_FEATURE_WIFI |
+				    S31_RADIO_FEATURE_BLUETOOTH)) ==
+	    (S31_RADIO_FEATURE_WIFI | S31_RADIO_FEATURE_BLUETOOTH)) {
+		phase_ns = args->worker_start_ns ? ktime_get_mono_fast_ns() : 0;
 		s31_rtos_tick();
-	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
+		if (phase_ns) {
+			phase_end_ns = ktime_get_mono_fast_ns();
+			s31_timing.timer_tick_total_ns += phase_end_ns - phase_ns;
+			s31_timing.timer_tick_samples++;
+		}
+	}
+	args->timer_wait_us = s31_linux_timer_next_due_us();
+	if (args->worker_start_ns && args->timer_wait_us <= 1)
+		s31_timing.timer_due_immediate++;
+	if (irq_pass)
+		atomic_set(&s31_radio_pending_isrs, 0);
+	for (i = 0; irq_pass && i < S31_RADIO_IRQ_SLOTS; i++) {
 		struct s31_idf_irq_registration *registration = &s31_idf_irqs[i];
 		u64 worker_ns, entered_ns, handler_end_ns;
 
@@ -2396,29 +2899,51 @@ static void s31_radio_run_blob_pass(void *opaque)
 		    !atomic_xchg(&registration->callback_pending, 0))
 			continue;
 		worker_ns = args->worker_start_ns;
-		if (worker_ns >= registration->pending_since_ns) {
+		if (worker_ns && worker_ns >= registration->pending_since_ns) {
 			s31_timing_add(worker_ns - registration->pending_since_ns,
 				       &s31_timing.irq_to_worker_total_ns,
 				       &s31_timing.irq_to_worker_max_ns);
 			s31_timing.irq_samples++;
 		}
-		entered_ns = ktime_get_mono_fast_ns();
+		entered_ns = worker_ns ? ktime_get_mono_fast_ns() : 0;
 		s31_rtos_isr_depth++;
 		registration->handler(registration->arg);
 		s31_rtos_isr_depth--;
-		handler_end_ns = ktime_get_mono_fast_ns();
-		s31_timing_add(handler_end_ns - entered_ns,
-			       &s31_timing.isr_total_ns, &s31_timing.isr_max_ns);
-		s31_timing.isr_samples++;
-		WRITE_ONCE(s31_timing.last_isr_end_ns, handler_end_ns);
-		atomic_inc(&registration->callback_count);
+		if (entered_ns) {
+			handler_end_ns = ktime_get_mono_fast_ns();
+			s31_timing_add(handler_end_ns - entered_ns,
+				       &s31_timing.isr_total_ns,
+				       &s31_timing.isr_max_ns);
+			s31_timing.isr_samples++;
+			WRITE_ONCE(s31_timing.last_isr_end_ns,
+				   handler_end_ns);
+		}
+		if (READ_ONCE(s31_radio_timing_enabled))
+			atomic_inc(&registration->callback_count);
 	}
+	phase_ns = args->worker_start_ns ? ktime_get_mono_fast_ns() : 0;
 	s31_radio_hci_process_tx();
+	if (phase_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.hci_tx_total_ns += phase_end_ns - phase_ns;
+		s31_timing.hci_tx_samples++;
+	}
+	phase_ns = args->worker_start_ns ? ktime_get_mono_fast_ns() : 0;
 	s31_radio_wifi_process_tx();
+	if (phase_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.wifi_tx_total_ns += phase_end_ns - phase_ns;
+		s31_timing.wifi_tx_samples++;
+	}
 	atomic_inc(&s31_radio_worker_passes);
+	if (args->worker_start_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.blob_pass_total_ns += phase_end_ns - gate_end_ns;
+		s31_timing.blob_pass_samples++;
+	}
 	s31_linux_blob_leave();
-	if (irq_pass) {
-		sched_setscheduler_nocheck(current, SCHED_NORMAL, &cfs_param);
+	if (irq_pass || args->rt_wake_armed) {
+		esp32s31_sched_setscheduler(current, SCHED_NORMAL, 0);
 		set_user_nice(current, S31_RADIO_WORKER_NICE);
 	}
 	/*
@@ -2432,11 +2957,17 @@ static void s31_radio_run_blob_pass(void *opaque)
 	cond_resched();
 }
 
-static int s31_radio_run_linux_pass(void)
+static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed)
 {
 	struct s31_radio_blob_pass_args args = {
 		.tick_events = atomic_xchg(&s31_tick_pending, 0),
+		.timer_wait_us = 10000,
+		.rt_wake_armed = rt_wake_armed,
 	};
+	u64 pass_start_ns, phase_start_ns, phase_end_ns;
+
+	pass_start_ns = READ_ONCE(s31_radio_timing_enabled) ?
+		ktime_get_mono_fast_ns() : 0;
 
 	/*
 	 * Drain the RX rings before acquiring the blob gate.  These only touch
@@ -2446,9 +2977,19 @@ static int s31_radio_run_linux_pass(void)
 	 * worker, instead of waiting for the worker to win the blob gate behind
 	 * a Wi-Fi task that can hold it for an entire AMPDU batch.
 	 */
+	phase_start_ns = pass_start_ns ? ktime_get_mono_fast_ns() : 0;
 	s31_radio_hci_deliver_rx();
+	if (phase_start_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.hci_rx_total_ns += phase_end_ns - phase_start_ns;
+	}
+	phase_start_ns = pass_start_ns ? ktime_get_mono_fast_ns() : 0;
 	s31_radio_wifi_deliver_scan();
 	s31_radio_wifi_deliver_control_events();
+	if (phase_start_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.wifi_event_total_ns += phase_end_ns - phase_start_ns;
+	}
 
 	/*
 	 * Command processing creates kthreads through kthread_create().  It
@@ -2456,7 +2997,12 @@ static int s31_radio_run_linux_pass(void)
 	 * requests, before the worker blocks on the blob gate: the compat task
 	 * that queued the request may itself be the gate holder.
 	 */
+	phase_start_ns = pass_start_ns ? ktime_get_mono_fast_ns() : 0;
 	s31_radio_process_commands();
+	if (phase_start_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.command_total_ns += phase_end_ns - phase_start_ns;
+	}
 
 	if (s31_radio_worker_stack)
 		s31_linux_call_on_stack(s31_radio_worker_stack,
@@ -2464,6 +3010,7 @@ static int s31_radio_run_linux_pass(void)
 					s31_radio_run_blob_pass, &args);
 	else
 		s31_radio_run_blob_pass(&args);
+	*timer_wait_us = args.timer_wait_us;
 
 	/*
 	 * The blob pass may have drained the TX ring.  If the net queue was
@@ -2471,9 +3018,16 @@ static int s31_radio_run_linux_pass(void)
 	 * space is available again.  netif_wake_queue() is a no-op when the
 	 * queue is already running, so this is cheap in the common case.
 	 */
+	phase_start_ns = pass_start_ns ? ktime_get_mono_fast_ns() : 0;
 	if (s31_wifi_ops && s31_wifi_ops->tx_wakeup &&
 	    (s31_wifi_tx_head + 1) % S31_WIFI_TX_SLOTS != s31_wifi_tx_tail)
 		s31_wifi_ops->tx_wakeup(s31_wifi_context);
+	if (phase_start_ns) {
+		phase_end_ns = ktime_get_mono_fast_ns();
+		s31_timing.tx_wakeup_total_ns += phase_end_ns - phase_start_ns;
+		s31_timing.linux_pass_total_ns += phase_end_ns - pass_start_ns;
+		s31_timing.linux_pass_samples++;
+	}
 
 	return 0;
 }
@@ -2531,12 +3085,20 @@ static int s31_radio_runtime_thread(void *unused)
 	struct sched_param param = { };
 	void __iomem *rom;
 	unsigned long next_tick;
-	/* 10 ms RTOS tick (CONFIG_HZ=100) for esp_timer/xTaskDelay. */
-	const unsigned long tick_period = max_t(unsigned long, 1,
-						 msecs_to_jiffies(10));
+	/* Keep the native 10 ms cadence through controller initialization.  During
+	 * BT-only runtime, account the same RTOS ticks in 40 ms batches: controller
+	 * IRQs still run directly, while the Linux HCI bridge avoids one wakeup per
+	 * media packet. */
+	const unsigned long init_tick_period = max_t(unsigned long, 1,
+						      msecs_to_jiffies(10));
+	const unsigned long bt_tick_period = max_t(unsigned long, 1,
+						    msecs_to_jiffies(40));
+	unsigned long tick_period = init_tick_period;
 	bool hw_tick;
 	u32 identity_word, ioremap_word;
 	unsigned int cpu_mhz;
+	u32 timer_wait_us = 10000;
+	bool rt_wake_armed = false;
 	int ret;
 
 	pr_info("esp32s31-radio: worker entered\n");
@@ -2544,10 +3106,10 @@ static int s31_radio_runtime_thread(void *unused)
 	 * direct path.  Keep it in ordinary CFS so the closed Wi-Fi task can still
 	 * run, with enough weight to service a freshly queued ACK promptly without
 	 * starving that task under sustained receive load. */
-	sched_setscheduler_nocheck(current, SCHED_NORMAL, &param);
+	esp32s31_sched_setscheduler(current, SCHED_NORMAL, 0);
 	set_user_nice(current, S31_RADIO_WORKER_NICE);
 	/* Low identity mappings intentionally exist only in init_mm. */
-	kthread_use_mm(&init_mm);
+	esp32s31_kthread_use_init_mm();
 	pr_info("esp32s31-radio: init_mm active\n");
 
 	rom = ioremap(S31_ROM_BASE, PAGE_SIZE);
@@ -2581,8 +3143,11 @@ static int s31_radio_runtime_thread(void *unused)
 	pr_info("esp32s31-radio: using Linux jiffies tick\n");
 	pr_info("esp32s31-radio: initializing compatibility RTOS\n");
 	s31_rtos_init();
+	pr_info("esp32s31-radio: compatibility RTOS base initialized\n");
+	pr_info("esp32s31-radio: creating radio-init compatibility task\n");
 	if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
-				    NULL, 24, NULL, 0) != 1) {
+				    (void *)(uintptr_t)s31_radio_features,
+				    24, NULL, 0) != 1) {
 		pr_err("esp32s31-radio: cannot create IDF init task\n");
 		goto failed;
 	}
@@ -2615,6 +3180,22 @@ static int s31_radio_runtime_thread(void *unused)
 		}
 		if (kthread_should_stop())
 			break;
+		/* The 40 ms tick batch is a BT-only power/CPU optimization.  In a
+		 * Wi-Fi+BT combo it violates the IDF 100 Hz FreeRTOS cadence used by
+		 * libcoexist and lets its Wi-Fi request/release callbacks slip by up to
+		 * 30 ms.  Keep the native 10 ms cadence whenever Wi-Fi is attached. */
+		if ((s31_radio_features & (S31_RADIO_FEATURE_WIFI |
+					  S31_RADIO_FEATURE_BLUETOOTH)) ==
+		    S31_RADIO_FEATURE_BLUETOOTH &&
+		    s31_radio_bt_batching_active()) {
+			if (tick_period != bt_tick_period) {
+				tick_period = bt_tick_period;
+				next_tick = jiffies + tick_period;
+			}
+		} else if (tick_period != init_tick_period) {
+			tick_period = init_tick_period;
+			next_tick = jiffies + tick_period;
+		}
 		if (!hw_tick && time_after_eq(jiffies, next_tick)) {
 			unsigned long elapsed = jiffies - next_tick;
 			unsigned long ticks = elapsed / tick_period + 1;
@@ -2622,7 +3203,8 @@ static int s31_radio_runtime_thread(void *unused)
 			atomic_add(ticks, &s31_tick_pending);
 			next_tick += ticks * tick_period;
 		}
-		ret = s31_radio_run_linux_pass();
+		ret = s31_radio_run_linux_pass(&timer_wait_us, rt_wake_armed);
+		rt_wake_armed = false;
 		if (ret) {
 			pr_err("esp32s31-radio: serialized blob pass failed: %d\n", ret);
 			goto failed;
@@ -2634,15 +3216,40 @@ static int s31_radio_runtime_thread(void *unused)
 		 * a runnable compatibility task immediately and to ordinary Linux work
 		 * whenever the CFS slice expires. */
 		cond_resched();
-		wait_event_interruptible_timeout(s31_radio_waitq,
-			kthread_should_stop() ||
-			atomic_read(&s31_tick_pending) ||
-			s31_radio_irq_work_pending() ||
-			s31_radio_command_work_pending() ||
+		/* Sleep until the next IDF esp_timer deadline.  The compatibility
+		 * timer bridge uses the same absolute monotonic deadlines as IDF, so
+		 * this avoids both the old fixed 1 ms polling jitter and unnecessary
+		 * idle wakeups.  IRQ, command and TX work still wake the worker early.
+		 */
+		if ((s31_radio_features & (S31_RADIO_FEATURE_WIFI |
+					    S31_RADIO_FEATURE_BLUETOOTH)) ==
+		    (S31_RADIO_FEATURE_WIFI | S31_RADIO_FEATURE_BLUETOOTH) &&
+		    READ_ONCE(s31_bt_enable_result) == 0) {
+			if (READ_ONCE(s31_radio_rt_wake)) {
+				esp32s31_sched_setscheduler(current, SCHED_FIFO, 70);
+				rt_wake_armed = true;
+			}
+			wait_event_interruptible_hrtimeout(s31_radio_waitq,
+				kthread_should_stop() ||
+				atomic_read(&s31_tick_pending) ||
+				s31_radio_irq_work_pending() ||
+				s31_radio_command_work_pending() ||
+				s31_radio_hci_rx_pending() ||
 				s31_radio_hci_tx_pending() ||
-			s31_radio_wifi_tx_pending(),
-			time_before(jiffies, next_tick) ?
-				next_tick - jiffies : 1);
+				s31_radio_wifi_tx_pending(),
+				us_to_ktime(clamp_t(u32, timer_wait_us, 50, 10000)));
+		} else {
+			wait_event_interruptible_timeout(s31_radio_waitq,
+				kthread_should_stop() ||
+				atomic_read(&s31_tick_pending) ||
+				s31_radio_irq_work_pending() ||
+				s31_radio_command_work_pending() ||
+				s31_radio_hci_rx_pending() ||
+				s31_radio_hci_tx_pending() ||
+				s31_radio_wifi_tx_pending(),
+				time_before(jiffies, next_tick) ?
+					next_tick - jiffies : 1);
+		}
 		/* next_tick is advanced in the fallback branch above. */
 	}
 	pr_info("esp32s31-radio: scheduler worker stopped\n");
@@ -2656,11 +3263,11 @@ out:
 	#ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	WRITE_ONCE(s31_radio_worker, NULL);
 	#endif
-	kthread_unuse_mm(&init_mm);
+	esp32s31_kthread_unuse_init_mm();
 	return 0;
 }
 
-static int __init s31_radio_runtime_init(void)
+int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 {
 	struct task_struct *task;
 	int ret;
@@ -2671,8 +3278,33 @@ static int __init s31_radio_runtime_init(void)
 	}
 
 	pr_info("esp32s31-radio: late init entered\n");
+	/* Reload within one module lifetime must not reuse indices or pending
+	 * events referencing the previous payload heap.  Frontends are detached. */
+	s31_hci_rx_head = s31_hci_rx_tail = 0;
+	s31_hci_tx_head = s31_hci_tx_tail = 0;
+	s31_wifi_rx_head = s31_wifi_rx_tail = 0;
+	s31_wifi_tx_head = s31_wifi_tx_tail = 0;
+	s31_wifi_tx_retry_at = 0;
+	s31_wifi_scan_inflight = s31_wifi_scan_ready = false;
+	s31_wifi_connected_ready = s31_wifi_disconnected_ready = false;
+	s31_wifi_control_poisoned = false;
+	atomic_set(&s31_wifi_rx_direct_pending, 0);
+	atomic_set(&s31_tick_pending, 0);
+	WRITE_ONCE(s31_bt_enable_result, -EINPROGRESS);
+	WRITE_ONCE(s31_bt_disable_result, -EINPROGRESS);
+	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
+	s31_radio_features = (enable_wifi ? S31_RADIO_FEATURE_WIFI : 0) |
+		(enable_bt ? S31_RADIO_FEATURE_BLUETOOTH : 0);
+	WRITE_ONCE(s31_wifi_init_result, enable_wifi ? -EINPROGRESS : 0);
+	WRITE_ONCE(s31_bt_init_result, enable_bt ? -EINPROGRESS : 0);
 
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	#ifdef MODULE
+	/* A loadable radio bundle cannot use the vmlinux XIP linker script.  Its
+	 * compatibility objects are relocated by the module loader, while the
+	 * controller heap still uses loader-reserved, cache-independent SRAM. */
+	s31_radio_heap_base = S31_RADIO_HEAP_BASE;
+	#else
 	/* These sections have an XIP load image but execute/read from HP SRAM.
 	 * Linux's generic data copier does not cover the custom low VMA. */
 	memcpy(__s31_radio_data_start, __s31_radio_data_load,
@@ -2680,6 +3312,7 @@ static int __init s31_radio_runtime_init(void)
 	memset(__s31_radio_bss_start, 0,
 	       __s31_radio_bss_end - __s31_radio_bss_start);
 	s31_radio_heap_base = ALIGN((unsigned long)__s31_radio_static_end, 64);
+	#endif
 	if (s31_radio_heap_base >= S31_RADIO_HEAP_END)
 		return -ENOMEM;
 	s31_radio_heap_size = S31_RADIO_HEAP_END - s31_radio_heap_base;
@@ -2697,8 +3330,8 @@ static int __init s31_radio_runtime_init(void)
 		pr_warn("esp32s31-radio: cannot map heap2 chunk\n");
 	s31_radio_heap_pool = gen_pool_create(4, -1);
 	if (!s31_radio_heap_pool) {
-		memunmap(s31_radio_heap_linux);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto unmap_heaps;
 	}
 	/* Wi-Fi esf_bufs (~1848 bytes), BT controller objects and small RTOS
 	 * bridge allocations have very different lifetimes.  First-fit leaves
@@ -2710,30 +3343,46 @@ static int __init s31_radio_runtime_init(void)
 			   s31_radio_heap_size, -1);
 	if (ret) {
 		gen_pool_destroy(s31_radio_heap_pool);
-		memunmap(s31_radio_heap_linux);
-		return ret;
+		s31_radio_heap_pool = NULL;
+		goto unmap_heaps;
 	}
+	#ifndef MODULE
 	pr_info("esp32s31-radio: internal static data %#lx..%#lx, bss %#lx..%#lx\n",
 		(unsigned long)__s31_radio_data_start,
 		(unsigned long)__s31_radio_data_end,
 		(unsigned long)__s31_radio_bss_start,
 		(unsigned long)__s31_radio_bss_end);
+	#else
+	pr_info("esp32s31-radio: module data relocated by the Linux loader\n");
+	#endif
 	pr_info("esp32s31-radio: private SRAM heap %#lx..%#lx (%zu bytes)\n",
 		s31_radio_heap_base, S31_RADIO_HEAP_END, s31_radio_heap_size);
 
 	/* These rings are accessed from callbacks executing inside the blob gate.
 	 * Keep both sides in the same internal-SRAM ownership domain as the blob. */
-	s31_hci_rx = s31_radio_sram_alloc(sizeof(*s31_hci_rx) * S31_HCI_RX_SLOTS);
-	s31_hci_tx = s31_radio_sram_alloc(sizeof(*s31_hci_tx) * S31_HCI_TX_SLOTS);
-	s31_wifi_rx = s31_radio_sram_alloc(sizeof(*s31_wifi_rx) * S31_WIFI_RX_SLOTS);
-	s31_wifi_rx_data = s31_radio_sram_alloc(S31_WIFI_RX_SLOTS *
-						 S31_WIFI_FRAME_SIZE);
-	s31_wifi_tx = s31_radio_sram_alloc(sizeof(*s31_wifi_tx) * S31_WIFI_TX_SLOTS);
-	s31_wifi_connect_params = s31_radio_sram_alloc(sizeof(*s31_wifi_connect_params));
-	s31_wifi_disconnect_reason = s31_radio_sram_alloc(sizeof(*s31_wifi_disconnect_reason));
-	if (!s31_hci_rx || !s31_hci_tx || !s31_wifi_rx || !s31_wifi_rx_data ||
-	    !s31_wifi_tx ||
-	    !s31_wifi_connect_params || !s31_wifi_disconnect_reason) {
+	if (enable_bt) {
+		s31_hci_rx = s31_radio_sram_alloc(sizeof(*s31_hci_rx) *
+						 S31_HCI_RX_SLOTS);
+		s31_hci_tx = s31_radio_sram_alloc(sizeof(*s31_hci_tx) *
+						 S31_HCI_TX_SLOTS);
+	}
+	if (enable_wifi) {
+		s31_wifi_rx = s31_radio_sram_alloc(sizeof(*s31_wifi_rx) *
+						  S31_WIFI_RX_SLOTS);
+		s31_wifi_rx_data = s31_radio_sram_alloc(S31_WIFI_RX_SLOTS *
+							 S31_WIFI_FRAME_SIZE);
+		s31_wifi_tx = s31_radio_sram_alloc(sizeof(*s31_wifi_tx) *
+						  S31_WIFI_TX_SLOTS);
+		s31_wifi_connect_params =
+			s31_radio_sram_alloc(sizeof(*s31_wifi_connect_params));
+		s31_wifi_disconnect_reason =
+			s31_radio_sram_alloc(sizeof(*s31_wifi_disconnect_reason));
+		s31_wifi_control_buffer = s31_radio_sram_alloc(sizeof(*s31_wifi_control_buffer));
+	}
+	if ((enable_bt && (!s31_hci_rx || !s31_hci_tx)) ||
+	    (enable_wifi && (!s31_wifi_rx || !s31_wifi_rx_data ||
+			     !s31_wifi_tx || !s31_wifi_connect_params ||
+			     !s31_wifi_disconnect_reason || !s31_wifi_control_buffer))) {
 		pr_err("esp32s31-radio: cannot allocate blob buffers in SRAM\n");
 		ret = -ENOMEM;
 		goto free_rings;
@@ -2793,6 +3442,12 @@ static int __init s31_radio_runtime_init(void)
 
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 free_rings:
+	s31_radio_sram_free(s31_wifi_connect_params);
+	s31_radio_sram_free(s31_wifi_disconnect_reason);
+	s31_radio_sram_free(s31_wifi_control_buffer);
+	s31_wifi_connect_params = NULL;
+	s31_wifi_disconnect_reason = NULL;
+	s31_wifi_control_buffer = NULL;
 	s31_radio_sram_free(s31_wifi_rx_data);
 	s31_radio_sram_free(s31_wifi_tx);
 	s31_radio_sram_free(s31_wifi_rx);
@@ -2804,11 +3459,131 @@ free_rings:
 	s31_hci_tx = NULL;
 	s31_hci_rx = NULL;
 	gen_pool_destroy(s31_radio_heap_pool);
+	s31_radio_heap_pool = NULL;
+unmap_heaps:
+	if (s31_radio_heap2_linux) {
+		memunmap(s31_radio_heap2_linux);
+		s31_radio_heap2_linux = NULL;
+	}
+	if (s31_radio_heap_low_linux) {
+		memunmap(s31_radio_heap_low_linux);
+		s31_radio_heap_low_linux = NULL;
+	}
 	memunmap(s31_radio_heap_linux);
+	s31_radio_heap_linux = NULL;
 	return ret;
 #else
 free_rings:
 	return ret;
 #endif
 }
-late_initcall(s31_radio_runtime_init);
+
+int s31_radio_runtime_wait_ready(void)
+{
+	unsigned long timeout = jiffies + 10 * HZ;
+
+	do {
+		int state = atomic_read(&s31_radio_state);
+		int bt = READ_ONCE(s31_bt_init_result);
+
+		if (state == ESP32S31_RADIO_FAILED ||
+		    (bt != -EINPROGRESS && bt))
+			return -EIO;
+		if (state == ESP32S31_RADIO_READY && !bt)
+			return 0;
+		msleep(20);
+	} while (time_before(jiffies, timeout));
+	return -ETIMEDOUT;
+}
+
+int s31_radio_runtime_shutdown(void)
+{
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	struct s31_radio_command shutdown;
+	struct task_struct *worker;
+	int shutdown_ret = 0;
+	int i;
+
+	if (READ_ONCE(s31_radio_worker) &&
+	    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
+		reinit_completion(&s31_shutdown_done);
+		WRITE_ONCE(s31_shutdown_result, -EINPROGRESS);
+		INIT_LIST_HEAD(&shutdown.node);
+		init_completion(&shutdown.done);
+		shutdown.type = S31_RADIO_COMMAND_SHUTDOWN;
+		shutdown.result = -EINPROGRESS;
+		spin_lock(&s31_radio_command_lock);
+		list_add_tail(&shutdown.node, &s31_radio_commands);
+		spin_unlock(&s31_radio_command_lock);
+		wake_up(&s31_radio_waitq);
+		wait_for_completion(&shutdown.done);
+		if (shutdown.result)
+			shutdown_ret = shutdown.result;
+		else if (!wait_for_completion_timeout(&s31_shutdown_done, 5 * HZ))
+			shutdown_ret = -ETIMEDOUT;
+		else
+			shutdown_ret = READ_ONCE(s31_shutdown_result);
+		if (shutdown_ret)
+			pr_warn("esp32s31-radio: payload shutdown returned %d\n",
+				shutdown_ret);
+	}
+	atomic_set(&s31_radio_state, ESP32S31_RADIO_OFFLINE);
+	s31_radio_fail_commands();
+	cancel_work_sync(&s31_radio_health_work);
+
+	/* Task teardown still needs the loaded payload and SRAM allocator. */
+	s31_linux_tasks_stop_all();
+	worker = xchg(&s31_radio_worker, NULL);
+	if (worker) {
+		wake_up_process(worker);
+		kthread_stop(worker);
+	}
+	s31_blob_gate_wait_hook = NULL;
+
+	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
+		struct s31_idf_irq_registration *registration = &s31_idf_irqs[i];
+
+		if (registration->virq) {
+			free_irq(registration->virq, registration);
+			irq_dispose_mapping(registration->virq);
+		}
+		memset(registration, 0, sizeof(*registration));
+	}
+	atomic_set(&s31_radio_pending_isrs, 0);
+
+	s31_radio_sram_free(s31_radio_worker_stack);
+	s31_radio_sram_free(s31_wifi_disconnect_reason);
+	s31_radio_sram_free(s31_wifi_control_buffer);
+	s31_wifi_control_buffer = NULL;
+	s31_radio_sram_free(s31_wifi_connect_params);
+	s31_radio_sram_free(s31_wifi_rx_data);
+	s31_radio_sram_free(s31_wifi_tx);
+	s31_radio_sram_free(s31_wifi_rx);
+	s31_radio_sram_free(s31_hci_tx);
+	s31_radio_sram_free(s31_hci_rx);
+	s31_radio_worker_stack = NULL;
+	s31_wifi_disconnect_reason = NULL;
+	s31_wifi_connect_params = NULL;
+	s31_wifi_rx_data = NULL;
+	s31_wifi_tx = NULL;
+	s31_wifi_rx = NULL;
+	s31_hci_tx = NULL;
+	s31_hci_rx = NULL;
+	s31_radio_heap_destroy();
+	if (s31_radio_heap2_linux) {
+		memunmap(s31_radio_heap2_linux);
+		s31_radio_heap2_linux = NULL;
+	}
+	if (s31_radio_heap_low_linux) {
+		memunmap(s31_radio_heap_low_linux);
+		s31_radio_heap_low_linux = NULL;
+	}
+	if (s31_radio_heap_linux) {
+		memunmap(s31_radio_heap_linux);
+		s31_radio_heap_linux = NULL;
+	}
+	return shutdown_ret;
+#else
+	return -EOPNOTSUPP;
+#endif
+}

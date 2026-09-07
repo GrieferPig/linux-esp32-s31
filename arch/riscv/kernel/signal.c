@@ -61,7 +61,7 @@ static long restore_esp32s31_ext_state(void __user *sc_ext)
 			       sizeof(current->thread.esp32s31_ext));
 	if (unlikely(err))
 		return err;
-	esp32s31_ext_restore(current);
+	current->thread.esp32s31_ext_active = false;
 	return 0;
 }
 #endif
@@ -365,6 +365,16 @@ static long setup_sigcontext(struct rt_sigframe __user *frame,
 	/* And put END __riscv_ctx_hdr at the end. */
 	err |= __put_user(END_MAGIC, &sc_ext_ptr->magic);
 	err |= __put_user(END_HDR_SIZE, &sc_ext_ptr->size);
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * A signal handler must not inherit an active control-flow loop from
+	 * the interrupted code.  The interrupted state is now in the signal
+	 * frame; start the handler with an empty extension context.  Nested
+	 * signals follow the same rule and rt_sigreturn restores each frame.
+	 */
+	if (!err)
+		esp32s31_ext_reset(current);
+#endif
 
 	return err;
 }

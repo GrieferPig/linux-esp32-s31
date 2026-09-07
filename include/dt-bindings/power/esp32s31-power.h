@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause */
+#ifndef _DT_BINDINGS_POWER_ESP32S31_POWER_H
+#define _DT_BINDINGS_POWER_ESP32S31_POWER_H
+
+#define ESP32S31_PD_TOP			0
+#define ESP32S31_PD_HPALIVE		1
+#define ESP32S31_PD_MODEMPWR		2
+#define ESP32S31_PD_HPCPU		3
+#define ESP32S31_PD_HPCNNT		4
+#define ESP32S31_PD_MODEM		5
+#define ESP32S31_PD_LP_PERI		6
+
+#define ESP32S31_PD_NR			7
+
+#endif

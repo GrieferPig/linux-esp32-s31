@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "i2c0";
+	espressif,resource-claims = "i2c0";
+};
+
+&gpio {
+	i2c0_dynamic: i2c0-dynamic-pins {
+		scl-pins {
+			espressif,route-name = "i2c0.scl";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(35, 68, 0)>,
+				 <ESP32S31_MATRIX_IN(35, 68, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+		sda-pins {
+			espressif,route-name = "i2c0.sda";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(36, 69, 0)>,
+				 <ESP32S31_MATRIX_IN(36, 69, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+};
+
+&i2c0 {
+	espressif,param-name = "clock-frequency";
+	espressif,param-values = <100000 400000 1000000>;
+	clock-frequency = <100000>;
+	pinctrl-0 = <&i2c0_dynamic>;
+	status = "okay";
+};

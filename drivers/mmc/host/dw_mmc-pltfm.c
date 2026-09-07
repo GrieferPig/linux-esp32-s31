@@ -7,6 +7,7 @@
  */
 
 #include <linux/err.h>
+#include <linux/bitfield.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/io.h>
@@ -26,6 +27,12 @@
 #define SOCFPGA_DW_MMC_CLK_PHASE_STEP	45
 #define SYSMGR_SDMMC_CTRL_SET(smplsel, drvsel, reg_shift) \
 	((((smplsel) & 0x7) << reg_shift) | (((drvsel) & 0x7) << 0))
+
+#define ESP32S31_SDMMC_DLL_CLK_CONF	0x808
+#define ESP32S31_SDMMC_DLL_CLK_EN	GENMASK(2, 0)
+#define ESP32S31_SDMMC_SAMPLE_PHASE	GENMASK(20, 15)
+#define ESP32S31_SDMMC_TAPS		64
+#define ESP32S31_SDMMC_ALL_INT_CLR	0x1ffff
 
 int dw_mci_pltfm_register(struct platform_device *pdev,
 			  const struct dw_mci_drv_data *drv_data)
@@ -70,20 +77,79 @@ EXPORT_SYMBOL_GPL(dw_mci_pltfm_pmops);
 static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
 {
 	u32 slot_id = 0;
+	u32 num_slots = 1;
 
 	of_property_read_u32(host->dev->of_node, "espressif,slot-id", &slot_id);
+	of_property_read_u32(host->dev->of_node, "espressif,num-slots", &num_slots);
 	if (slot_id > 1)
 		return dev_err_probe(host->dev, -EINVAL,
 				     "invalid physical slot %u\n", slot_id);
+	if (!num_slots || num_slots > 2 || slot_id + num_slots > 2)
+		return dev_err_probe(host->dev, -EINVAL,
+				     "invalid slot range %u+%u\n",
+				     slot_id, num_slots);
 	host->slot_id = slot_id;
+	host->num_slots = num_slots;
 	host->quirks |= DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT |
 			DW_MMC_QUIRK_LOST_IRQ_POLL;
 
 	return 0;
 }
 
+static void dw_mci_esp32s31_set_sample_tap(struct dw_mci *host,
+					   unsigned int tap)
+{
+	u32 val = readl(host->regs + ESP32S31_SDMMC_DLL_CLK_CONF);
+
+	val &= ~ESP32S31_SDMMC_SAMPLE_PHASE;
+	val |= FIELD_PREP(ESP32S31_SDMMC_SAMPLE_PHASE, tap) |
+	       ESP32S31_SDMMC_DLL_CLK_EN;
+	writel(val, host->regs + ESP32S31_SDMMC_DLL_CLK_CONF);
+}
+
+static int dw_mci_esp32s31_execute_tuning(struct dw_mci_slot *slot,
+					  u32 opcode)
+{
+	struct dw_mci *host = slot->host;
+	u64 good = 0;
+	unsigned int best_len = 0, best_end = 0, len = 0;
+	unsigned int tap, best;
+
+	for (tap = 0; tap < ESP32S31_SDMMC_TAPS; tap++) {
+		dw_mci_esp32s31_set_sample_tap(host, tap);
+		mci_writel(host, RINTSTS, ESP32S31_SDMMC_ALL_INT_CLR);
+		if (!mmc_send_tuning(slot->mmc, opcode, NULL))
+			good |= BIT_ULL(tap);
+	}
+	if (!good)
+		return dev_err_probe(host->dev, -EIO,
+				     "no valid SDMMC sampling tap\n");
+
+	/* Find the middle of the longest valid window, including wraparound. */
+	for (tap = 0; tap < ESP32S31_SDMMC_TAPS * 2; tap++) {
+		if (good & BIT_ULL(tap % ESP32S31_SDMMC_TAPS)) {
+			if (len < ESP32S31_SDMMC_TAPS)
+				len++;
+			if (len > best_len) {
+				best_len = len;
+				best_end = tap;
+			}
+		} else {
+			len = 0;
+		}
+	}
+	best = (best_end + ESP32S31_SDMMC_TAPS - best_len / 2) %
+		ESP32S31_SDMMC_TAPS;
+	dw_mci_esp32s31_set_sample_tap(host, best);
+	mci_writel(host, RINTSTS, ESP32S31_SDMMC_ALL_INT_CLR);
+	dev_info(host->dev, "SDMMC tuning selected tap %u from %u-tap window\n",
+		 best, best_len);
+	return 0;
+}
+
 static const struct dw_mci_drv_data esp32s31_drv_data = {
 	.init		= dw_mci_esp32s31_priv_init,
+	.execute_tuning = dw_mci_esp32s31_execute_tuning,
 };
 
 static int dw_mci_socfpga_priv_init(struct dw_mci *host)

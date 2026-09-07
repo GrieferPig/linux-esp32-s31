@@ -13,6 +13,7 @@
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task_stack.h>
+#include <linux/soc/espressif/esp32s31-pm.h>
 #include <linux/tick.h>
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
@@ -61,16 +62,24 @@ void arch_cpu_idle_prepare(void)
 	 * IRQ-enabled polling idle loop.  The polling hook also drains a pending
 	 * native source if the CLIC cross-privilege sentinel blocks hardware entry.
 	 */
-	if (!polling_enabled) {
+	if (!esp32s31_sbi_idle_enabled() && !polling_enabled) {
 		polling_enabled = true;
 		cpu_idle_poll_ctrl(true);
 		pr_info("S31 SMP: using IRQ-enabled idle polling\n");
+	} else if (esp32s31_sbi_idle_enabled()) {
+		pr_info_once("S31 SMP: using OpenSBI CLIC-aware WFI\n");
 	}
 }
 #endif
 
 void noinstr arch_cpu_idle(void)
 {
+#ifdef CONFIG_SOC_ESP32S31
+	if (esp32s31_sbi_idle_enabled()) {
+		esp32s31_sbi_wfi();
+		return;
+	}
+#endif
 	cpu_do_idle();
 }
 
@@ -233,6 +242,9 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 	fstate_save(src, task_pt_regs(src));
 	esp32s31_ext_save(src);
 	*dst = *src;
+#ifdef CONFIG_SOC_ESP32S31
+	dst->thread.esp32s31_ext_active = false;
+#endif
 	/* clear entire V context, including datap for a new task */
 	memset(&dst->thread.vstate, 0, sizeof(struct __riscv_v_ext_state));
 	memset(&dst->thread.kernel_vstate, 0, sizeof(struct __riscv_v_ext_state));

@@ -10,6 +10,9 @@
 
 &sdmmc {
 	espressif,slot-id = <1>;
+	espressif,param-name = "bus-width";
+	espressif,param-values = <1 4>;
 	pinctrl-0 = <&sdmmc1_default>;
+	bus-width = <4>;
 	status = "okay";
 };

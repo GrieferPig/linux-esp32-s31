@@ -44,6 +44,8 @@ struct ctucan_priv {
 	struct napi_struct napi;
 	struct device *dev;
 	struct clk *can_clk;
+	bool presume_ack_uses_stm;
+	bool rx_hwtstamp_enabled;
 
 	int irq_flags;
 	unsigned long drv_flags;

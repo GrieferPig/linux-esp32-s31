@@ -13,7 +13,7 @@ maintainers:
 description:
   ESP32 UART controller is a part of the ESP32 SoC.
   ESP32S3 UART controller is a part of the ESP32S3 SoC.
-  Both SoCs are produced by Espressif Systems Co. Ltd.
+  ESP32-S31 adds hardware RS-485, IrDA and a fourth UART instance.
 
 allOf:
   - $ref: serial.yaml#
@@ -23,6 +23,8 @@ properties:
     enum:
       - esp,esp32-uart
       - esp,esp32s3-uart
+      - espressif,esp32s31-uart
+      - espressif,esp32s31-uart-uhci
 
   reg:
     maxItems: 1
@@ -32,6 +34,19 @@ properties:
 
   clocks:
     maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  clock-frequency: true
+
+  espressif,irda-mode:
+    type: boolean
+    description: Enable the S31 UART IrDA encoder and decoder.
+
+  linux,rs485-enabled-at-boot-time: true
+  rs485-rts-delay: true
+  rs485-rts-active-low: true
 
 required:
   - compatible

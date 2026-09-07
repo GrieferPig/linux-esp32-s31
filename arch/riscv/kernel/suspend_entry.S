@@ -10,6 +10,7 @@
 #include <asm/asm-offsets.h>
 #include <asm/assembler.h>
 #include <asm/csr.h>
+#include <asm/esp32s31_cache.h>
 #include <asm/xip_fixup.h>
 
 	.text
@@ -64,6 +65,14 @@ SYM_TYPED_FUNC_START(__cpu_resume_enter)
 	load_global_pointer
 
 #ifdef CONFIG_MMU
+#ifdef CONFIG_SOC_ESP32S31
+	/*
+	 * S31's page-table walker does not snoop the write-back D-cache.  The
+	 * active swapper tables may have been dirtied since boot and were kept
+	 * alive only by TLB entries.  Publish them before rebuilding SATP.
+	 */
+	ESP32S31_DCACHE_WRITEBACK_LINUX_PSRAM
+#endif
 	/* Save A0 and A1 */
 	add	t0, a0, zero
 	add	t1, a1, zero

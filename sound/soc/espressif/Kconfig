@@ -1,0 +1,7 @@
+config SND_SOC_ESP32S31_I2S
+	tristate "ESP32-S31 I2S controller"
+	depends on ARCH_ESPRESSIF || COMPILE_TEST
+	depends on OF && DMADEVICES
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	help
+	  ALSA SoC support for the ESP32-S31 I2S0 and I2S1 controllers.

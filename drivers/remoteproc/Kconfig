@@ -14,6 +14,16 @@ config REMOTEPROC
 
 if REMOTEPROC
 
+config ESP32S31_LP_REMOTEPROC
+	tristate "ESP32-S31 low-power core support"
+	depends on SOC_ESP32S31
+	select MAILBOX
+	select MFD_SYSCON
+	help
+	  Load and control ESP-IDF ULP LP-core firmware on the ESP32-S31.
+	  The driver also exposes the hardware LP mailbox through the Linux
+	  mailbox framework and provides /dev/s31-lp for simple 32-bit IPC.
+
 config REMOTEPROC_CDEV
 	bool "Remoteproc character device interface"
 	help

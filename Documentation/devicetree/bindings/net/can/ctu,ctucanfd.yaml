@@ -32,6 +32,10 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: espressif,esp32s31-twaifd
+          - const: ctu,ctucanfd-2
+          - const: ctu,ctucanfd
+      - items:
           - const: ctu,ctucanfd-2
           - const: ctu,ctucanfd
       - const: ctu,ctucanfd
@@ -47,6 +51,33 @@ properties:
       phandle of reference clock (100 MHz is appropriate
       for FPGA implementation on Zynq-7000 system).
     maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  espressif,acceptance-filter-a:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description: Mask, value and frame-type flags for S31 filter A.
+
+  espressif,acceptance-filter-b:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description: Mask, value and frame-type flags for S31 filter B.
+
+  espressif,acceptance-filter-c:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description: Mask, value and frame-type flags for S31 filter C.
+
+  espressif,acceptance-filter-range:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description: Low ID, high ID and frame-type flags for the S31 range filter.
 
 required:
   - compatible

@@ -1591,7 +1591,17 @@ config I2C_VIRTIO
           I2C adapter driver. The hardware can be emulated by any device model
           software according to the virtio protocol.
 
-          This driver can also be built as a module. If so, the module
-          will be called i2c-virtio.
+	  This driver can also be built as a module. If so, the module
+	  will be called i2c-virtio.
+
+config I2C_ESP32S31
+	tristate "Espressif ESP32-S31 I2C controller"
+	depends on SOC_ESP32S31 || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  Say Y here to enable the two high-performance I2C master
+	  controllers in the ESP32-S31.  The driver supports 7-bit and
+	  10-bit addressing, repeated starts, hardware timeout and bus
+	  recovery through the standard Linux I2C adapter interface.
 
 endmenu

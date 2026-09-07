@@ -1,0 +1,1 @@
+obj-$(CONFIG_SND_SOC_ESP32S31_I2S) += esp32s31-i2s.o

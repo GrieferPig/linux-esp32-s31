@@ -214,6 +214,8 @@ struct dw_mci {
 	void			*priv;
 	struct clk		*biu_clk;
 	struct clk		*ciu_clk;
+	/* Registered cards; @slot remains the card currently owning the bus. */
+	struct dw_mci_slot	*slots[2];
 	struct dw_mci_slot	*slot;
 
 	/* FIFO push and pull */
@@ -235,8 +237,9 @@ struct dw_mci {
 	int			irq;
 
 	int			sdio_id0;
-	/* Physical card index for single-slot wrappers (normally zero). */
+	/* First physical card index and number of registered S31 card ports. */
 	u8			slot_id;
+	u8			num_slots;
 
 	struct timer_list       cmd11_timer;
 	struct timer_list       cto_timer;

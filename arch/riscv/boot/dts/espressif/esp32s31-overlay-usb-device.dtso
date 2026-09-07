@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "usb-device";
+	espressif,resource-claims = "usb-otg-hs";
+};
+
+&usb_otghs {
+	dr_mode = "peripheral";
+	/*
+	 * The S31 DWC2 integration has 896 32-bit FIFO words.  DWC2's generic
+	 * gadget defaults assume a much larger core and otherwise overcommit the
+	 * SRAM when a ConfigFS function is bound.
+	 */
+	g-rx-fifo-size = <256>;
+	g-np-tx-fifo-size = <128>;
+	g-tx-fifo-size = <256 32 32 32 32 32 32 32>;
+	status = "okay";
+};

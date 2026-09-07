@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/adc/espressif,esp32s31-adc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 SAR ADC
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+properties:
+  compatible:
+    const: espressif,esp32s31-adc
+
+  reg:
+    items:
+      - description: SAR ADC register block
+      - description: LP ADC clock and reset register
+
+  reg-names:
+    items:
+      - const: adc
+      - const: clkrst
+
+  interrupts:
+    maxItems: 1
+
+  analog-supply:
+    description: Shared analog register-I2C power switch.
+
+  '#io-channel-cells':
+    const: 1
+
+  espressif,filter-channels:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 2
+    items:
+      maximum: 15
+    description: ADC channels assigned to the two hardware IIR filters.
+
+  espressif,filter-factors:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 2
+    items:
+      enum: [2, 4, 8, 16, 32, 64]
+    description: IIR smoothing factors paired with filter-channels.
+
+dependencies:
+  espressif,filter-channels: [espressif,filter-factors]
+  espressif,filter-factors: [espressif,filter-channels]
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - analog-supply
+  - '#io-channel-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    adc@20815000 {
+        compatible = "espressif,esp32s31-adc";
+        reg = <0x20815000 0x400>, <0x20710020 0x4>;
+        reg-names = "adc", "clkrst";
+        interrupts = <144 4>;
+        #io-channel-cells = <1>;
+    };
+...

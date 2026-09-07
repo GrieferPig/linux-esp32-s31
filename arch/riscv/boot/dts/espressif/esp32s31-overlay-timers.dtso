@@ -8,3 +8,5 @@
 
 &systimer { status = "okay"; };
 &rtc_timer { status = "okay"; };
+&gptimer0 { status = "okay"; };
+&gptimer1 { status = "okay"; };

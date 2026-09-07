@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+#include <linux/reset.h>
 #include <linux/serial_core.h>
 #include <linux/slab.h>
 #include <linux/tty_flip.h>
@@ -22,7 +23,7 @@
 
 #define DRIVER_NAME	"esp32-uart"
 #define DEV_NAME	"ttyS"
-#define UART_NR		3
+#define UART_NR		4
 
 #define ESP32_UART_TX_FIFO_SIZE	127
 #define ESP32_UART_RX_FIFO_SIZE	127
@@ -107,6 +108,17 @@
 #define ESP32S3_UART_CLK_CONF_REG	0x78
 #define ESP32S31_UART_REG_UPDATE_REG	0x98
 #define ESP32S31_UART_REG_UPDATE		BIT(0)
+#define ESP32S31_UART_IRDA_EN		BIT(14)
+#define ESP32S31_UART_LOOPBACK		BIT(12)
+#define ESP32S31_UART_SW_RTS		BIT(21)
+#define ESP32S31_UART_TX_FLOW_EN		BIT(13)
+#define ESP32S31_UART_RX_FLOW_EN		BIT(8)
+#define ESP32S31_UART_RTS_INV		BIT(18)
+#define ESP32S31_UART_RS485_CONF_REG	0x4c
+#define ESP32S31_UART_RS485_EN		BIT(0)
+#define ESP32S31_UART_RS485_DL0_EN	BIT(1)
+#define ESP32S31_UART_RS485_DL1_EN	BIT(2)
+#define ESP32S31_UART_RS485TX_RX_EN	BIT(3)
 #define ESP32S3_UART_SCLK_DIV_B			GENMASK(5, 0)
 #define ESP32S3_UART_SCLK_DIV_A			GENMASK(11, 6)
 #define ESP32S3_UART_SCLK_DIV_NUM		GENMASK(19, 12)
@@ -148,6 +160,8 @@ struct esp32_uhci_dma_slot {
 struct esp32_port {
 	struct uart_port port;
 	struct clk *clk;
+	struct reset_control *rst;
+	bool irda_mode;
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
 	struct clk *uhci_clk;
 	void __iomem *uhci_base;
@@ -207,6 +221,7 @@ static const struct esp32_uart_variant esp32s31_variant = {
 	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
 	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
+	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
 	.type = "ESP32-S31 UART",
 	.needs_reg_update = true,
 };
@@ -217,6 +232,7 @@ static const struct esp32_uart_variant esp32s31_uhci_variant = {
 	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
 	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
+	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
 	.type = "ESP32-S31 UHCI UART",
 	.needs_reg_update = true,
 	.uhci_dma = true,
@@ -576,14 +592,11 @@ static void esp32_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 	u32 conf0 = esp32_uart_read(port, UART_CONF0_REG);
 
 	if (port_variant(port)->needs_reg_update) {
-		/*
-		 * S31 keeps software RTS/DTR in different registers than S3.
-		 * The driver does not expose those unpinned modem signals, but
-		 * TIOCM_LOOP remains useful for controller self-tests.
-		 */
-		conf0 &= ~BIT(12);
+		conf0 &= ~(ESP32S31_UART_LOOPBACK | ESP32S31_UART_SW_RTS);
+		if (mctrl & TIOCM_RTS)
+			conf0 |= ESP32S31_UART_SW_RTS;
 		if (mctrl & TIOCM_LOOP)
-			conf0 |= BIT(12);
+			conf0 |= ESP32S31_UART_LOOPBACK;
 		esp32_uart_write(port, UART_CONF0_REG, conf0);
 		esp32_uart_update(port);
 		return;
@@ -602,6 +615,49 @@ static void esp32_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 
 	esp32_uart_write(port, UART_CONF0_REG, conf0);
 	esp32_uart_update(port);
+}
+
+static const struct serial_rs485 esp32s31_rs485_supported = {
+	.flags = SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND |
+		 SER_RS485_RTS_AFTER_SEND | SER_RS485_RX_DURING_TX,
+};
+
+/* Called with port->lock held, or from probe before the port is registered. */
+static int esp32s31_uart_rs485_config(struct uart_port *port,
+				      struct ktermios *termios,
+				      struct serial_rs485 *rs485)
+{
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	u32 conf0 = esp32_uart_read(port, UART_CONF0_REG);
+	u32 conf1 = esp32_uart_read(port, UART_CONF1_REG);
+	u32 rs485_conf = 0;
+
+	if ((rs485->flags & SER_RS485_ENABLED) && sport->irda_mode)
+		return -EBUSY;
+
+	conf0 &= ~(ESP32S31_UART_IRDA_EN | ESP32S31_UART_SW_RTS);
+	conf1 &= ~ESP32S31_UART_RTS_INV;
+
+	if (rs485->flags & SER_RS485_ENABLED) {
+		/* Match the S31 HAL half-duplex setup, including one-bit turns. */
+		conf0 |= ESP32S31_UART_SW_RTS;
+		rs485_conf = ESP32S31_UART_RS485_EN |
+			     ESP32S31_UART_RS485_DL0_EN |
+			     ESP32S31_UART_RS485_DL1_EN;
+		if (rs485->flags & SER_RS485_RX_DURING_TX)
+			rs485_conf |= ESP32S31_UART_RS485TX_RX_EN;
+		if (!(rs485->flags & SER_RS485_RTS_ON_SEND))
+			conf1 |= ESP32S31_UART_RTS_INV;
+	} else if (sport->irda_mode) {
+		conf0 |= ESP32S31_UART_IRDA_EN;
+	}
+
+	esp32_uart_write(port, ESP32S31_UART_RS485_CONF_REG, rs485_conf);
+	esp32_uart_write(port, UART_CONF0_REG, conf0);
+	esp32_uart_write(port, UART_CONF1_REG, conf1);
+	esp32_uart_update(port);
+
+	return 0;
 }
 
 static unsigned int esp32_uart_get_mctrl(struct uart_port *port)
@@ -780,6 +836,11 @@ static int esp32_uart_startup(struct uart_port *port)
 	ret = clk_prepare_enable(sport->clk);
 	if (ret)
 		return ret;
+	ret = reset_control_reset(sport->rst);
+	if (ret) {
+		clk_disable_unprepare(sport->clk);
+		return ret;
+	}
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
 	if (port_variant(port)->uhci_dma) {
@@ -840,6 +901,7 @@ static void esp32_uart_shutdown(struct uart_port *port)
 		sport->tx_dma_active = false;
 		sport->rx_dma_active = false;
 		clk_disable_unprepare(sport->uhci_clk);
+		reset_control_assert(sport->rst);
 		clk_disable_unprepare(sport->clk);
 		return;
 	}
@@ -847,6 +909,7 @@ static void esp32_uart_shutdown(struct uart_port *port)
 
 	esp32_uart_write(port, UART_INT_ENA_REG, 0);
 	free_irq(port->irq, port);
+	reset_control_assert(sport->rst);
 	clk_disable_unprepare(sport->clk);
 }
 
@@ -902,6 +965,12 @@ static void esp32_uart_set_termios(struct uart_port *port,
 
 	conf0 = esp32_uart_read(port, UART_CONF0_REG);
 	conf0 &= ~(UART_PARITY_EN | UART_PARITY | UART_BIT_NUM | UART_STOP_BIT_NUM);
+	if (port_variant(port)->needs_reg_update) {
+		conf0 &= ~ESP32S31_UART_IRDA_EN;
+		if (container_of(port, struct esp32_port, port)->irda_mode &&
+		    !(port->rs485.flags & SER_RS485_ENABLED))
+			conf0 |= ESP32S31_UART_IRDA_EN;
+	}
 
 	conf1 = esp32_uart_read(port, UART_CONF1_REG);
 	conf1 &= ~rx_flow_en;
@@ -1326,6 +1395,10 @@ static int esp32_uart_probe(struct platform_device *pdev)
 	}
 
 	port->uartclk = clk_get_rate(sport->clk);
+	sport->rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
+	if (IS_ERR(sport->rst))
+		return dev_err_probe(&pdev->dev, PTR_ERR(sport->rst),
+				     "reset unavailable\n");
 	port->dev = &pdev->dev;
 	port->type = PORT_GENERIC;
 	port->iotype = UPIO_MEM;
@@ -1334,6 +1407,21 @@ static int esp32_uart_probe(struct platform_device *pdev)
 	port->has_sysrq = 1;
 	port->fifosize = ESP32_UART_TX_FIFO_SIZE;
 	port->private_data = (void *)variant;
+	if (variant->needs_reg_update) {
+		sport->irda_mode = device_property_read_bool(&pdev->dev,
+						       "espressif,irda-mode");
+		port->rs485_config = esp32s31_uart_rs485_config;
+		port->rs485_supported = esp32s31_rs485_supported;
+		ret = uart_get_rs485_mode(port);
+		if (ret)
+			goto err_port;
+		if (sport->irda_mode &&
+		    (port->rs485.flags & SER_RS485_ENABLED)) {
+			ret = dev_err_probe(&pdev->dev, -EINVAL,
+					    "IrDA and RS-485 cannot be enabled together\n");
+			goto err_port;
+		}
+	}
 
 	esp32_uart_ports[port->line] = sport;
 
@@ -1346,6 +1434,13 @@ static int esp32_uart_probe(struct platform_device *pdev)
 			goto err_dma;
 #endif
 	}
+	return ret;
+
+err_port:
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (variant->uhci_dma)
+		goto err_dma;
+#endif
 	return ret;
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)

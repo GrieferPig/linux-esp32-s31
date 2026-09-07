@@ -6,6 +6,7 @@
 
 / {
 	espressif,overlay-name = "pwm-counter";
+	espressif,gpio-claims = <20 21 23 24 25 35 36 37 38 39 40 42>;
 };
 
 &gpio {
@@ -29,8 +30,31 @@
 		mcpwm0-out {
 			espressif,route-name = "mcpwm0.out";
 			espressif,route-kind = "matrix-output";
-			pinmux = <ESP32S31_MATRIX_OUT(22, 89, 0)>;
+			/* GPIO42 is shorted to the capture input on GPIO40. */
+			pinmux = <ESP32S31_MATRIX_OUT(42, 89, 0)>;
 			drive-strength = <20>;
+		};
+		mcpwm0-capture {
+			espressif,route-name = "mcpwm0.capture0";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(40, 95, 0)>;
+			input-enable;
+			bias-disable;
+		};
+		mcpwm0-fault {
+			espressif,route-name = "mcpwm0.fault0";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(39, 92, 0)>;
+			input-enable;
+			input-debounce = <1>;
+			bias-pull-down;
+		};
+		mcpwm0-sync {
+			espressif,route-name = "mcpwm0.sync0";
+			espressif,route-kind = "matrix-input";
+			pinmux = <ESP32S31_MATRIX_IN(38, 89, 0)>;
+			input-enable;
+			bias-pull-down;
 		};
 	};
 	mcpwm1_dynamic: mcpwm1-dynamic-pins {
@@ -85,9 +109,24 @@
 	};
 };
 
-&ledc0 { pinctrl-names = "default"; pinctrl-0 = <&ledc0_dynamic>; status = "okay"; };
+&ledc0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ledc0_dynamic>;
+	espressif,fade-time-ms = <250>;
+	espressif,gamma-correction;
+	status = "okay";
+};
 &ledc1 { pinctrl-names = "default"; pinctrl-0 = <&ledc1_dynamic>; status = "okay"; };
-&mcpwm0 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm0_dynamic>; status = "okay"; };
+&mcpwm0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mcpwm0_dynamic>;
+	/* GPIO39 is an active-high one-shot brake; GPIO38 synchronizes timer 0. */
+	espressif,fault-mask = <1>;
+	espressif,fault-active-high-mask = <1>;
+	espressif,sync-inputs = <4 0 0>;
+	espressif,sync-phases = <0 0 0>;
+	status = "okay";
+};
 &mcpwm1 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm1_dynamic>; status = "okay"; };
 &mcpwm2 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm2_dynamic>; status = "okay"; };
 &mcpwm3 { pinctrl-names = "default"; pinctrl-0 = <&mcpwm3_dynamic>; status = "okay"; };

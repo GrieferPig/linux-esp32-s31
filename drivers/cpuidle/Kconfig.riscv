@@ -13,3 +13,12 @@ config RISCV_SBI_CPUIDLE
 	  Select this option to enable RISC-V SBI firmware based CPU idle
 	  driver for RISC-V systems. This drivers also supports hierarchical
 	  DT based layout of the idle state.
+
+config ESP32S31_CPUIDLE
+	bool "ESP32-S31 OpenSBI CPU idle"
+	depends on SOC_ESP32S31 && RISCV_SBI
+	default y
+	help
+	  Enter WFI through the ESP32-S31 OpenSBI CLIC service. Each hart uses
+	  its own SYSTIMER comparator as a bounded wake source, avoiding the
+	  shared CLINT alias while allowing both harts to idle concurrently.

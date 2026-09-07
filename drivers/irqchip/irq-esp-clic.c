@@ -35,6 +35,7 @@
 #include <linux/of_irq.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
+#include <linux/syscore_ops.h>
 
 #include "irq-esp32s31-internal.h"
 
@@ -74,6 +75,54 @@ struct esp_clic {
 };
 
 static struct esp_clic *clic;
+static inline void __iomem *esp_clic_hart_reg(struct esp_clic *priv,
+					       unsigned int cpu,
+					       unsigned int off);
+static u8 clic_saved_ie[2][CLIC_EXT_LAST + 1];
+
+static int esp_clic_syscore_suspend(void)
+{
+	unsigned int cpu, slot;
+
+	if (!clic)
+		return 0;
+	for (cpu = 0; cpu < 2; cpu++)
+		for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++)
+			clic_saved_ie[cpu][slot] =
+				readb_relaxed(esp_clic_hart_reg(clic, cpu,
+						      CLIC_INTIE_OFF(slot)));
+	return 0;
+}
+
+static void esp_clic_syscore_resume(void)
+{
+	unsigned int cpu, slot;
+
+	if (!clic)
+		return;
+	for (cpu = 0; cpu < 2; cpu++) {
+		for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++) {
+			writeb_relaxed(0, esp_clic_hart_reg(clic, cpu,
+						       CLIC_INTIE_OFF(slot)));
+			writeb_relaxed(0, esp_clic_hart_reg(clic, cpu,
+						       CLIC_INTIP_OFF(slot)));
+			writeb_relaxed(CLIC_ATTR_MODE_S | CLIC_ATTR_TRIG_LEVEL,
+				esp_clic_hart_reg(clic, cpu,
+						  CLIC_INTATTR_OFF(slot)));
+			writeb_relaxed(CLIC_CTL_MAX_PRIO,
+				esp_clic_hart_reg(clic, cpu,
+						  CLIC_INTCTL_OFF(slot)));
+			writeb_relaxed(clic_saved_ie[cpu][slot] & 1,
+				esp_clic_hart_reg(clic, cpu,
+						  CLIC_INTIE_OFF(slot)));
+		}
+	}
+}
+
+static struct syscore_ops esp_clic_syscore_ops = {
+	.suspend = esp_clic_syscore_suspend,
+	.resume = esp_clic_syscore_resume,
+};
 
 static inline unsigned int slot_to_idx(unsigned int slot)
 {
@@ -236,6 +285,7 @@ void esp_clic_configure_local(unsigned int cpu, unsigned int slot, bool enable)
 	if (enable)
 		writeb_relaxed(1, esp_clic_hart_reg(clic, cpu,
 							CLIC_INTIE_OFF(slot)));
+	readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIE_OFF(slot)));
 }
 
 static int esp_clic_domain_alloc(struct irq_domain *domain, unsigned int virq,
@@ -324,6 +374,7 @@ static int __init esp_clic_init(struct device_node *node,
 
 	priv->domain = domain;
 	clic = priv;
+	register_syscore_ops(&esp_clic_syscore_ops);
 
 	pr_info("esp-clic: %u external slots (IDs %u-%u), chained on %pOF\n",
 		CLIC_EXT_COUNT, CLIC_EXT_FIRST, CLIC_EXT_LAST, parent);

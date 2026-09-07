@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/counter/espressif,esp32s31-gptimer.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 timer-group general-purpose timers
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+properties:
+  compatible:
+    const: espressif,esp32s31-gptimer
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  espressif,reserved-timer-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 3
+    description:
+      Bit mask of timer channels reserved by firmware and therefore omitted
+      from the Linux Counter device. Bit 0 selects timer 0 and bit 1 timer 1.
+
+required:
+  - compatible
+  - reg
+  - clocks
+
+additionalProperties: false
+...

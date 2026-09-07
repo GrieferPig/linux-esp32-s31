@@ -7,6 +7,8 @@
 #include <dt-bindings/clock/esp32s31-clock.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+#include <dt-bindings/power/esp32s31-power.h>
+#include <dt-bindings/reset/esp32s31-reset.h>
 
 / {
 	#address-cells = <1>;
@@ -22,7 +24,15 @@
 		serial0 = &uhci0;
 		serial1 = &uart1;
 		serial2 = &uart2;
-		mmc0 = &sdmmc;
+		serial3 = &uart3;
+		usbserial0 = &usb_serial_jtag;
+		spi2 = &gpspi2;
+		spi3 = &gpspi3;
+		i2c0 = &i2c0;
+		i2c1 = &i2c1;
+		can0 = &twai0;
+		can1 = &twai1;
+		/* Let the MMC core allocate mmc0/mmc1 for the controller's two slots. */
 		ethernet0 = &emac;
 	};
 
@@ -35,6 +45,8 @@
 			device_type = "cpu";
 			compatible = "espressif,esp32s31", "riscv";
 			reg = <0>;
+			clocks = <&clkc ESP32S31_CLK_CPU>;
+			operating-points-v2 = <&cpu_opp_table>;
 			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
@@ -58,6 +70,8 @@
 			device_type = "cpu";
 			compatible = "espressif,esp32s31", "riscv";
 			reg = <1>;
+			clocks = <&clkc ESP32S31_CLK_CPU>;
+			operating-points-v2 = <&cpu_opp_table>;
 			riscv,isa = "rv32imafbcn_zba_zbb_zbc_zbs";
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a", "f", "zba", "zbb",
@@ -82,6 +96,32 @@
 				core0 { cpu = <&cpu0>; };
 				core1 { cpu = <&cpu1>; };
 			};
+		};
+
+	};
+
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-80000000 {
+			opp-hz = /bits/ 64 <80000000>;
+			clock-latency-ns = <100000>;
+		};
+
+		opp-160000000 {
+			opp-hz = /bits/ 64 <160000000>;
+			clock-latency-ns = <100000>;
+		};
+
+		opp-240000000 {
+			opp-hz = /bits/ 64 <240000000>;
+			clock-latency-ns = <100000>;
+		};
+
+		opp-320000000 {
+			opp-hz = /bits/ 64 <320000000>;
+			clock-latency-ns = <100000>;
 		};
 	};
 
@@ -122,7 +162,7 @@
 			/* pair index, AXI peripheral trigger (LCD=0 .. SHA=5) */
 			#dma-cells = <2>;
 			dma-channels = <3>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		ahb_gdma: dma-controller@20343000 {
@@ -130,6 +170,7 @@
 			reg = <0x20343000 0x628>, <0x2f075380 0x1000>;
 			reg-names = "dma", "descriptors";
 			clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
+			resets = <&clkc ESP32S31_RST_AHB_GDMA>;
 			interrupt-parent = <&intmtx>;
 			interrupts = <36 IRQ_TYPE_LEVEL_HIGH>,
 				     <37 IRQ_TYPE_LEVEL_HIGH>,
@@ -145,7 +186,7 @@
 					  "tx0", "tx1", "tx2", "tx3", "tx4";
 			#dma-cells = <2>;
 			dma-channels = <5>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		uhci0: serial@2038a000 {
@@ -164,9 +205,72 @@
 		clkc: clock-controller@20587000 {
 			compatible = "espressif,esp32s31-clock";
 			reg = <0x20587000 0x1000>, <0x20586000 0x1000>,
-			      <0x20359000 0x1000>;
-			reg-names = "hp-sys-clkrst", "hp-system", "cnnt-sys";
+			      <0x20359000 0x1000>, <0x20589000 0x1000>,
+			      <0x20701000 0x1000>;
+			reg-names = "hp-sys-clkrst", "hp-system", "cnnt-sys",
+				    "hp-alive-sys", "lp-aon-clkrst";
 			#clock-cells = <1>;
+			#reset-cells = <1>;
+		};
+
+		lp_core: remoteproc@2e000000 {
+			compatible = "espressif,esp32s31-lp-core";
+			reg = <0x2e000000 0x8000>,
+			      <0x20817000 0x100>,
+			      <0x20700000 0x100>,
+			      <0x20710000 0x100>,
+			      <0x20800000 0x400>;
+			reg-names = "sram", "mailbox", "lp-sys", "lp-clkrst",
+				    "rtc-timer";
+			interrupt-parent = <&intmtx>;
+			interrupts = <139 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "mailbox";
+			firmware-name = "esp32s31/s31-lp-core.elf";
+			espressif,pmu = <&pmu>;
+			clocks = <&clkc ESP32S31_CLK_CPU>;
+			clock-names = "cpu";
+			#mbox-cells = <0>;
+			status = "okay";
+		};
+
+		pmu: power-controller@20704000 {
+			compatible = "espressif,esp32s31-pmu", "syscon";
+			reg = <0x20704000 0x1000>;
+			espressif,allow-hpcnnt-power-off;
+			#power-domain-cells = <1>;
+		};
+
+		radio: radio {
+			compatible = "espressif,esp32s31-radio";
+			status = "disabled";
+
+			wifi: wifi {
+				compatible = "espressif,esp32s31-wifi";
+				status = "disabled";
+			};
+
+			bluetooth: bluetooth {
+				compatible = "espressif,esp32s31-btdm";
+				status = "disabled";
+			};
+		};
+
+		ana_i2c: regulator@20704208 {
+			compatible = "espressif,esp32s31-ana-i2c";
+			reg = <0x20704208 0x4>;
+			regulator-name = "ana-i2c";
+			regulator-always-on;
+			regulator-boot-on;
+		};
+
+		gp_ldo1: regulator@20704218 {
+			compatible = "espressif,esp32s31-gp-ldo";
+			reg = <0x20704218 0x4>;
+			regulator-name = "vdd-psram";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+			regulator-boot-on;
 		};
 
 		efuse: efuse@2071502c {
@@ -217,7 +321,20 @@
 			compatible = "espressif,esp32s31-adc";
 			reg = <0x20815000 0x400>, <0x20710020 0x4>;
 			reg-names = "adc", "clkrst";
+			interrupt-parent = <&intmtx>;
+			/* IDF ETS_LP_ADC_INTR_SOURCE. */
+			interrupts = <144 IRQ_TYPE_LEVEL_HIGH>;
 			#io-channel-cells = <1>;
+			analog-supply = <&ana_i2c>;
+			status = "disabled";
+		};
+
+		dac: dac@2081a000 {
+			compatible = "espressif,esp32s31-dac";
+			reg = <0x2081a000 0x400>, <0x2071004c 0x4>;
+			reg-names = "dac", "clkrst";
+			#io-channel-cells = <1>;
+			analog-supply = <&ana_i2c>;
 			status = "disabled";
 		};
 
@@ -225,6 +342,10 @@
 			compatible = "espressif,esp32s31-tsens";
 			reg = <0x20818000 0x2c>, <0x20710030 0x4>;
 			reg-names = "tsens", "clkrst";
+			interrupt-parent = <&intmtx>;
+			/* IDF ETS_LP_TSENS_INTR_SOURCE. */
+			interrupts = <150 IRQ_TYPE_LEVEL_HIGH>;
+			analog-supply = <&ana_i2c>;
 			status = "disabled";
 		};
 
@@ -253,6 +374,14 @@
 			reg-names = "gpio", "iomux", "cnnt-pad-ctrl";
 			gpio-controller;
 			#gpio-cells = <2>;
+			/*
+			 * These are bonded GPIOs, but the base Linux image cannot
+			 * safely hand them to consumers: GPIO26..32 carry the live XIP
+			 * flash bus, GPIO33/34 are owned by USB Serial/JTAG, and
+			 * GPIO58/59 carry the UART0 console.  Keep them visible in the
+			 * pinctrl numbering while excluding normal gpiolib requests.
+			 */
+			gpio-reserved-ranges = <26 7>, <33 2>, <58 2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&intmtx>;
@@ -293,6 +422,192 @@
 
 				rx-pins {
 					pinmux = <ESP32S31_MATRIX_IN(43, 16, 0)>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			gpspi2_default: gpspi2-default-pins {
+				spi-pins {
+					espressif,route-names = "gpspi2.sclk", "gpspi2.mosi",
+								 "gpspi2.miso", "gpspi2.cs0";
+					espressif,route-kinds = "matrix-output", "matrix-output",
+								 "matrix-input", "matrix-output";
+					pinmux = <ESP32S31_MATRIX_OUT(43, 53, 0)>,
+						 <ESP32S31_MATRIX_OUT(40, 55, 0)>,
+						 <ESP32S31_MATRIX_IN(42, 54, 0)>,
+						 <ESP32S31_MATRIX_OUT(44, 62, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			gpspi3_default: gpspi3-default-pins {
+				spi-pins {
+					espressif,route-names = "gpspi3.sclk", "gpspi3.mosi",
+								 "gpspi3.miso", "gpspi3.cs0";
+					espressif,route-kinds = "matrix-output", "matrix-output",
+								 "matrix-input", "matrix-output";
+					pinmux = <ESP32S31_MATRIX_OUT(46, 47, 0)>,
+						 <ESP32S31_MATRIX_OUT(40, 49, 0)>,
+						 <ESP32S31_MATRIX_IN(42, 48, 0)>,
+						 <ESP32S31_MATRIX_OUT(47, 52, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			gpspi2_target: gpspi2-target-pins {
+				spi-pins {
+					espressif,route-names = "gpspi2-target.sclk",
+								 "gpspi2-target.mosi",
+								 "gpspi2-target.miso",
+								 "gpspi2-target.cs0";
+					espressif,route-kinds = "matrix-input", "matrix-input",
+								 "matrix-output", "matrix-input";
+					pinmux = <ESP32S31_MATRIX_IN(43, 53, 0)>,
+						 <ESP32S31_MATRIX_IN(40, 55, 0)>,
+						 <ESP32S31_MATRIX_OUT(42, 54, 0)>,
+						 <ESP32S31_MATRIX_IN(44, 62, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			gpspi3_target: gpspi3-target-pins {
+				spi-pins {
+					espressif,route-names = "gpspi3-target.sclk",
+								 "gpspi3-target.mosi",
+								 "gpspi3-target.miso",
+								 "gpspi3-target.cs0";
+					espressif,route-kinds = "matrix-input", "matrix-input",
+								 "matrix-output", "matrix-input";
+					pinmux = <ESP32S31_MATRIX_IN(46, 47, 0)>,
+						 <ESP32S31_MATRIX_IN(40, 49, 0)>,
+						 <ESP32S31_MATRIX_OUT(42, 48, 0)>,
+						 <ESP32S31_MATRIX_IN(47, 52, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			i2s0_default: i2s0-default-pins {
+				i2s-pins {
+					espressif,route-names = "i2s0.bck-out", "i2s0.bck-in",
+							 "i2s0.ws-out", "i2s0.ws-in",
+							 "i2s0.data-out", "i2s0.data-in";
+					espressif,route-kinds = "matrix-output", "matrix-input",
+							 "matrix-output", "matrix-input",
+							 "matrix-output", "matrix-input";
+					pinmux = <ESP32S31_MATRIX_OUT(43, 25, 0)>,
+						 <ESP32S31_MATRIX_IN(43, 29, 0)>,
+						 <ESP32S31_MATRIX_OUT(44, 27, 0)>,
+						 <ESP32S31_MATRIX_IN(44, 30, 0)>,
+						 <ESP32S31_MATRIX_OUT(40, 28, 0)>,
+						 <ESP32S31_MATRIX_IN(42, 28, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			i2s1_default: i2s1-default-pins {
+				i2s-pins {
+					espressif,route-names = "i2s1.bck-out", "i2s1.bck-in",
+							 "i2s1.ws-out", "i2s1.ws-in",
+							 "i2s1.data-out", "i2s1.data-in";
+					espressif,route-kinds = "matrix-output", "matrix-input",
+							 "matrix-output", "matrix-input",
+							 "matrix-output", "matrix-input";
+					pinmux = <ESP32S31_MATRIX_OUT(43, 31, 0)>,
+						 <ESP32S31_MATRIX_IN(43, 35, 0)>,
+						 <ESP32S31_MATRIX_OUT(44, 33, 0)>,
+						 <ESP32S31_MATRIX_IN(44, 36, 0)>,
+						 <ESP32S31_MATRIX_OUT(40, 34, 0)>,
+						 <ESP32S31_MATRIX_IN(42, 34, 0)>;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			i2c0_default: i2c0-default-pins {
+				scl-pins {
+					espressif,route-name = "i2c0.scl";
+					espressif,route-kind = "matrix-bidirectional";
+					pinmux = <ESP32S31_MATRIX_OUT(35, 68, 0)>,
+						 <ESP32S31_MATRIX_IN(35, 68, 0)>;
+					drive-open-drain;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+				sda-pins {
+					espressif,route-name = "i2c0.sda";
+					espressif,route-kind = "matrix-bidirectional";
+					pinmux = <ESP32S31_MATRIX_OUT(36, 69, 0)>,
+						 <ESP32S31_MATRIX_IN(36, 69, 0)>;
+					drive-open-drain;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			i2c1_default: i2c1-default-pins {
+				scl-pins {
+					espressif,route-name = "i2c1.scl";
+					espressif,route-kind = "matrix-bidirectional";
+					pinmux = <ESP32S31_MATRIX_OUT(44, 70, 0)>,
+						 <ESP32S31_MATRIX_IN(44, 70, 0)>;
+					drive-open-drain;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+				sda-pins {
+					espressif,route-name = "i2c1.sda";
+					espressif,route-kind = "matrix-bidirectional";
+					pinmux = <ESP32S31_MATRIX_OUT(45, 71, 0)>,
+						 <ESP32S31_MATRIX_IN(45, 71, 0)>;
+					drive-open-drain;
+					drive-strength = <20>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			twai0_default: twai0-default-pins {
+				tx-pins {
+					espressif,route-name = "twai0.tx";
+					espressif,route-kind = "matrix-output";
+					pinmux = <ESP32S31_MATRIX_OUT(46, 80, 0)>;
+					drive-strength = <20>;
+				};
+				rx-pins {
+					espressif,route-name = "twai0.rx";
+					espressif,route-kind = "matrix-input";
+					pinmux = <ESP32S31_MATRIX_IN(47, 80, 0)>;
+					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			twai1_default: twai1-default-pins {
+				tx-pins {
+					espressif,route-name = "twai1.tx";
+					espressif,route-kind = "matrix-output";
+					pinmux = <ESP32S31_MATRIX_OUT(48, 83, 0)>;
+					drive-strength = <20>;
+				};
+				rx-pins {
+					espressif,route-name = "twai1.rx";
+					espressif,route-kind = "matrix-input";
+					pinmux = <ESP32S31_MATRIX_IN(49, 81, 0)>;
 					bias-pull-up;
 					input-enable;
 				};
@@ -397,6 +712,16 @@
 				};
 			};
 
+			dac_default: dac-default-pins {
+				dac-pads {
+					pinmux = <ESP32S31_IOMUX(4, 1)>,
+						 <ESP32S31_IOMUX(5, 1)>;
+					bias-disable;
+					input-disable;
+					output-disable;
+				};
+			};
+
 			touch_test: touch-test-pins {
 				touch-pads {
 					pinmux = <ESP32S31_IOMUX(6, 1)>,
@@ -473,10 +798,8 @@
 		 * a programmable divider and GMAC has independently selectable MAC
 		 * and PTP clocks.
 		 *
-		 * The S31 clock controller below owns the Linux-visible gates,
-		 * reset pulses, SRAM power forcing, and GMAC reference divider.
-		 * Runtime clock disable still intentionally leaves these domains on
-		 * until a fuller genpd/runtime-PM model exists.
+		 * The S31 clock/reset controller owns the Linux-visible gates and
+		 * resets; the PMU provider owns the shared HPCNNT power domain.
 		 */
 		sdmmc: mmc@20342000 {
 			compatible = "espressif,esp32s31-dw-mshc", "snps,dw-mshc";
@@ -487,6 +810,9 @@
 			clocks = <&clkc ESP32S31_CLK_SDMMC_BIU>,
 				 <&clkc ESP32S31_CLK_SDMMC_CIU>;
 			clock-names = "biu", "ciu";
+			resets = <&clkc ESP32S31_RST_SDMMC>;
+			reset-names = "reset";
+			power-domains = <&pmu ESP32S31_PD_HPCNNT>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&sdmmc0_default>;
 			espressif,slot-id = <0>;
@@ -510,6 +836,9 @@
 				 <&clkc ESP32S31_CLK_EMAC_PTP_REF>,
 				 <&clkc ESP32S31_CLK_EMAC_RGMII_TXC>;
 			clock-names = "stmmaceth", "pclk", "ptp_ref", "tx";
+			resets = <&clkc ESP32S31_RST_EMAC>;
+			reset-names = "stmmaceth";
+			power-domains = <&pmu ESP32S31_PD_HPCNNT>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&emac_rgmii_default>;
 			/* Match IDF esp_read_mac(ESP_MAC_ETH): factory base + 3. */
@@ -565,24 +894,36 @@
 
 				partition@200000 {
 					label = "dtb";
-					reg = <0x200000 0x200000>;
+					reg = <0x200000 0x010000>;
+					read-only;
+				};
+
+				partition@210000 {
+					label = "radio-bundle";
+					reg = <0x210000 0x1f0000>;
 					read-only;
 				};
 
 				partition@400000 {
 					label = "linux";
-					reg = <0x400000 0x600000>;
+					reg = <0x400000 0x630000>;
 					read-only;
 				};
 
-				partition@a00000 {
+				partition@a30000 {
 					label = "persist";
-					reg = <0xa00000 0x100000>;
+					reg = <0xa30000 0x090000>;
 				};
 
-				partition@b00000 {
+				partition@ac0000 {
+					label = "hil-scratch";
+					reg = <0xac0000 0x010000>;
+				};
+
+				partition@ad0000 {
 					label = "rootfs";
-					reg = <0xb00000 0x400000>;
+					reg = <0xad0000 0x430000>;
+					linux,rootfs;
 					read-only;
 				};
 			};
@@ -595,6 +936,7 @@
 			      <0x205890b0 0x4>;
 			reg-names = "utmi", "clkrst", "otg-ctrl", "usb-ctrl",
 				    "phy-ctrl";
+			power-domains = <&pmu ESP32S31_PD_HPCNNT>;
 			#phy-cells = <0>;
 		};
 
@@ -607,22 +949,25 @@
 			interrupts = <99 IRQ_TYPE_LEVEL_HIGH>;
 			phys = <&usb_phy>;
 			phy-names = "usb2-phy";
+			power-domains = <&pmu ESP32S31_PD_HPCNNT>;
 			dr_mode = "host";
 			status = "okay";
 		};
 
 		ledc0: pwm@20392000 {
 			compatible = "espressif,esp32s31-ledc";
-			reg = <0x20392000 0x180>, <0x20586208 0x4>;
+			reg = <0x20392000 0x600>, <0x20586208 0x4>;
 			clocks = <&clkc ESP32S31_CLK_LEDC0>;
+			resets = <&clkc ESP32S31_RST_LEDC0>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
 
 		ledc1: pwm@2039c000 {
 			compatible = "espressif,esp32s31-ledc";
-			reg = <0x2039c000 0x180>, <0x20586298 0x4>;
+			reg = <0x2039c000 0x600>, <0x20586298 0x4>;
 			clocks = <&clkc ESP32S31_CLK_LEDC1>;
+			resets = <&clkc ESP32S31_RST_LEDC1>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
@@ -631,6 +976,7 @@
 			compatible = "espressif,esp32s31-mcpwm";
 			reg = <0x20381000 0x164>;
 			clocks = <&clkc ESP32S31_CLK_MCPWM0>;
+			resets = <&clkc ESP32S31_RST_MCPWM0>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
@@ -639,6 +985,7 @@
 			compatible = "espressif,esp32s31-mcpwm";
 			reg = <0x20382000 0x164>;
 			clocks = <&clkc ESP32S31_CLK_MCPWM1>;
+			resets = <&clkc ESP32S31_RST_MCPWM1>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
@@ -647,6 +994,7 @@
 			compatible = "espressif,esp32s31-mcpwm";
 			reg = <0x20383000 0x164>;
 			clocks = <&clkc ESP32S31_CLK_MCPWM2>;
+			resets = <&clkc ESP32S31_RST_MCPWM2>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
@@ -655,6 +1003,7 @@
 			compatible = "espressif,esp32s31-mcpwm";
 			reg = <0x20384000 0x164>;
 			clocks = <&clkc ESP32S31_CLK_MCPWM3>;
+			resets = <&clkc ESP32S31_RST_MCPWM3>;
 			#pwm-cells = <3>;
 			status = "disabled";
 		};
@@ -670,14 +1019,20 @@
 		pcnt0: counter@20389000 {
 			compatible = "espressif,esp32s31-pcnt";
 			reg = <0x20389000 0x100>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <114 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc ESP32S31_CLK_PCNT0>;
+			resets = <&clkc ESP32S31_RST_PCNT0>;
 			status = "disabled";
 		};
 
 		pcnt1: counter@2039d000 {
 			compatible = "espressif,esp32s31-pcnt";
 			reg = <0x2039d000 0x100>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <115 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc ESP32S31_CLK_PCNT1>;
+			resets = <&clkc ESP32S31_RST_PCNT1>;
 			status = "disabled";
 		};
 
@@ -717,6 +1072,7 @@
 			interrupt-parent = <&intmtx>;
 			interrupts = <10 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc ESP32S31_CLK_UART1>;
+			resets = <&clkc ESP32S31_RST_UART1>;
 			clock-frequency = <40000000>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart1_default>;
@@ -730,6 +1086,7 @@
 			interrupt-parent = <&intmtx>;
 			interrupts = <11 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc ESP32S31_CLK_UART2>;
+			resets = <&clkc ESP32S31_RST_UART2>;
 			clock-frequency = <40000000>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&uart2_default>;
@@ -737,27 +1094,181 @@
 			status = "disabled";
 		};
 
-		wdt0: watchdog@20580000 {
-			compatible = "espressif,esp32s31-timg-wdt";
-			reg = <0x20580000 0x100>;
-			clocks = <&clkc ESP32S31_CLK_WDT0>;
-			timeout-sec = <30>;
+		uart3: serial@2038d000 {
+			compatible = "espressif,esp32s31-uart";
+			reg = <0x2038d000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <12 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_UART3>;
+			resets = <&clkc ESP32S31_RST_UART3>;
+			clock-frequency = <40000000>;
+			status = "disabled";
+		};
+
+		gpspi2: spi@2038f000 {
+			compatible = "espressif,esp32s31-gpspi";
+			reg = <0x2038f000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <4 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_GPSPI2>;
+			resets = <&clkc ESP32S31_RST_GPSPI2>;
+			dmas = <&axi_gdma 1 1>, <&axi_gdma 0 1>;
+			dma-names = "tx", "rx";
+			num-cs = <6>;
+			espressif,max-data-lines = <8>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&gpspi2_default>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		gpspi3: spi@20390000 {
+			compatible = "espressif,esp32s31-gpspi";
+			reg = <0x20390000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <5 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_GPSPI3>;
+			resets = <&clkc ESP32S31_RST_GPSPI3>;
+			dmas = <&axi_gdma 2 2>, <&axi_gdma 0 2>;
+			dma-names = "tx", "rx";
+			num-cs = <3>;
+			espressif,max-data-lines = <4>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&gpspi3_default>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		usb_serial_jtag: serial@20391000 {
+			compatible = "espressif,esp32s31-usb-serial-jtag";
+			reg = <0x20391000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&pmu ESP32S31_PD_HPCNNT>;
 			status = "okay";
 		};
 
-		wdt1: watchdog@20581000 {
-			compatible = "espressif,esp32s31-timg-wdt";
-			reg = <0x20581000 0x100>;
+		i2s0: i2s@20387000 {
+			compatible = "espressif,esp32s31-i2s";
+			reg = <0x20387000 0x1000>;
+			clocks = <&clkc ESP32S31_CLK_I2S0>;
+			resets = <&clkc ESP32S31_RST_I2S0>;
+			dmas = <&ahb_gdma 3 1>, <&ahb_gdma 2 1>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s0_default>;
+			status = "disabled";
+		};
+
+		i2s1: i2s@20388000 {
+			compatible = "espressif,esp32s31-i2s";
+			reg = <0x20388000 0x1000>;
+			clocks = <&clkc ESP32S31_CLK_I2S1>;
+			resets = <&clkc ESP32S31_RST_I2S1>;
+			dmas = <&ahb_gdma 4 5>, <&ahb_gdma 1 5>;
+			dma-names = "tx", "rx";
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s1_default>;
+			status = "disabled";
+		};
+
+		i2c0: i2c@20385000 {
+			compatible = "espressif,esp32s31-i2c";
+			reg = <0x20385000 0x200>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <23 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_I2C0>;
+			resets = <&clkc ESP32S31_RST_I2C0>;
+			clock-frequency = <100000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c0_default>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@20386000 {
+			compatible = "espressif,esp32s31-i2c";
+			reg = <0x20386000 0x200>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <24 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_I2C1>;
+			resets = <&clkc ESP32S31_RST_I2C1>;
+			clock-frequency = <100000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c1_default>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		twai0: can@20394000 {
+			compatible = "espressif,esp32s31-twaifd", "ctu,ctucanfd-2",
+				     "ctu,ctucanfd";
+			reg = <0x20394000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <18 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_TWAI0>;
+			resets = <&clkc ESP32S31_RST_TWAI0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&twai0_default>;
+			status = "disabled";
+		};
+
+		twai1: can@20395000 {
+			compatible = "espressif,esp32s31-twaifd", "ctu,ctucanfd-2",
+				     "ctu,ctucanfd";
+			reg = <0x20395000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <20 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_TWAI1>;
+			resets = <&clkc ESP32S31_RST_TWAI1>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&twai1_default>;
+			status = "disabled";
+		};
+
+		gptimer0: timer@20580000 {
+			compatible = "espressif,esp32s31-gptimer";
+			reg = <0x20580000 0x48>;
+			clocks = <&clkc ESP32S31_CLK_WDT0>;
+			espressif,reserved-timer-mask = <2>;
+			status = "disabled";
+		};
+
+		gptimer1: timer@20581000 {
+			compatible = "espressif,esp32s31-gptimer";
+			reg = <0x20581000 0x48>;
 			clocks = <&clkc ESP32S31_CLK_WDT1>;
+			espressif,reserved-timer-mask = <2>;
+			status = "disabled";
+		};
+
+		wdt0: watchdog@20580048 {
+			compatible = "espressif,esp32s31-timg-wdt";
+			reg = <0x20580048 0x20>;
+			clocks = <&clkc ESP32S31_CLK_WDT0>;
+			resets = <&clkc ESP32S31_RST_WDT0>;
 			timeout-sec = <30>;
-			status = "okay";
+			status = "disabled";
+		};
+
+		wdt1: watchdog@20581048 {
+			compatible = "espressif,esp32s31-timg-wdt";
+			reg = <0x20581048 0x20>;
+			clocks = <&clkc ESP32S31_CLK_WDT1>;
+			resets = <&clkc ESP32S31_RST_WDT1>;
+			timeout-sec = <30>;
+			status = "disabled";
 		};
 
 		rtc_wdt: watchdog@20801000 {
 			compatible = "espressif,esp32s31-rtc-wdt";
 			reg = <0x20801000 0x400>;
 			timeout-sec = <30>;
-			status = "okay";
+			status = "disabled";
 		};
 
 	};

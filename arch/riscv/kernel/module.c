@@ -190,7 +190,13 @@ static int apply_r_riscv_pcrel_lo12_s_rela(struct module *me, void *location,
 static int apply_r_riscv_hi20_rela(struct module *me, void *location,
 				   Elf_Addr v)
 {
-	if (IS_ENABLED(CONFIG_CMODEL_MEDLOW)) {
+	/*
+	 * RV32 can materialize every 32-bit absolute address with the
+	 * HI20/LO12 pair below.  The medlow rejection is only needed for RV64,
+	 * where an arbitrary module address may not be sign-extended from the
+	 * instruction's 32-bit immediate.
+	 */
+	if (IS_ENABLED(CONFIG_CMODEL_MEDLOW) && !IS_ENABLED(CONFIG_32BIT)) {
 		pr_err(
 		  "%s: target %016llx can not be addressed by the 32-bit offset from PC = %p\n",
 		  me->name, (long long)v, location);

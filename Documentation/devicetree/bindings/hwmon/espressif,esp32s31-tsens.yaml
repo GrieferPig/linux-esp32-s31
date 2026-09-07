@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/hwmon/espressif,esp32s31-tsens.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 on-chip temperature sensor
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+properties:
+  compatible:
+    const: espressif,esp32s31-tsens
+
+  reg:
+    items:
+      - description: Temperature sensor register block
+      - description: LP temperature sensor clock and reset register
+
+  reg-names:
+    items:
+      - const: tsens
+      - const: clkrst
+
+  interrupts:
+    maxItems: 1
+
+  analog-supply:
+    description: Shared analog register-I2C power switch.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - analog-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    temperature-sensor@20818000 {
+        compatible = "espressif,esp32s31-tsens";
+        reg = <0x20818000 0x2c>, <0x20710030 0x4>;
+        reg-names = "tsens", "clkrst";
+        interrupts = <150 4>;
+    };
+...

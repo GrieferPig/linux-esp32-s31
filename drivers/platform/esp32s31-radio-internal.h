@@ -5,6 +5,28 @@
 #include <linux/types.h>
 
 struct esp32s31_radio_wifi_ap;
+struct device;
+
+#define S31_RADIO_FEATURE_WIFI		(1U << 0)
+#define S31_RADIO_FEATURE_BLUETOOTH	(1U << 1)
+
+int s31_radio_runtime_init(bool enable_wifi, bool enable_bt);
+int s31_radio_runtime_shutdown(void);
+int s31_radio_runtime_wait_ready(void);
+int s31_radio_fw_reset(void);
+int s31_radio_wifi_frontend_suspend(void);
+int s31_radio_wifi_frontend_resume(void);
+int s31_radio_btdm_frontend_suspend(void);
+int s31_radio_btdm_frontend_resume(void);
+int s31_radio_fw_load(struct device *device);
+void s31_radio_fw_unload(void);
+u32 *s31_radio_fw_isr_depth(void);
+void s31_radio_wifi_clock_enable(void);
+void s31_radio_wifi_clock_disable(void);
+int s31_radio_wifi_frontend_init(struct device *parent);
+void s31_radio_wifi_frontend_exit(void);
+int s31_radio_btdm_frontend_init(struct device *parent, bool direct_hci);
+void s31_radio_btdm_frontend_exit(void);
 
 /* Keep these values synchronized with radio_firmware/s31_rtos/s31_rtos.h. */
 enum s31_blob_release_reason {
@@ -25,32 +47,44 @@ enum s31_blob_release_reason {
 extern void s31_radio_stack_task(void *arg);
 extern void s31_radio_bt_enable_task(void *arg);
 extern void s31_radio_bt_disable_task(void *arg);
+extern void s31_radio_shutdown_task(void *arg);
 extern int s31_radio_vhci_try_send(u8 *frame, u16 length);
+extern int s31_radio_coex_status(u8 type, u8 op, u8 status);
 extern void s31_radio_wifi_scan_task(void *arg);
 extern void s31_radio_wifi_connect_task(void *arg);
 extern void s31_radio_wifi_disconnect_task(void *arg);
+extern void s31_radio_wifi_control_task(void *arg);
+extern int s31_radio_wifi_try_send_interface(u8 interface, u8 *frame, u16 length);
+void s31_radio_wifi_control_complete(int result);
+void s31_radio_wifi_receive_aux(u8 interface, const u8 *frame, u16 length,
+			      u8 channel, s8 signal);
 extern int s31_radio_wifi_read_mac(u8 *mac);
 extern int s31_radio_wifi_try_send(u8 *frame, u16 length);
-extern void s31_radio_wifi_guard_pp_state(void);
 extern void s31_rtos_init(void);
 extern void s31_rtos_tick(void);
+extern u32 s31_linux_timer_next_due_us(void);
 extern void s31_rtos_hard_tick(void);
 extern void s31_rtos_free(void *ptr);
 extern void s31_rtos_task_release(void *cookie);
-extern u32 s31_rtos_isr_depth;
+void s31_linux_tasks_stop_all(void);
+#define s31_rtos_isr_depth (*s31_radio_fw_isr_depth())
 void *s31_linux_task_create(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
-				    void *arg, u32 priority, void *cookie);
+				    void *arg, u32 priority, void *cookie,
+				    s32 core_id);
 void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
 				     u32 stack_size, void *stack_base,
-				     void *arg, u32 priority, void *cookie);
+				     void *arg, u32 priority, void *cookie,
+				     s32 core_id);
 void s31_linux_task_exit_current(void);
 int s31_linux_task_stop(void *task);
 void *s31_linux_current_cookie(void);
 void s31_linux_task_delay(u32 ticks);
 u32 s31_linux_tick_count(void);
 uint64_t s31_linux_time_ns(void);
+int32_t s31_linux_current_cpu(void);
 void s31_linux_printf(const char *fmt, ...);
+u64 s31_linux_wall_time_seconds(void);
 void *s31_linux_sync_create(void);
 void s31_linux_sync_destroy(void *sync);
 void s31_linux_sync_lock(void *sync);
@@ -81,9 +115,8 @@ enum s31_direct_isr_result {
 	S31_DIRECT_ISR_DEFER_NESTED,
 };
 int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg);
+bool s31_radio_payload_uses_fp(void);
 bool s31_radio_blob_run_pending_isrs(void);
-u32 s31_radio_blob_irqs_mask(void);
-void s31_radio_blob_irqs_restore(u32 mask);
 void s31_linux_task_dump_all(void);
 void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns, u64 exec_ns,
 				     u32 tick_start);
@@ -139,5 +172,7 @@ int __wrap_esp_intr_alloc(int source, int flags, void (*handler)(void *),
 int __wrap_esp_intr_enable(void *handle);
 int __wrap_esp_intr_disable(void *handle);
 int __wrap_esp_intr_free(void *handle);
+
+void s31_radio_wifi_ap_station(const u8 *mac, bool joined);
 
 #endif /* _ESP32S31_RADIO_INTERNAL_H */

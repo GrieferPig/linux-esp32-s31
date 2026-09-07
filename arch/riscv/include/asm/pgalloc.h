@@ -118,6 +118,7 @@ static inline void sync_kernel_mappings(pgd_t *pgd)
 	 */
 	{
 		static const unsigned long s31_platform_low_pgds[] = {
+			0x2c000000UL,
 			0x2f000000UL,
 			0x2f800000UL,
 		};

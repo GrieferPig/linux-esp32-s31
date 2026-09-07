@@ -12,10 +12,20 @@
 #include <linux/init.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
+#include <linux/syscore_ops.h>
+#include <linux/timekeeping.h>
 #include <linux/clocksource/esp32s31-systimer.h>
 #include <asm/fixmap.h>
 
 #define S31_SYSTIMER_PHYS		0x20399000U
+#define S31_HP_CLKRST_PHYS		0x20587000U
+#define S31_RTC_TIMER_PHYS		0x20800000U
+#define S31_HP_CLKRST_SYSTIMER_CTRL0	0x120
+#define S31_SYSTIMER_APB_CLK_EN		BIT(0)
+#define S31_SYSTIMER_RST_EN		BIT(1)
+#define S31_SYSTIMER_FORCE_NORST		BIT(2)
+#define S31_SYSTIMER_CLK_SRC_SEL	BIT(3)
+#define S31_SYSTIMER_FUNC_CLK_EN	BIT(4)
 
 #define S31_SYSTIMER_UNIT1_OP		0x08
 #define S31_SYSTIMER_UNIT1_VALUE_HI	0x48
@@ -31,19 +41,91 @@
 #define S31_SYSTIMER_INT_ENA		0x64
 #define S31_SYSTIMER_INT_ST		0x68
 #define S31_SYSTIMER_INT_CLR		0x6c
+#define S31_SYSTIMER_ALL_TARGETS	GENMASK(2, 0)
+#define S31_SYSTIMER_ALL_TARGET_EN	GENMASK(24, 22)
 #define S31_SYSTIMER_TARGET_EN(cpu)	BIT(24 - (cpu))
 #define S31_SYSTIMER_COUNTER1_SEL	BIT(31)
 
+#define S31_RTC_TIMER_UPDATE		0x10
+#define S31_RTC_TIMER_COUNTER0_LO	0x14
+#define S31_RTC_TIMER_COUNTER0_HI	0x18
+#define S31_RTC_TIMER_DATE		0x3fc
+#define S31_RTC_TIMER_SNAPSHOT		BIT(27)
+#define S31_RTC_TIMER_SYS_STALL		BIT(30)
+#define S31_RTC_TIMER_SYS_RST		BIT(31)
+#define S31_RTC_TIMER_CLK_EN		BIT(31)
+#define S31_RTC_TIMER_HI_MASK		GENMASK(15, 0)
+#define S31_RTC_SLOW_RATE		32768U
+
 static void __iomem *s31_systimer_base;
+static void __iomem *s31_rtc_timer_base;
 static u64 s31_systimer_last;
 static DEFINE_RAW_SPINLOCK(s31_systimer_lock);
 
+static void s31_rtc_timer_ensure_mmio(void)
+{
+	u32 val;
+
+	if (likely(s31_rtc_timer_base))
+		return;
+
+	set_fixmap_io(FIX_S31_RTC_TIMER, S31_RTC_TIMER_PHYS);
+	s31_rtc_timer_base = (void __iomem *)fix_to_virt(FIX_S31_RTC_TIMER);
+	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_DATE);
+	writel(val | S31_RTC_TIMER_CLK_EN,
+	       s31_rtc_timer_base + S31_RTC_TIMER_DATE);
+	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
+	val &= ~(S31_RTC_TIMER_SYS_STALL | S31_RTC_TIMER_SYS_RST);
+	writel(val, s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
+}
+
+static u64 notrace s31_rtc_timer_read_counter(void)
+{
+	u32 val, hi, lo;
+
+	s31_rtc_timer_ensure_mmio();
+	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
+	writel(val | S31_RTC_TIMER_SNAPSHOT,
+	       s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
+	lo = readl(s31_rtc_timer_base + S31_RTC_TIMER_COUNTER0_LO);
+	hi = readl(s31_rtc_timer_base + S31_RTC_TIMER_COUNTER0_HI) &
+	     S31_RTC_TIMER_HI_MASK;
+	return ((u64)hi << 32) | lo;
+}
+
+void read_persistent_clock64(struct timespec64 *ts)
+{
+	u64 cycles = s31_rtc_timer_read_counter();
+	u32 rem;
+
+	ts->tv_sec = div_u64_rem(cycles, S31_RTC_SLOW_RATE, &rem);
+	ts->tv_nsec = div_u64((u64)rem * NSEC_PER_SEC,
+			      S31_RTC_SLOW_RATE);
+}
+
 static void s31_systimer_ensure_mmio(void)
 {
+	void __iomem *clkrst;
 	u32 conf;
 
 	if (likely(s31_systimer_base))
 		return;
+
+	/*
+	 * The HP clock/reset gate powers up disabled and is not part of the
+	 * SYSTIMER page. Do not depend on ROM, SPL, or an earlier IDF image to
+	 * leave it enabled: establish a known XTAL-clocked peripheral state
+	 * before the first SYSTIMER access.
+	 */
+	set_fixmap_io(FIX_S31_CLKRST, S31_HP_CLKRST_PHYS);
+	clkrst = (void __iomem *)fix_to_virt(FIX_S31_CLKRST);
+	conf = readl(clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
+	conf |= S31_SYSTIMER_APB_CLK_EN | S31_SYSTIMER_FUNC_CLK_EN;
+	/* ESP-IDF maps clk_src_sel=0 to XTAL and 1 to RC_FAST. */
+	conf &= ~(S31_SYSTIMER_RST_EN | S31_SYSTIMER_CLK_SRC_SEL);
+	writel(conf,
+	       clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
+	readl(clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
 
 	/* timer_probe() and the RISC-V CPUHP timer callback both run before
 	 * normal ioremap is available.  The fixed mapping is shared by the
@@ -53,11 +135,48 @@ static void s31_systimer_ensure_mmio(void)
 
 	/* Counter 1 is Linux-owned, XTAL-derived and must not stall with either
 	 * HP hart.  Keep the register clock and counter running. */
+	writel(0, s31_systimer_base + S31_SYSTIMER_INT_ENA);
+	writel(S31_SYSTIMER_ALL_TARGETS,
+	       s31_systimer_base + S31_SYSTIMER_INT_CLR);
+	readl(s31_systimer_base + S31_SYSTIMER_INT_ST);
 	conf = readl(s31_systimer_base);
+	conf &= ~S31_SYSTIMER_ALL_TARGET_EN;
 	conf |= BIT(31) | BIT(29);
 	conf &= ~(BIT(25) | BIT(26));
 	writel(conf, s31_systimer_base);
 }
+
+static void s31_systimer_syscore_resume(void)
+{
+	void __iomem *clkrst;
+	u32 conf;
+
+	if (!s31_systimer_base)
+		return;
+
+	/* HP sleep resets/gates this peripheral without invalidating Linux's
+	 * fixed virtual mapping.  Re-establish its clock and Linux-owned counter
+	 * before the timekeeping core or IRQ polling path accesses it. */
+	clkrst = (void __iomem *)fix_to_virt(FIX_S31_CLKRST);
+	conf = readl(clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
+	conf |= S31_SYSTIMER_APB_CLK_EN | S31_SYSTIMER_FUNC_CLK_EN;
+	conf &= ~(S31_SYSTIMER_RST_EN | S31_SYSTIMER_CLK_SRC_SEL);
+	writel(conf, clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
+	readl(clkrst + S31_HP_CLKRST_SYSTIMER_CTRL0);
+
+	writel(0, s31_systimer_base + S31_SYSTIMER_INT_ENA);
+	writel(S31_SYSTIMER_ALL_TARGETS,
+	       s31_systimer_base + S31_SYSTIMER_INT_CLR);
+	conf = readl(s31_systimer_base);
+	conf &= ~S31_SYSTIMER_ALL_TARGET_EN;
+	conf |= BIT(31) | BIT(29);
+	conf &= ~(BIT(25) | BIT(26));
+	writel(conf, s31_systimer_base);
+}
+
+static struct syscore_ops s31_systimer_syscore_ops = {
+	.resume = s31_systimer_syscore_resume,
+};
 
 static u64 notrace s31_systimer_read_counter(void)
 {
@@ -102,9 +221,11 @@ void esp32s31_systimer_stop(void)
 
 	val = readl(s31_systimer_base);
 	writel(val & ~S31_SYSTIMER_TARGET_EN(cpu), s31_systimer_base);
+	readl(s31_systimer_base);
 	val = readl(s31_systimer_base + S31_SYSTIMER_INT_ENA);
 	writel(val & ~BIT(cpu), s31_systimer_base + S31_SYSTIMER_INT_ENA);
 	writel(BIT(cpu), s31_systimer_base + S31_SYSTIMER_INT_CLR);
+	readl(s31_systimer_base + S31_SYSTIMER_INT_ST);
 
 	raw_spin_unlock_irqrestore(&s31_systimer_lock, flags);
 }
@@ -136,9 +257,11 @@ int esp32s31_systimer_set_next_event(unsigned long delta)
 	 * read/modify/write sequences across the two HP harts. */
 	val = readl(s31_systimer_base);
 	writel(val & ~S31_SYSTIMER_TARGET_EN(cpu), s31_systimer_base);
+	readl(s31_systimer_base);
 	val = readl(s31_systimer_base + S31_SYSTIMER_INT_ENA);
 	writel(val & ~BIT(cpu), s31_systimer_base + S31_SYSTIMER_INT_ENA);
 	writel(BIT(cpu), s31_systimer_base + S31_SYSTIMER_INT_CLR);
+	readl(s31_systimer_base + S31_SYSTIMER_INT_ST);
 
 	target = s31_systimer_read_counter() + max_t(unsigned long, delta, 2);
 	writel(upper_32_bits(target) & S31_SYSTIMER_VALUE_HI_MASK,
@@ -182,6 +305,7 @@ static int __init s31_systimer_init(struct device_node *np)
 	}
 
 	pr_info("registered 16 MHz always-on clocksource\n");
+	register_syscore_ops(&s31_systimer_syscore_ops);
 	return 0;
 }
 

@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/esp32s31-clock.h>
+
+/ {
+	espressif,overlay-name = "uart3-dma";
+	espressif,resource-claims = "uart3", "uhci0", "ahb-gdma-pair0";
+};
+
+&ahb_gdma {
+	status = "okay";
+};
+
+&uart3 {
+	compatible = "espressif,esp32s31-uhci-uart";
+	reg = <0x2038d000 0x1000>, <0x20398000 0x1000>,
+	      <0x20587084 0x4>, <0x2f076400 0x2800>;
+	reg-names = "uart", "uhci", "clkrst", "dma-buf";
+	clocks = <&clkc ESP32S31_CLK_UART3>, <&clkc ESP32S31_CLK_UHCI>;
+	clock-names = "uart", "bus";
+	dmas = <&ahb_gdma 0 0>;
+	dma-names = "tx";
+	status = "okay";
+};

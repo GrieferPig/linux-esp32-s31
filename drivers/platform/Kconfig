@@ -10,21 +10,22 @@ config ESP32S31_DT_OVERLAY
 	  the previous overlay is restored if applying the new one fails.
 
 config ESP32S31_RADIO_SMODE_DRIVER
-	bool "ESP32-S31 S-mode radio runtime"
+	tristate "ESP32-S31 S-mode radio runtime"
 	depends on ESP32S31_RADIO_SMODE
+	depends on BT && WLAN
 	select FUTEX
+	select CFG80211
 	help
-	  Start the serialized radio kernel thread, provide the ESP-IDF
-	  compatibility runtime, and dispatch the Linux-owned timer and modem
-	  interrupts. All blob entry points execute in the worker's protected
-	  ILP32F context; Linux front ends use typed radio-core requests.
+	  Build the reloadable esp32s31-radio.ko. It owns the shared PHY, SRAM,
+	  clocks and interrupts and exposes cfg80211 plus direct HCI from one
+	  module. mode=wifi, mode=bt, or mode=combo selects the runtime profile.
+	  The versioned ESP-IDF radio closure is loaded from the radio bundle as
+	  external firmware and is not statically linked into this module.
 
 config ESP32S31_RADIO_BLOBS
-	bool "Link ESP-IDF Wi-Fi/Bluetooth firmware into the kernel"
-	depends on ESP32S31_RADIO_SMODE
-	help
-	  Link the locally generated, ILP32F ESP-IDF radio payload into vmlinux.
-	  Run the top-level radio-linux-payload target after updating ESP-IDF.
+	bool
+	depends on ESP32S31_RADIO_SMODE_DRIVER
+	default y
 
 source "drivers/platform/mips/Kconfig"
 

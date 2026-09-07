@@ -3,6 +3,7 @@
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
+#include <linux/cpu.h>
 #include <linux/fpu.h>
 #include <linux/interrupt.h>
 #include <linux/mm_types.h>
@@ -19,6 +20,7 @@
 #include <linux/wait.h>
 
 #include <asm/csr.h>
+#include <asm/esp32s31_ext.h>
 
 #include "esp32s31-radio-internal.h"
 
@@ -139,8 +141,7 @@ struct s31_linux_task {
 	bool critical_active;
 	bool critical_suspended;
 	u32 sync_lock_depth;
-	u32 sync_irq_mask;
-	u32 critical_irq_mask;
+	unsigned long sync_irq_flags;
 	unsigned long critical_flags;
 	struct s31_blob_context blob;
 	/* Payload execution stack in internal SRAM.  The PHY changes the
@@ -149,12 +150,12 @@ struct s31_linux_task {
 	void *payload_stack;
 	u32 payload_stack_size;
 	unsigned long sp_save[14];
-	/* ILP32F callee-saved payload context.  kernel_fpu_end() restores the
-	 * kthread's pre-blob kernel state, so these registers must be preserved
+	/* ILP32F callee-saved payload context.  These registers must be preserved
 	 * explicitly across every FreeRTOS-style blocking point. */
 	u32 fp_saved[13]; /* fs0..fs11, fcsr */
 	bool fp_valid;
 	u32 payload_stack_peak;
+	s32 requested_cpu;
 	struct s31_linux_task *next;
 };
 
@@ -171,8 +172,41 @@ static DEFINE_MUTEX(s31_blob_mutex);
 static struct s31_linux_task *s31_task_list;
 static DEFINE_SPINLOCK(s31_task_list_lock);
 
-#define S31_GATE_TIMING_SLOTS 16
-#define S31_GATE_LONGEST_SAMPLES 8
+/*
+ * Radio payloads run only on dedicated PF_KTHREAD contexts.  They have no
+ * userspace FP state to preserve, while s31_payload_fp_save_area() already
+ * retains the ILP32F callee-saved state across every payload blocking point.
+ * Avoid the generic kernel_fpu_begin()/end() pair here: it saves and restores
+ * all 32 registers on every BTDM queue wake even though the surrounding
+ * kthread never consumes that state.  Preemption remains disabled throughout
+ * each payload execution window, and the direct hardirq path still saves the
+ * complete interrupted FP register file before invoking a closed ISR.
+ *
+ * The pinned IDF radio objects contain no Xesploop or Xespv instructions, so
+ * these kthreads deliberately do not opt into esp32s31_ext_kernel_begin().
+ * User extension state is still suspended on kernel entry and managed by the
+ * architecture code; paying two SBI transitions at every payload wait would
+ * only save and restore an extension state that the radio never consumes.
+ */
+static void s31_blob_fpu_begin(void)
+{
+	WARN_ON_ONCE(!(current->flags & PF_KTHREAD));
+	preempt_disable();
+	if (s31_radio_payload_uses_fp())
+		csr_set(CSR_SSTATUS, SR_FS);
+}
+
+static void s31_blob_fpu_end(void)
+{
+	if (s31_radio_payload_uses_fp())
+		csr_clear(CSR_SSTATUS, SR_FS);
+	preempt_enable();
+}
+
+/* Production keeps this disabled.  Retain one opt-in sample of each kind
+ * without reserving more than 10 KiB of module BSS for dormant diagnostics. */
+#define S31_GATE_TIMING_SLOTS 1
+#define S31_GATE_LONGEST_SAMPLES 1
 
 struct s31_gate_reason_timing {
 	u64 wall_total_ns;
@@ -278,7 +312,7 @@ static void s31_gate_timing_acquired(struct s31_blob_context *context,
 	slot->enters++;
 	context->gate_timing_generation = s31_gate_timing_generation;
 	context->gate_acquired_ns = acquired_ns;
-	context->gate_exec_start_ns = task_sched_runtime(current);
+	context->gate_exec_start_ns = esp32s31_task_runtime(current);
 	context->last_wifi_event_valid = false;
 	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
 }
@@ -333,7 +367,7 @@ static void s31_gate_timing_released(struct s31_blob_context *context,
 		return;
 	}
 	now = ktime_get_mono_fast_ns();
-	exec_now = task_sched_runtime(current);
+	exec_now = esp32s31_task_runtime(current);
 
 	spin_lock_irqsave(&s31_gate_timing_lock, flags);
 	if (context->gate_timing_generation != s31_gate_timing_generation)
@@ -485,6 +519,10 @@ static struct s31_linux_task *s31_linux_current_task(void)
 
 static noinline void s31_payload_fp_save_area(u32 *fp_saved, bool *fp_valid)
 {
+	/* RISC-V trap entry clears sstatus.FS.  A blocking bridge call may be
+	 * reached from a native IDF ISR, so do not rely on the task-side FPU gate
+	 * state surviving that trap. */
+	csr_set(CSR_SSTATUS, SR_FS);
 	asm volatile(
 		"fsw fs0, 0(%0)\n\t"  "fsw fs1, 4(%0)\n\t"
 		"fsw fs2, 8(%0)\n\t"  "fsw fs3, 12(%0)\n\t"
@@ -501,6 +539,7 @@ static noinline void s31_payload_fp_restore_area(u32 *fp_saved, bool fp_valid)
 {
 	if (!fp_valid)
 		return;
+	csr_set(CSR_SSTATUS, SR_FS);
 	asm volatile(
 		"flw fs0, 0(%0)\n\t"  "flw fs1, 4(%0)\n\t"
 		"flw fs2, 8(%0)\n\t"  "flw fs3, 12(%0)\n\t"
@@ -617,7 +656,7 @@ static void s31_linux_task_unregister(struct s31_linux_task *task)
 static void s31_linux_task_cleanup(struct s31_linux_task *task)
 {
 	if (task->blob_active) {
-		kernel_fpu_end();
+		s31_blob_fpu_end();
 		s31_blob_restore_context(&task->blob);
 		mutex_unlock(&s31_blob_mutex);
 		task->blob_active = false;
@@ -650,12 +689,10 @@ bool s31_linux_blob_held_by_current(void)
 }
 
 /*
- * Linux clears sstatus.FS on every trap entry.  A native IDF ISR preserves
- * the complete interrupted FP register file, while an ordinary C call only
- * preserves the ABI callee-saved subset.  The closed radio objects contain
- * FP instructions, so a nested hardirq callback needs the stronger interrupt
- * contract: enable FS temporarily, save all 32 single-precision registers,
- * run the callback, restore them, then return to Linux with FS disabled.
+ * Linux clears sstatus.FS on every trap entry.  When Wi-Fi is enabled, a
+ * native IDF ISR preserves the complete interrupted FP register file because
+ * its payload objects contain FP instructions.  The pinned BTDM object region
+ * is integer-only, so a Bluetooth-only runtime can avoid this save/restore.
  */
 static noinline void s31_direct_isr_fp_save(u32 *fp)
 {
@@ -710,13 +747,15 @@ int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg)
 	struct s31_blob_context *context;
 	struct task_struct *owner;
 	struct s31_linux_task *task;
+	bool preserve_fp;
 	u32 fp[33] __aligned(16);
 
 	/* User page tables do not contain the blob's low identity mapping.  Every
 	 * compatibility task and the radio worker is a CPU0 kthread using init_mm;
 	 * other contexts retain the deferred fallback. */
 	if (!handler || !in_hardirq() || raw_smp_processor_id() != 0 ||
-	    !(current->flags & PF_KTHREAD) || current->active_mm != &init_mm)
+	    !(current->flags & PF_KTHREAD) ||
+	    !esp32s31_current_uses_init_mm())
 		return S31_DIRECT_ISR_DEFER_CONTEXT;
 	task = s31_linux_current_task();
 	if (task && ((task->critical_active && !task->critical_suspended) ||
@@ -735,11 +774,14 @@ int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg)
 	if (owner == current) {
 		if (!task || !s31_blob_active() || !context->stack_switched)
 			return S31_DIRECT_ISR_DEFER_OWNER;
-		s31_direct_isr_fp_save(fp);
+		preserve_fp = s31_radio_payload_uses_fp();
+		if (preserve_fp)
+			s31_direct_isr_fp_save(fp);
 		s31_rtos_isr_depth++;
 		handler(arg);
 		s31_rtos_isr_depth--;
-		s31_direct_isr_fp_restore(fp);
+		if (preserve_fp)
+			s31_direct_isr_fp_restore(fp);
 		return S31_DIRECT_ISR_HANDLED;
 	}
 	if (owner)
@@ -758,6 +800,14 @@ int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg)
 uint64_t s31_linux_time_ns(void)
 {
 	return ktime_get_mono_fast_ns();
+}
+
+int32_t s31_linux_current_cpu(void)
+{
+	/* The blob gate disables preemption before payload code can query this,
+	 * so the returned HP-hart identity remains stable for the duration of the
+	 * IDF critical-section/portMUX operation. */
+	return raw_smp_processor_id();
 }
 
 void s31_linux_printf(const char *fmt, ...)
@@ -785,7 +835,7 @@ static int s31_linux_task_main(void *arg)
 {
 	struct s31_linux_task *task = arg;
 
-	kthread_use_mm(&init_mm);
+	esp32s31_kthread_use_init_mm();
 	pr_info("esp32s31-radio: compatibility task %s entered\n", current->comm);
 	s31_linux_blob_enter();
 	s31_payload_run(task->sp_save,
@@ -796,7 +846,7 @@ static int s31_linux_task_main(void *arg)
 	if (task->blob_active)
 		s31_linux_blob_leave();
 	pr_info("esp32s31-radio: compatibility task %s returned\n", current->comm);
-	kthread_unuse_mm(&init_mm);
+	esp32s31_kthread_unuse_init_mm();
 	s31_linux_task_cleanup(task);
 	s31_linux_task_unregister(task);
 	s31_rtos_free(task->payload_stack);
@@ -808,7 +858,8 @@ static int s31_linux_task_main(void *arg)
 
 void *s31_linux_task_create(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
-				    void *arg, u32 priority, void *cookie)
+				    void *arg, u32 priority, void *cookie,
+				    s32 core_id)
 {
 	struct s31_linux_task *task;
 	struct sched_param param = { };
@@ -826,6 +877,7 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 	task->cookie = cookie;
 	task->payload_stack = stack_base;
 	task->payload_stack_size = stack_size;
+	task->requested_cpu = core_id;
 	init_completion(&task->exited);
 	atomic_set(&task->stopping, 0);
 	task->thread = kthread_create(s31_linux_task_main, task, "%s",
@@ -838,22 +890,32 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 	task->next = s31_task_list;
 	s31_task_list = task;
 	spin_unlock(&s31_task_list_lock);
-	/* Radio hardware, IRQ callbacks and the serialized blob worker all run
-	 * on CPU0.  Keep every FreeRTOS compatibility task on that CPU as well. */
-	kthread_bind(task->thread, 0);
-	/* BTDM has hard controller deadlines.  Keep Wi-Fi on CFS so a long receive
-	 * burst cannot exclude the Linux worker and ACK path on hart 0. */
-	realtime_task = name && !strcmp(name, "btdm");
+	/* Keep IDF's requested affinity intact.  The blob execution gate remains
+	 * the mutual-exclusion boundary, but releasing it while an IDF task blocks
+	 * must allow the next native-designated task to run on the other HP core.
+	 * This is required for dual-core IDF builds; NO_AFFINITY stays migratable. */
+	if (core_id >= 0 && core_id < nr_cpu_ids && cpu_online(core_id))
+		kthread_bind(task->thread, core_id);
+	/* BTDM has hard controller deadlines on the native dedicated core.  In the
+	 * Linux shared-core combo profile, SCHED_RR/80 preempts both the Wi-Fi task
+	 * and the TCP-ACK worker whenever media IRQs are pending.  Keep RT only for
+	 * BT-only mode; combo uses a high-priority CFS controller task so both
+	 * clients receive service on the one compatibility hart. */
+	realtime_task = name && !strcmp(name, "btdm") &&
+		!s31_radio_payload_uses_fp();
 	if (realtime_task) {
 		param.sched_priority = 80;
-		sched_setscheduler_nocheck(task->thread, SCHED_RR, &param);
+		esp32s31_sched_setscheduler(task->thread, SCHED_RR,
+					   param.sched_priority);
 	} else {
-		sched_setscheduler_nocheck(task->thread, SCHED_NORMAL, &param);
+		esp32s31_sched_setscheduler(task->thread, SCHED_NORMAL, 0);
 		set_user_nice(task->thread,
+			name && !strcmp(name, "btdm") ? -10 :
 			name && !strcmp(name, "wifi") ? -10 : 5);
 	}
-	pr_info("esp32s31-radio: task %s FreeRTOS-prio=%u Linux=%s/%d\n",
+	pr_info("esp32s31-radio: task %s FreeRTOS-prio=%u core=%d Linux=%s/%d\n",
 		name && *name ? name : "s31-task", priority,
+		core_id,
 		realtime_task ? "RR" : "CFS",
 		realtime_task ? param.sched_priority : task_nice(task->thread));
 	wake_up_process(task->thread);
@@ -899,6 +961,30 @@ int32_t s31_linux_task_stop(void *opaque)
 	return 0;
 }
 
+void s31_linux_tasks_stop_all(void)
+{
+	for (;;) {
+		struct s31_linux_task *task;
+		struct task_struct *thread;
+
+		spin_lock(&s31_task_list_lock);
+		task = s31_task_list;
+		if (!task) {
+			spin_unlock(&s31_task_list_lock);
+			break;
+		}
+		atomic_set(&task->stopping, 1);
+		thread = task->thread;
+		get_task_struct(thread);
+		spin_unlock(&s31_task_list_lock);
+
+		atomic_inc(&s31_sync_stop_generation);
+		wake_up_process(thread);
+		kthread_stop(thread);
+		put_task_struct(thread);
+	}
+}
+
 void s31_linux_task_delay(u32 ticks)
 {
 	struct s31_linux_task *task = s31_linux_current_task();
@@ -937,15 +1023,24 @@ void s31_linux_task_set_priority(void *opaque, u32 priority)
 {
 	struct s31_linux_task *task = opaque;
 	struct sched_param param = { };
+	bool realtime_task;
 
 	if (!task || task->magic != S31_LINUX_TASK_MAGIC)
 		return;
-	if (!strcmp(task->thread->comm, "btdm")) {
+	/* Controller priority changes are normal during BTDM bring-up.  In the
+	 * combo profile they must preserve the CFS policy selected at creation;
+	 * promoting the task back to RR/80 here silently starves Wi-Fi despite the
+	 * shared-core policy above. */
+	realtime_task = !strcmp(task->thread->comm, "btdm") &&
+		!s31_radio_payload_uses_fp();
+	if (realtime_task) {
 		param.sched_priority = 80;
-		sched_setscheduler_nocheck(task->thread, SCHED_RR, &param);
+		esp32s31_sched_setscheduler(task->thread, SCHED_RR,
+					   param.sched_priority);
 	} else {
-		sched_setscheduler_nocheck(task->thread, SCHED_NORMAL, &param);
+		esp32s31_sched_setscheduler(task->thread, SCHED_NORMAL, 0);
 		set_user_nice(task->thread,
+			!strcmp(task->thread->comm, "btdm") ||
 			!strcmp(task->thread->comm, "wifi") ? -10 : 5);
 	}
 	pr_info("esp32s31-radio: task %s priority update FreeRTOS=%u\n",
@@ -974,16 +1069,19 @@ void s31_linux_sync_lock(void *opaque)
 {
 	struct s31_linux_sync *sync = opaque;
 	struct s31_linux_task *task = s31_linux_current_task();
+	unsigned long flags;
 
 	if (!sync)
 		return;
-	/* Match native IDF ordering: hold the radio IRQ at the device boundary
-	 * before publishing/acquiring a queue/event lock.  This makes the next
-	 * interrupt arrive only after the unsafe point instead of turning it into
-	 * a worker callback which can deadlock behind this task's blob gate. */
+	/* These queue/event locks are never held across a blocking bridge call.
+	 * Match the native FreeRTOS port by masking local interrupts across the
+	 * short lock instead of walking Linux's generic disable/enable IRQ path on
+	 * every BTDM queue operation.  The outermost depth owns the saved state. */
 	if (task) {
-		if (!task->sync_lock_depth)
-			task->sync_irq_mask = s31_radio_blob_irqs_mask();
+		if (!task->sync_lock_depth) {
+			local_irq_save(flags);
+			task->sync_irq_flags = flags;
+		}
 		task->sync_lock_depth++;
 	}
 	raw_spin_lock(&sync->lock);
@@ -998,18 +1096,17 @@ void s31_linux_sync_unlock(void *opaque)
 		return;
 	raw_spin_unlock(&sync->lock);
 	if (task) {
-		u32 irq_mask = 0;
+		unsigned long flags = 0;
 
 		WARN_ON_ONCE(!task->sync_lock_depth);
 		if (task->sync_lock_depth) {
 			task->sync_lock_depth--;
 			if (!task->sync_lock_depth) {
-				irq_mask = task->sync_irq_mask;
-				task->sync_irq_mask = 0;
+				flags = task->sync_irq_flags;
+				task->sync_irq_flags = 0;
+				local_irq_restore(flags);
 			}
 		}
-		if (irq_mask)
-			s31_radio_blob_irqs_restore(irq_mask);
 		s31_radio_blob_run_pending_isrs();
 	}
 }
@@ -1067,34 +1164,36 @@ void s31_linux_sync_wake(void *opaque)
 u32 s31_linux_critical_enter(void)
 {
 	struct s31_linux_task *task = s31_linux_current_task();
+	unsigned long flags;
 
-	/* Mask only radio device IRQs, not all local Linux interrupts.  This keeps
-	 * timer/UART/IPI service live while reproducing native IDF's guarantee
-	 * that the closed ISR never nests a task holding its critical raw lock. */
+	/* FreeRTOS portENTER_CRITICAL masks local interrupts before taking the
+	 * controller lock.  The BT sleep sequencer starts its wake transaction
+	 * inside this window and can miss the hardware acknowledgement when a
+	 * Linux timer interrupt splits that short register sequence.  Preserve
+	 * the native ordering here; blocking compatibility calls suspend this
+	 * critical section below, so local IRQs are never held off while sleeping. */
+	local_irq_save(flags);
 	if (task) {
-		task->critical_irq_mask = s31_radio_blob_irqs_mask();
 		task->critical_active = true;
-		task->critical_flags = 0;
+		task->critical_flags = flags;
 	}
 	raw_spin_lock(&s31_critical_lock);
-	return 0;
+	return (u32)flags;
 }
 
 void s31_linux_critical_exit(u32 flags)
 {
 	struct s31_linux_task *task = s31_linux_current_task();
-	u32 irq_mask = 0;
+	unsigned long irq_flags = flags;
 
-	(void)flags;
 	raw_spin_unlock(&s31_critical_lock);
 	/* Keep the exclusion published until the lock is actually free. */
 	if (task) {
 		task->critical_active = false;
-		irq_mask = task->critical_irq_mask;
-		task->critical_irq_mask = 0;
+		irq_flags = task->critical_flags;
+		task->critical_flags = 0;
 	}
-	if (irq_mask)
-		s31_radio_blob_irqs_restore(irq_mask);
+	local_irq_restore(irq_flags);
 	s31_radio_blob_run_pending_isrs();
 }
 
@@ -1107,30 +1206,28 @@ void s31_linux_critical_suspend(void)
 	raw_spin_unlock(&s31_critical_lock);
 	/* The raw lock is free before this state permits direct nesting. */
 	task->critical_suspended = true;
-	if (task->critical_irq_mask) {
-		u32 irq_mask = task->critical_irq_mask;
-
-		task->critical_irq_mask = 0;
-		s31_radio_blob_irqs_restore(irq_mask);
-	}
+	local_irq_restore(task->critical_flags);
 	s31_radio_blob_run_pending_isrs();
 }
 
 void s31_linux_critical_resume(void)
 {
 	struct s31_linux_task *task = s31_linux_current_task();
+	unsigned long flags;
+
 	if (!task || !task->critical_active || !task->critical_suspended)
 		return;
-	task->critical_irq_mask = s31_radio_blob_irqs_mask();
+	local_irq_save(flags);
+	task->critical_flags = flags;
 	raw_spin_lock(&s31_critical_lock);
-	task->critical_flags = 0;
 	task->critical_suspended = false;
 }
 
 void s31_linux_blob_enter(void)
 {
 	struct s31_blob_context *context;
-	u64 wait_start_ns = ktime_get_mono_fast_ns();
+	bool timing = READ_ONCE(s31_gate_timing_enabled);
+	u64 wait_start_ns = timing ? ktime_get_mono_fast_ns() : 0;
 	u64 acquired_ns;
 
 	/* A woken Wi-Fi task normally has a higher SCHED_FIFO priority than the
@@ -1146,11 +1243,11 @@ void s31_linux_blob_enter(void)
 		}
 		mutex_lock(&s31_blob_mutex);
 	}
-	acquired_ns = ktime_get_mono_fast_ns();
+	acquired_ns = timing ? ktime_get_mono_fast_ns() : 0;
 	context = s31_blob_context_current();
 	s31_gate_timing_acquired(context, wait_start_ns, acquired_ns);
 	s31_blob_install_context(context);
-	kernel_fpu_begin();
+	s31_blob_fpu_begin();
 	s31_blob_set_active(true);
 	s31_radio_timing_blob_enter();
 }
@@ -1165,7 +1262,7 @@ void s31_linux_blob_leave(void)
 	 * ownership domain. */
 	s31_radio_blob_run_pending_isrs();
 	s31_gate_timing_released(context, S31_BLOB_RELEASE_LEAVE, NULL);
-	kernel_fpu_end();
+	s31_blob_fpu_end();
 	s31_blob_restore_context(context);
 	s31_blob_set_active(false);
 	mutex_unlock(&s31_blob_mutex);
@@ -1186,12 +1283,15 @@ void s31_linux_blob_suspend(u32 reason)
 	s31_radio_blob_run_pending_isrs();
 	if (s31_blob_active()) {
 		s31_gate_timing_released(context, reason, &release);
-		if (task)
-			s31_payload_fp_save_area(task->fp_saved, &task->fp_valid);
-		else
-			s31_payload_fp_save_area(context->fp_saved,
-					 &context->fp_valid);
-		kernel_fpu_end();
+		if (s31_radio_payload_uses_fp()) {
+			if (task)
+				s31_payload_fp_save_area(task->fp_saved,
+							 &task->fp_valid);
+			else
+				s31_payload_fp_save_area(context->fp_saved,
+							 &context->fp_valid);
+		}
+		s31_blob_fpu_end();
 		s31_blob_restore_context(context);
 		s31_blob_set_active(false);
 		mutex_unlock(&s31_blob_mutex);
@@ -1205,22 +1305,26 @@ void s31_linux_blob_resume(void)
 {
 	struct s31_blob_context *context;
 	struct s31_linux_task *task = s31_linux_current_task();
+	bool timing = READ_ONCE(s31_gate_timing_enabled);
 	u64 wait_start_ns;
 	u64 acquired_ns;
 
 	if (!s31_blob_active()) {
-		wait_start_ns = ktime_get_mono_fast_ns();
+		wait_start_ns = timing ? ktime_get_mono_fast_ns() : 0;
 		mutex_lock(&s31_blob_mutex);
-		acquired_ns = ktime_get_mono_fast_ns();
+		acquired_ns = timing ? ktime_get_mono_fast_ns() : 0;
 		context = s31_blob_context_current();
 		s31_gate_timing_acquired(context, wait_start_ns, acquired_ns);
 		s31_blob_install_context(context);
-		kernel_fpu_begin();
-		if (task)
-			s31_payload_fp_restore_area(task->fp_saved, task->fp_valid);
-		else
-			s31_payload_fp_restore_area(context->fp_saved,
-					    context->fp_valid);
+		s31_blob_fpu_begin();
+		if (s31_radio_payload_uses_fp()) {
+			if (task)
+				s31_payload_fp_restore_area(task->fp_saved,
+							    task->fp_valid);
+			else
+				s31_payload_fp_restore_area(context->fp_saved,
+							    context->fp_valid);
+		}
 		s31_blob_set_active(true);
 		s31_radio_timing_blob_enter();
 	}

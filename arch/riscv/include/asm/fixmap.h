@@ -40,8 +40,12 @@ enum fixed_addresses {
 #ifdef CONFIG_SOC_ESP32S31
 	/* Bootstrap mapping used to publish page-table writes to the Sv32 walker. */
 	FIX_S31_CACHE,
+	/* HP clock/reset mapping needed before the early timer clocksource. */
+	FIX_S31_CLKRST,
 	/* Always-on SYSTIMER mapping used by the early clocksource. */
 	FIX_S31_SYSTIMER,
+	/* RTC slow-clock counter used to account time across HP suspend. */
+	FIX_S31_RTC_TIMER,
 #endif
 
 	__end_of_permanent_fixed_addresses,

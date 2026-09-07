@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 obj-y					+= actions/
+obj-$(CONFIG_ESP32S31_PMU)		+= esp32s31-pmu.o
 obj-y					+= amlogic/
 obj-y					+= apple/
 obj-y					+= arm/

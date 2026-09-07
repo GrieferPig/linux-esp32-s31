@@ -212,3 +212,5 @@ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
 obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
 
 ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+obj-$(CONFIG_REGULATOR_ESP32S31_GP_LDO) += esp32s31-gp-ldo.o
+obj-$(CONFIG_REGULATOR_ESP32S31_ANA_I2C) += esp32s31-ana-i2c.o

@@ -12,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #define ESP32S31_USB_CLK_APB_EN		BIT(0)
 #define ESP32S31_USB_CLK_SYS_EN		BIT(1)
@@ -43,6 +44,11 @@ struct esp32s31_usb_phy {
 	enum phy_mode mode;
 	bool powered;
 };
+
+static void esp32s31_usb_phy_pm_disable(void *data)
+{
+	pm_runtime_disable(data);
+}
 
 static void esp32s31_usb_update(void __iomem *reg, u32 clear, u32 set)
 {
@@ -149,6 +155,7 @@ static int esp32s31_usb_phy_probe(struct platform_device *pdev)
 {
 	struct phy_provider *provider;
 	struct esp32s31_usb_phy *priv;
+	int ret;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -178,6 +185,20 @@ static int esp32s31_usb_phy_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->phy_ctrl);
 
 	priv->mode = PHY_MODE_USB_HOST;
+
+	/*
+	 * Enable runtime PM before creating the generic PHY.  The PHY core then
+	 * mirrors runtime PM into its child device, so a PHY user resumes this
+	 * provider (and HPCNNT) before any register access.
+	 */
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+	ret = devm_add_action_or_reset(&pdev->dev,
+				       esp32s31_usb_phy_pm_disable,
+				       &pdev->dev);
+	if (ret)
+		return ret;
+
 	priv->phy = devm_phy_create(&pdev->dev, NULL,
 				    &esp32s31_usb_phy_ops);
 	if (IS_ERR(priv->phy))
@@ -191,6 +212,8 @@ static int esp32s31_usb_phy_probe(struct platform_device *pdev)
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
 
+	/* No PHY user exists yet, so release the provider's initial active vote. */
+	pm_runtime_idle(&pdev->dev);
 	dev_info(&pdev->dev, "integrated 16-bit UTMI+ PHY registered\n");
 	return 0;
 }

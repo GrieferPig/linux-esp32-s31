@@ -1286,7 +1286,9 @@ int gserial_alloc_line_no_console(unsigned char *line_num)
 	struct usb_cdc_line_coding	coding;
 	struct gs_port			*port;
 	struct device			*tty_dev;
-	int				ret;
+	struct device			*existing;
+	char				name[16];
+	int				ret = -EBUSY;
 	int				port_num;
 
 	coding.dwDTERate = cpu_to_le32(9600);
@@ -1295,34 +1297,47 @@ int gserial_alloc_line_no_console(unsigned char *line_num)
 	coding.bDataBits = USB_CDC_1_STOP_BITS;
 
 	for (port_num = 0; port_num < MAX_U_SERIAL_PORTS; port_num++) {
+		/*
+		 * A different tty driver may already expose the ttyGS minor.  This
+		 * is the case on ESP32-S31 where the fixed USB Serial/JTAG console
+		 * owns ttyGS0.  Avoid calling device_add() for an occupied name: in
+		 * addition to returning -EEXIST it emits a noisy sysfs warning.
+		 */
+		snprintf(name, sizeof(name), "ttyGS%d", port_num);
+		existing = class_find_device_by_name(&tty_class, name);
+		if (existing) {
+			put_device(existing);
+			continue;
+		}
+
 		ret = gs_port_alloc(port_num, &coding);
 		if (ret == -EBUSY)
 			continue;
 		if (ret)
 			return ret;
-		break;
-	}
-	if (ret)
-		return ret;
 
-	/* ... and sysfs class devices, so mdev/udev make /dev/ttyGS* */
-
-	port = ports[port_num].port;
-	tty_dev = tty_port_register_device(&port->port,
-			gs_tty_driver, port_num, NULL);
-	if (IS_ERR(tty_dev)) {
-		pr_err("%s: failed to register tty for port %d, err %ld\n",
-				__func__, port_num, PTR_ERR(tty_dev));
+		/* ... and sysfs class devices, so mdev/udev make /dev/ttyGS* */
+		port = ports[port_num].port;
+		tty_dev = tty_port_register_device(&port->port,
+					   gs_tty_driver, port_num, NULL);
+		if (!IS_ERR(tty_dev)) {
+			*line_num = port_num;
+			return 0;
+		}
 
 		ret = PTR_ERR(tty_dev);
 		mutex_lock(&ports[port_num].lock);
 		ports[port_num].port = NULL;
 		mutex_unlock(&ports[port_num].lock);
 		gserial_free_port(port);
-		goto err;
+		/* Another tty driver can legitimately own this minor. */
+		if (ret == -EEXIST || ret == -EBUSY)
+			continue;
+		pr_err("%s: failed to register tty for port %d, err %d\n",
+			__func__, port_num, ret);
+		return ret;
 	}
-	*line_num = port_num;
-err:
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(gserial_alloc_line_no_console);

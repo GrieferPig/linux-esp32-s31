@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "radio-wifi";
+	espressif,resource-claims = "radio";
+};
+
+&radio {
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+};
+
+&bluetooth {
+	status = "disabled";
+};

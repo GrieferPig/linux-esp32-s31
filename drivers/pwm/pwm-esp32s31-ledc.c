@@ -10,18 +10,26 @@
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/pwm.h>
+#include <linux/reset.h>
 
 #define LEDC_CH_STRIDE			0x14
 #define LEDC_CH_CONF0(ch)		((ch) * LEDC_CH_STRIDE)
 #define LEDC_CH_HPOINT(ch)		(0x04 + (ch) * LEDC_CH_STRIDE)
 #define LEDC_CH_DUTY(ch)		(0x08 + (ch) * LEDC_CH_STRIDE)
 #define LEDC_CH_CONF1(ch)		(0x0c + (ch) * LEDC_CH_STRIDE)
+#define LEDC_CH_DUTY_R(ch)		(0x10 + (ch) * LEDC_CH_STRIDE)
 #define LEDC_TIMER_CONF(t)		(0xa0 + (t) * 8)
+#define LEDC_INT_RAW			0xc0
+#define LEDC_INT_CLR			0xcc
+#define LEDC_GAMMA_CONF(ch)		(0x100 + (ch) * 4)
+#define LEDC_GAMMA_RANGE(ch, range)	(0x400 + (ch) * 0x40 + (range) * 4)
 #define LEDC_CH_POWER			0x174
 #define LEDC_TIMER_POWER		0x178
 
@@ -30,6 +38,12 @@
 #define LEDC_CH_IDLE_LEVEL		BIT(3)
 #define LEDC_CH_PARA_UP			BIT(4)
 #define LEDC_DUTY_START			BIT(31)
+#define LEDC_DUTY_DONE(ch)		BIT(4 + (ch))
+#define LEDC_GAMMA_ENTRY_NUM		GENMASK(4, 0)
+#define LEDC_GAMMA_STEP			GENMASK(30, 21)
+#define LEDC_GAMMA_SCALE		GENMASK(20, 11)
+#define LEDC_GAMMA_CYCLE		GENMASK(10, 1)
+#define LEDC_GAMMA_INCREASE		BIT(0)
 
 #define LEDC_TIMER_DUTY_RES		GENMASK(4, 0)
 #define LEDC_TIMER_CLK_DIV		GENMASK(22, 5)
@@ -48,6 +62,9 @@ struct esp32s31_ledc {
 	struct mutex lock;
 	u64 timer_period[4];
 	unsigned int timer_users[4];
+	u64 logical_duty[8];
+	u32 fade_time_ms;
+	bool gamma_correction;
 };
 
 static inline struct esp32s31_ledc *to_esp32s31_ledc(struct pwm_chip *chip)
@@ -74,6 +91,71 @@ static int esp32s31_ledc_choose_timer(struct esp32s31_ledc *ledc, u64 period,
 	}
 
 	return -ERANGE;
+}
+
+static u32 esp32s31_ledc_map_duty(struct esp32s31_ledc *ledc, u64 duty_ns,
+				  u64 period_ns, unsigned int resolution)
+{
+	u64 full = BIT_ULL(resolution);
+	u64 logical = DIV64_U64_ROUND_CLOSEST(duty_ns * full, period_ns);
+
+	logical = min(logical, full);
+	/* The Linux PWM state always describes electrical on-time.  Gamma mode
+	 * selects the multi-range fade engine; it must not square the requested
+	 * steady-state duty cycle (25% would otherwise become 6.25%). */
+	return logical;
+}
+
+static int esp32s31_ledc_fade(struct esp32s31_ledc *ledc, unsigned int ch,
+			      unsigned int resolution, u64 period_ns,
+			      u64 old_ns, u64 new_ns)
+{
+	unsigned int ranges = ledc->gamma_correction ? 16 : 1;
+	u64 total_cycles = DIV64_U64_ROUND_CLOSEST((u64)ledc->fade_time_ms *
+						     NSEC_PER_MSEC, period_ns);
+	u32 start, target, status;
+	unsigned int range;
+
+	start = esp32s31_ledc_map_duty(ledc, old_ns, period_ns, resolution);
+	target = esp32s31_ledc_map_duty(ledc, new_ns, period_ns, resolution);
+	if (!total_cycles || start == target)
+		return 0;
+
+	writel(start << 4, ledc->base + LEDC_CH_DUTY(ch));
+	for (range = 0; range < ranges; range++) {
+		u64 delta_ns = new_ns >= old_ns ? new_ns - old_ns :
+						      old_ns - new_ns;
+		u64 head_delta = div64_u64(delta_ns * range, ranges);
+		u64 tail_delta = div64_u64(delta_ns * (range + 1), ranges);
+		u64 logical_head = new_ns >= old_ns ? old_ns + head_delta :
+						       old_ns - head_delta;
+		u64 logical_tail = new_ns >= old_ns ? old_ns + tail_delta :
+						       old_ns - tail_delta;
+		u32 head = esp32s31_ledc_map_duty(ledc, logical_head,
+						  period_ns, resolution);
+		u32 tail = esp32s31_ledc_map_duty(ledc, logical_tail,
+						  period_ns, resolution);
+		u32 delta = abs((int)tail - (int)head);
+		u32 steps = clamp_t(u32, delta, 1, 1023);
+		u32 scale = delta ? clamp_t(u32,
+			DIV_ROUND_CLOSEST(delta, steps), 1, 1023) : 0;
+		u32 cycle = clamp_t(u64, div64_u64(total_cycles,
+						   (u64)ranges * steps), 1, 1023);
+		u32 entry = FIELD_PREP(LEDC_GAMMA_STEP, steps) |
+			    FIELD_PREP(LEDC_GAMMA_SCALE, scale) |
+			    FIELD_PREP(LEDC_GAMMA_CYCLE, cycle);
+
+		if (tail >= head)
+			entry |= LEDC_GAMMA_INCREASE;
+		writel(entry, ledc->base + LEDC_GAMMA_RANGE(ch, range));
+	}
+	writel(FIELD_PREP(LEDC_GAMMA_ENTRY_NUM, ranges),
+	       ledc->base + LEDC_GAMMA_CONF(ch));
+	writel(LEDC_DUTY_DONE(ch), ledc->base + LEDC_INT_CLR);
+	writel(LEDC_DUTY_START, ledc->base + LEDC_CH_CONF1(ch));
+	return readl_poll_timeout(ledc->base + LEDC_INT_RAW, status,
+				 status & LEDC_DUTY_DONE(ch), 100,
+				 ledc->fade_time_ms * 1000 + 100000);
 }
 
 static int esp32s31_ledc_request(struct pwm_chip *chip,
@@ -130,13 +212,9 @@ static int esp32s31_ledc_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	writel(conf, ledc->base + LEDC_TIMER_CONF(timer));
 	writel(BIT(timer), ledc->base + LEDC_TIMER_POWER);
 
-	duty = DIV64_U64_ROUND_CLOSEST(state->duty_cycle * BIT_ULL(resolution),
-				      state->period);
-	duty = min_t(u32, duty, BIT(resolution));
+	duty = esp32s31_ledc_map_duty(ledc, state->duty_cycle,
+				       state->period, resolution);
 	writel(0, ledc->base + LEDC_CH_HPOINT(ch));
-	/* IDF stores the integer duty at bit 4 of the 25-bit field. */
-	writel(duty << 4, ledc->base + LEDC_CH_DUTY(ch));
-	writel(LEDC_DUTY_START, ledc->base + LEDC_CH_CONF1(ch));
 
 	conf = FIELD_PREP(LEDC_CH_TIMER_SEL, timer) | LEDC_CH_PARA_UP;
 	if (state->enabled)
@@ -148,6 +226,19 @@ static int esp32s31_ledc_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	if (!state->enabled)
 		writel(readl(ledc->base + LEDC_CH_POWER) & ~BIT(ch),
 		       ledc->base + LEDC_CH_POWER);
+
+	if (state->enabled && ledc->fade_time_ms &&
+	    ledc->logical_duty[ch] != state->duty_cycle) {
+		ret = esp32s31_ledc_fade(ledc, ch, resolution, state->period,
+					ledc->logical_duty[ch], state->duty_cycle);
+		if (ret)
+			goto out;
+	}
+	/* End on the exact target even when a gamma segment rounded a step. */
+	writel(0, ledc->base + LEDC_GAMMA_CONF(ch));
+	writel(duty << 4, ledc->base + LEDC_CH_DUTY(ch));
+	writel(LEDC_DUTY_START, ledc->base + LEDC_CH_CONF1(ch));
+	ledc->logical_duty[ch] = state->duty_cycle;
 out:
 	mutex_unlock(&ledc->lock);
 	return ret;
@@ -164,6 +255,7 @@ static int esp32s31_ledc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct esp32s31_ledc *ledc;
 	struct pwm_chip *chip;
+	struct reset_control *rst;
 	int ret;
 
 	chip = devm_pwmchip_alloc(dev, 8, sizeof(*ledc));
@@ -181,6 +273,16 @@ static int esp32s31_ledc_probe(struct platform_device *pdev)
 	ledc->clk = devm_clk_get_enabled(dev, NULL);
 	if (IS_ERR(ledc->clk))
 		return dev_err_probe(dev, PTR_ERR(ledc->clk), "clock unavailable\n");
+	rst = devm_reset_control_get_optional_exclusive(dev, NULL);
+	if (IS_ERR(rst))
+		return dev_err_probe(dev, PTR_ERR(rst), "reset unavailable\n");
+	ret = reset_control_reset(rst);
+	if (ret)
+		return dev_err_probe(dev, ret, "reset failed\n");
+	device_property_read_u32(dev, "espressif,fade-time-ms",
+				 &ledc->fade_time_ms);
+	ledc->gamma_correction = device_property_read_bool(dev,
+						   "espressif,gamma-correction");
 
 	/* IDF: force channel/gamma RAM on while Linux owns the controller. */
 	writel((readl(ledc->mem_lp) & ~BIT(2)) | BIT(3), ledc->mem_lp);

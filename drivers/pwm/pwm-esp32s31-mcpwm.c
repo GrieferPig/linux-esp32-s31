@@ -3,19 +3,22 @@
  * ESP32-S31 MCPWM basic waveform driver.
  *
  * Each of the four instances has three timer/operator pairs and two
- * generators per operator.  Capture, fault, sync and dead-time facilities
- * are intentionally left to the counter/capture interfaces; this driver
- * exposes all 24 basic PWM outputs through the PWM framework.
+ * generators per operator.  The PWM framework exposes all 24 basic outputs
+ * and its capture ABI exposes the three capture inputs.  Device-tree policy
+ * can additionally arm GPIO faults and timer synchronization.
  */
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pwm.h>
+#include <linux/reset.h>
 
 #define MCPWM_TIMER_CFG0(t)		((t) * 0x10)
 #define MCPWM_TIMER_CFG1(t)		(0x04 + (t) * 0x10)
@@ -26,6 +29,16 @@
 #define MCPWM_GEN_CFG(op)		(MCPWM_OPERATOR_BASE(op) + 0x0c)
 #define MCPWM_GENERATOR(op, gen)	(MCPWM_OPERATOR_BASE(op) + 0x14 + \
 					 (gen) * 0x04)
+#define MCPWM_TIMER_SYNC(t)		(0x08 + (t) * 0x10)
+#define MCPWM_TIMER_SYNCI_CFG		0x30
+#define MCPWM_FAULT_DETECT		0xe0
+#define MCPWM_CAP_TIMER_CFG		0xe4
+#define MCPWM_CAP_CH_CFG(ch)		(0xec + (ch) * 4)
+#define MCPWM_CAP_CH_VALUE(ch)		(0xf8 + (ch) * 4)
+#define MCPWM_CAP_STATUS		0x104
+#define MCPWM_INT_RAW			0x110
+#define MCPWM_INT_CLR			0x118
+#define MCPWM_FH_CFG0(op)		(0x64 + (op) * 0x38)
 
 #define MCPWM_TIMER_PRESCALE		GENMASK(7, 0)
 #define MCPWM_TIMER_PERIOD		GENMASK(23, 8)
@@ -34,6 +47,12 @@
 #define MCPWM_TIMER_START_FREE		2
 #define MCPWM_TIMER_MODE_UP		1
 #define MCPWM_STAMP_VALUE		GENMASK(15, 0)
+#define MCPWM_TIMER_SYNC_ENABLE	BIT(0)
+#define MCPWM_TIMER_SYNC_PHASE		GENMASK(19, 4)
+#define MCPWM_CAP_TIMER_ENABLE		BIT(0)
+#define MCPWM_CAP_ENABLE		BIT(0)
+#define MCPWM_CAP_BOTH_EDGES		GENMASK(2, 1)
+#define MCPWM_CAP_INT(ch)		BIT(27 + (ch))
 
 #define MCPWM_ACTION_LOW		1
 #define MCPWM_ACTION_HIGH		2
@@ -139,9 +158,124 @@ out:
 	return ret;
 }
 
+static int esp32s31_mcpwm_capture(struct pwm_chip *chip,
+				  struct pwm_device *pwm,
+				  struct pwm_capture *result,
+				  unsigned long timeout_ms)
+{
+	struct esp32s31_mcpwm *pc = to_esp32s31_mcpwm(chip);
+	unsigned int cap = pwm->hwpwm % 3;
+	ktime_t deadline = ktime_add_ms(ktime_get(), timeout_ms);
+	u32 first_rise = 0, fall = 0, second_rise = 0, status;
+	unsigned long rate = clk_get_rate(pc->clk);
+	bool have_rise = false, have_fall = false, done = false;
+	int ret = 0;
+
+	if (!rate || !timeout_ms)
+		return -EINVAL;
+
+	mutex_lock(&pc->lock);
+	writel(MCPWM_CAP_INT(cap), pc->base + MCPWM_INT_CLR);
+	writel(MCPWM_CAP_ENABLE | MCPWM_CAP_BOTH_EDGES,
+	       pc->base + MCPWM_CAP_CH_CFG(cap));
+	writel(readl(pc->base + MCPWM_CAP_TIMER_CFG) |
+	       MCPWM_CAP_TIMER_ENABLE, pc->base + MCPWM_CAP_TIMER_CFG);
+
+	while (ktime_before(ktime_get(), deadline)) {
+		u32 value;
+		bool falling;
+
+		status = readl(pc->base + MCPWM_INT_RAW);
+		if (!(status & MCPWM_CAP_INT(cap))) {
+			usleep_range(50, 100);
+			continue;
+		}
+		value = readl(pc->base + MCPWM_CAP_CH_VALUE(cap));
+		falling = readl(pc->base + MCPWM_CAP_STATUS) & BIT(cap);
+		writel(MCPWM_CAP_INT(cap), pc->base + MCPWM_INT_CLR);
+
+		if (!falling) {
+			if (!have_rise) {
+				first_rise = value;
+				have_rise = true;
+			} else if (have_fall) {
+				second_rise = value;
+				done = true;
+				break;
+			} else {
+				first_rise = value;
+			}
+		} else if (have_rise) {
+			fall = value;
+			have_fall = true;
+		}
+	}
+	writel(0, pc->base + MCPWM_CAP_CH_CFG(cap));
+	writel(MCPWM_CAP_INT(cap), pc->base + MCPWM_INT_CLR);
+
+	if (!done) {
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	result->period = mul_u64_u64_div_u64((u32)(second_rise - first_rise),
+					       NSEC_PER_SEC, rate);
+	result->duty_cycle = mul_u64_u64_div_u64((u32)(fall - first_rise),
+						   NSEC_PER_SEC, rate);
+out:
+	mutex_unlock(&pc->lock);
+	return ret;
+}
+
+static int esp32s31_mcpwm_init_fault_sync(struct platform_device *pdev,
+					   struct esp32s31_mcpwm *pc)
+{
+	u32 fault_mask = 0, active_high = 0;
+	u32 sync_sources[3] = { 0 }, sync_phases[3] = { 0 };
+	u32 fault_cfg, sync_cfg = 0;
+	unsigned int op, source;
+
+	device_property_read_u32(&pdev->dev, "espressif,fault-mask",
+				 &fault_mask);
+	device_property_read_u32(&pdev->dev, "espressif,fault-active-high-mask",
+				 &active_high);
+	if ((fault_mask | active_high) & ~GENMASK(2, 0))
+		return -EINVAL;
+	fault_cfg = fault_mask | (active_high << 3);
+	writel(fault_cfg, pc->base + MCPWM_FAULT_DETECT);
+	if (fault_mask) {
+		for (op = 0; op < 3; op++) {
+			u32 cfg = BIT(12) | BIT(14) | BIT(20) | BIT(22);
+			unsigned int fault;
+
+			for (fault = 0; fault < 3; fault++)
+				if (fault_mask & BIT(fault))
+					cfg |= BIT(7 - fault);
+			writel(cfg, pc->base + MCPWM_FH_CFG0(op));
+		}
+	}
+
+	device_property_read_u32_array(&pdev->dev, "espressif,sync-inputs",
+				       sync_sources, ARRAY_SIZE(sync_sources));
+	device_property_read_u32_array(&pdev->dev, "espressif,sync-phases",
+				       sync_phases, ARRAY_SIZE(sync_phases));
+	for (op = 0; op < 3; op++) {
+		source = sync_sources[op];
+		if (source > 6 || sync_phases[op] > U16_MAX)
+			return -EINVAL;
+		sync_cfg |= source << (op * 3);
+		if (source)
+			writel(MCPWM_TIMER_SYNC_ENABLE |
+			       FIELD_PREP(MCPWM_TIMER_SYNC_PHASE, sync_phases[op]),
+			       pc->base + MCPWM_TIMER_SYNC(op));
+	}
+	writel(sync_cfg, pc->base + MCPWM_TIMER_SYNCI_CFG);
+	return 0;
+}
+
 static const struct pwm_ops esp32s31_mcpwm_ops = {
 	.request = esp32s31_mcpwm_request,
 	.free = esp32s31_mcpwm_free,
+	.capture = esp32s31_mcpwm_capture,
 	.apply = esp32s31_mcpwm_apply,
 };
 
@@ -149,6 +283,7 @@ static int esp32s31_mcpwm_probe(struct platform_device *pdev)
 {
 	struct esp32s31_mcpwm *pc;
 	struct pwm_chip *chip;
+	struct reset_control *rst;
 	int ret;
 
 	chip = devm_pwmchip_alloc(&pdev->dev, 6, sizeof(*pc));
@@ -163,6 +298,17 @@ static int esp32s31_mcpwm_probe(struct platform_device *pdev)
 	if (IS_ERR(pc->clk))
 		return dev_err_probe(&pdev->dev, PTR_ERR(pc->clk),
 				     "clock unavailable\n");
+	rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
+	if (IS_ERR(rst))
+		return dev_err_probe(&pdev->dev, PTR_ERR(rst),
+				     "reset unavailable\n");
+	ret = reset_control_reset(rst);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "reset failed\n");
+	ret = esp32s31_mcpwm_init_fault_sync(pdev, pc);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "invalid fault/sync configuration\n");
 
 	chip->ops = &esp32s31_mcpwm_ops;
 	ret = pwmchip_add(chip);
