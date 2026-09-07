@@ -25,6 +25,7 @@
 #define TOUCH_AON_DATE			0xfc
 #define TOUCH_SCAN_MAP			GENMASK(16, 2)
 #define TOUCH_XPD_WAIT			GENMASK(31, 17)
+#define TOUCH_OUT_EN			GENMASK(14, 0)
 #define TOUCH_OUT_GATE			BIT(27)
 #define TOUCH_OUT_AS_CLOCK		BIT(25)
 #define TOUCH_DIV0			GENMASK(24, 22)
@@ -81,8 +82,10 @@ static int esp32s31_touch_read_raw(struct iio_dev *indio_dev,
 		return -EINVAL;
 	mutex_lock(&touch->lock);
 	writel(FIELD_PREP(TOUCH_SCAN_MAP, pad_mask) |
-	       FIELD_PREP(TOUCH_XPD_WAIT, 4),
+	       FIELD_PREP(TOUCH_XPD_WAIT, 4096),
 	       touch->aon + TOUCH_AON_SCAN_CTRL1);
+	writel((readl(touch->aon + TOUCH_AON_FILTER2) & ~TOUCH_OUT_EN) |
+	       pad_mask, touch->aon + TOUCH_AON_FILTER2);
 	/* Power and start only the selected physical touch pad. */
 	writel(pad_mask | (pad_mask << 15), touch->aon + TOUCH_AON_MUX1);
 	mux = FIELD_PREP(TOUCH_DATA_SEL, TOUCH_DATA_SMOOTH) |
@@ -90,7 +93,7 @@ static int esp32s31_touch_read_raw(struct iio_dev *indio_dev,
 	writel(mux | TOUCH_START_EN, touch->aon + TOUCH_AON_MUX0);
 	writel(mux, touch->aon + TOUCH_AON_MUX0);
 	ret = readl_poll_timeout(touch->base + TOUCH_STATUS, status,
-				 status & TOUCH_MEAS_DONE, 10, 100000);
+				 status & TOUCH_MEAS_DONE, 0, 100000);
 	if (!ret)
 		*val = readl(touch->base + TOUCH_DATA(chan->address)) & 0xffff;
 	else
@@ -105,6 +108,8 @@ static int esp32s31_touch_read_raw(struct iio_dev *indio_dev,
 			readl(touch->aon + TOUCH_AON_MUX1),
 			readl(touch->clkrst));
 	writel(0, touch->aon + TOUCH_AON_MUX1);
+	writel(readl(touch->aon + TOUCH_AON_FILTER2) & ~TOUCH_OUT_EN,
+	       touch->aon + TOUCH_AON_FILTER2);
 	mutex_unlock(&touch->lock);
 	return ret ? ret : IIO_VAL_INT;
 }
@@ -140,7 +145,7 @@ static int esp32s31_touch_probe(struct platform_device *pdev)
 	       touch->base + TOUCH_DATE);
 	writel(readl(touch->aon + TOUCH_AON_DATE) | TOUCH_AON_CLK,
 	       touch->aon + TOUCH_AON_DATE);
-	/* ESP-IDF V3 default sample configuration: divide by 8, 500 cycles. */
+	/* ESP-IDF V3 defaults: 256 us at 16 MHz, divide by 8, 500 cycles. */
 	writel(500 | (500 << 10) | (500 << 20),
 	       touch->aon + TOUCH_AON_WORK_MEAS);
 	writel(TOUCH_OUT_GATE | TOUCH_OUT_AS_CLOCK |
