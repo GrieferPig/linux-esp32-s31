@@ -1626,30 +1626,6 @@ static bool s31_radio_irq_callback_pending(void)
 	return atomic_read(&s31_radio_pending_isrs) != 0;
 }
 
-/* Print the most recent gate-held PC samples with symbol resolution.  The
- * tick IRQ samples the interrupted PC whenever current holds the blob gate,
- * so this is a cheap view of where the payload/worker spends long holds. */
-static void s31_pc_sample_dump(void)
-{
-	u32 head = READ_ONCE(s31_pc_sample_head);
-	u32 printed, i, start;
-
-	if (!head)
-		return;
-	printed = head > 32 ? 32 : head;
-	start = head - printed;
-	pr_info("esp32s31-radio: gate-held PC samples (last %u):\n", printed);
-	for (i = 0; i < printed; i++) {
-		u32 idx = (start + i) % S31_PC_SAMPLE_RING;
-		struct s31_pc_sample *sample = &s31_pc_sample_ring[idx];
-
-		pr_info("esp32s31-radio:   tick=%u pid=%u epc=%pS ra=%pS\n",
-			sample->tick, sample->pid,
-			(void *)(unsigned long)sample->epc,
-			(void *)(unsigned long)sample->ra);
-	}
-}
-
 void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns,
 				      u64 exec_ns, u32 tick_start)
 {
@@ -3082,7 +3058,6 @@ static void s31_radio_health_workfn(struct work_struct *work)
 
 static int s31_radio_runtime_thread(void *unused)
 {
-	struct sched_param param = { };
 	void __iomem *rom;
 	unsigned long next_tick;
 	/* Keep the native 10 ms cadence through controller initialization.  During
@@ -3400,10 +3375,10 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	ret = gen_pool_add(s31_radio_heap_pool, S31_RADIO_HEAP2_BASE,
 			   S31_RADIO_HEAP2_SIZE, -1);
 	if (ret) {
-		pr_warn("esp32s31-radio: cannot add SRAM heap2 %#x..%#x: %d\n",
+		pr_warn("esp32s31-radio: cannot add SRAM heap2 %#lx..%#lx: %d\n",
 			S31_RADIO_HEAP2_BASE, S31_RADIO_HEAP2_END, ret);
 	} else {
-		pr_info("esp32s31-radio: added SRAM heap2 %#x..%#x (%zu bytes)\n",
+		pr_info("esp32s31-radio: added SRAM heap2 %#lx..%#lx (%zu bytes)\n",
 			S31_RADIO_HEAP2_BASE, S31_RADIO_HEAP2_END,
 			(size_t)S31_RADIO_HEAP2_SIZE);
 	}
@@ -3418,10 +3393,10 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	ret = gen_pool_add(s31_radio_heap_pool, S31_RADIO_HEAP_LOW_BASE,
 			   S31_RADIO_HEAP_LOW_SIZE, -1);
 	if (ret) {
-		pr_warn("esp32s31-radio: cannot add SRAM heap-low %#x..%#x: %d\n",
+		pr_warn("esp32s31-radio: cannot add SRAM heap-low %#lx..%#lx: %d\n",
 			S31_RADIO_HEAP_LOW_BASE, S31_RADIO_HEAP_LOW_END, ret);
 	} else {
-		pr_info("esp32s31-radio: added SRAM heap-low %#x..%#x (%zu bytes)\n",
+		pr_info("esp32s31-radio: added SRAM heap-low %#lx..%#lx (%zu bytes)\n",
 			S31_RADIO_HEAP_LOW_BASE, S31_RADIO_HEAP_LOW_END,
 			(size_t)S31_RADIO_HEAP_LOW_SIZE);
 	}

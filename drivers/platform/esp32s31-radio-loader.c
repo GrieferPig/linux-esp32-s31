@@ -14,6 +14,7 @@
 #include <asm/cacheflush.h>
 
 #include "esp32s31-radio-internal.h"
+#include "esp32s31-radio-elf.h"
 
 #define S31_RADIO_FW_ABI_VERSION 1U
 #define S31_RADIO_FW_DEFAULT_NAME "esp32s31-radio-fw-v1.o"
@@ -112,14 +113,6 @@ static unsigned long s31_fw_import_lookup(const char *name, bool weak)
 	return weak ? 0 : ULONG_MAX;
 }
 
-static bool s31_fw_range_valid(size_t file_size, u32 offset, u32 length)
-{
-	size_t end;
-
-	return !check_add_overflow((size_t)offset, (size_t)length, &end) &&
-	       end <= file_size;
-}
-
 static int s31_fw_validate_call_relocations(Elf32_Shdr *sections,
 					     unsigned int symbol_section,
 					     unsigned int relocation_section,
@@ -174,7 +167,7 @@ static Elf32_Sym *s31_fw_find_symbol(Elf32_Sym *symbols, size_t count,
 	size_t index;
 
 	for (index = 1; index < count; index++) {
-		if (symbols[index].st_name >= strings_size)
+		if (!s31_fw_string_valid(strings, strings_size, symbols[index].st_name))
 			continue;
 		if (!strcmp(strings + symbols[index].st_name, name))
 			return &symbols[index];
@@ -184,12 +177,15 @@ static Elf32_Sym *s31_fw_find_symbol(Elf32_Sym *symbols, size_t count,
 
 static int s31_fw_export(void **destination, Elf32_Sym *symbols,
 			 size_t symbol_count, const char *strings,
-			 size_t strings_size, const char *name)
+			 size_t strings_size, const char *name,
+			 const Elf32_Shdr *sections, size_t section_count,
+			 bool function)
 {
 	Elf32_Sym *symbol = s31_fw_find_symbol(symbols, symbol_count, strings,
 					       strings_size, name);
 
-	if (!symbol || symbol->st_shndx == SHN_UNDEF || !symbol->st_value) {
+	if (!s31_fw_export_valid(symbol, sections, section_count, function,
+				 !function)) {
 		pr_err("esp32s31-radio: firmware export %s is missing\n", name);
 		return -ENOEXEC;
 	}
@@ -199,28 +195,30 @@ static int s31_fw_export(void **destination, Elf32_Sym *symbols,
 
 static void s31_fw_export_optional(void **destination, Elf32_Sym *symbols,
 				   size_t symbol_count, const char *strings,
-				   size_t strings_size, const char *name)
+				   size_t strings_size, const char *name,
+				   const Elf32_Shdr *sections, size_t section_count)
 {
 	Elf32_Sym *symbol = s31_fw_find_symbol(symbols, symbol_count, strings,
 					       strings_size, name);
 
-	if (symbol && symbol->st_shndx != SHN_UNDEF && symbol->st_value)
+	if (s31_fw_export_valid(symbol, sections, section_count, true, false))
 		*destination = (void *)(uintptr_t)symbol->st_value;
 }
 
 #define S31_FW_EXPORT(field, name) \
 	s31_fw_export((void **)&s31_fw.field, symbols, symbol_count, strings, \
-		      strings_size, name)
+		      strings_size, name, sections, section_count, true)
 
 static int s31_fw_collect_exports(Elf32_Sym *symbols, size_t symbol_count,
-				  const char *strings, size_t strings_size)
+				  const char *strings, size_t strings_size,
+				  const Elf32_Shdr *sections, size_t section_count)
 {
 	Elf32_Sym *abi;
 	int ret;
 
 	abi = s31_fw_find_symbol(symbols, symbol_count, strings, strings_size,
 				 "s31_radio_fw_abi_version");
-	if (!abi || abi->st_shndx == SHN_UNDEF || !abi->st_value ||
+	if (!s31_fw_export_valid(abi, sections, section_count, false, false) ||
 	    *(u32 *)(uintptr_t)abi->st_value != S31_RADIO_FW_ABI_VERSION) {
 		pr_err("esp32s31-radio: incompatible or missing firmware ABI\n");
 		return -EPROTO;
@@ -252,11 +250,13 @@ static int s31_fw_collect_exports(Elf32_Sym *symbols, size_t symbol_count,
 	ret = ret ?: S31_FW_EXPORT(rtos_free, "s31_rtos_free");
 	ret = ret ?: S31_FW_EXPORT(rtos_task_release, "s31_rtos_task_release");
 	ret = ret ?: S31_FW_EXPORT(task_create_pinned, "xTaskCreatePinnedToCore");
-	ret = ret ?: S31_FW_EXPORT(rtos_isr_depth, "s31_rtos_isr_depth");
+	ret = ret ?: s31_fw_export((void **)&s31_fw.rtos_isr_depth, symbols,
+				  symbol_count, strings, strings_size,
+				  "s31_rtos_isr_depth", sections, section_count, false);
 	if (!ret)
 		s31_fw_export_optional((void **)&s31_fw.coex_status, symbols,
 				       symbol_count, strings, strings_size,
-				       "s31_radio_coex_status");
+				       "s31_radio_coex_status", sections, section_count);
 	return ret;
 }
 
@@ -280,22 +280,12 @@ int s31_radio_fw_load(struct device *device)
 	if (ret)
 		return dev_err_probe(device, ret, "cannot load firmware %s\n",
 				     s31_fw_name);
-	if (firmware->size < sizeof(*header)) {
-		ret = -ENOEXEC;
+	ret = s31_fw_validate_elf(firmware->data, firmware->size);
+	if (ret) {
+		dev_err(device, "malformed radio ELF: %d\n", ret);
 		goto out_release;
 	}
 	header = (const Elf32_Ehdr *)firmware->data;
-	if (memcmp(header->e_ident, ELFMAG, SELFMAG) ||
-	    header->e_ident[EI_CLASS] != ELFCLASS32 ||
-	    header->e_ident[EI_DATA] != ELFDATA2LSB ||
-	    header->e_type != ET_REL || header->e_machine != EM_RISCV ||
-	    header->e_shentsize != sizeof(Elf32_Shdr) || !header->e_shnum ||
-	    header->e_shnum >= SHN_LORESERVE ||
-	    !s31_fw_range_valid(firmware->size, header->e_shoff,
-				header->e_shnum * sizeof(Elf32_Shdr))) {
-		ret = -ENOEXEC;
-		goto out_release;
-	}
 	file_sections = (const Elf32_Shdr *)(firmware->data + header->e_shoff);
 	sections = kmemdup(file_sections,
 			    header->e_shnum * sizeof(*sections), GFP_KERNEL);
@@ -442,7 +432,8 @@ int s31_radio_fw_load(struct device *device)
 	}
 	flush_icache_range((unsigned long)s31_fw_image,
 			   (unsigned long)s31_fw_image + image_size);
-	ret = s31_fw_collect_exports(symbols, symbol_count, strings, strings_size);
+	ret = s31_fw_collect_exports(symbols, symbol_count, strings, strings_size,
+				     sections, header->e_shnum);
 	if (ret)
 		goto out_free_symbols;
 	s31_fw_reset_sections = kcalloc(header->e_shnum,
