@@ -124,11 +124,11 @@ void noinstr esp32s31_sbi_wfi(void)
 
 	/* Restore the IRQ-disabled state expected by the cpuidle core. */
 	raw_local_irq_enable();
-	asm volatile("ecall"
+	asm volatile(RISCV_SBI_ECALL_ASM
 		     : "+r"(a0), "+r"(a1)
 		     : "r"(a2), "r"(a3), "r"(a4), "r"(a5),
 		       "r"(a6), "r"(a7)
-		     : "memory");
+		     : RISCV_SBI_ECALL_CLOBBERS);
 	raw_local_irq_disable();
 }
 

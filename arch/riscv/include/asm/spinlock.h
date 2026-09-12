@@ -58,8 +58,8 @@ static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
 {
 	/* Never dispatch Linux IPIs while waiting for a raw lock. The generic
 	 * CALL_FUNC queue also carries scheduler TTWU callbacks, which can acquire
-	 * a runqueue lock and recurse into this path. Cross-hart fences use the
-	 * SBI RFENCE extension instead.
+	 * a runqueue lock and recurse into this path. CALL_FUNC dispatch must stay
+	 * in the normal IRQ/idle context.
 	 */
 	while (esp32s31_spin_acquire(lock))
 		__asm__ __volatile__("nop");

@@ -172,7 +172,7 @@ int ipi_mux_create(unsigned int nr_ipi, void (*mux_send)(unsigned int cpu))
 {
 	struct fwnode_handle *fwnode;
 	struct irq_domain *domain;
-	int rc;
+	int rc, cpu;
 
 	if (ipi_mux_domain)
 		return -EEXIST;
@@ -183,6 +183,15 @@ int ipi_mux_create(unsigned int nr_ipi, void (*mux_send)(unsigned int cpu))
 	ipi_mux_pcpu = alloc_percpu(typeof(*ipi_mux_pcpu));
 	if (!ipi_mux_pcpu)
 		return -ENOMEM;
+
+	/* Initialize through the atomic access path too. On S31 an allocator's
+	 * cached zero fill does not initialize the AMO backing word. */
+	for_each_possible_cpu(cpu) {
+		struct ipi_mux_cpu *icpu = per_cpu_ptr(ipi_mux_pcpu, cpu);
+
+		atomic_set(&icpu->enable, 0);
+		atomic_set(&icpu->bits, 0);
+	}
 
 	fwnode = irq_domain_alloc_named_fwnode("IPI-Mux");
 	if (!fwnode) {

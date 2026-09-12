@@ -8,6 +8,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/irqflags.h>
 #include <linux/cpu.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
@@ -26,6 +27,10 @@
 #define ESP32S31_SBI_EXT_FLASH		0x09000000
 #define ESP32S31_SBI_FLASH_WRITE	0
 #define ESP32S31_SBI_FLASH_ERASE	1
+#define ESP32S31_SBI_FLASH_PREPARE	2
+#define ESP32S31_SBI_FLASH_PARK		3
+#define ESP32S31_SBI_FLASH_PARK_STATUS	4
+#define ESP32S31_SBI_FLASH_RELEASE	5
 #define ESP32S31_FLASH_XIP_BASE		0x40000000
 #define ESP32S31_FLASH_XIP_SIZE		0x00f00000
 #define ESP32S31_FLASH_RAW_OFFSET	0x00100000
@@ -38,59 +43,69 @@ struct esp32s31_flash {
 	struct mutex lock;
 };
 
-struct esp32s31_flash_peer_park {
-	atomic_t entered;
-	atomic_t release;
-	atomic_t exited;
-};
+/* Use the same IRQ delivery fallback as the S31 idle path, only while the
+ * caller has IRQs enabled. Never dispatch callbacks from the parked IRQ or
+ * an IRQ-disabled raw-lock wait.
+ */
+extern void esp32s31_irq_poll(void);
 
-static void esp32s31_flash_park_peer(void *data)
+static void esp32s31_flash_park_peer(void *unused)
 {
-	struct esp32s31_flash_peer_park *park = data;
-
-	atomic_set_release(&park->entered, 1);
-	while (!atomic_read_acquire(&park->release))
-		cpu_relax();
-	atomic_set_release(&park->exited, 1);
+	/* Both polling code and handshake words live in OpenSBI SRAM. */
+	sbi_ecall(ESP32S31_SBI_EXT_FLASH, ESP32S31_SBI_FLASH_PARK,
+		  0, 0, 0, 0, 0, 0);
 }
 
 static struct sbiret esp32s31_flash_ecall(unsigned long funcid, u32 address,
 					  const void *buffer, u32 length)
 {
-	struct esp32s31_flash_peer_park park;
-	struct sbiret ret;
-	int cpu, peer;
-	bool parked = false;
+	struct sbiret ret, release;
+	int cpu, peer, error;
+	bool queued = false;
 
-	atomic_set(&park.entered, 0);
-	atomic_set(&park.release, 0);
-	atomic_set(&park.exited, 0);
-
-	/*
-	 * The PMU cannot reliably stall a hart which is transitioning through its
-	 * idle path.  Pin this caller and hold the other hart in active S-mode so
-	 * the OpenSBI ROM proxy can stall it before temporarily disabling XIP.
-	 */
 	cpus_read_lock();
 	cpu = get_cpu();
 	peer = cpu ^ 1;
-	if (peer < nr_cpu_ids && cpu_online(peer) &&
-	    !smp_call_function_single(peer, esp32s31_flash_park_peer,
-				      &park, false)) {
-		while (!atomic_read_acquire(&park.entered))
-			cpu_relax();
-		parked = true;
+	if (peer >= nr_cpu_ids || !cpu_online(peer)) {
+		ret = (struct sbiret){ .error = -1, .value = 1 };
+		goto out;
 	}
-
+	ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH, ESP32S31_SBI_FLASH_PREPARE,
+			peer, 0, 0, 0, 0, 0);
+	if (ret.error || ret.value)
+		goto out;
+	error = smp_call_function_single(peer, esp32s31_flash_park_peer,
+					 NULL, false);
+	if (error) {
+		ret = (struct sbiret){ .error = -1, .value = 1 };
+		goto release_peer;
+	}
+	queued = true;
+	for (;;) {
+		ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH,
+				ESP32S31_SBI_FLASH_PARK_STATUS,
+				peer, 0, 0, 0, 0, 0);
+		if (ret.error)
+			goto release_peer;
+		if (ret.value & 1)
+			break;
+		/* A remote TLB caller can be waiting for this CPU while it is
+		 * arranging the park. Service incoming IRQs through their normal
+		 * handlers if CLIC's sentinel has delayed hardware entry.
+		 */
+		if (!irqs_disabled())
+			esp32s31_irq_poll();
+		cpu_relax();
+	}
 	ret = sbi_ecall(ESP32S31_SBI_EXT_FLASH, funcid, address,
 			buffer ? virt_to_phys((void *)buffer) : 0, length,
 			0, 0, 0);
-
-	if (parked) {
-		atomic_set_release(&park.release, 1);
-		while (!atomic_read_acquire(&park.exited))
-			cpu_relax();
-	}
+release_peer:
+	release = sbi_ecall(ESP32S31_SBI_EXT_FLASH, ESP32S31_SBI_FLASH_RELEASE,
+			    peer, queued, 0, 0, 0, 0);
+	if (!ret.error && !ret.value && (release.error || release.value))
+		ret = release;
+out:
 	put_cpu();
 	cpus_read_unlock();
 	return ret;
@@ -104,7 +119,10 @@ static int esp32s31_flash_read(struct mtd_info *mtd, loff_t from,
 	if (from < 0 || from >= mtd->size || len > mtd->size - from)
 		return -EINVAL;
 
+	/* Readers must not observe a program/erase before cache invalidation. */
+	mutex_lock(&flash->lock);
 	memcpy_fromio(buf, flash->base + from, len);
+	mutex_unlock(&flash->lock);
 	*retlen = len;
 	return 0;
 }
@@ -165,8 +183,10 @@ static int esp32s31_flash_write(struct mtd_info *mtd, loff_t to, size_t len,
 		if (ret)
 			break;
 		/* phys_base is the CPU-visible identity base, not a flash offset. */
-		esp32s31_cache_invalidate(flash->phys_base + aligned_to,
-					 write_len);
+		ret = esp32s31_cache_invalidate(flash->phys_base + aligned_to,
+					       write_len);
+		if (ret)
+			break;
 		to += bytes;
 		buf += bytes;
 		len -= bytes;
@@ -194,8 +214,12 @@ static int esp32s31_flash_erase(struct mtd_info *mtd, struct erase_info *instr)
 			instr->fail_addr = offset;
 			break;
 		}
-		esp32s31_cache_invalidate(flash->phys_base + offset,
-					 mtd->erasesize);
+		ret = esp32s31_cache_invalidate(flash->phys_base + offset,
+					       mtd->erasesize);
+		if (ret) {
+			instr->fail_addr = offset;
+			break;
+		}
 		offset += mtd->erasesize;
 		len -= mtd->erasesize;
 		cond_resched();

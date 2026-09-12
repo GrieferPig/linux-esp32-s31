@@ -7,10 +7,11 @@
 #ifndef __ASSEMBLY__
 
 #include <linux/types.h>
+#include <linux/errno.h>
 
 #ifdef CONFIG_ESP32S31_CACHE
 void esp32s31_cache_writeback(phys_addr_t paddr, size_t size);
-void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size);
+int esp32s31_cache_invalidate(phys_addr_t paddr, size_t size);
 void esp32s31_cache_sync_for_exec(phys_addr_t paddr, size_t size);
 void esp32s31_cache_sync_all_for_exec(void);
 #else
@@ -18,8 +19,9 @@ static inline void esp32s31_cache_writeback(phys_addr_t paddr, size_t size)
 {
 }
 
-static inline void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
+static inline int esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
 {
+	return -ENODEV;
 }
 
 static inline void esp32s31_cache_sync_for_exec(phys_addr_t paddr, size_t size)

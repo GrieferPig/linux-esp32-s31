@@ -12,6 +12,7 @@
 
 #include <linux/cacheflush.h>
 #include <linux/init.h>
+#include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/spinlock.h>
 
@@ -52,6 +53,9 @@ static struct sbiret esp32s31_cache_op(unsigned long func, phys_addr_t paddr,
 	ret = sbi_ecall(esp32s31_cache_extid(), func, (unsigned long)paddr,
 			(unsigned long)size, 0, 0, 0, 0);
 	raw_spin_unlock_irqrestore(&esp32s31_cache_lock, flags);
+	if (ret.error || ret.value)
+		pr_err_ratelimited("operation %lu failed at %pa+%zu: SBI %ld, ROM %ld\n",
+				   func, &paddr, size, ret.error, ret.value);
 	return ret;
 }
 
@@ -77,15 +81,20 @@ void esp32s31_cache_writeback(phys_addr_t paddr, size_t size)
 }
 EXPORT_SYMBOL_GPL(esp32s31_cache_writeback);
 
-void esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
+int esp32s31_cache_invalidate(phys_addr_t paddr, size_t size)
 {
+	struct sbiret ret;
+
 	/* Flash is read through the shared external D-cache by MTD and may also
 	 * contain executable mappings.  Drop the data copy first, then both hart
 	 * I-caches, so the operation that just completed is immediately visible
 	 * without requiring a reboot.
 	 */
-	esp32s31_cache_op(S31_SBI_CACHE_INVAL, paddr, size);
-	esp32s31_cache_op(S31_SBI_ICACHE_SYNC_RANGE, paddr, size);
+	ret = esp32s31_cache_op(S31_SBI_CACHE_INVAL, paddr, size);
+	if (ret.error || ret.value)
+		return -EIO;
+	ret = esp32s31_cache_op(S31_SBI_ICACHE_SYNC_RANGE, paddr, size);
+	return ret.error || ret.value ? -EIO : 0;
 }
 EXPORT_SYMBOL_GPL(esp32s31_cache_invalidate);
 

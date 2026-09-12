@@ -53,6 +53,23 @@ static __always_inline void arch_atomic_set(atomic_t *v, int i)
 #endif
 }
 
+#ifdef CONFIG_SOC_ESP32S31
+/* The generic native-word acquire/release fallback uses cached lw/sw and
+ * bypasses arch_atomic_read/set.  Keep ordered accesses on the same AMO
+ * path as the other atomic operations. */
+static __always_inline int arch_atomic_read_acquire(const atomic_t *v)
+{
+	return arch_atomic_read(v);
+}
+#define arch_atomic_read_acquire arch_atomic_read_acquire
+
+static __always_inline void arch_atomic_set_release(atomic_t *v, int i)
+{
+	arch_atomic_set(v, i);
+}
+#define arch_atomic_set_release arch_atomic_set_release
+#endif
+
 #ifndef CONFIG_GENERIC_ATOMIC64
 #define ATOMIC64_INIT(i) { (i) }
 static __always_inline s64 arch_atomic64_read(const atomic64_t *v)

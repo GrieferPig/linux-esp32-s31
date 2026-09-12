@@ -7,6 +7,7 @@
 #ifndef _ASM_RISCV_SBI_H
 #define _ASM_RISCV_SBI_H
 
+#include <asm/sbi-ecall.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
 #include <linux/jump_label.h>
