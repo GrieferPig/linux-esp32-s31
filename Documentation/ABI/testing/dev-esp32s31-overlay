@@ -1,0 +1,24 @@
+What:           /dev/s31-overlay
+Date:           September 2026
+Contact:        ESP32-S31 port maintainers
+Description:
+                Private runtime device-tree overlay misc device (not configfs).
+                The UAPI is include/uapi/linux/esp32s31-overlay.h.
+                write() submits one complete DTBO of at most 128 KiB. The
+                manager checks names, GPIO claims and exclusive resources.
+                At most 32 overlays are active simultaneously.
+
+                S31_OVERLAY_IOC_GET_LAST_ID returns the last applied integer ID.
+                S31_OVERLAY_IOC_LIST returns count and active items; each item
+                has a signed ID, 32-byte name and aligned 64-bit GPIO mask.
+                S31_OVERLAY_IOC_REMOVE_NAME removes the named overlay.
+                S31_OVERLAY_IOC_REMOVE_ALL removes active overlays in reverse
+                application order. A failure can leave later entries removed.
+                ioctl values and structure padding are part of the ABI; use
+                the shared header rather than a private copy.
+
+                Permissions on the device node control access. Invalid blobs,
+                names, sizes, unavailable resources and busy removals return
+                negative errno. Successful application does not prove external
+                hardware behavior. The kernel does not save boot policy;
+                s31-overlay manages that policy and its userspace lock.
