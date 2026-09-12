@@ -39,6 +39,7 @@ properties:
     maxItems: 1
 
   clock-frequency: true
+  current-speed: true
 
   espressif,irda-mode:
     type: boolean

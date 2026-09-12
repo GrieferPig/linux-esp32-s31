@@ -18,6 +18,11 @@ properties:
   compatible:
     const: espressif,esp32s31-radio
 
+  '#address-cells':
+    const: 1
+  '#size-cells':
+    const: 1
+  ranges: true
   status: true
 
   wifi:
@@ -36,6 +41,9 @@ properties:
     properties:
       compatible:
         const: espressif,esp32s31-btdm
+      espressif,direct-hci:
+        type: boolean
+        description: Expose the private H4 character device for the direct-HCI userspace stack.
       status: true
     required:
       - compatible

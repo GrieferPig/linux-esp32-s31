@@ -18,7 +18,11 @@ description: |
 
 properties:
   compatible:
-    const: espressif,esp32s31-pmu
+    oneOf:
+      - const: espressif,esp32s31-pmu
+      - items:
+          - const: espressif,esp32s31-pmu
+          - const: syscon
 
   reg:
     maxItems: 1

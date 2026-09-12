@@ -9,6 +9,11 @@ title: Espressif ESP32-S31 general-purpose SPI controller
 maintainers:
   - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
 
+description: |
+  The controller can switch between host and target through runtime overlays.
+  Target mode keeps the base tree's address-cell count; changing it on a live
+  node is rejected by OF overlay. The target child has no reg property.
+
 allOf:
   - $ref: spi-controller.yaml#
 
@@ -29,13 +34,22 @@ properties:
     maxItems: 1
 
   dmas:
-    maxItems: 1
+    minItems: 2
+    maxItems: 2
 
   dma-names:
     items:
-      - const: dma
+      - const: tx
+      - const: rx
+
+  espressif,gpio-cs-drive-strength:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: GPIO chip-select pad drive strength in mA.
+    enum: [5, 10, 20, 40]
 
   espressif,max-data-lines:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Maximum controller data bus width.
     enum: [4, 8]
 
 required:

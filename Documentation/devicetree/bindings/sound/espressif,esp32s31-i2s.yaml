@@ -57,6 +57,7 @@ properties:
 
   espressif,loopback:
     type: boolean
+    description: Connect the transmit stream to the internal receive loopback path.
 
 required:
   - compatible

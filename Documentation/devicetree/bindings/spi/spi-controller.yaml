@@ -150,9 +150,23 @@ allOf:
         "#address-cells":
           const: 1
     else:
-      properties:
-        "#address-cells":
-          const: 0
+      # S31 target overlays keep the base host node's cell count: OF overlays
+      # cannot change #address-cells on an existing live node.
+      if:
+        properties:
+          compatible:
+            contains:
+              const: espressif,esp32s31-gpspi
+        required:
+          - compatible
+      then:
+        properties:
+          "#address-cells":
+            enum: [0, 1]
+      else:
+        properties:
+          "#address-cells":
+            const: 0
   - not:
       required:
         - fifo-depth

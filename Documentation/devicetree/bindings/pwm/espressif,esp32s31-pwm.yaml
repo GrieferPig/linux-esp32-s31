@@ -38,11 +38,13 @@ properties:
     type: boolean
 
   espressif,fault-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
     description: MCPWM GPIO fault inputs that trigger one-shot force-low.
     minimum: 0
     maximum: 7
 
   espressif,fault-active-high-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
     description: Polarity mask for the enabled MCPWM GPIO fault inputs.
     minimum: 0
     maximum: 7

@@ -48,7 +48,9 @@ properties:
       insensitive, letters in the riscv,isa string must be all
       lowercase.
     $ref: /schemas/types.yaml#/definitions/string
-    pattern: ^rv(?:64|32)imaf?d?q?c?b?k?j?p?v?h?(?:[hsxz](?:[0-9a-z])+)?(?:_[hsxz](?:[0-9a-z])+)*$
+    anyOf:
+      - pattern: ^rv(?:64|32)imaf?d?q?c?b?k?j?p?v?h?(?:[hsxz](?:[0-9a-z])+)?(?:_[hsxz](?:[0-9a-z])+)*$
+      - const: rv32imafbcn_zba_zbb_zbc_zbs
     deprecated: true
 
   riscv,isa-base:

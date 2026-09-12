@@ -21,9 +21,11 @@ properties:
 
   espressif,ripple-suppression:
     type: boolean
+    description: Enable the hardware output ripple suppression circuit.
 
   espressif,current-limit:
     type: boolean
+    description: Enable the hardware output current limiting circuit.
 
 required:
   - compatible

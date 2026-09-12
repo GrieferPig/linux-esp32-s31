@@ -40,6 +40,8 @@ properties:
 
   gpio-controller: true
 
+  gpio-reserved-ranges: true
+
   '#gpio-cells':
     const: 2
 
@@ -51,45 +53,64 @@ properties:
   interrupts:
     maxItems: 1
 
-$defs:
-  esp32s31-pin-group:
-    type: object
-    additionalProperties: false
-
-    properties:
-      pinmux:
-        $ref: /schemas/types.yaml#/definitions/uint32-array
-        minItems: 1
-        description: Encoded IO_MUX and GPIO matrix operations.
-
-      bias-disable: true
-      bias-pull-up: true
-      bias-pull-down: true
-      input-enable: true
-      input-disable: true
-      input-schmitt-enable: true
-      input-debounce:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        description: A nonzero value enables the fixed hardware glitch filter.
-      drive-open-drain: true
-      drive-push-pull: true
-      drive-strength:
-        $ref: /schemas/types.yaml#/definitions/uint32
-        enum: [5, 10, 20, 40]
-        description: Approximate pad drive strength in mA.
-      output-high: true
-      output-low: true
-
-    required:
-      - pinmux
-
 patternProperties:
   '-pins$':
     type: object
     additionalProperties: false
     patternProperties:
-      '-pins$':
-        $ref: '#/$defs/esp32s31-pin-group'
+      '(-pins|-pads|-signals|-in|-out|-capture|-fault|-sync)$|^(outputs|loopback-inputs|rx|tx)$':
+        type: object
+        additionalProperties: false
+
+        properties:
+          pinmux:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            minItems: 1
+            maxItems: 124
+            description: Encoded IO_MUX and GPIO matrix operations.
+
+          espressif,route-name:
+            $ref: /schemas/types.yaml#/definitions/string
+            description: User-visible name of a scalar configurable GPIO route.
+          espressif,route-kind:
+            $ref: /schemas/types.yaml#/definitions/string
+            description: Hardware route class for the scalar route.
+            enum: [matrix-input, matrix-output, matrix-bidirectional]
+          espressif,route-names:
+            $ref: /schemas/types.yaml#/definitions/string-array
+            description: Configurable route name for each pinmux entry.
+            minItems: 1
+            maxItems: 124
+          espressif,route-kinds:
+            $ref: /schemas/types.yaml#/definitions/non-unique-string-array
+            description: Hardware route class for each pinmux entry.
+            minItems: 1
+            maxItems: 124
+            items:
+              enum: [matrix-input, matrix-output, matrix-bidirectional]
+
+          bias-disable: true
+          bias-pull-up: true
+          bias-pull-down: true
+          input-enable: true
+          input-disable: true
+          input-schmitt-enable: true
+          input-debounce:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            maxItems: 1
+            description: A nonzero value enables the fixed hardware glitch filter.
+          drive-open-drain: true
+          drive-push-pull: true
+          drive-strength:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            enum: [5, 10, 20, 40]
+            description: Approximate pad drive strength in mA.
+          output-disable: true
+          output-high: true
+          output-low: true
+
+        required:
+          - pinmux
 
 required:
   - compatible

@@ -12,10 +12,33 @@ maintainers:
 allOf:
   - $ref: usb-drd.yaml#
   - $ref: usb-hcd.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: espressif,esp32s31-dwc2
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+      required:
+        - reg-names
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names: false
+      required:
+        - clocks
+        - clock-names
 
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: espressif,esp32s31-dwc2
+          - const: snps,dwc2
       - const: brcm,bcm2835-usb
       - const: hisilicon,hi6220-usb
       - const: ingenic,jz4775-otg
@@ -71,7 +94,13 @@ properties:
       - const: intel,socfpga-agilex-hsotg
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: core
+      - const: local-mem
 
   interrupts:
     maxItems: 1
@@ -185,8 +214,6 @@ required:
   - compatible
   - reg
   - interrupts
-  - clocks
-  - clock-names
 
 unevaluatedProperties: false
 

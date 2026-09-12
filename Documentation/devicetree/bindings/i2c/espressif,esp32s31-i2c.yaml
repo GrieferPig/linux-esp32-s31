@@ -28,6 +28,17 @@ properties:
   resets:
     maxItems: 1
 
+  espressif,param-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Property exposed by the overlay tool as a configurable scalar.
+    const: clock-frequency
+
+  espressif,param-values:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Allowed clock frequencies for the overlay tool.
+    minItems: 1
+    maxItems: 3
+
   clock-frequency:
     default: 100000
     minimum: 50000

@@ -241,6 +241,9 @@
 		};
 
 		radio: radio {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
 			compatible = "espressif,esp32s31-radio";
 			status = "disabled";
 

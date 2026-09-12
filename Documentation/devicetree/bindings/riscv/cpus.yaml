@@ -23,6 +23,19 @@ description: |
   two cores, each of which has two hyperthreads, could be described as
   having four harts.
 
+# The S31 root and CPU currently share the SoC compatible. Only CPU nodes
+# select this binding; root-node compatibility must not imply a hart.
+select:
+  properties:
+    device_type:
+      const: cpu
+    compatible:
+      contains:
+        const: riscv
+  required:
+    - device_type
+    - compatible
+
 allOf:
   - $ref: /schemas/cpu.yaml#
   - $ref: extensions.yaml
@@ -47,6 +60,7 @@ properties:
               - amd,mbv32
               - amd,mbv64
               - andestech,ax45mp
+              - espressif,esp32s31
               - canaan,k210
               - sifive,bullet0
               - sifive,e5

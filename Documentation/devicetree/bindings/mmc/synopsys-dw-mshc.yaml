@@ -42,11 +42,27 @@ properties:
   iommus:
     maxItems: 1
 
+  power-domains:
+    maxItems: 1
+
+  espressif,param-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    const: bus-width
+    description: Runtime overlay parameter exposed by the S31 overlay manager.
+
+  espressif,param-values:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      enum: [1, 4]
+    description: Allowed bus widths for the selected S31 pin profile.
+
   espressif,slot-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
     enum: [0, 1]
     description: First physical card port exposed by an ESP32-S31 controller.
 
   espressif,num-slots:
+    $ref: /schemas/types.yaml#/definitions/uint32
     minimum: 1
     maximum: 2
     description: Number of consecutive ESP32-S31 card ports to register.
