@@ -389,7 +389,8 @@ stop:
 	return ret;
 }
 
-static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s)
+static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
+					 unsigned int timeout_ms)
 {
 	u32 cmd;
 	unsigned long timeout;
@@ -404,7 +405,8 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s)
 		return -ETIMEDOUT;
 	}
 	writel(S31_SPI_CMD_USR, s->base + S31_SPI_CMD);
-	timeout = wait_for_completion_timeout(&s->done, msecs_to_jiffies(100));
+	timeout = wait_for_completion_timeout(&s->done,
+					       msecs_to_jiffies(timeout_ms));
 	writel(0, s->base + S31_SPI_INT_ENA);
 	if (!timeout)
 		return -ETIMEDOUT;
@@ -425,6 +427,7 @@ static void esp32s31_spi_dma_complete(void *data)
 }
 
 static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s,
+				     struct spi_controller *ctlr,
 				     struct spi_transfer *xfer, u32 misc)
 {
 	struct dma_async_tx_descriptor *desc;
@@ -437,6 +440,7 @@ static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s,
 	dma_cookie_t cookie;
 	unsigned long completed;
 	u32 dma_conf;
+	unsigned int timeout_ms = spi_controller_xfer_timeout(ctlr, xfer);
 	int ret;
 
 	direction = xfer->tx_buf ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM;
@@ -495,11 +499,11 @@ static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s,
 	writel(misc, s->base + S31_SPI_MISC);
 	writel(xfer->len * 8 - 1, s->base + S31_SPI_MS_DLEN);
 	dma_async_issue_pending(chan);
-	ret = esp32s31_spi_wait_transaction(s);
+	ret = esp32s31_spi_wait_transaction(s, timeout_ms);
 	if (ret)
 		goto terminate;
 	completed = wait_for_completion_timeout(done,
-						msecs_to_jiffies(100));
+						msecs_to_jiffies(timeout_ms));
 	if (!completed) {
 		ret = -ETIMEDOUT;
 		goto terminate;
@@ -521,6 +525,7 @@ terminate:
 }
 
 static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s,
+					     struct spi_controller *ctlr,
 					     struct spi_transfer *xfer,
 					     u32 misc)
 {
@@ -529,6 +534,7 @@ static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s,
 	dma_cookie_t tx_cookie, rx_cookie;
 	unsigned long tx_completed, rx_completed;
 	u32 dma_conf = readl(s->base + S31_SPI_DMA_CONF);
+	unsigned int timeout_ms = spi_controller_xfer_timeout(ctlr, xfer);
 	int ret;
 
 	memcpy(s->tx_dma_buf, xfer->tx_buf, xfer->len);
@@ -589,13 +595,13 @@ static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s,
 	/* Match IDF: arm the receive path before data can enter the TX path. */
 	dma_async_issue_pending(s->rx_dma);
 	dma_async_issue_pending(s->tx_dma);
-	ret = esp32s31_spi_wait_transaction(s);
+	ret = esp32s31_spi_wait_transaction(s, timeout_ms);
 	if (ret)
 		goto terminate;
 	rx_completed = wait_for_completion_timeout(&s->dma_rx_done,
-						   msecs_to_jiffies(100));
+						   msecs_to_jiffies(timeout_ms));
 	tx_completed = wait_for_completion_timeout(&s->dma_tx_done,
-						   msecs_to_jiffies(100));
+						   msecs_to_jiffies(timeout_ms));
 	if (!rx_completed || !tx_completed) {
 		ret = -ETIMEDOUT;
 		goto terminate;
@@ -699,10 +705,10 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 		misc |= S31_SPI_CK_IDLE_EDGE;
 	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
 	    (!!xfer->tx_buf != !!xfer->rx_buf))
-		return esp32s31_spi_dma_transfer(s, xfer, misc);
+		return esp32s31_spi_dma_transfer(s, ctlr, xfer, misc);
 	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
 	    xfer->tx_buf && xfer->rx_buf)
-		return esp32s31_spi_dma_duplex_transfer(s, xfer, misc);
+		return esp32s31_spi_dma_duplex_transfer(s, ctlr, xfer, misc);
 
 	for (offset = 0; offset < xfer->len; offset += S31_SPI_FIFO_SIZE) {
 		unsigned int chunk = min_t(unsigned int, S31_SPI_FIFO_SIZE,
@@ -732,7 +738,8 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 			}
 		}
 
-		ret = esp32s31_spi_wait_transaction(s);
+		ret = esp32s31_spi_wait_transaction(s,
+				spi_controller_xfer_timeout(ctlr, xfer));
 		if (ret)
 			return ret;
 
