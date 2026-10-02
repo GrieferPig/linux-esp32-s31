@@ -726,8 +726,10 @@ static bool s31_wifi_scan_ready;
 #define S31_WIFI_FRAME_SIZE	ESP32S31_RADIO_WIFI_FRAME_MAX
 /* Copy out of the closed driver's RX buffer while its callback owns it.  The
  * closed driver does not permit the esf_buf lifetime to extend past callback
- * return, so staging data must live in internal SRAM and be returned at once. */
-#define S31_WIFI_RX_SLOTS	32
+ * return, so staging data must live in internal SRAM and be returned at once.
+ * In combo mode, 32 4144-byte buffers plus TX/HCI rings exceed the 192 KiB
+ * first heap before the non-contiguous SRAM pools are attached. */
+#define S31_WIFI_RX_SLOTS	8
 /* The netdev now stops its queue before this staging ring fills and the radio
  * worker wakes it after consuming entries.  A small ring therefore provides
  * bounded buffering without stealing the SRAM needed by dynamic RX esf_bufs. */
