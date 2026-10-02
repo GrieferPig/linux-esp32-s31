@@ -8,7 +8,9 @@
 #include <asm/asm.h>
 
 /* void *memset(void *, int, size_t) */
-SYM_FUNC_START(__memset)
+/* Share the exact scalar implementation between early Flash and runtime
+ * PSRAM entries. __pi_* must remain executable before the XIP data copy. */
+.macro S31_MEMSET_BODY
 	move t0, a0  /* Preserve return value */
 
 	/* Defer to byte-oriented fill for small sizes */
@@ -109,7 +111,20 @@ SYM_FUNC_START(__memset)
 	bltu t0, a3, 5b
 6:
 	ret
+.endm
+
+SYM_FUNC_START(__memset)
+ S31_MEMSET_BODY
 SYM_FUNC_END(__memset)
+
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+.pushsection .s31_rx_ram.text,"ax",@progbits
+SYM_FUNC_START(memset)
+ S31_MEMSET_BODY
+SYM_FUNC_END(memset)
+.popsection
+#else
 SYM_FUNC_ALIAS_WEAK(memset, __memset)
+#endif
 SYM_FUNC_ALIAS(__pi_memset, __memset)
 SYM_FUNC_ALIAS(__pi___memset, __memset)

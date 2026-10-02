@@ -43,6 +43,15 @@ struct kernel_mapping kernel_map __ro_after_init;
 EXPORT_SYMBOL(kernel_map);
 #ifdef CONFIG_XIP_KERNEL
 #define kernel_map	(*(struct kernel_mapping *)XIP_FIXUP(&kernel_map))
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+/* This translation unit executes with the MMU off during __copy_data and
+ * setup_vm. Runtime PSRAM addresses are neither populated nor translated
+ * yet, so every early memory primitive must use its Flash entry. */
+extern void *__pi_memcpy(void *dest, const void *src, size_t n);
+extern void *__pi_memset(void *dest, int c, size_t n);
+#define memcpy __pi_memcpy
+#define memset __pi_memset
+#endif
 #endif
 
 #ifdef CONFIG_64BIT
@@ -796,9 +805,35 @@ asmlinkage void __init __copy_data(void)
 }
 #endif
 
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+extern char __s31_rx_ram_start[], __s31_rx_ram_end[];
+
+static bool __meminit s31_rx_ram_pgprot(uintptr_t va, pgprot_t *prot)
+{
+	if (va >= (uintptr_t)__s31_rx_ram_start &&
+	    va < (uintptr_t)__s31_rx_ram_end) {
+		*prot = PAGE_KERNEL_READ_EXEC;
+		return true;
+	}
+	/* Data pages in this PGD must remain writable and non-executable. */
+	if ((va & PGDIR_MASK) ==
+	    ((uintptr_t)__s31_rx_ram_start & PGDIR_MASK)) {
+		*prot = PAGE_KERNEL;
+		return true;
+	}
+	return false;
+}
+#endif
+
 #ifdef CONFIG_STRICT_KERNEL_RWX
 static __meminit pgprot_t pgprot_from_va(uintptr_t va)
 {
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	pgprot_t prot;
+
+	if (s31_rx_ram_pgprot(va, &prot))
+		return prot;
+#endif
 	if (is_va_kernel_text(va))
 		return PAGE_KERNEL_READ_EXEC;
 
@@ -824,6 +859,12 @@ void mark_rodata_ro(void)
 #else
 static __meminit pgprot_t pgprot_from_va(uintptr_t va)
 {
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	pgprot_t prot;
+
+	if (s31_rx_ram_pgprot(va, &prot))
+		return prot;
+#endif
 	if (IS_ENABLED(CONFIG_64BIT) && !is_kernel_mapping(va))
 		return PAGE_KERNEL;
 
@@ -1016,7 +1057,9 @@ static void __init create_kernel_page_table(pgd_t *pgdir,
 	for (va = start_va; va < end_va; va += PMD_SIZE)
 		create_pgd_mapping(pgdir, va,
 				   kernel_map.phys_addr + (va - start_va),
-				   PMD_SIZE, PAGE_KERNEL);
+				   PMD_SIZE,
+				   early && IS_ENABLED(CONFIG_SOC_ESP32S31) ?
+				   PAGE_KERNEL_EXEC : PAGE_KERNEL);
 }
 #else
 static void __init create_kernel_page_table(pgd_t *pgdir, bool early)

@@ -7,7 +7,9 @@
 #include <asm/asm.h>
 
 /* void *memcpy(void *, const void *, size_t) */
-SYM_FUNC_START(__memcpy)
+/* Share the exact scalar implementation between early Flash and runtime
+ * PSRAM entries. __pi_* must remain executable before the XIP data copy. */
+.macro S31_MEMCPY_BODY
 	move t6, a0  /* Preserve return value */
 
 	/* Defer to byte-oriented copy for small sizes */
@@ -104,7 +106,20 @@ SYM_FUNC_START(__memcpy)
 	bltu a1, a3, 5b
 6:
 	ret
+.endm
+
+SYM_FUNC_START(__memcpy)
+ S31_MEMCPY_BODY
 SYM_FUNC_END(__memcpy)
+
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+.pushsection .s31_rx_ram.text,"ax",@progbits
+SYM_FUNC_START(memcpy)
+ S31_MEMCPY_BODY
+SYM_FUNC_END(memcpy)
+.popsection
+#else
 SYM_FUNC_ALIAS_WEAK(memcpy, __memcpy)
+#endif
 SYM_FUNC_ALIAS(__pi_memcpy, __memcpy)
 SYM_FUNC_ALIAS(__pi___memcpy, __memcpy)

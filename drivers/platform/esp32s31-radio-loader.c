@@ -10,6 +10,7 @@
 #include "esp32s31-radio-xip.h"
 extern u8 esp32s31_radio_xip_ram[S31_XIP_RAM_SIZE];
 extern const void *esp32s31_radio_xip_get(void);
+extern void *esp32s31_radio_wifi_iram_get(void);
 extern const unsigned long _mtvt_table[48];
 static const struct s31_xip_header *s31_xip_image;
 struct s31_fw_import {
@@ -63,7 +64,10 @@ static int s31_fw_xip_reset(void)
 {
 	const struct s31_xip_header *h = s31_xip_image;
 	u32 i;
+	void *wifi_iram = esp32s31_radio_wifi_iram_get();
 
+	if (wifi_iram != (void *)S31_XIP_WIFI_IRAM_BASE)
+		return -ENODEV;
 	/* Validate all bindings before overwriting the stable writable arena. */
 	for (i = 0; i < h->import_count; i++) {
 		unsigned long target = s31_fw_import_lookup(h->imports[i].name, false);
@@ -71,6 +75,10 @@ static int s31_fw_xip_reset(void)
 		if (!target || target == ULONG_MAX)
 			return -ENOENT;
 	}
+	memcpy(wifi_iram, (const u8 *)h + h->wifi_iram_offset,
+	       h->wifi_iram_size);
+	flush_icache_range(S31_XIP_WIFI_IRAM_BASE,
+		S31_XIP_WIFI_IRAM_BASE + h->wifi_iram_size);
 	memcpy(esp32s31_radio_xip_ram, (const u8 *)h + h->data_offset, h->data_size);
 	memset(esp32s31_radio_xip_ram + h->bss_offset, 0, h->bss_size);
 	for (i = 0; i < h->import_count; i++)
@@ -112,6 +120,11 @@ static int s31_fw_xip_load(struct device *device)
 		S31_XIP_RAM_SIZE, h->abi);
 	return 0;
 }
+size_t s31_radio_fw_wifi_iram_size(void)
+{
+	return s31_xip_image ? s31_xip_image->wifi_iram_size : 0;
+}
+
 int s31_radio_fw_reset(void)
 {
 	return s31_xip_image ? s31_fw_xip_reset() : -ENODEV;

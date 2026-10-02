@@ -27,6 +27,12 @@ ifdef CONFIG_LTO_CLANG
 initcalls-lds := .tmp_initcalls.lds
 endif
 
+# Preserve selected S31 network text before the relocatable link merges
+# per-function sections and loses input-object identity.
+ifeq ($(CONFIG_SOC_ESP32S31)$(CONFIG_XIP_KERNEL),yy)
+initcalls-lds += $(srctree)/arch/riscv/kernel/s31-rx-ram.lds
+endif
+
 # objtool for vmlinux.o
 # ---------------------------------------------------------------------------
 #

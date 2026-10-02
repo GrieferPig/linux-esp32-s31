@@ -112,6 +112,7 @@ static size_t s31_radio_heap_low_size;
 static void *s31_radio_heap2_linux;
 static unsigned long s31_radio_heap_base;
 static unsigned long s31_radio_heap_end;
+static unsigned long s31_radio_heap_tail_base;
 static size_t s31_radio_heap_size;
 
 static atomic_long_t s31_radio_heap_high_main = ATOMIC_LONG_INIT(0);
@@ -3020,12 +3021,20 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	       __s31_radio_bss_end - __s31_radio_bss_start);
 	s31_radio_heap_base = ALIGN((unsigned long)__s31_radio_static_end, 64);
 	#endif
-	s31_radio_heap_end = S31_RADIO_HEAP_END;
+	/* The image always executes its Wi-Fi hot code in this SRAM tail. */
+	if (!s31_radio_fw_wifi_iram_size())
+		return -ENOEXEC;
+	s31_radio_heap_end = S31_RADIO_HEAP_WIFI_END;
+	s31_radio_heap_tail_base = ALIGN(S31_RADIO_HEAP_WIFI_END +
+					s31_radio_fw_wifi_iram_size(), 64);
+	if (s31_radio_heap_tail_base > S31_RADIO_HEAP_END)
+		return -ENOMEM;
 	if (s31_radio_heap_base >= s31_radio_heap_end)
 		return -ENOMEM;
 	s31_radio_heap_size = s31_radio_heap_end - s31_radio_heap_base;
 	s31_radio_heap_linux = memremap(s31_radio_heap_base,
-					s31_radio_heap_size, MEMREMAP_WB);
+					S31_RADIO_HEAP_END - s31_radio_heap_base,
+					MEMREMAP_WB);
 	if (!s31_radio_heap_linux)
 		return -ENOMEM;
 	s31_radio_heap_low_base = s31_radio_low_heap_start();
@@ -3122,6 +3131,13 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 		pr_info("esp32s31-radio: added SRAM heap2 %#lx..%#lx (%zu bytes)\n",
 			S31_RADIO_HEAP2_BASE, S31_RADIO_HEAP2_END,
 			(size_t)S31_RADIO_HEAP2_SIZE);
+	}
+	/* Reuse only bytes after the executable image, never the code itself. */
+	if (s31_radio_heap_tail_base < S31_RADIO_HEAP_END) {
+		ret = gen_pool_add(s31_radio_heap_pool, s31_radio_heap_tail_base,
+				   S31_RADIO_HEAP_END - s31_radio_heap_tail_base, -1);
+		if (ret)
+			goto free_rings;
 	}
 	/* Preserve the running OpenSBI heap, including dynamically allocated
 	 * SSE state. The tail is added after allocating the Linux rings. */

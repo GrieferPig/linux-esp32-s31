@@ -1320,7 +1320,7 @@ static int sm_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 		return -EOPNOTSUPP;
 	/* Include MAC/LLC plus software CCMP IV (8) and MIC (8). */
 	ieee80211_vif_to_wdev(vif)->netdev->max_mtu = S31_SOFTMAC_FRAME_MAX - 48;
-	ieee80211_vif_to_wdev(vif)->netdev->mtu = 1400;
+	ieee80211_vif_to_wdev(vif)->netdev->mtu = ETH_DATA_LEN;
 	sm->has_vif = true;
 	return 0;
 }

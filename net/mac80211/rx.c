@@ -4574,8 +4574,12 @@ void ieee80211_check_fast_rx(struct sta_info *sta)
 	fastrx.uses_rss = ieee80211_hw_check(&local->hw, USES_RSS);
 
 	/* fast-rx doesn't do reordering */
+	/* S31 invokes fast RX after its software reorder, duplicate and PN
+	 * checks. Keep RSS and other drivers on the generic eligibility rule. */
 	if (ieee80211_hw_check(&local->hw, AMPDU_AGGREGATION) &&
-	    !ieee80211_hw_check(&local->hw, SUPPORTS_REORDERING_BUFFER))
+	    !ieee80211_hw_check(&local->hw, SUPPORTS_REORDERING_BUFFER) &&
+	    !(IS_ENABLED(CONFIG_SOC_ESP32S31) && !fastrx.uses_rss &&
+	      sdata->vif.type == NL80211_IFTYPE_STATION))
 		goto clear;
 
 	switch (sdata->vif.type) {

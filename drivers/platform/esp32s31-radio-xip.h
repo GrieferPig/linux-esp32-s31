@@ -11,6 +11,10 @@
 #define S31_XIP_HEADER_SIZE 4096U
 #define S31_XIP_SLOT_SIZE 0x1f0000U
 #define S31_XIP_RAM_SIZE 40960U
+#define S31_XIP_WIFI_IRAM_BASE 0xbe420000U
+#define S31_XIP_WIFI_IRAM_PHYS 0x2f060000U
+#define S31_XIP_WIFI_IRAM_CAPACITY 0x11800U
+#define S31_XIP_WIFI_IRAM_MAP_SIZE 0x12000U
 #define S31_XIP_EXPORTS 23U
 #define S31_XIP_MAX_IMPORTS ((S31_XIP_HEADER_SIZE - 156U - 8U) / 68U)
 #define S31_XIP_WIFI_IRAM_FIELDS_OFFSET (156U + S31_XIP_MAX_IMPORTS * 68U)
@@ -27,11 +31,11 @@ struct s31_xip_header {
 	u32 import_count, export_count, body_crc, header_crc;
 	u32 exports[S31_XIP_EXPORTS];
 	struct s31_xip_import imports[S31_XIP_MAX_IMPORTS];
-	/* Reserved image fields, required to be zero. */
+	/* Version 2: pristine Wi-Fi IRAM copy inside the flash body. */
 	u32 wifi_iram_offset, wifi_iram_size;
 };
 
-/* Pure bounds/address preflight, also compiled by the host tests. */
+/* Bounds/address preflight shared with the image-format validator. */
 static inline bool s31_xip_range(u32 offset, u32 size, u32 capacity)
 {
 	return offset <= capacity && size <= capacity - offset;
@@ -42,7 +46,7 @@ static inline bool s31_xip_valid(const struct s31_xip_header *h, u32 ram)
 	u32 i, body_end;
 
 	if (h->magic != S31_XIP_MAGIC ||
-	    h->version != 1 || h->abi != 1 ||
+	    h->version != 2 || h->abi != 1 ||
 	    h->base != S31_XIP_BASE || h->ram != ram ||
 	    h->ram_capacity != S31_XIP_RAM_SIZE ||
 	    h->image_size <= S31_XIP_HEADER_SIZE ||
@@ -56,12 +60,21 @@ static inline bool s31_xip_valid(const struct s31_xip_header *h, u32 ram)
 	    !s31_xip_range(h->bss_offset, h->bss_size, S31_XIP_RAM_SIZE) ||
 	    !s31_xip_range(h->vectors_offset, 192, h->data_size))
 		return false;
-	if (h->wifi_iram_offset || h->wifi_iram_size)
+	if (!h->wifi_iram_size ||
+	    h->wifi_iram_size > S31_XIP_WIFI_IRAM_CAPACITY ||
+	    h->wifi_iram_offset < S31_XIP_HEADER_SIZE ||
+	    !s31_xip_range(h->wifi_iram_offset, h->wifi_iram_size,
+			  h->data_offset))
 		return false;
 	body_end = S31_XIP_BASE + h->data_offset;
 	for (i = 0; i < S31_XIP_EXPORTS - 1; i++) {
-		if (h->exports[i] < S31_XIP_BASE + S31_XIP_HEADER_SIZE ||
-		    h->exports[i] >= body_end)
+		if ((h->exports[i] < S31_XIP_BASE + S31_XIP_HEADER_SIZE ||
+		     h->exports[i] >= body_end ||
+		     (h->exports[i] >= S31_XIP_BASE + h->wifi_iram_offset &&
+		      h->exports[i] < S31_XIP_BASE + h->wifi_iram_offset +
+					 h->wifi_iram_size)) &&
+		    !(h->exports[i] >= S31_XIP_WIFI_IRAM_BASE &&
+		      h->exports[i] < S31_XIP_WIFI_IRAM_BASE + h->wifi_iram_size))
 			return false;
 		if (h->exports[i] & 1)
 			return false;

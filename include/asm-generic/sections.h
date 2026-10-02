@@ -208,8 +208,18 @@ static inline bool is_kernel_inittext(unsigned long addr)
  * Returns: true if the address is located in .text, false otherwise.
  * Note: an internal helper, only check the range of _stext to _etext.
  */
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+/* XIP receive text is copied to a separate executable PSRAM range. */
+extern char __s31_rx_ram_start[], __s31_rx_ram_end[];
+#endif
+
 static inline bool __is_kernel_text(unsigned long addr)
 {
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	if (addr >= (unsigned long)__s31_rx_ram_start &&
+	    addr < (unsigned long)__s31_rx_ram_end)
+		return true;
+#endif
 	return addr >= (unsigned long)_stext &&
 	       addr < (unsigned long)_etext;
 }

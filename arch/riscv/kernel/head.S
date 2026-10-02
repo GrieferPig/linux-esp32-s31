@@ -144,6 +144,10 @@ relocate_enable_mmu:
 #ifdef CONFIG_SMP
 	.global secondary_start_sbi
 secondary_start_sbi:
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	/* The primary hart copied executable PSRAM before starting us. */
+	fence.i
+#endif
 	/* Mask all interrupts */
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
@@ -322,6 +326,9 @@ SYM_CODE_START(_start_kernel)
 	mv s0, a0
 	mv s1, a1
 	call __copy_data
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	fence.i
+#endif
 
 	/* Restore hart ID and DTB physical address */
 	mv a0, s0

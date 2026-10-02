@@ -133,6 +133,15 @@ SECTIONS
 
 	_sdata = .;			/* Start of data section */
 	_data = .;
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
+	/* Initialized text shares the XIP data copy but gets its own ROX pages. */
+	.s31_rx_ram.text : AT(ADDR(.s31_rx_ram.text) - LOAD_OFFSET) {
+		__s31_rx_ram_start = .;
+		*(.s31_rx_ram.text)
+		. = ALIGN(PAGE_SIZE);
+		__s31_rx_ram_end = .;
+	}
+#endif
 	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_SIZE)
 	_edata = .;
 	__start_ro_after_init = .;

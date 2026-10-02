@@ -23,6 +23,7 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt);
 int s31_radio_runtime_shutdown(void);
 int s31_radio_runtime_wait_ready(void);
 int s31_radio_fw_reset(void);
+size_t s31_radio_fw_wifi_iram_size(void);
 int s31_radio_wifi_frontend_suspend(void);
 int s31_radio_wifi_frontend_resume(void);
 int s31_radio_btdm_frontend_suspend(void);
