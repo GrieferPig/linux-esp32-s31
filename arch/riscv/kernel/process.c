@@ -46,8 +46,17 @@ extern asmlinkage void ret_from_fork_user_asm(void);
 extern void esp32s31_irq_poll(void);
 void arch_cpu_idle_poll(void);
 
+static unsigned int s31_idle_poll_ticks[2];
+
 void arch_cpu_idle_poll(void)
 {
+	unsigned int cpu = raw_smp_processor_id();
+
+	/* Hardware IRQs enter normally with SIE enabled. Sample the sentinel
+	 * periodically rather than paying MMIO costs on every polling cycle. */
+	if (esp32s31_sbi_idle_enabled() && cpu < ARRAY_SIZE(s31_idle_poll_ticks) &&
+	    (++s31_idle_poll_ticks[cpu] & 63))
+		return;
 	esp32s31_irq_poll();
 }
 

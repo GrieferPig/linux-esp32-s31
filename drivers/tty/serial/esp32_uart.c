@@ -771,7 +771,13 @@ static void esp32_uart_transmit_buffer(struct uart_port *port)
 
 static void esp32_uart_txint(struct uart_port *port)
 {
+	unsigned long flags;
+
+	/* start_tx() and console writes hold this lock. The IRQ may run on a
+	 * different CPU, so it must serialize FIFO consumption with them too. */
+	spin_lock_irqsave(&port->lock, flags);
 	esp32_uart_transmit_buffer(port);
+	spin_unlock_irqrestore(&port->lock, flags);
 }
 
 static irqreturn_t esp32_uart_int(int irq, void *dev_id)

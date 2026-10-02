@@ -9,6 +9,7 @@
 #include <linux/cpuidle.h>
 #include <linux/suspend.h>
 #include <linux/livepatch.h>
+#include <linux/export.h>
 #include "sched.h"
 #include "smp.h"
 
@@ -25,6 +26,29 @@ void sched_idle_set_state(struct cpuidle_state *idle_state)
 }
 
 static int __read_mostly cpu_idle_force_poll;
+
+#ifdef CONFIG_SOC_ESP32S31
+/* Keep hart 0 responsive while the radio STA is connected. */
+static bool s31_radio_active;
+
+void esp32s31_radio_idle_poll_set(bool active);
+void esp32s31_radio_idle_poll_set(bool active)
+{
+	WRITE_ONCE(s31_radio_active, active);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_idle_poll_set);
+
+static __always_inline bool s31_radio_idle_poll_this_cpu(void)
+{
+	return !smp_processor_id() && READ_ONCE(s31_radio_active);
+}
+#else
+static __always_inline bool s31_radio_idle_poll_this_cpu(void)
+{
+	return false;
+}
+#endif
+
 
 void cpu_idle_poll_ctrl(bool enable)
 {
@@ -66,7 +90,8 @@ static noinline int __cpuidle cpu_idle_poll(void)
 
 	raw_local_irq_enable();
 	while (!tif_need_resched() &&
-	       (cpu_idle_force_poll || tick_check_broadcast_expired())) {
+	       (cpu_idle_force_poll || s31_radio_idle_poll_this_cpu() ||
+		    tick_check_broadcast_expired())) {
 		arch_cpu_idle_poll();
 		cpu_relax();
 	}
@@ -328,7 +353,8 @@ static void do_idle(void)
 		 * broadcast device expired for us, we don't want to go deep
 		 * idle as we know that the IPI is going to arrive right away.
 		 */
-		if (cpu_idle_force_poll || tick_check_broadcast_expired()) {
+		if (cpu_idle_force_poll || s31_radio_idle_poll_this_cpu() ||
+		    tick_check_broadcast_expired()) {
 			tick_nohz_idle_restart_tick();
 			cpu_idle_poll();
 		} else {

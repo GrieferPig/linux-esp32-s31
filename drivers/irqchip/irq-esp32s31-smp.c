@@ -122,8 +122,13 @@ void noinstr esp32s31_sbi_wfi(void)
 	register unsigned long a6 asm("a6") = ESP32S31_SBI_CLIC_WFI;
 	register unsigned long a7 asm("a7") = ESP32S31_SBI_EXT_CLIC;
 
-	/* Restore the IRQ-disabled state expected by the cpuidle core. */
-	raw_local_irq_enable();
+	/* Keep the idle core's IRQ-disabled entry atomic with respect to wake
+	 * events. Enabling IRQs here can consume an IPI/timer before the SBI
+	 * boundary masks SIE again, then enter WFI after that wake was handled.
+	 * The private M-level guard wakes with SIE clear; cpuidle enables IRQs
+	 * after return. Preserve the existing SBI trap-state recovery sequence.
+	 */
+	raw_local_irq_disable();
 	asm volatile(RISCV_SBI_ECALL_ASM
 		     : "+r"(a0), "+r"(a1)
 		     : "r"(a2), "r"(a3), "r"(a4), "r"(a5),
