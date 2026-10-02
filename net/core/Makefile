@@ -21,8 +21,8 @@ obj-y += net-sysfs.o
 obj-y += hotdata.o
 
 ifeq ($(CONFIG_SOC_ESP32S31),y)
-CFLAGS_skbuff.o += -O2
-CFLAGS_gro.o += -O2
+CFLAGS_skbuff.o += -Os
+CFLAGS_gro.o += -Os
 endif
 obj-y += netdev_rx_queue.o
 obj-y += netdev_queues.o

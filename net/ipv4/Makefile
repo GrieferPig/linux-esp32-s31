@@ -19,8 +19,8 @@ obj-y     := route.o inetpeer.o protocol.o \
 obj-$(CONFIG_NET_IP_TUNNEL) += ip_tunnel.o
 
 ifeq ($(CONFIG_SOC_ESP32S31),y)
-CFLAGS_tcp_input.o += -O2
-CFLAGS_tcp.o += -O2
+CFLAGS_tcp_input.o += -Os
+CFLAGS_tcp.o += -Os
 endif
 obj-$(CONFIG_SYSCTL) += sysctl_net_ipv4.o
 obj-$(CONFIG_PROC_FS) += proc.o

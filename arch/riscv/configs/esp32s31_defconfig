@@ -230,7 +230,7 @@ CONFIG_DWMAC_GENERIC=y
 CONFIG_MOTORCOMM_PHY=y
 CONFIG_BT=y
 CONFIG_BT_LE=y
-# CONFIG_BT_ESP32S31 is not set
+CONFIG_BT_ESP32S31=y
 # CONFIG_BT_BREDR is not set
 # CONFIG_BT_BNEP is not set
 CONFIG_RFKILL=y
@@ -334,3 +334,14 @@ CONFIG_PREEMPT_VOLUNTARY=y
 CONFIG_HZ_100=y
 
 CONFIG_ESP32S31_RADIO_XIP=y
+
+# Full peripherals means S31 controllers plus their required frameworks.
+# External USB/HID/audio device drivers are opt-in, not part of this profile.
+# CONFIG_USB_NET_DRIVERS is not set
+# CONFIG_USB_SERIAL is not set
+# CONFIG_HID_SUPPORT is not set
+# CONFIG_SND_DRIVERS is not set
+# CONFIG_SND_SPI is not set
+# CONFIG_SND_USB is not set
+# CONFIG_SND_SOC_I2C_AND_SPI is not set
+# CONFIG_SND_SOC_SDCA_OPTIONAL is not set

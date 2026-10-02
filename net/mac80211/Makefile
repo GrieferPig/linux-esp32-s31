@@ -72,13 +72,13 @@ mac80211-y += wbrf.o
 ccflags-y += -DDEBUG
 
 # S31 executes networking from XIP flash. Keep the receive hot path optimized
-# for throughput while retaining the kernel's size optimization elsewhere.
+# with size optimization consistently with the rest of the kernel.
 ifeq ($(CONFIG_SOC_ESP32S31),y)
-CFLAGS_rx.o += -O2
-CFLAGS_aead_api.o += -O2
-CFLAGS_wpa.o += -O2
-CFLAGS_tx.o += -O2
-CFLAGS_status.o += -O2
-CFLAGS_util.o += -O2
-CFLAGS_sta_info.o += -O2
+CFLAGS_rx.o += -Os
+CFLAGS_aead_api.o += -Os
+CFLAGS_wpa.o += -Os
+CFLAGS_tx.o += -Os
+CFLAGS_status.o += -Os
+CFLAGS_util.o += -Os
+CFLAGS_sta_info.o += -Os
 endif

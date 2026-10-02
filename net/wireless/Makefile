@@ -56,5 +56,5 @@ $(obj)/extra-certs.c: $(CONFIG_CFG80211_EXTRA_REGDB_KEYDIR) \
 clean-files += shipped-certs.c extra-certs.c
 
 ifeq ($(CONFIG_SOC_ESP32S31),y)
-CFLAGS_util.o += -O2
+CFLAGS_util.o += -Os
 endif
