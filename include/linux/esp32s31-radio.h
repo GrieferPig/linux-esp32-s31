@@ -6,6 +6,12 @@
 #include <linux/esp32s31-radio-control.h>
 
 struct device;
+struct sk_buff;
+
+/* The SoftMAC association toggles the CPU0 IRQ-latency idle policy. */
+void esp32s31_radio_idle_poll_set(bool active);
+/* Internal frontend hint; publish while holding the RX ring lock. */
+void s31_radio_softmac_rx_pending_set(bool pending);
 
 #define ESP32S31_RADIO_CORE_ABI_VERSION	1U
 
@@ -94,7 +100,7 @@ struct esp32s31_radio_wifi_ops {
 	void (*ap_station)(void *context, const u8 *mac, bool joined);
 };
 
-#define ESP32S31_RADIO_WIFI_FRAME_MAX	1600
+#define ESP32S31_RADIO_WIFI_FRAME_MAX	4144
 
 bool esp32s31_radio_is_disabled(void);
 void s31_linux_pmu_radio_vote(bool active);
@@ -123,6 +129,10 @@ int esp32s31_radio_wifi_connect(
 int esp32s31_radio_wifi_disconnect(u16 reason);
 int esp32s31_radio_wifi_send(const u8 *frame, size_t length);
 int esp32s31_radio_wifi_send_interface(u8 interface, const u8 *frame, size_t length);
+/* Copies header and skb directly into the owned SRAM staging slot.
+ * No skb reference survives this call; publication follows a complete copy. */
+int esp32s31_radio_softmac_send_skb(const struct s31_softmac_tx_header *header,
+                                 const struct sk_buff *skb);
 int esp32s31_radio_wifi_control(const struct s31_wifi_control *control);
 bool esp32s31_radio_wifi_tx_has_space(void);
 bool esp32s31_radio_wifi_rx_pending(void);

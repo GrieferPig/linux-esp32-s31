@@ -359,6 +359,11 @@ ieee80211_verify_sta_ht_mcs_support(struct ieee80211_sub_if_data *sdata,
 
 	if (!ht_op)
 		return false;
+	if (IS_ENABLED(CONFIG_SOC_ESP32S31) &&
+	    !memchr_inv(ht_op->basic_set, 0xff, sizeof(ht_op->basic_set))) {
+		sdata_info(sdata, "ignoring invalid all-ones Basic HT-MCS placeholder\n");
+		return true;
+	}
 
 	memcpy(&sta_ht_cap, &sband->ht_cap, sizeof(sta_ht_cap));
 	ieee80211_apply_htcap_overrides(sdata, &sta_ht_cap);

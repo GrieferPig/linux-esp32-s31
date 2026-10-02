@@ -19,6 +19,11 @@ obj-$(CONFIG_NETDEV_ADDR_LIST_TEST) += dev_addr_lists_test.o
 
 obj-y += net-sysfs.o
 obj-y += hotdata.o
+
+ifeq ($(CONFIG_SOC_ESP32S31),y)
+CFLAGS_skbuff.o += -O2
+CFLAGS_gro.o += -O2
+endif
 obj-y += netdev_rx_queue.o
 obj-y += netdev_queues.o
 obj-$(CONFIG_PAGE_POOL) += page_pool.o page_pool_user.o

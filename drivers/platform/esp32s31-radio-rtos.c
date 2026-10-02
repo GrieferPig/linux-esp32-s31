@@ -5,6 +5,7 @@
 #include <linux/completion.h>
 #include <linux/cpu.h>
 #include <linux/fpu.h>
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/mm_types.h>
 #include <linux/jiffies.h>
@@ -119,15 +120,21 @@ struct s31_blob_context {
 	bool fp_valid;
 	bool stack_switched;
 	bool irq_disabled;
-	u64 gate_acquired_ns;
-	u64 gate_exec_start_ns;
-	u32 gate_timing_generation;
-	u32 tick_acquired;
-	u32 last_wifi_event;
-	bool last_wifi_event_valid;
 };
 
 static struct s31_blob_context *s31_blob_context_current(void);
+
+/* Timer IRQs can interrupt a userspace mm. Low payload SRAM is mapped
+ * only in init_mm, so every asynchronously dereferenced wait object must
+ * be allocated in ordinary, globally mapped kernel memory. */
+struct s31_native_wait {
+	struct hrtimer timer;
+	wait_queue_entry_t entry;
+	struct task_struct *thread;
+	atomic_t expired;
+};
+
+static enum hrtimer_restart s31_native_wait_expired(struct hrtimer *timer);
 
 struct s31_linux_task {
 	u32 magic;
@@ -140,6 +147,9 @@ struct s31_linux_task {
 	bool blob_active;
 	bool critical_active;
 	bool critical_suspended;
+	bool on_kernel_stack;
+	bool exit_preempt_guard;
+	struct s31_native_wait *native_wait;
 	u32 sync_lock_depth;
 	unsigned long sync_irq_flags;
 	unsigned long critical_flags;
@@ -167,6 +177,7 @@ struct s31_linux_sync {
 
 static DEFINE_PER_CPU(struct s31_blob_context, s31_foreign_blob_context);
 static atomic_t s31_sync_stop_generation = ATOMIC_INIT(0);
+static struct s31_linux_task *s31_linux_current_task(void);
 static DEFINE_RAW_SPINLOCK(s31_critical_lock);
 static DEFINE_MUTEX(s31_blob_mutex);
 static struct s31_linux_task *s31_task_list;
@@ -203,288 +214,41 @@ static void s31_blob_fpu_end(void)
 	preempt_enable();
 }
 
-/* Production keeps this disabled.  Retain one opt-in sample of each kind
- * without reserving more than 10 KiB of module BSS for dormant diagnostics. */
-#define S31_GATE_TIMING_SLOTS 1
-#define S31_GATE_LONGEST_SAMPLES 1
+static const bool s31_native_queue_poll = true;
+static unsigned int s31_native_queue_polls;
 
-struct s31_gate_reason_timing {
-	u64 wall_total_ns;
-	u64 wall_max_ns;
-	u64 exec_total_ns;
-	u64 exec_max_ns;
-	u64 offcpu_total_ns;
-	u64 offcpu_max_ns;
-	u32 count;
-};
+static const bool s31_native_queue_irq_service = true;
+static unsigned int s31_native_queue_empty_skips;
 
-struct s31_gate_timing_slot {
-	struct task_struct *thread;
-	char name[TASK_COMM_LEN];
-	u64 wait_total_ns;
-	u64 wait_max_ns;
-	u32 enters;
-	struct s31_gate_reason_timing reason[S31_BLOB_RELEASE_COUNT];
-};
-
-struct s31_gate_long_sample {
-	char name[TASK_COMM_LEN];
-	u32 reason;
-	u64 wall_ns;
-	u64 exec_ns;
-	u64 offcpu_ns;
-	u32 last_wifi_event;
-	bool last_wifi_event_valid;
-};
-
-static DEFINE_SPINLOCK(s31_gate_timing_lock);
-static struct s31_gate_timing_slot s31_gate_timing[S31_GATE_TIMING_SLOTS];
-static struct s31_gate_long_sample
-	s31_gate_longest[S31_GATE_LONGEST_SAMPLES];
-static u32 s31_gate_timing_generation;
-static bool s31_gate_timing_enabled;
-
-static const char * const s31_gate_reason_name[S31_BLOB_RELEASE_COUNT] = {
-	[S31_BLOB_RELEASE_LEAVE] = "leave",
-	[S31_BLOB_RELEASE_TASK_DELAY] = "task-delay",
-	[S31_BLOB_RELEASE_TASK_YIELD] = "task-yield",
-	[S31_BLOB_RELEASE_QUEUE_SEND] = "queue-send",
-	[S31_BLOB_RELEASE_QUEUE_RECEIVE] = "queue-receive",
-	[S31_BLOB_RELEASE_SEMAPHORE_TAKE] = "semaphore-take",
-	[S31_BLOB_RELEASE_NOTIFY_TAKE] = "notify-take",
-	[S31_BLOB_RELEASE_NOTIFY_WAIT] = "notify-wait",
-	[S31_BLOB_RELEASE_EVENT_WAIT] = "event-wait",
-	[S31_BLOB_RELEASE_TASK_SUSPEND] = "task-suspend",
-};
-
-struct s31_gate_release_info {
-	bool valid;
-	u32 reason;
-	u64 wall_ns;
-	u64 exec_ns;
-	u32 tick_start;
-};
-
-static struct s31_gate_timing_slot *s31_gate_timing_slot_locked(void)
-{
-	struct s31_gate_timing_slot *free = NULL;
-	int i;
-
-	for (i = 0; i < S31_GATE_TIMING_SLOTS; i++) {
-		if (s31_gate_timing[i].thread == current)
-			return &s31_gate_timing[i];
-		if (!s31_gate_timing[i].thread && !free)
-			free = &s31_gate_timing[i];
-	}
-	if (!free)
-		free = &s31_gate_timing[S31_GATE_TIMING_SLOTS - 1];
-	if (!free->thread) {
-		free->thread = current;
-		strscpy(free->name, current->comm, sizeof(free->name));
-	}
-	return free;
-}
-
-static void s31_gate_timing_acquired(struct s31_blob_context *context,
-				     u64 wait_start_ns, u64 acquired_ns)
-{
-	struct s31_gate_timing_slot *slot;
-	unsigned long flags;
-	u64 wait_ns = acquired_ns - wait_start_ns;
-
-	/* The gate-hold histogram is diagnostic-only and proved the earlier
-	 * bottleneck (ROM UART polling in esp_rom_printf).  Its bookkeeping
-	 * (task_sched_runtime() + spin_lock_irqsave on every blob enter) is
-	 * measurable overhead in the hot path, so keep it compiled out of the
-	 * acquire/release fast path unless explicitly re-enabled. */
-	if (!READ_ONCE(s31_gate_timing_enabled)) {
-		context->gate_timing_generation = 0;
-		context->gate_acquired_ns = 0;
-		context->gate_exec_start_ns = 0;
-		context->tick_acquired = 0;
-		return;
-	}
-	context->tick_acquired = s31_linux_tick_count();
-	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	slot = s31_gate_timing_slot_locked();
-	slot->wait_total_ns += wait_ns;
-	slot->wait_max_ns = max(slot->wait_max_ns, wait_ns);
-	slot->enters++;
-	context->gate_timing_generation = s31_gate_timing_generation;
-	context->gate_acquired_ns = acquired_ns;
-	context->gate_exec_start_ns = esp32s31_task_runtime(current);
-	context->last_wifi_event_valid = false;
-	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-}
-
-static void s31_gate_record_longest_locked(u32 reason, u64 wall_ns,
-					   u64 exec_ns, u64 offcpu_ns)
-{
-	struct s31_gate_long_sample *sample;
-	int i, pos = -1;
-
-	for (i = 0; i < S31_GATE_LONGEST_SAMPLES; i++) {
-		if (wall_ns > s31_gate_longest[i].wall_ns) {
-			pos = i;
-			break;
-		}
-	}
-	if (pos < 0)
-		return;
-	for (i = S31_GATE_LONGEST_SAMPLES - 1; i > pos; i--)
-		s31_gate_longest[i] = s31_gate_longest[i - 1];
-	sample = &s31_gate_longest[pos];
-	strscpy(sample->name, current->comm, sizeof(sample->name));
-	sample->reason = reason;
-	sample->wall_ns = wall_ns;
-	sample->exec_ns = exec_ns;
-	sample->offcpu_ns = offcpu_ns;
-	sample->last_wifi_event = s31_blob_context_current()->last_wifi_event;
-	sample->last_wifi_event_valid =
-		s31_blob_context_current()->last_wifi_event_valid;
-}
-
-static void s31_gate_timing_released(struct s31_blob_context *context,
-				     u32 reason,
-				     struct s31_gate_release_info *info)
-{
-	struct s31_gate_timing_slot *slot;
-	struct s31_gate_reason_timing *timing;
-	unsigned long flags;
-	u64 now, exec_now;
-	u64 wall_ns = 0, exec_ns = 0, offcpu_ns = 0;
-
-	if (info)
-		info->valid = false;
-	if (reason >= S31_BLOB_RELEASE_COUNT)
-		reason = S31_BLOB_RELEASE_LEAVE;
-
-	if (!READ_ONCE(s31_gate_timing_enabled) || !context->gate_acquired_ns) {
-		context->gate_acquired_ns = 0;
-		context->gate_exec_start_ns = 0;
-		context->gate_timing_generation = 0;
-		context->tick_acquired = 0;
-		return;
-	}
-	now = ktime_get_mono_fast_ns();
-	exec_now = esp32s31_task_runtime(current);
-
-	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	if (context->gate_timing_generation != s31_gate_timing_generation)
-		goto out;
-	wall_ns = now - context->gate_acquired_ns;
-	exec_ns = exec_now - context->gate_exec_start_ns;
-	offcpu_ns = wall_ns > exec_ns ? wall_ns - exec_ns : 0;
-	slot = s31_gate_timing_slot_locked();
-	timing = &slot->reason[reason];
-	timing->wall_total_ns += wall_ns;
-	timing->wall_max_ns = max(timing->wall_max_ns, wall_ns);
-	timing->exec_total_ns += exec_ns;
-	timing->exec_max_ns = max(timing->exec_max_ns, exec_ns);
-	timing->offcpu_total_ns += offcpu_ns;
-	timing->offcpu_max_ns = max(timing->offcpu_max_ns, offcpu_ns);
-	timing->count++;
-	s31_gate_record_longest_locked(reason, wall_ns, exec_ns, offcpu_ns);
-	if (info) {
-		info->valid = true;
-		info->reason = reason;
-		info->wall_ns = wall_ns;
-		info->exec_ns = exec_ns;
-		info->tick_start = context->tick_acquired;
-	}
-out:
-	context->gate_acquired_ns = 0;
-	context->gate_exec_start_ns = 0;
-	context->gate_timing_generation = 0;
-	context->tick_acquired = 0;
-	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-}
-
-void s31_linux_gate_timing_reset(void)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	memset(s31_gate_timing, 0, sizeof(s31_gate_timing));
-	memset(s31_gate_longest, 0, sizeof(s31_gate_longest));
-	s31_gate_timing_generation++;
-	if (!s31_gate_timing_generation)
-		s31_gate_timing_generation++;
-	/* Leave the histogram disabled: it was diagnostic for the UART-poll
-	 * hold and its per-enter bookkeeping now costs hot-path cycles. */
-	s31_gate_timing_enabled = false;
-	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-}
-
-void s31_linux_gate_timing_report(const char *stage)
-{
-	unsigned long flags;
-	int i, reason;
-
-	spin_lock_irqsave(&s31_gate_timing_lock, flags);
-	s31_gate_timing_enabled = false;
-	spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-
-	for (i = 0; i < S31_GATE_TIMING_SLOTS; i++) {
-		char name[TASK_COMM_LEN];
-		u64 wait_total_ns, wait_max_ns;
-		u32 enters;
-
-		spin_lock_irqsave(&s31_gate_timing_lock, flags);
-		strscpy(name, s31_gate_timing[i].name, sizeof(name));
-		wait_total_ns = s31_gate_timing[i].wait_total_ns;
-		wait_max_ns = s31_gate_timing[i].wait_max_ns;
-		enters = s31_gate_timing[i].enters;
-		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-
-		if (!name[0])
-			continue;
-		pr_info("esp32s31-radio: gate timing %s task=%s enter=%u wait_avg=%lluns wait_max=%lluns\n",
-			stage, name, enters,
-			enters ? div_u64(wait_total_ns, enters) : 0,
-			wait_max_ns);
-		for (reason = 0; reason < S31_BLOB_RELEASE_COUNT; reason++) {
-			struct s31_gate_reason_timing timing;
-
-			spin_lock_irqsave(&s31_gate_timing_lock, flags);
-			timing = s31_gate_timing[i].reason[reason];
-			spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-			if (!timing.count)
-				continue;
-			pr_info("esp32s31-radio: gate hold %s task=%s reason=%s count=%u wall_avg=%lluns wall_max=%lluns exec_avg=%lluns exec_max=%lluns offcpu_avg=%lluns offcpu_max=%lluns\n",
-				stage, name, s31_gate_reason_name[reason],
-				timing.count,
-				div_u64(timing.wall_total_ns, timing.count),
-				timing.wall_max_ns,
-				div_u64(timing.exec_total_ns, timing.count),
-				timing.exec_max_ns,
-				div_u64(timing.offcpu_total_ns, timing.count),
-				timing.offcpu_max_ns);
-		}
-	}
-	for (i = 0; i < S31_GATE_LONGEST_SAMPLES; i++) {
-		struct s31_gate_long_sample sample;
-
-		spin_lock_irqsave(&s31_gate_timing_lock, flags);
-		sample = s31_gate_longest[i];
-		spin_unlock_irqrestore(&s31_gate_timing_lock, flags);
-		if (!sample.wall_ns)
-			continue;
-		pr_info("esp32s31-radio: gate longest %s rank=%d task=%s reason=%s wall=%lluns exec=%lluns offcpu=%lluns last_event=%s%u\n",
-			stage, i + 1, sample.name,
-			s31_gate_reason_name[sample.reason], sample.wall_ns,
-			sample.exec_ns, sample.offcpu_ns,
-			sample.last_wifi_event_valid ? "" : "none/",
-			sample.last_wifi_event);
-	}
-}
+/* Bounded polling retains the real native owner and payload stack. */
 
 void s31_linux_trace_wifi_event(u32 event)
 {
-	struct s31_blob_context *context = s31_blob_context_current();
 
-	context->last_wifi_event = event;
-	context->last_wifi_event_valid = true;
+	if (READ_ONCE(s31_native_queue_poll) && !in_interrupt() &&
+	    !irqs_disabled() && !s31_rtos_isr_depth &&
+	    s31_radio_native_current() && s31_linux_blob_held_by_current()) {
+		struct s31_linux_task *task = s31_linux_current_task();
+
+		/* The dispatcher queue was unlocked before this trace callback.
+		 * PP's outer loop takes its interrupt mux only after receive returns.
+		 * Never service from an ISR, a borrowed Linux SP, or a critical region. */
+		if (task && task->blob_active && task->blob.stack_switched &&
+		    !task->on_kernel_stack && !task->critical_active &&
+		    !task->sync_lock_depth && task->native_wait) {
+
+			if (READ_ONCE(s31_native_queue_irq_service) &&
+			    !s31_radio_native_service_due()) {
+				s31_native_queue_empty_skips++;
+				return;
+			} else {
+				if (s31_radio_native_poll() == U32_MAX)
+					return;
+				s31_native_queue_polls++;
+			}
+
+		}
+	}
 }
 
 /* Set by the radio worker while it waits for the blob gate.  The worker is
@@ -589,6 +353,19 @@ void s31_linux_call_on_stack(void *stack, u32 stack_size,
 		return;
 	s31_payload_run(save, (unsigned long)stack + stack_size - 16,
 			entry, arg);
+}
+
+static void s31_task_kernel_call(struct s31_linux_task *task,
+                                 void (*entry)(void *), void *arg)
+{
+ unsigned long save[14];
+ if (task->on_kernel_stack) {
+  entry(arg);
+  return;
+ }
+ task->on_kernel_stack = true;
+ s31_payload_run(save, task->sp_save[1] - 16, entry, arg);
+ task->on_kernel_stack = false;
 }
 
 static struct s31_blob_context *s31_blob_context_current(void)
@@ -758,7 +535,8 @@ int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg)
 	    !esp32s31_current_uses_init_mm())
 		return S31_DIRECT_ISR_DEFER_CONTEXT;
 	task = s31_linux_current_task();
-	if (task && ((task->critical_active && !task->critical_suspended) ||
+	if (task && (task->on_kernel_stack ||
+		     (task->critical_active && !task->critical_suspended) ||
 		     READ_ONCE(task->sync_lock_depth)))
 		return S31_DIRECT_ISR_DEFER_UNSAFE;
 	if (READ_ONCE(s31_rtos_isr_depth))
@@ -842,12 +620,18 @@ static int s31_linux_task_main(void *arg)
 			(unsigned long)task->payload_stack +
 				task->payload_stack_size - 16,
 			task->entry, task->arg);
+	/* A self-delete returns here with one transition guard still held. */
+	if (task->exit_preempt_guard) {
+		task->exit_preempt_guard = false;
+		preempt_enable();
+	}
 	/* Reached on normal entry return or after vTaskDelete(self). */
 	if (task->blob_active)
 		s31_linux_blob_leave();
 	pr_info("esp32s31-radio: compatibility task %s returned\n", current->comm);
 	esp32s31_kthread_unuse_init_mm();
 	s31_linux_task_cleanup(task);
+	kfree(task->native_wait);
 	s31_linux_task_unregister(task);
 	s31_rtos_free(task->payload_stack);
 	s31_rtos_task_release(task->cookie);
@@ -856,7 +640,7 @@ static int s31_linux_task_main(void *arg)
 	return 0;
 }
 
-void *s31_linux_task_create(void (*entry)(void *), const char *name,
+static void *s31_task_create_on_linux_stack(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
 				    void *arg, u32 priority, void *cookie,
 				    s32 core_id)
@@ -878,13 +662,27 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 	task->payload_stack = stack_base;
 	task->payload_stack_size = stack_size;
 	task->requested_cpu = core_id;
+	if (name && !strcmp(name, "wifi") &&
+	    IS_ENABLED(CONFIG_ESP32S31_WIFI_SOFTMAC)) {
+		task->native_wait = kzalloc(sizeof(*task->native_wait), GFP_KERNEL);
+		if (!task->native_wait) {
+			s31_radio_sram_free(task);
+			return NULL;
+		}
+	}
 	init_completion(&task->exited);
 	atomic_set(&task->stopping, 0);
 	task->thread = kthread_create(s31_linux_task_main, task, "%s",
 				      name && *name ? name : "s31-task");
 	if (IS_ERR(task->thread)) {
+		kfree(task->native_wait);
 		s31_radio_sram_free(task);
 		return NULL;
+	}
+	if (task->native_wait) {
+		task->native_wait->thread = task->thread;
+		hrtimer_setup(&task->native_wait->timer, s31_native_wait_expired,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	}
 	spin_lock(&s31_task_list_lock);
 	task->next = s31_task_list;
@@ -918,8 +716,50 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 		core_id,
 		realtime_task ? "RR" : "CFS",
 		realtime_task ? param.sched_priority : task_nice(task->thread));
+	if (name && !strcmp(name, "wifi"))
+		s31_radio_native_attach(task->thread);
 	wake_up_process(task->thread);
 	return task;
+}
+
+struct s31_create_args {
+ void (*entry)(void *);
+ const char *name;
+ u32 stack_size;
+ void *stack_base, *arg, *cookie, *result;
+ u32 priority;
+ s32 core_id;
+};
+
+static void s31_create_on_kernel_stack(void *opaque)
+{
+ struct s31_create_args *args = opaque;
+ preempt_enable();
+ args->result = s31_task_create_on_linux_stack(args->entry, args->name,
+  args->stack_size, args->stack_base, args->arg, args->priority,
+  args->cookie, args->core_id);
+ s31_linux_blob_resume();
+}
+
+void *s31_linux_task_create(void (*entry)(void *), const char *name,
+ u32 stack_size, void *stack_base, void *arg, u32 priority,
+ void *cookie, s32 core_id)
+{
+ struct s31_linux_task *caller = s31_linux_current_task();
+ struct s31_create_args args = {
+  .entry = entry, .name = name, .stack_size = stack_size,
+  .stack_base = stack_base, .arg = arg, .priority = priority,
+  .cookie = cookie, .core_id = core_id,
+ };
+ if (!caller || caller->on_kernel_stack)
+  return s31_task_create_on_linux_stack(entry, name, stack_size,
+   stack_base, arg, priority, cookie, core_id);
+ /* kthread_create waits on a completion completed by another hart.
+  * Both that completion and any scheduling must use the Linux stack. */
+ preempt_disable();
+ s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_DELAY);
+ s31_task_kernel_call(caller, s31_create_on_kernel_stack, &args);
+ return args.result;
 }
 
 void *s31_linux_current_cookie(void)
@@ -935,6 +775,8 @@ void s31_linux_task_exit_current(void)
 	if (!task)
 		return;
 	if (task->blob_active) {
+		preempt_disable();
+		task->exit_preempt_guard = true;
 		s31_linux_blob_leave();
 		task->blob_active = false;
 	}
@@ -944,20 +786,49 @@ void s31_linux_task_exit_current(void)
 	unreachable();
 }
 
+struct s31_stop_args {
+	struct task_struct *target;
+	bool resume_blob;
+};
+
+static void s31_stop_on_kernel_stack(void *opaque)
+{
+	struct s31_stop_args *args = opaque;
+
+	if (args->resume_blob)
+		preempt_enable();
+	kthread_stop(args->target);
+	if (args->resume_blob)
+		s31_linux_blob_resume();
+}
+
 int32_t s31_linux_task_stop(void *opaque)
 {
 	struct s31_linux_task *task = opaque;
+	struct s31_linux_task *caller = s31_linux_current_task();
+	struct s31_stop_args args;
 
 	if (!task || task->magic != S31_LINUX_TASK_MAGIC)
 		return -EINVAL;
-	if (task == s31_linux_current_task()) {
+	if (task == caller) {
 		s31_linux_task_exit_current();
 		unreachable();
 	}
 	atomic_set(&task->stopping, 1);
 	atomic_inc(&s31_sync_stop_generation);
 	wake_up_process(task->thread);
-	kthread_stop(task->thread);
+	args.target = task->thread;
+	args.resume_blob = caller && caller->blob_active;
+	if (args.resume_blob) {
+		/* Keep one preemption reference until SP is back on the Linux
+		 * stack, then release the gate while the target exits. */
+		preempt_disable();
+		s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_DELAY);
+	}
+	if (caller)
+		s31_task_kernel_call(caller, s31_stop_on_kernel_stack, &args);
+	else
+		s31_stop_on_kernel_stack(&args);
 	return 0;
 }
 
@@ -985,38 +856,42 @@ void s31_linux_tasks_stop_all(void)
 	}
 }
 
+struct s31_delay_args { unsigned long timeout; bool yielding; };
+static void s31_delay_on_kernel_stack(void *opaque)
+{
+ struct s31_delay_args *args=opaque;
+ preempt_enable();
+ if (args->yielding) {
+  yield();
+ } else {
+  set_current_state(TASK_INTERRUPTIBLE);
+  if (args->timeout == MAX_SCHEDULE_TIMEOUT) schedule();
+  else schedule_timeout(args->timeout);
+  __set_current_state(TASK_RUNNING);
+ }
+ if (kthread_should_stop()) {
+  s31_linux_task_exit_current();
+  unreachable();
+ }
+ s31_linux_blob_resume();
+}
+
 void s31_linux_task_delay(u32 ticks)
 {
-	struct s31_linux_task *task = s31_linux_current_task();
-	unsigned long timeout;
-
-	if (!task || atomic_read(&task->stopping))
-		return;
-	if (!ticks) {
-		cond_resched();
-		return;
-	}
-	timeout = s31_ticks_to_jiffies(ticks);
-	s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_DELAY);
-	set_current_state(TASK_INTERRUPTIBLE);
-	if (timeout == MAX_SCHEDULE_TIMEOUT)
-		schedule();
-	else
-		schedule_timeout(timeout);
-	__set_current_state(TASK_RUNNING);
-	s31_linux_blob_resume();
+ struct s31_linux_task *task=s31_linux_current_task();
+ struct s31_delay_args args={ .timeout=s31_ticks_to_jiffies(ticks), .yielding=!ticks };
+ if (!task || atomic_read(&task->stopping)) return;
+ /* Hold an extra preemption reference across the SRAM -> Linux SP pivot.
+  * blob_suspend drops the payload reference; the helper drops this guard
+  * only after it is running on the globally mapped Linux task stack. */
+ preempt_disable();
+ s31_linux_blob_suspend(ticks ? S31_BLOB_RELEASE_TASK_DELAY : S31_BLOB_RELEASE_TASK_YIELD);
+ s31_task_kernel_call(task, s31_delay_on_kernel_stack, &args);
 }
 
 void s31_linux_task_yield(void)
 {
-	struct s31_linux_task *task = s31_linux_current_task();
-
-	if (!task || atomic_read(&task->stopping))
-		return;
-	/* FreeRTOS vTaskDelay(0) is an explicit scheduler yield. */
-	s31_linux_blob_suspend(S31_BLOB_RELEASE_TASK_YIELD);
-	yield();
-	s31_linux_blob_resume();
+ s31_linux_task_delay(0);
 }
 
 void s31_linux_task_set_priority(void *opaque, u32 priority)
@@ -1118,34 +993,95 @@ u32 s31_linux_sync_sequence(void *opaque)
 	return sync ? atomic_read(&sync->sequence) : 0;
 }
 
+static enum hrtimer_restart s31_native_wait_expired(struct hrtimer *timer)
+{
+	struct s31_native_wait *wait = container_of(timer, struct s31_native_wait, timer);
+	atomic_set(&wait->expired, 1);
+	wake_up_process(wait->thread);
+	return HRTIMER_NORESTART;
+}
+
+struct s31_wait_args {
+ struct s31_linux_sync *sync;
+ struct s31_linux_task *task;
+ u32 sequence, service_seq, service_us;
+ int stop_generation;
+ long timeout, ret;
+ bool native, guarded;
+};
+
+static unsigned int s31_native_wait_timer_arms;
+static unsigned int s31_native_wait_schedules;
+
+static void s31_wait_on_kernel_stack(void *opaque)
+{
+ struct s31_wait_args *args=opaque;
+ struct s31_linux_sync *sync=args->sync;
+ long ret;
+ if (args->guarded) preempt_enable();
+ if (args->native) {
+  struct s31_native_wait *wait=args->task->native_wait;
+  u64 wait_us=min_t(u64, args->service_us, jiffies_to_usecs(args->timeout));
+  atomic_set(&wait->expired,0);
+  init_wait_entry(&wait->entry,0);
+
+   hrtimer_setup(&wait->timer,s31_native_wait_expired,CLOCK_MONOTONIC,HRTIMER_MODE_REL);
+   hrtimer_start(&wait->timer,us_to_ktime(max_t(u64,wait_us,50)),HRTIMER_MODE_REL);
+   s31_native_wait_timer_arms++;
+
+  for (;;) {
+   ret=prepare_to_wait_event(&sync->waitq,&wait->entry,TASK_INTERRUPTIBLE);
+   if (atomic_read(&sync->sequence)!=args->sequence ||
+       atomic_read(&s31_sync_stop_generation)!=args->stop_generation ||
+       kthread_should_stop() || s31_radio_native_pending() ||
+       s31_radio_native_generation()!=args->service_seq || atomic_read(&wait->expired)) {
+    ret=1; break;
+   }
+   if (ret) break;
+
+   s31_native_wait_schedules++;
+   schedule();
+  }
+  hrtimer_cancel(&wait->timer);
+  finish_wait(&sync->waitq,&wait->entry);
+ } else {
+  ret=wait_event_interruptible_timeout(sync->waitq,
+   atomic_read(&sync->sequence)!=args->sequence ||
+   atomic_read(&s31_sync_stop_generation)!=args->stop_generation ||
+   kthread_should_stop(),args->timeout);
+ }
+ if (kthread_should_stop()) {
+  s31_linux_task_exit_current();
+  unreachable();
+ }
+ args->ret=ret;
+ /* This can block on the blob mutex too, so it stays on Linux SP.
+  * Resume restores the payload preemption reference before the SP pivot. */
+ s31_linux_blob_resume();
+}
+
 int32_t s31_linux_sync_wait(void *opaque, u32 sequence, u32 ticks, u32 reason)
 {
-	struct s31_linux_sync *sync = opaque;
-	int stop_generation = atomic_read(&s31_sync_stop_generation);
-	long timeout = s31_ticks_to_jiffies(ticks);
-	long ret;
-
-	if (!sync || !timeout)
-		return 0;
-	s31_linux_blob_suspend(reason);
-	ret = wait_event_interruptible_timeout(sync->waitq,
-		atomic_read(&sync->sequence) != sequence ||
-		atomic_read(&s31_sync_stop_generation) != stop_generation ||
-		kthread_should_stop(), timeout);
-	/* vTaskDelete(other) is implemented with kthread_stop().  Waking the
-	 * blocked FreeRTOS primitive is not sufficient: most blob tasks retry
-	 * their queue/event wait after an error.  More importantly, the deleting
-	 * task still owns the blob gate while it waits in kthread_stop(), so the
-	 * target must escape before trying to reacquire that gate or the two tasks
-	 * deadlock.  Let the normal task trampoline run compatibility clean-up. */
-	if (kthread_should_stop()) {
-		s31_linux_task_exit_current();
-		unreachable();
-	}
-	s31_linux_blob_resume();
-	if (ret < 0)
-		return -1;
-	return ret ? 1 : 0;
+ struct s31_linux_task *task=s31_linux_current_task();
+ struct s31_wait_args args={
+  .sync=opaque, .task=task, .sequence=sequence,
+  .stop_generation=atomic_read(&s31_sync_stop_generation),
+  .timeout=s31_ticks_to_jiffies(ticks),
+  .service_seq=s31_radio_native_generation(), .service_us=U32_MAX,
+  .guarded=task!=NULL,
+ };
+ args.native=s31_radio_native_current() && reason==S31_BLOB_RELEASE_QUEUE_RECEIVE &&
+  task && !task->critical_active && !task->sync_lock_depth && task->native_wait;
+ if (!args.sync || !args.timeout) return 0;
+ if (args.native) {
+  s31_linux_critical_suspend();
+  args.service_us=s31_radio_native_poll();
+ }
+ if (args.guarded) preempt_disable();
+ s31_linux_blob_suspend(reason);
+ if (task) s31_task_kernel_call(task,s31_wait_on_kernel_stack,&args);
+ else s31_wait_on_kernel_stack(&args);
+ return args.ret<0 ? -1 : args.ret ? 1 : 0;
 }
 
 void s31_linux_sync_wake(void *opaque)
@@ -1226,9 +1162,6 @@ void s31_linux_critical_resume(void)
 void s31_linux_blob_enter(void)
 {
 	struct s31_blob_context *context;
-	bool timing = READ_ONCE(s31_gate_timing_enabled);
-	u64 wait_start_ns = timing ? ktime_get_mono_fast_ns() : 0;
-	u64 acquired_ns;
 
 	/* A woken Wi-Fi task normally has a higher SCHED_FIFO priority than the
 	 * radio worker.  It must sleep while the worker owns this gate; yielding
@@ -1243,13 +1176,12 @@ void s31_linux_blob_enter(void)
 		}
 		mutex_lock(&s31_blob_mutex);
 	}
-	acquired_ns = timing ? ktime_get_mono_fast_ns() : 0;
+
 	context = s31_blob_context_current();
-	s31_gate_timing_acquired(context, wait_start_ns, acquired_ns);
 	s31_blob_install_context(context);
 	s31_blob_fpu_begin();
 	s31_blob_set_active(true);
-	s31_radio_timing_blob_enter();
+
 }
 
 void s31_linux_blob_leave(void)
@@ -1261,18 +1193,17 @@ void s31_linux_blob_leave(void)
 	 * Service it on the already installed payload stack before releasing the
 	 * ownership domain. */
 	s31_radio_blob_run_pending_isrs();
-	s31_gate_timing_released(context, S31_BLOB_RELEASE_LEAVE, NULL);
 	s31_blob_fpu_end();
 	s31_blob_restore_context(context);
 	s31_blob_set_active(false);
 	mutex_unlock(&s31_blob_mutex);
+	if (!s31_radio_native_current()) s31_radio_native_wake();
 }
 
 void s31_linux_blob_suspend(u32 reason)
 {
 	struct s31_blob_context *context = s31_blob_context_current();
 	struct s31_linux_task *task = s31_linux_current_task();
-	struct s31_gate_release_info release;
 
 	s31_payload_stack_measure(task);
 
@@ -1282,7 +1213,6 @@ void s31_linux_blob_suspend(u32 reason)
 	s31_linux_critical_suspend();
 	s31_radio_blob_run_pending_isrs();
 	if (s31_blob_active()) {
-		s31_gate_timing_released(context, reason, &release);
 		if (s31_radio_payload_uses_fp()) {
 			if (task)
 				s31_payload_fp_save_area(task->fp_saved,
@@ -1295,9 +1225,8 @@ void s31_linux_blob_suspend(u32 reason)
 		s31_blob_restore_context(context);
 		s31_blob_set_active(false);
 		mutex_unlock(&s31_blob_mutex);
-		/* Long-gate PC sampling is kept for future diagnostics, but the
-		 * automatic serial print is disabled: the holds were proven to be
-		 * ROM UART polling in esp_rom_printf(), not a scheduler bug. */
+		if (!s31_radio_native_current()) s31_radio_native_wake();
+
 	}
 }
 
@@ -1305,16 +1234,12 @@ void s31_linux_blob_resume(void)
 {
 	struct s31_blob_context *context;
 	struct s31_linux_task *task = s31_linux_current_task();
-	bool timing = READ_ONCE(s31_gate_timing_enabled);
-	u64 wait_start_ns;
-	u64 acquired_ns;
 
 	if (!s31_blob_active()) {
-		wait_start_ns = timing ? ktime_get_mono_fast_ns() : 0;
+
 		mutex_lock(&s31_blob_mutex);
-		acquired_ns = timing ? ktime_get_mono_fast_ns() : 0;
+
 		context = s31_blob_context_current();
-		s31_gate_timing_acquired(context, wait_start_ns, acquired_ns);
 		s31_blob_install_context(context);
 		s31_blob_fpu_begin();
 		if (s31_radio_payload_uses_fp()) {
@@ -1326,7 +1251,7 @@ void s31_linux_blob_resume(void)
 							    context->fp_valid);
 		}
 		s31_blob_set_active(true);
-		s31_radio_timing_blob_enter();
+
 	}
 	s31_linux_critical_resume();
 }

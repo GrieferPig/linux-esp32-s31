@@ -6,6 +6,15 @@
 
 struct esp32s31_radio_wifi_ap;
 struct device;
+struct task_struct;
+
+void s31_radio_native_attach(struct task_struct *task);
+bool s31_radio_native_current(void);
+bool s31_radio_native_pending(void);
+bool s31_radio_native_service_due(void);
+u32 s31_radio_native_generation(void);
+u32 s31_radio_native_poll(void);
+void s31_radio_native_wake(void);
 
 #define S31_RADIO_FEATURE_WIFI		(1U << 0)
 #define S31_RADIO_FEATURE_BLUETOOTH	(1U << 1)
@@ -72,10 +81,7 @@ void *s31_linux_task_create(void (*entry)(void *), const char *name,
 				    u32 stack_size, void *stack_base,
 				    void *arg, u32 priority, void *cookie,
 				    s32 core_id);
-void *s31_radio_task_create_deferred(void (*entry)(void *), const char *name,
-				     u32 stack_size, void *stack_base,
-				     void *arg, u32 priority, void *cookie,
-				     s32 core_id);
+
 void s31_linux_task_exit_current(void);
 int s31_linux_task_stop(void *task);
 void *s31_linux_current_cookie(void);
@@ -101,8 +107,6 @@ void s31_linux_blob_leave(void);
 void s31_linux_blob_suspend(u32 reason);
 void s31_linux_blob_resume(void);
 void s31_linux_trace_wifi_event(u32 event);
-void s31_linux_gate_timing_reset(void);
-void s31_linux_gate_timing_report(const char *stage);
 void s31_linux_call_on_stack(void *stack, u32 stack_size,
 			     void (*entry)(void *), void *arg);
 const char *s31_linux_blob_holder(void);
@@ -118,8 +122,6 @@ int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg);
 bool s31_radio_payload_uses_fp(void);
 bool s31_radio_blob_run_pending_isrs(void);
 void s31_linux_task_dump_all(void);
-void s31_radio_diag_long_gate_release(u32 reason, u64 wall_ns, u64 exec_ns,
-				     u32 tick_start);
 extern void (*s31_blob_gate_wait_hook)(void);
 extern int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,
 				   u32 stack_size, void *arg, u32 priority,
@@ -143,12 +145,6 @@ void s31_radio_wifi_connected(const u8 *bssid, u8 channel, int status);
 void s31_radio_wifi_disconnected(u16 reason);
 int s31_radio_wifi_receive(u8 *frame, u16 length);
 int s31_radio_wifi_receive_zerocopy(u8 *frame, void *eb, u16 length);
-void s31_radio_timing_blob_enter(void);
-void s31_radio_timing_reset(void);
-u32 s31_radio_timing_tx_begin(u64 enqueue_ns, u64 start_ns,
-			      const u8 *frame, u16 length);
-void s31_radio_timing_tx_return(u32 sequence, u64 end_ns, int result);
-void s31_radio_timing_tx_done(bool status, const u8 *frame, u16 length);
 void s31_radio_heap_report(const char *stage);
 
 void *__wrap_heap_caps_malloc(size_t size, u32 caps);
@@ -175,4 +171,9 @@ int __wrap_esp_intr_free(void *handle);
 
 void s31_radio_wifi_ap_station(const u8 *mac, bool joined);
 
+#ifdef CONFIG_ESP32S31_WIFI_SOFTMAC
+#endif
+
 #endif /* _ESP32S31_RADIO_INTERNAL_H */
+
+void s31_linux_critical_debug_print(void);

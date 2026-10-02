@@ -11,10 +11,12 @@ esp32s31-radio-y := esp32s31-radio-module.o \
 	esp32s31-radio-loader.o esp32s31-radio-imports.o \
 	esp32s31-radio-wifi.o esp32s31-radio-btdm.o
 
+# RX buffer processing and ACK submission are throughput critical on S31.
+CFLAGS_esp32s31-radio-wifi.o += -O2
+
 LDFLAGS_esp32s31-radio.o += --gc-sections \
 	-T $(src)/esp32s31-radio-core.lds --undefined=init_module \
-	--undefined=s31_radio_modinfo_anchor \
-	--undefined=s31_radio_timing_param_anchor
+	--undefined=s31_radio_modinfo_anchor
 
 obj-$(CONFIG_X86)		+= x86/
 obj-$(CONFIG_LOONGARCH)		+= loongarch/

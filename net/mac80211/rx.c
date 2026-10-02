@@ -4085,6 +4085,9 @@ static void ieee80211_rx_handlers_result(struct ieee80211_rx_data *rx,
 	kfree_skb_reason(rx->skb, (__force u32)res);
 }
 
+static bool ieee80211_invoke_fast_rx(struct ieee80211_rx_data *rx,
+                                   struct ieee80211_fast_rx *fast_rx);
+
 static void ieee80211_rx_handlers(struct ieee80211_rx_data *rx,
 				  struct sk_buff_head *frames)
 {
@@ -4093,7 +4096,7 @@ static void ieee80211_rx_handlers(struct ieee80211_rx_data *rx,
 
 #define CALL_RXH(rxh)			\
 	do {				\
-		res = rxh(rx);		\
+		res = rxh(rx); \
 		if (res != RX_CONTINUE)	\
 			goto rxh_next;  \
 	} while (0)
@@ -4107,6 +4110,7 @@ static void ieee80211_rx_handlers(struct ieee80211_rx_data *rx,
 	spin_lock_bh(&rx->local->rx_path_lock);
 
 	while ((skb = __skb_dequeue(frames))) {
+        bool decrypted = false;
 		/*
 		 * all the other fields are valid across frames
 		 * that belong to an aMPDU since they are on the
@@ -4119,8 +4123,32 @@ static void ieee80211_rx_handlers(struct ieee80211_rx_data *rx,
 
 		CALL_RXH(ieee80211_rx_h_check_more_data);
 		CALL_RXH(ieee80211_rx_h_uapsd_and_pspoll);
+        if (IS_ENABLED(CONFIG_SOC_ESP32S31) && rx->sta &&
+            rx->sdata->vif.type == NL80211_IFTYPE_STATION) {
+            struct ieee80211_fast_rx *fast_rx = rcu_dereference(rx->sta->fast_rx);
+            struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+            struct ieee80211_hdr *hdr = (void *)skb->data;
+            if (fast_rx && !fast_rx->uses_rss && fast_rx->key &&
+                (status->flag & (RX_FLAG_DECRYPTED | RX_FLAG_MIC_STRIPPED)) ==
+                    (RX_FLAG_DECRYPTED | RX_FLAG_MIC_STRIPPED) &&
+                ieee80211_is_data_present(hdr->frame_control) &&
+                ieee80211_has_protected(hdr->frame_control) && !ieee80211_is_frag(hdr)) {
+                CALL_RXH(ieee80211_rx_h_decrypt);
+                decrypted = true;
+                if (rx->key && rx->key->conf.cipher == WLAN_CIPHER_SUITE_CCMP) {
+                    /* The normal CCMP routine above checked and committed PN,
+                     * then stripped IV. check_dup ran before software reorder. */
+                    status = IEEE80211_SKB_RXCB(rx->skb);
+                    status->flag |= RX_FLAG_DUP_VALIDATED | RX_FLAG_PN_VALIDATED |
+                                    RX_FLAG_IV_STRIPPED;
+                    if (ieee80211_invoke_fast_rx(rx, fast_rx)) {
+                        continue;
+                    }
+                }
+            }
+        }
 		CALL_RXH(ieee80211_rx_h_sta_process);
-		CALL_RXH(ieee80211_rx_h_decrypt);
+        if (!decrypted) CALL_RXH(ieee80211_rx_h_decrypt);
 		CALL_RXH(ieee80211_rx_h_defragment);
 		CALL_RXH(ieee80211_rx_h_michael_mic_verify);
 		/* must be after MMIC verify so header is counted in MPDU mic */

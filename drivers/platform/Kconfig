@@ -15,12 +15,29 @@ config ESP32S31_RADIO_SMODE_DRIVER
 	depends on BT && WLAN
 	select FUTEX
 	select CFG80211
+	select MAC80211
 	help
 	  Build the reloadable esp32s31-radio.ko. It owns the shared PHY, SRAM,
 	  clocks and interrupts and exposes cfg80211 plus direct HCI from one
 	  module. mode=wifi, mode=bt, or mode=combo selects the runtime profile.
-	  The versioned ESP-IDF radio closure is loaded from the radio bundle as
-	  external firmware and is not statically linked into this module.
+	  The prelinked ESP-IDF closure runs from its fixed flash-XIP slot.
+
+config ESP32S31_WIFI_SOFTMAC
+	bool
+	depends on ESP32S31_RADIO_SMODE_DRIVER && MAC80211
+	default y
+	help
+	  Single-STA mac80211 bridge with native MAC CCMP, bounded TX
+	  aggregation and software replay/reorder checks on received frames.
+
+config ESP32S31_RADIO_XIP
+	bool
+	depends on SOC_ESP32S31 && XIP_KERNEL && 32BIT
+	select CRC32
+	default y
+	help
+	  Fixed executable flash mapping and 40 KiB writable SRAM arena.
+	  The radio image and Linux module must be built together.
 
 config ESP32S31_RADIO_BLOBS
 	bool
