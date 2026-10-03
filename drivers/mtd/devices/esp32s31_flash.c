@@ -31,9 +31,10 @@
 #define ESP32S31_SBI_FLASH_PARK		3
 #define ESP32S31_SBI_FLASH_PARK_STATUS	4
 #define ESP32S31_SBI_FLASH_RELEASE	5
+/* SPL maps the complete flash linearly, without a raw-offset bias. */
 #define ESP32S31_FLASH_XIP_BASE		0x40000000
-#define ESP32S31_FLASH_XIP_SIZE		0x00f00000
-#define ESP32S31_FLASH_RAW_OFFSET	0x00100000
+#define ESP32S31_FLASH_XIP_SIZE		0x01000000
+#define ESP32S31_FLASH_RAW_OFFSET	0x00000000
 
 struct esp32s31_flash {
 	void __iomem *base;

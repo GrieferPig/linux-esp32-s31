@@ -39,7 +39,14 @@ static int __init esp32s31_radio_xip_init(void)
 
 	BUILD_BUG_ON(S31_XIP_MAP_BASE < VMALLOC_START ||
 		     S31_XIP_MAP_BASE + S31_XIP_MAP_SIZE >= VMALLOC_END ||
-		     S31_XIP_MAP_SIZE != PGDIR_SIZE);
+		     S31_XIP_MAP_SIZE != PGDIR_SIZE ||
+		     (S31_XIP_MAP_BASE & (PGDIR_SIZE - 1)) ||
+		     (S31_XIP_MAP_PHYS & (PGDIR_SIZE - 1)) ||
+		     S31_XIP_BASE < S31_XIP_MAP_BASE ||
+		     S31_XIP_BASE + S31_XIP_SLOT_SIZE >
+					S31_XIP_MAP_BASE + S31_XIP_MAP_SIZE ||
+		     S31_XIP_PHYS - S31_XIP_MAP_PHYS !=
+					S31_XIP_BASE - S31_XIP_MAP_BASE);
 	area = __get_vm_area_caller(S31_XIP_MAP_SIZE, VM_IOREMAP,
 		S31_XIP_MAP_BASE, S31_XIP_MAP_BASE + S31_XIP_MAP_SIZE + PAGE_SIZE,
 		__builtin_return_address(0));
@@ -61,7 +68,8 @@ static int __init esp32s31_radio_xip_init(void)
 		return -EBUSY;
 	}
 	/* Use the same aligned Sv32 leaf format as the working kernel XIP map.
-	 * The image is at offset 0x210000 within this reserved flash window.
+	 * The compact image starts at raw flash offset 0x6e000 within this
+	 * reserved window. SPL maps raw flash offset zero at 0x40000000.
 	 */
 	set_pmd((pmd_t *)pgdp, __pmd(pgd_val(pfn_pgd(
 		S31_XIP_MAP_PHYS >> PAGE_SHIFT, PAGE_KERNEL_READ_EXEC))));
