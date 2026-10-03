@@ -218,7 +218,8 @@ static int esp32s31_i2s_update(struct esp32s31_i2s *i2s, u32 reg)
 	int ret;
 
 	writel(readl(i2s->base + reg) | S31_I2S_UPDATE, i2s->base + reg);
-	ret = readl_poll_timeout(i2s->base + reg, val,
+	/* The PCM trigger path calls this with the stream spinlock held. */
+	ret = readl_poll_timeout_atomic(i2s->base + reg, val,
 				 !(val & S31_I2S_UPDATE), 1, 1000);
 	if (ret)
 		dev_err(i2s->dev, "register %#x update stuck at %#08x\n",

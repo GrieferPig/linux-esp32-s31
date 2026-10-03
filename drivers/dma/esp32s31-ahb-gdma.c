@@ -203,8 +203,10 @@ static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
 	 * follows the same sequence: mount, set descriptor address, start.
 	 * Resets remain confined to terminate/recovery paths and cyclic RX EOF.
 	 */
-	if (desc->direction == DMA_MEM_TO_MEM)
-		esp32s31_ahb_reset(chan, desc->direction);
+	if (desc->direction == DMA_MEM_TO_MEM) {
+		esp32s31_ahb_reset(chan, DMA_DEV_TO_MEM);
+		esp32s31_ahb_reset(chan, DMA_MEM_TO_DEV);
+	}
 	dma_wmb();
 	if (desc->direction == DMA_DEV_TO_MEM ||
 	    desc->direction == DMA_MEM_TO_MEM) {
@@ -227,7 +229,9 @@ static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
 		writel(desc->direction == DMA_MEM_TO_MEM ? AHB_M2M_DUMMY : chan->request_id,
 		       ahb_ch_reg(chan, AHB_TX_PERI_SEL));
 		writel(lower_32_bits(desc->tx_dma), ahb_ch_reg(chan, AHB_TX_LINK_ADDR));
-		writel(BIT(1) | AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR,
+		/* RX EOF is the completion boundary for memory copies. */
+		writel((desc->direction == DMA_MEM_TO_MEM ? 0 : BIT(1)) |
+		       AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR,
 		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
 		writel(AHB_TX_START, ahb_ch_reg(chan, AHB_TX_LINK));
 	}
@@ -242,6 +246,12 @@ static void esp32s31_ahb_start_pending(struct esp32s31_ahb_chan *chan)
 	list_for_each_entry_safe(vd, next, &chan->vc.desc_issued, node) {
 		desc = to_ahb_desc(vd);
 		if (desc->direction == DMA_DEV_TO_MEM && chan->cyclic_rx)
+			continue;
+		if (desc->direction == DMA_MEM_TO_DEV && chan->cyclic_tx)
+			continue;
+		if (desc->direction == DMA_MEM_TO_MEM &&
+		    (chan->active_tx || chan->active_rx ||
+		     chan->cyclic_tx || chan->cyclic_rx))
 			continue;
 		if ((desc->direction == DMA_DEV_TO_MEM && chan->active_rx) ||
 		    (desc->direction == DMA_MEM_TO_DEV && chan->active_tx))
@@ -529,13 +539,16 @@ static irqreturn_t esp32s31_ahb_irq(int irq, void *data)
 	else
 		chan->rx_irqs++;
 
+	/* Serialize acknowledgement with reset/start and descriptor changes. */
+	spin_lock_irqsave(&chan->vc.lock, flags);
 	status = readl(chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
 					     AHB_RX_INT(chan->id)) + AHB_RX_ST);
-	if (!status)
+	if (!status) {
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
 		return IRQ_NONE;
+	}
 	writel(status, chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
 					     AHB_RX_INT(chan->id)) + AHB_RX_CLR);
-	spin_lock_irqsave(&chan->vc.lock, flags);
 	if (tx && chan->cyclic_tx) {
 		desc = chan->cyclic_tx;
 		chan->tx_node = (chan->tx_node + 1) % desc->ndesc;
@@ -646,6 +659,16 @@ static irqreturn_t esp32s31_ahb_irq(int irq, void *data)
 	}
 	desc = tx ? chan->active_tx : chan->active_rx;
 	if (desc) {
+		if (desc->direction == DMA_MEM_TO_MEM) {
+			/* TX EOF only drains the source FIFO, not the destination. */
+			if (tx && !(status & (AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR))) {
+				spin_unlock_irqrestore(&chan->vc.lock, flags);
+				return IRQ_HANDLED;
+			}
+			/* Stop both halves before returning their descriptors. */
+			esp32s31_ahb_reset(chan, DMA_DEV_TO_MEM);
+			esp32s31_ahb_reset(chan, DMA_MEM_TO_DEV);
+		}
 		/*
 		 * RX one-shot links need an explicit stop before completion.  A TX
 		 * link is already parked at EOF and must remain untouched so the next

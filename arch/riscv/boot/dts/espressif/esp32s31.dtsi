@@ -877,10 +877,14 @@
 			};
 		};
 
-		/* U-Boot SPL maps raw flash 0x100000..0x1000000 here. */
+		/*
+		 * SPL maps all 16 MiB linearly: CPU address = 0x40000000 +
+		 * raw flash offset. Keep Linux at 0x40400000 for Sv32's 4 MiB
+		 * leaf mappings; its XIP image spans more than one leaf.
+		 */
 		flash: flash@40000000 {
 			compatible = "espressif,esp32s31-flash-mtd";
-			reg = <0x40000000 0x00f00000>;
+			reg = <0x40000000 0x01000000>;
 			#address-cells = <1>;
 			#size-cells = <1>;
 
@@ -889,43 +893,45 @@
 				#address-cells = <1>;
 				#size-cells = <1>;
 
-				partition@0 {
+				/* Reserve 0x0..0x2000 for ROM FlashEncryption metadata. */
+				partition@2000 {
+					label = "spl";
+					reg = <0x002000 0x00c000>;
+					read-only;
+				};
+
+				partition@e000 {
 					label = "u-boot-fit";
-					reg = <0x000000 0x200000>;
+					reg = <0x00e000 0x050000>;
 					read-only;
 				};
 
-				partition@200000 {
+				partition@5e000 {
 					label = "dtb";
-					reg = <0x200000 0x010000>;
+					reg = <0x05e000 0x010000>;
 					read-only;
 				};
 
-				partition@210000 {
+				partition@6e000 {
 					label = "radio-bundle";
-					reg = <0x210000 0x1f0000>;
+					reg = <0x06e000 0x180000>;
 					read-only;
+				};
+
+				partition@1ee000 {
+					label = "persist";
+					reg = <0x1ee000 0x212000>;
 				};
 
 				partition@400000 {
 					label = "linux";
-					reg = <0x400000 0x630000>;
+					reg = <0x400000 0x600000>;
 					read-only;
 				};
 
-				partition@a30000 {
-					label = "persist";
-					reg = <0xa30000 0x090000>;
-				};
-
-				partition@ac0000 {
-					label = "hil-scratch";
-					reg = <0xac0000 0x010000>;
-				};
-
-				partition@ad0000 {
+				partition@a00000 {
 					label = "rootfs";
-					reg = <0xad0000 0x430000>;
+					reg = <0xa00000 0x600000>;
 					linux,rootfs;
 					read-only;
 				};

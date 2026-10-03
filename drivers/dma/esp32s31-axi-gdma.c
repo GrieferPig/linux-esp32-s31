@@ -691,9 +691,8 @@ static void esp32s31_axi_complete_eof(struct esp32s31_axi_chan *chan,
 				      dma_addr_t eof, bool tx)
 {
 	struct esp32s31_axi_desc *desc, *tmp;
-	unsigned long flags;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	lockdep_assert_held(&chan->vc.lock);
 	list_for_each_entry_safe(desc, tmp, &chan->running, running_node) {
 		dma_addr_t tail = tx ? desc->tx[desc->tx_count - 1].dma :
 					 desc->rx[desc->rx_count - 1].dma;
@@ -707,28 +706,29 @@ static void esp32s31_axi_complete_eof(struct esp32s31_axi_chan *chan,
 			break;
 	}
 	esp32s31_axi_start_pending(chan);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static void esp32s31_axi_fail_running(struct esp32s31_axi_chan *chan,
 				      enum dmaengine_tx_result result)
 {
 	struct esp32s31_axi_desc *desc, *tmp;
-	unsigned long flags;
 
-	spin_lock_irqsave(&chan->vc.lock, flags);
+	lockdep_assert_held(&chan->vc.lock);
 	esp32s31_axi_stop_pair(chan);
 	list_for_each_entry_safe(desc, tmp, &chan->running, running_node)
 		esp32s31_axi_complete_desc(chan, desc, result);
 	esp32s31_axi_start_pending(chan);
-	spin_unlock_irqrestore(&chan->vc.lock, flags);
 }
 
 static irqreturn_t esp32s31_axi_rx_irq(int irq, void *data)
 {
 	struct esp32s31_axi_chan *chan = data;
-	u32 status = esp32s31_axi_ack(chan, false);
+	unsigned long flags;
+	u32 status;
 
+	/* Keep sampled status attached to the running list it came from. */
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	status = esp32s31_axi_ack(chan, false);
 	if (status & ESP32S31_AXI_RX_ERROR_MASK) {
 		dev_err_ratelimited(chan->gdma->dev,
 				    "channel %u RX error, status=%#x\n",
@@ -744,14 +744,18 @@ static irqreturn_t esp32s31_axi_rx_irq(int irq, void *data)
 			readl(esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_DSCR_BF0)),
 			false);
 	}
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	return IRQ_HANDLED;
 }
 
 static irqreturn_t esp32s31_axi_tx_irq(int irq, void *data)
 {
 	struct esp32s31_axi_chan *chan = data;
-	u32 status = esp32s31_axi_ack(chan, true);
+	unsigned long flags;
+	u32 status;
 
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	status = esp32s31_axi_ack(chan, true);
 	if (status & ESP32S31_AXI_TX_DSCR_ERR) {
 		dev_err_ratelimited(chan->gdma->dev,
 				    "channel %u TX descriptor error, status=%#x\n",
@@ -762,6 +766,7 @@ static irqreturn_t esp32s31_axi_tx_irq(int irq, void *data)
 			readl(esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_EOF_DESC)),
 			true);
 	}
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
 	return IRQ_HANDLED;
 }
 
@@ -1066,7 +1071,11 @@ static void esp32s31_axi_free_chan_resources(struct dma_chan *dchan)
 
 static void esp32s31_axi_synchronize(struct dma_chan *dchan)
 {
-	vchan_synchronize(&to_esp32s31_axi_chan(dchan)->vc);
+	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
+
+	synchronize_irq(chan->rx_irq);
+	synchronize_irq(chan->tx_irq);
+	vchan_synchronize(&chan->vc);
 }
 
 static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)

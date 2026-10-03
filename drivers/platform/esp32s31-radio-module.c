@@ -208,13 +208,25 @@ static int esp32s31_radio_suspend(struct device *dev)
 
 	if (!s31_radio_started)
 		return 0;
-	if (bt) {
-		ret = s31_radio_btdm_frontend_suspend();
+	/* SoftMAC cannot replay a running MLME after a radio reset. Honor its
+	 * veto before stopping another frontend or freeing the live payload. */
+	if (wifi) {
+		ret = s31_radio_wifi_frontend_suspend();
 		if (ret)
 			return ret;
 	}
-	if (wifi)
-		s31_radio_wifi_frontend_suspend();
+	if (bt) {
+		ret = s31_radio_btdm_frontend_suspend();
+		if (ret) {
+			if (wifi) {
+				recover = s31_radio_wifi_frontend_resume();
+				if (recover)
+					dev_err(dev, "Wi-Fi suspend rollback failed: %d\n",
+						recover);
+			}
+			return ret;
+		}
+	}
 	/* Deinit the closed MAC/controller, stop all compatibility tasks, remove
 	 * device IRQs, and free DMA rings before allowing APPWR to remove power.
 	 * Keep frontend objects and the pristine payload data for warm restart. */
