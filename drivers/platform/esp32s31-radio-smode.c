@@ -3296,6 +3296,7 @@ int s31_radio_runtime_shutdown(void)
 {
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	struct s31_radio_command shutdown;
+	struct workqueue_struct *wq;
 	int shutdown_ret = 0;
 	int i;
 
@@ -3326,14 +3327,18 @@ int s31_radio_runtime_shutdown(void)
 
 	/* Task teardown still needs the loaded payload and SRAM allocator. */
 	s31_linux_tasks_stop_all();
-	/* Stop the deadline timer first so its callback cannot requeue, then
-	 * drain the serialized passes and destroy the queue.  destroy waits
-	 * for queued work; late wake sites see a NULL queue and skip. */
-	hrtimer_cancel(&s31_radio_hrtimer);
-	cancel_delayed_work_sync(&s31_radio_work);
-	if (s31_radio_wq) {
-		destroy_workqueue(s31_radio_wq);
+	/* Unpublish the queue first (same role as the old worker-pointer
+	 * xchg): late hard-IRQ wakes skip a NULL queue.  Then stop the
+	 * deadline timer so its callback cannot requeue, drain the serialized
+	 * passes, and destroy the queue.  The queue/timer only exist outside
+	 * workerless mode (Wi-Fi SoftMAC has neither); tearing down zeroed
+	 * objects would fault. */
+	wq = READ_ONCE(s31_radio_wq);
+	if (wq) {
 		WRITE_ONCE(s31_radio_wq, NULL);
+		hrtimer_cancel(&s31_radio_hrtimer);
+		cancel_delayed_work_sync(&s31_radio_work);
+		destroy_workqueue(wq);
 	}
 	WRITE_ONCE(s31_radio_runner, NULL);
 	s31_blob_gate_wait_hook = NULL;
