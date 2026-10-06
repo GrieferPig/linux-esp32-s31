@@ -274,7 +274,14 @@ static unsigned long s31_ticks_to_jiffies(u32 ticks)
 
 static struct s31_linux_task *s31_linux_current_task(void)
 {
-	struct s31_linux_task *task = kthread_data(current);
+	struct s31_linux_task *task;
+
+	/* kthread_data() is only valid on kthreads; other callers (notably
+	 * module init running in process context) have no compatibility task.
+	 * The old code only ever ran on kthreads, so this was implicit. */
+	if (!(current->flags & PF_KTHREAD))
+		return NULL;
+	task = kthread_data(current);
 
 	if (!task || task->magic != S31_LINUX_TASK_MAGIC)
 		return NULL;

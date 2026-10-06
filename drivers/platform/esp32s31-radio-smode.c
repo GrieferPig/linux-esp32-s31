@@ -889,9 +889,15 @@ static void *s31_radio_worker_stack;
 #define S31_RADIO_WORKER_STACK_SIZE 8192U
 /* Next RTOS tick edge for the serialized runner's tick accounting. */
 static unsigned long s31_radio_next_tick;
-/* Mask-ROM identity verified once per runtime on the first pass, where the
- * runner has borrowed init_mm (the low mapping exists only there). */
+/* Mask-ROM identity verified and radio-init task created once per runtime
+ * on the first pass, where the runner has borrowed init_mm (the low mapping
+ * exists only there).  Creation runs on a pool kworker exactly like the
+ * retired dedicated thread did; never in module-load process context. */
 static bool s31_radio_hw_checked;
+/* Set when first-pass init fails terminally (ROM or radio-init task):
+ * the runner parks permanently, matching the retired thread which exited
+ * on the same failures.  Reset in runtime_init for reload. */
+static bool s31_radio_init_dead;
 static u32 s31_radio_features;
 static atomic_t s31_radio_state = ATOMIC_INIT(ESP32S31_RADIO_OFFLINE);
 static atomic_t s31_radio_worker_passes = ATOMIC_INIT(0);
@@ -1444,8 +1450,9 @@ static bool s31_radio_command_work_pending(void)
 static void s31_radio_queue(void)
 {
 	/* NULL once the queue is destroyed in shutdown; wake sites stay silent
-	 * afterwards (same role as the old worker-pointer checks). */
-	if (!READ_ONCE(s31_radio_wq))
+	 * afterwards (same role as the old worker-pointer checks).  Also
+	 * parked permanently after terminal first-pass init failure. */
+	if (READ_ONCE(s31_radio_init_dead) || !READ_ONCE(s31_radio_wq))
 		return;
 	hrtimer_try_to_cancel(&s31_radio_hrtimer);
 	queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
@@ -2888,6 +2895,15 @@ static void s31_radio_workfn(struct work_struct *work)
 		cpu_mhz = ((s31_rom_cpu_freq_t)S31_ROM_CPU_FREQ)();
 		pr_info("esp32s31-radio: S-mode identity map ready, rom=%08x cpu=%u MHz\n",
 			identity_word, cpu_mhz);
+		pr_info("esp32s31-radio: creating radio-init compatibility task\n");
+		if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init",
+					    8192,
+					    (void *)(uintptr_t)s31_radio_features,
+					    24, NULL, 0) != 1) {
+			pr_err("esp32s31-radio: cannot create IDF init task\n");
+			goto hw_failed;
+		}
+		pr_info("esp32s31-radio: compatibility RTOS initialized\n");
 		WRITE_ONCE(s31_radio_hw_checked, true);
 	}
 #ifdef CONFIG_SMP
@@ -2967,6 +2983,7 @@ static void s31_radio_workfn(struct work_struct *work)
 hw_failed:
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
 	s31_radio_fail_commands();
+	WRITE_ONCE(s31_radio_init_dead, true);
 out:
 	esp32s31_kthread_unuse_init_mm();
 	WRITE_ONCE(s31_radio_runner, NULL);
@@ -2997,6 +3014,7 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	WRITE_ONCE(s31_radio_next_tick, jiffies + max_t(unsigned long, 1,
 							msecs_to_jiffies(10)));
 	WRITE_ONCE(s31_radio_hw_checked, false);
+	WRITE_ONCE(s31_radio_init_dead, false);
 	WRITE_ONCE(s31_bt_enable_result, -EINPROGRESS);
 	WRITE_ONCE(s31_bt_disable_result, -EINPROGRESS);
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
@@ -3202,22 +3220,14 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	pr_info("esp32s31-radio: runner blob stack %px..%px in HP SRAM\n",
 		s31_radio_worker_stack,
 		(u8 *)s31_radio_worker_stack + S31_RADIO_WORKER_STACK_SIZE);
-	pr_info("esp32s31-radio: creating radio-init compatibility task\n");
-	if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
-				    (void *)(uintptr_t)s31_radio_features,
-				    24, NULL, 0) != 1) {
-		pr_err("esp32s31-radio: cannot create IDF init task\n");
-		atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
-		s31_radio_fail_commands();
-		s31_radio_sram_free(s31_radio_worker_stack);
-		s31_radio_worker_stack = NULL;
-		destroy_workqueue(s31_radio_wq);
-		s31_radio_wq = NULL;
-		/* Keep the rings so post-mortem state matches the old thread's
-		 * failed path; wait_ready() reports -EIO from FAILED. */
-		return 0;
-	}
-	pr_info("esp32s31-radio: compatibility RTOS initialized\n");
+	/* The radio-init task is created by the first serialized pass, which
+	 * runs on a pool kworker (a real kthread with borrowed init_mm) —
+	 * exactly like the retired dedicated thread did.  Creating it here in
+	 * module-load process context would expose payload task APIs
+	 * (kthread_data and friends) to a non-kthread caller.  Init only
+	 * queues the first pass and returns; wait_ready() observes STARTING
+	 * until the pass reports READY/FAILED, unchanged from before. */
+	pr_info("esp32s31-radio: queuing first serialized pass\n");
 	s31_blob_gate_wait_hook = s31_radio_gate_wait_sync;
 	queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
 	return 0;
