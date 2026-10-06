@@ -9,6 +9,7 @@
 #include <linux/if_ether.h>
 #include <linux/genalloc.h>
 #include <linux/delay.h>
+#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irqdomain.h>
@@ -667,7 +668,6 @@ struct s31_idf_irq_registration {
 #define S31_RADIO_IRQ_SLOTS	7
 static struct s31_idf_irq_registration s31_idf_irqs[S31_RADIO_IRQ_SLOTS];
 static atomic_t s31_radio_pending_isrs = ATOMIC_INIT(0);
-static DECLARE_WAIT_QUEUE_HEAD(s31_radio_waitq);
 
 enum s31_radio_command_type {
 	S31_RADIO_COMMAND_HEALTH,
@@ -812,7 +812,19 @@ static u8 s31_radio_tx_kind(const u8 *frame, u16 length)
 	return S31_TX_IPV4;
 }
 
-static struct task_struct *s31_radio_worker;
+/* The serialized radio runner.  This was a dedicated "s31-radio" kthread
+ * sleeping on s31_radio_waitq with a fixed 10/40 ms jiffy tick.  It is now an
+ * ordered workqueue (shared pool, single execution at a time: the same
+ * serialization as the old loop) plus a one-shot hrtimer for precise
+ * deadline-driven requeue.  No driver-owned thread remains.
+ * s31_radio_runner mirrors the old "current == worker" identity tests: it
+ * points at the kworker task only while a radio pass is executing.
+ */
+static struct workqueue_struct *s31_radio_wq;
+static struct delayed_work s31_radio_work;
+static struct hrtimer s31_radio_hrtimer;
+static struct task_struct *s31_radio_runner;
+static DECLARE_WAIT_QUEUE_HEAD(s31_radio_bt_disable_waitq);
 /* SoftMAC services PP on the existing native wifi task and its SRAM stack.
  * No extra radio kthread, tick poll, or data-path work item is created. */
 static bool s31_radio_workerless;
@@ -824,6 +836,7 @@ static bool s31_native_servicing;
 static void s31_radio_control_workfn(struct work_struct *work);
 static DECLARE_WORK(s31_radio_control_work, s31_radio_control_workfn);
 static void s31_radio_wake(void);
+static void s31_radio_queue(void);
 static void s31_radio_control_kick(void);
 
 #define S31_DEFER_REASON_COUNT (S31_DIRECT_ISR_DEFER_NESTED + 1)
@@ -874,6 +887,11 @@ static LIST_HEAD(s31_radio_commands);
 static DEFINE_SPINLOCK(s31_radio_command_lock);
 static void *s31_radio_worker_stack;
 #define S31_RADIO_WORKER_STACK_SIZE 8192U
+/* Next RTOS tick edge for the serialized runner's tick accounting. */
+static unsigned long s31_radio_next_tick;
+/* Mask-ROM identity verified once per runtime on the first pass, where the
+ * runner has borrowed init_mm (the low mapping exists only there). */
+static bool s31_radio_hw_checked;
 static u32 s31_radio_features;
 static atomic_t s31_radio_state = ATOMIC_INIT(ESP32S31_RADIO_OFFLINE);
 static atomic_t s31_radio_worker_passes = ATOMIC_INIT(0);
@@ -888,7 +906,6 @@ static void s31_radio_health_workfn(struct work_struct *work);
 static DECLARE_WORK(s31_radio_health_work, s31_radio_health_workfn);
 
 #define S31_IDF_INTR_DISABLED	BIT(5)
-static atomic_t s31_tick_pending = ATOMIC_INIT(0);
 
 static bool s31_radio_bt_batching_active(void)
 {
@@ -937,6 +954,7 @@ void s31_radio_report_bt_disable(int result)
 	if (!result)
 		WRITE_ONCE(s31_bt_enable_result, -EHOSTDOWN);
 	s31_radio_wake();
+	wake_up(&s31_radio_bt_disable_waitq);
 }
 
 void s31_radio_report_shutdown(int result)
@@ -1212,7 +1230,6 @@ bool s31_radio_blob_run_pending_isrs(void)
 static irqreturn_t s31_radio_hardirq(int irq, void *data)
 {
 	struct s31_idf_irq_registration *registration = data;
-	struct task_struct *worker;
 
 	int direct_result;
 
@@ -1248,10 +1265,9 @@ static irqreturn_t s31_radio_hardirq(int irq, void *data)
 		if (direct_result != S31_DIRECT_ISR_HANDLED) s31_radio_native_wake();
 		return IRQ_HANDLED;
 	}
-	worker = READ_ONCE(s31_radio_worker);
-	if (worker && (!s31_radio_bt_batching_active() ||
-		       direct_result != S31_DIRECT_ISR_HANDLED))
-		wake_up_process(worker);
+	if (!s31_radio_bt_batching_active() ||
+	    direct_result != S31_DIRECT_ISR_HANDLED)
+		s31_radio_queue();
 	return IRQ_HANDLED;
 }
 
@@ -1339,12 +1355,13 @@ static void s31_radio_sync_irq_registrations(void)
 		s31_radio_sync_one_irq(&s31_idf_irqs[i]);
 }
 
-/* Called from s31_linux_blob_enter() while this worker waits for the blob
- * gate.  A payload task can be stuck waiting for an IDF interrupt whose CLIC
- * mapping only this worker can install; syncing here breaks that cycle. */
+/* Called from s31_linux_blob_enter() while the serialized runner waits for
+ * the blob gate.  A payload task can be stuck waiting for an IDF interrupt
+ * whose CLIC mapping only the runner can install; syncing here breaks that
+ * cycle. */
 static void s31_radio_gate_wait_sync(void)
 {
-	if (current != READ_ONCE(s31_radio_worker))
+	if (current != READ_ONCE(s31_radio_runner))
 		return;
 	s31_radio_sync_irq_registrations();
 }
@@ -1421,12 +1438,25 @@ static bool s31_radio_command_work_pending(void)
 	return pending;
 }
 
+/* Queue an immediate serialized radio pass.  Safe from any context
+ * (including hard IRQ): workqueue queueing never sleeps, and duplicate
+ * queues collapse into the already-pending pass. */
+static void s31_radio_queue(void)
+{
+	/* NULL once the queue is destroyed in shutdown; wake sites stay silent
+	 * afterwards (same role as the old worker-pointer checks). */
+	if (!READ_ONCE(s31_radio_wq))
+		return;
+	hrtimer_try_to_cancel(&s31_radio_hrtimer);
+	queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
+}
+
 static void s31_radio_wake(void)
 {
 	if (READ_ONCE(s31_radio_workerless)) {
 		s31_radio_native_wake();
 	} else {
-		wake_up(&s31_radio_waitq);
+		s31_radio_queue();
 	}
 }
 
@@ -2019,7 +2049,7 @@ int esp32s31_radio_get_health(struct esp32s31_radio_health *health)
 
 	if (!health)
 		return -EINVAL;
-	if (current == READ_ONCE(s31_radio_worker))
+	if (current == READ_ONCE(s31_radio_runner))
 		return -EDEADLK;
 	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY)
 		return -EAGAIN;
@@ -2352,7 +2382,7 @@ int esp32s31_radio_bt_disable(void)
 	wait_for_completion(&command.done);
 	if (command.result)
 		return command.result;
-	if (!wait_event_timeout(s31_radio_waitq,
+	if (!wait_event_timeout(s31_radio_bt_disable_waitq,
 				READ_ONCE(s31_bt_disable_result) != -EINPROGRESS,
 				2 * HZ))
 		return -ETIMEDOUT;
@@ -2409,12 +2439,12 @@ static int s31_radio_wifi_enqueue(u8 interface, const u8 *frame, size_t length,
 	spin_unlock_irqrestore(&s31_wifi_tx_lock, flags);
 	s31_radio_wake();
 	/* Under PREEMPT_VOLUNTARY a same-hart CFS task can otherwise run until
-	 * the next 10 ms tick even though the ACK just woke the TX worker.  Ask
+	 * the next tick even though the ACK just queued the TX pass.  Ask
 	 * for one reschedule at the next safe kernel/softirq exit.  Never do this
-	 * while current owns the blob gate: the worker needs that task to resume
+	 * while current owns the blob gate: the runner needs that task to resume
 	 * and release the gate before esp_wifi_internal_tx() can run. */
 	if (kind == S31_TX_TCP_ACK && raw_smp_processor_id() == 0 &&
-	    current != READ_ONCE(s31_radio_worker) &&
+	    current != READ_ONCE(s31_radio_runner) &&
 	    !s31_linux_blob_held_by_current() &&
 	    !test_tsk_need_resched(current)) {
 		set_tsk_need_resched(current);
@@ -2550,7 +2580,7 @@ static void s31_radio_run_blob_pass(void *opaque)
 	 * dispatch additional callbacks; it only walks the same timer list again. */
 	/* The IDF coexist scheduler uses roughly 1 ms esp_timer periods, while the
 	 * compatibility RTOS clock intentionally stays at HZ=100.  In a combo
-	 * profile the radio IRQ/HCI activity already wakes this serialized worker
+	 * profile the radio IRQ/HCI activity already queues this serialized pass
 	 * several times per RTOS tick; poll absolute esp_timer deadlines on those
 	 * passes as well so a BT phase cannot occupy an entire 10 ms Linux tick.
 	 * s31_rtos_tick() does not advance time in S-mode -- it only dispatches due
@@ -2589,23 +2619,26 @@ static void s31_radio_run_blob_pass(void *opaque)
 	s31_linux_blob_leave();
 	if (irq_pass || args->rt_wake_armed) {
 		esp32s31_sched_setscheduler(current, SCHED_NORMAL, 0);
-		set_user_nice(current, S31_RADIO_WORKER_NICE);
+		/* No nice restore here: the runner is a shared workqueue worker
+		 * (baseline priority comes from WQ_HIGHPRI at creation), and
+		 * renicing it would leak into unrelated pool work. */
 	}
 	/*
 	 * The compatibility tasks are blocked on the blob mutex; Wi-Fi and BTDM
 	 * use RR priority while sys_evt remains CFS.  After releasing the gate,
 	 * yield the
 	 * CPU so they can enter the gate, process their event queues, and
-	 * push received frames into the Linux ring buffers while the worker
+	 * push received frames into the Linux ring buffers while the runner
 	 * is still running its post-gate delivery step.
 	 */
 	cond_resched();
 }
 
-static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed)
+static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed,
+				    int tick_events)
 {
 	struct s31_radio_blob_pass_args args = {
-		.tick_events = atomic_xchg(&s31_tick_pending, 0),
+		.tick_events = tick_events,
 		.timer_wait_us = 10000,
 		.rt_wake_armed = rt_wake_armed,
 	};
@@ -2614,8 +2647,8 @@ static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed)
 	 * Drain the RX rings before acquiring the blob gate.  These only touch
 	 * Linux network-stack state (skb allocation, netif_rx) and must run in
 	 * ordinary Linux context.  Doing this first means a received frame is
-	 * handed to the net stack immediately after the RX callback wakes the
-	 * worker, instead of waiting for the worker to win the blob gate behind
+	 * handed to the net stack immediately after the RX callback queues the
+	 * pass, instead of waiting for the runner to win the blob gate behind
 	 * a Wi-Fi task that can hold it for an entire AMPDU batch.
 	 */
 
@@ -2626,7 +2659,7 @@ static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed)
 
 	/*
 	 * Command processing creates kthreads through kthread_create().  It
-	 * must run on the worker's normal kernel stack and, for task-create
+	 * must run on the runner's normal kernel stack and, for task-create
 	 * requests, before the worker blocks on the blob gate: the compat task
 	 * that queued the request may itself be the gate holder.
 	 */
@@ -2786,192 +2819,162 @@ u32 s31_radio_native_poll(void)
 	return delay;
 }
 
-static int s31_radio_runtime_thread(void *unused)
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+/* One-shot hrtimer: deadline-driven requeue for the serialized pass.
+ * Armed only for timer/idle waits; every event wake queues work directly,
+ * so an expiry always means "run one pass now". */
+static enum hrtimer_restart s31_radio_hrtimer_fn(struct hrtimer *timer)
 {
-	void __iomem *rom;
-	unsigned long next_tick;
-	/* Keep the native 10 ms cadence through controller initialization.  During
-	 * BT-only runtime, account the same RTOS ticks in 40 ms batches: controller
-	 * IRQs still run directly, while the Linux HCI bridge avoids one wakeup per
-	 * media packet. */
+	s31_radio_queue();
+	return HRTIMER_NORESTART;
+}
+
+/* Immediate-work predicate: the retired thread's wait_event conditions
+ * minus the tick. */
+static bool s31_radio_pass_due(void)
+{
+	return s31_radio_irq_work_pending() ||
+		s31_radio_command_work_pending() ||
+		s31_radio_hci_rx_pending() ||
+		s31_radio_hci_tx_pending() ||
+		s31_radio_wifi_tx_pending();
+}
+
+/* Ordered-workqueue replacement for the retired s31-radio kthread loop.
+ * The queue is ordered, so passes never overlap: identical serialization to
+ * the old thread, with no driver-owned task left.  Tick accounting keeps the
+ * native 10 ms cadence (40 ms batches while BT-only batching is active);
+ * the hrtimer replaces the fixed tick sleep with the actual esp_timer
+ * deadline, and every event wake queues a pass directly. */
+static void s31_radio_workfn(struct work_struct *work)
+{
+	/* Keep the native 10 ms cadence through controller initialization.
+	 * During BT-only runtime, account the same RTOS ticks in 40 ms
+	 * batches: controller IRQs still run directly, while the Linux HCI
+	 * bridge avoids one wakeup per media packet. */
 	const unsigned long init_tick_period = max_t(unsigned long, 1,
 						      msecs_to_jiffies(10));
 	const unsigned long bt_tick_period = max_t(unsigned long, 1,
 						    msecs_to_jiffies(40));
-	unsigned long tick_period = init_tick_period;
-	bool hw_tick;
-	u32 identity_word, ioremap_word;
-	unsigned int cpu_mhz;
+	unsigned long tick_period;
 	u32 timer_wait_us = 10000;
-	bool rt_wake_armed = false;
+	int tick_events = 0;
 	int ret;
 
-	pr_info("esp32s31-radio: worker entered\n");
-	/* The worker services TCP ACK TX and every IRQ that cannot use the owner-only
-	 * direct path.  Keep it in ordinary CFS so the closed Wi-Fi task can still
-	 * run, with enough weight to service a freshly queued ACK promptly without
-	 * starving that task under sustained receive load. */
-	esp32s31_sched_setscheduler(current, SCHED_NORMAL, 0);
-	set_user_nice(current, S31_RADIO_WORKER_NICE);
-	/* Low identity mappings intentionally exist only in init_mm. */
+	WRITE_ONCE(s31_radio_runner, current);
+	/* Pool workers are kthreads without an mm, like the old dedicated
+	 * thread: borrow init_mm for the pass so the low identity mappings
+	 * (payload SRAM, ROM) are addressable.  Balanced at the single exit. */
 	esp32s31_kthread_use_init_mm();
-	pr_info("esp32s31-radio: init_mm active\n");
+	if (!READ_ONCE(s31_radio_hw_checked)) {
+		void __iomem *rom = ioremap(S31_ROM_BASE, PAGE_SIZE);
+		u32 identity_word, ioremap_word;
+		unsigned int cpu_mhz;
 
-	rom = ioremap(S31_ROM_BASE, PAGE_SIZE);
-	if (!rom) {
-		pr_err("esp32s31-radio: cannot map mask ROM for comparison\n");
-		goto out;
-	}
-
-	identity_word = READ_ONCE(*(u32 *)S31_ROM_BASE);
-	ioremap_word = readl(rom);
-	if (identity_word != ioremap_word) {
-		pr_err("esp32s31-radio: identity ROM mismatch %08x != %08x\n",
-		       identity_word, ioremap_word);
+		if (!rom) {
+			pr_err("esp32s31-radio: cannot map mask ROM for comparison\n");
+			goto hw_failed;
+		}
+		identity_word = READ_ONCE(*(u32 *)S31_ROM_BASE);
+		ioremap_word = readl(rom);
 		iounmap(rom);
-		goto out;
+		if (identity_word != ioremap_word) {
+			pr_err("esp32s31-radio: identity ROM mismatch %08x != %08x\n",
+			       identity_word, ioremap_word);
+			goto hw_failed;
+		}
+		/* This ROM routine is side-effect free and proves execute
+		 * permission. */
+		cpu_mhz = ((s31_rom_cpu_freq_t)S31_ROM_CPU_FREQ)();
+		pr_info("esp32s31-radio: S-mode identity map ready, rom=%08x cpu=%u MHz\n",
+			identity_word, cpu_mhz);
+		WRITE_ONCE(s31_radio_hw_checked, true);
 	}
-	iounmap(rom);
-
-	/* This ROM routine is side-effect free and proves execute permission. */
-	cpu_mhz = ((s31_rom_cpu_freq_t)S31_ROM_CPU_FREQ)();
-	pr_info("esp32s31-radio: S-mode identity map ready, rom=%08x cpu=%u MHz\n",
-		identity_word, cpu_mhz);
-#ifdef CONFIG_ESP32S31_RADIO_BLOBS
-	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
-	pr_info("esp32s31-radio: ILP32F Wi-Fi/BT payload linked\n");
-	/* TIMG1 hardirq tick removed: use Linux jiffies as the FreeRTOS/esp_timer
-	 * time base.  Blocking already uses Linux sleep/wait; only xTaskGetTickCount
-	 * and esp_timer_get_time need a monotonic 10 ms tick, which jiffies gives.
-	 */
-	hw_tick = false;
-	pr_info("esp32s31-radio: using Linux jiffies tick\n");
-	pr_info("esp32s31-radio: initializing compatibility RTOS\n");
-	s31_rtos_init();
-	pr_info("esp32s31-radio: compatibility RTOS base initialized\n");
-	pr_info("esp32s31-radio: creating radio-init compatibility task\n");
-	if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
-				    (void *)(uintptr_t)s31_radio_features,
-				    24, NULL, 0) != 1) {
-		pr_err("esp32s31-radio: cannot create IDF init task\n");
-		goto failed;
-	}
-	pr_info("esp32s31-radio: compatibility RTOS initialized\n");
-	pr_info("esp32s31-radio: Linux kthread task started\n");
-	next_tick = jiffies + tick_period;
-	for (;;) {
-		s31_radio_sync_irq_registrations();
-		s31_radio_update_state();
 #ifdef CONFIG_SMP
-		/* A direct S-mode CLIC source can remain pending after an SBI cache
-		 * ecall because of S31's cross-privilege 0xff sentinel.  The radio
-		 * worker keeps hart 0 runnable, so the idle poll fallback never gets
-		 * a chance to drain it.  Service pending native sources at this bounded
-		 * scheduling point; their direct hardware paths remain the fast path. */
-		esp32s31_irq_poll();
+	/* A direct S-mode CLIC source can remain pending after an SBI cache
+	 * ecall because of S31's cross-privilege 0xff sentinel.  Service
+	 * pending native sources at this bounded scheduling point; their
+	 * direct hardware paths remain the fast path. */
+	esp32s31_irq_poll();
 #endif
-		if (!s31_radio_worker_stack &&
-		    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
-			s31_radio_worker_stack =
-				s31_radio_sram_alloc(S31_RADIO_WORKER_STACK_SIZE);
-			if (!s31_radio_worker_stack) {
-				pr_err("esp32s31-radio: cannot allocate internal worker stack\n");
-				goto failed;
-			}
-			pr_info("esp32s31-radio: worker blob stack %px..%px in HP SRAM\n",
-				s31_radio_worker_stack,
-				(u8 *)s31_radio_worker_stack +
-					S31_RADIO_WORKER_STACK_SIZE);
-		}
-		if (kthread_should_stop())
-			break;
-		/* The 40 ms tick batch is a BT-only power/CPU optimization.  In a
-		 * Wi-Fi+BT combo it violates the IDF 100 Hz FreeRTOS cadence used by
-		 * libcoexist and lets its Wi-Fi request/release callbacks slip by up to
-		 * 30 ms.  Keep the native 10 ms cadence whenever Wi-Fi is attached. */
-		if ((s31_radio_features & (S31_RADIO_FEATURE_WIFI |
-					  S31_RADIO_FEATURE_BLUETOOTH)) ==
-		    S31_RADIO_FEATURE_BLUETOOTH &&
-		    s31_radio_bt_batching_active()) {
-			if (tick_period != bt_tick_period) {
-				tick_period = bt_tick_period;
-				next_tick = jiffies + tick_period;
-			}
-		} else if (tick_period != init_tick_period) {
-			tick_period = init_tick_period;
-			next_tick = jiffies + tick_period;
-		}
-		if (!hw_tick && time_after_eq(jiffies, next_tick)) {
-			unsigned long elapsed = jiffies - next_tick;
-			unsigned long ticks = elapsed / tick_period + 1;
-
-			atomic_add(ticks, &s31_tick_pending);
-			next_tick += ticks * tick_period;
-		}
-		ret = s31_radio_run_linux_pass(&timer_wait_us, rt_wake_armed);
-		rt_wake_armed = false;
-		if (ret) {
-			pr_err("esp32s31-radio: serialized blob pass failed: %d\n", ret);
-			goto failed;
-		}
-		/* The worker is SCHED_NORMAL, so the scheduler tick supplies fair
-		 * preemption.  Do not force a context switch after every radio IRQ:
-		 * without RX aggregation that limits receive progress to roughly one
-		 * Ethernet frame per scheduling round.  cond_resched() still yields to
-		 * a runnable compatibility task immediately and to ordinary Linux work
-		 * whenever the CFS slice expires. */
-		cond_resched();
-		/* Sleep until the next IDF esp_timer deadline.  The compatibility
-		 * timer bridge uses the same absolute monotonic deadlines as IDF, so
-		 * this avoids both the old fixed 1 ms polling jitter and unnecessary
-		 * idle wakeups.  IRQ, command and TX work still wake the worker early.
-		 */
-		if ((s31_radio_features & (S31_RADIO_FEATURE_WIFI |
-					    S31_RADIO_FEATURE_BLUETOOTH)) ==
-		    (S31_RADIO_FEATURE_WIFI | S31_RADIO_FEATURE_BLUETOOTH) &&
-		    READ_ONCE(s31_bt_enable_result) == 0) {
-
-			wait_event_interruptible_hrtimeout(s31_radio_waitq,
-				kthread_should_stop() ||
-				atomic_read(&s31_tick_pending) ||
-				s31_radio_irq_work_pending() ||
-				s31_radio_command_work_pending() ||
-				s31_radio_hci_rx_pending() ||
-				s31_radio_hci_tx_pending() ||
-				s31_radio_wifi_tx_pending(),
-				us_to_ktime(clamp_t(u32, timer_wait_us, 50, 10000)));
-		} else {
-			wait_event_interruptible_timeout(s31_radio_waitq,
-				kthread_should_stop() ||
-				atomic_read(&s31_tick_pending) ||
-				s31_radio_irq_work_pending() ||
-				s31_radio_command_work_pending() ||
-				s31_radio_hci_rx_pending() ||
-				s31_radio_hci_tx_pending() ||
-				s31_radio_wifi_tx_pending(),
-				time_before(jiffies, next_tick) ?
-					next_tick - jiffies : 1);
-		}
-		/* next_tick is advanced in the fallback branch above. */
+	s31_radio_sync_irq_registrations();
+	s31_radio_update_state();
+	/* The 40 ms tick batch is a BT-only power/CPU optimization.  In a
+	 * Wi-Fi+BT combo it violates the IDF 100 Hz FreeRTOS cadence used by
+	 * libcoexist and lets its Wi-Fi request/release callbacks slip by up to
+	 * 30 ms.  Keep the native 10 ms cadence whenever Wi-Fi is attached. */
+	if ((s31_radio_features & (S31_RADIO_FEATURE_WIFI |
+				  S31_RADIO_FEATURE_BLUETOOTH)) ==
+	    S31_RADIO_FEATURE_BLUETOOTH &&
+	    s31_radio_bt_batching_active()) {
+		tick_period = bt_tick_period;
+	} else {
+		tick_period = init_tick_period;
 	}
-	pr_info("esp32s31-radio: scheduler worker stopped\n");
-	goto out;
+	if (time_after_eq(jiffies, READ_ONCE(s31_radio_next_tick))) {
+		unsigned long elapsed = jiffies - READ_ONCE(s31_radio_next_tick);
+		unsigned long ticks = elapsed / tick_period + 1;
 
-failed:
+		/* Only the fact that time passed matters: one scan dispatches
+		 * every due timer (see s31_linux_timers_tick). */
+		tick_events = 1;
+		WRITE_ONCE(s31_radio_next_tick,
+			   READ_ONCE(s31_radio_next_tick) + ticks * tick_period);
+	}
+	ret = s31_radio_run_linux_pass(&timer_wait_us, false, tick_events);
+	if (ret) {
+		pr_err("esp32s31-radio: serialized blob pass failed: %d\n", ret);
+		atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
+		s31_radio_fail_commands();
+	} else {
+		/* No fixed tick sleep anymore; the scheduler tick alone supplies
+		 * fair preemption.  Do not force a context switch after every
+		 * radio IRQ: without RX aggregation that limits receive progress
+		 * to roughly one Ethernet frame per scheduling round.
+		 * cond_resched() still yields to a runnable compatibility task
+		 * immediately and to ordinary Linux work whenever the slice
+		 * expires. */
+		cond_resched();
+		/* Requeue: immediately while event work is pending (the old
+		 * wait_event predicate), else at the next esp_timer deadline.
+		 * The compatibility timer bridge uses the same absolute
+		 * monotonic deadlines as IDF, so this avoids both the old fixed
+		 * polling jitter and unnecessary idle wakeups. */
+		if (s31_radio_pass_due()) {
+			queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
+		} else {
+			u64 delay_us;
+
+			if ((s31_radio_features &
+			     (S31_RADIO_FEATURE_WIFI |
+			      S31_RADIO_FEATURE_BLUETOOTH)) ==
+			    (S31_RADIO_FEATURE_WIFI |
+			     S31_RADIO_FEATURE_BLUETOOTH) &&
+			    READ_ONCE(s31_bt_enable_result) == 0)
+				delay_us = clamp_t(u32, timer_wait_us, 50, 10000);
+			else if (time_before(jiffies,
+					     READ_ONCE(s31_radio_next_tick)))
+				delay_us =
+					(u64)(READ_ONCE(s31_radio_next_tick) -
+					      jiffies) * (1000000ULL / HZ);
+			else
+				delay_us = 1000000ULL / HZ;
+			hrtimer_start(&s31_radio_hrtimer, us_to_ktime(delay_us),
+				      HRTIMER_MODE_REL);
+		}
+	}
+	goto out;
+hw_failed:
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
 	s31_radio_fail_commands();
-#endif
 out:
-	#ifdef CONFIG_ESP32S31_RADIO_BLOBS
-	WRITE_ONCE(s31_radio_worker, NULL);
-	#endif
 	esp32s31_kthread_unuse_init_mm();
-	return 0;
+	WRITE_ONCE(s31_radio_runner, NULL);
 }
+#endif
 
 int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 {
-	struct task_struct *task;
 	int ret;
 
 	if (esp32s31_radio_is_disabled()) {
@@ -2991,7 +2994,9 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	s31_wifi_connected_ready = s31_wifi_disconnected_ready = false;
 	s31_wifi_control_poisoned = false;
 	atomic_set(&s31_wifi_rx_direct_pending, 0);
-	atomic_set(&s31_tick_pending, 0);
+	WRITE_ONCE(s31_radio_next_tick, jiffies + max_t(unsigned long, 1,
+							msecs_to_jiffies(10)));
+	WRITE_ONCE(s31_radio_hw_checked, false);
 	WRITE_ONCE(s31_bt_enable_result, -EINPROGRESS);
 	WRITE_ONCE(s31_bt_disable_result, -EINPROGRESS);
 	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
@@ -3160,18 +3165,65 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 		s31_radio_control_kick();
 		return 0;
 	}
-	task = kthread_create(s31_radio_runtime_thread, NULL, "s31-radio");
-	if (IS_ERR(task)) {
-		ret = PTR_ERR(task);
+#ifdef CONFIG_ESP32S31_RADIO_BLOBS
+	/* Serialized runner: ordered workqueue plus deadline hrtimer instead of
+	 * a dedicated kthread.  Ordered means one pass at a time — the same
+	 * serialization the retired s31-radio loop provided.  WQ_HIGHPRI keeps
+	 * the old nice(-10) urgency without renicing shared pool workers.
+	 * The mask-ROM identity check runs on the first pass, where init_mm
+	 * is borrowed for the runner (it cannot run here in process context).
+	 */
+	atomic_set(&s31_radio_state, ESP32S31_RADIO_STARTING);
+	pr_info("esp32s31-radio: ILP32F Wi-Fi/BT payload linked\n");
+	/* TIMG1 hardirq tick removed: use Linux jiffies as the FreeRTOS/esp_timer
+	 * time base.  Blocking already uses Linux sleep/wait; only xTaskGetTickCount
+	 * and esp_timer_get_time need a monotonic 10 ms tick, which jiffies gives.
+	 */
+	pr_info("esp32s31-radio: using Linux jiffies tick\n");
+	pr_info("esp32s31-radio: initializing compatibility RTOS\n");
+	s31_rtos_init();
+	pr_info("esp32s31-radio: compatibility RTOS base initialized\n");
+	s31_radio_wq = alloc_ordered_workqueue("s31-radio", WQ_HIGHPRI);
+	if (!s31_radio_wq) {
+		ret = -ENOMEM;
 		goto free_rings;
 	}
-	#ifdef CONFIG_ESP32S31_RADIO_BLOBS
-	WRITE_ONCE(s31_radio_worker, task);
-	#endif
+	INIT_DELAYED_WORK(&s31_radio_work, s31_radio_workfn);
+	hrtimer_setup(&s31_radio_hrtimer, s31_radio_hrtimer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
+	s31_radio_worker_stack = s31_radio_sram_alloc(S31_RADIO_WORKER_STACK_SIZE);
+	if (!s31_radio_worker_stack) {
+		pr_err("esp32s31-radio: cannot allocate internal runner stack\n");
+		destroy_workqueue(s31_radio_wq);
+		s31_radio_wq = NULL;
+		ret = -ENOMEM;
+		goto free_rings;
+	}
+	pr_info("esp32s31-radio: runner blob stack %px..%px in HP SRAM\n",
+		s31_radio_worker_stack,
+		(u8 *)s31_radio_worker_stack + S31_RADIO_WORKER_STACK_SIZE);
+	pr_info("esp32s31-radio: creating radio-init compatibility task\n");
+	if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
+				    (void *)(uintptr_t)s31_radio_features,
+				    24, NULL, 0) != 1) {
+		pr_err("esp32s31-radio: cannot create IDF init task\n");
+		atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
+		s31_radio_fail_commands();
+		s31_radio_sram_free(s31_radio_worker_stack);
+		s31_radio_worker_stack = NULL;
+		destroy_workqueue(s31_radio_wq);
+		s31_radio_wq = NULL;
+		/* Keep the rings so post-mortem state matches the old thread's
+		 * failed path; wait_ready() reports -EIO from FAILED. */
+		return 0;
+	}
+	pr_info("esp32s31-radio: compatibility RTOS initialized\n");
 	s31_blob_gate_wait_hook = s31_radio_gate_wait_sync;
-	kthread_bind(task, 0);
-	wake_up_process(task);
+	queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
 	return 0;
+#else
+	return 0;
+#endif
 
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 free_rings:
@@ -3234,11 +3286,10 @@ int s31_radio_runtime_shutdown(void)
 {
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	struct s31_radio_command shutdown;
-	struct task_struct *worker;
 	int shutdown_ret = 0;
 	int i;
 
-	if ((READ_ONCE(s31_radio_worker) || READ_ONCE(s31_radio_workerless)) &&
+	if ((READ_ONCE(s31_radio_wq) || READ_ONCE(s31_radio_workerless)) &&
 	    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
 		reinit_completion(&s31_shutdown_done);
 		WRITE_ONCE(s31_shutdown_result, -EINPROGRESS);
@@ -3265,11 +3316,16 @@ int s31_radio_runtime_shutdown(void)
 
 	/* Task teardown still needs the loaded payload and SRAM allocator. */
 	s31_linux_tasks_stop_all();
-	worker = xchg(&s31_radio_worker, NULL);
-	if (worker) {
-		wake_up_process(worker);
-		kthread_stop(worker);
+	/* Stop the deadline timer first so its callback cannot requeue, then
+	 * drain the serialized passes and destroy the queue.  destroy waits
+	 * for queued work; late wake sites see a NULL queue and skip. */
+	hrtimer_cancel(&s31_radio_hrtimer);
+	cancel_delayed_work_sync(&s31_radio_work);
+	if (s31_radio_wq) {
+		destroy_workqueue(s31_radio_wq);
+		WRITE_ONCE(s31_radio_wq, NULL);
 	}
+	WRITE_ONCE(s31_radio_runner, NULL);
 	s31_blob_gate_wait_hook = NULL;
 
 	for (i = 0; i < S31_RADIO_IRQ_SLOTS; i++) {
