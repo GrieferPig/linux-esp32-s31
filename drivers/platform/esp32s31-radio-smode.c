@@ -2586,7 +2586,10 @@ static void s31_radio_run_blob_pass(void *opaque)
 	 * single scan.  Repeating that scan for every elapsed 10 ms slice cannot
 	 * dispatch additional callbacks; it only walks the same timer list again. */
 	/* The IDF coexist scheduler uses roughly 1 ms esp_timer periods, while the
-	 * compatibility RTOS clock intentionally stays at HZ=100.  In a combo
+	 * payload FreeRTOS ABI tick stays at 10 ms (s31_linux_tick_count reports
+	 * 10 ms units from jiffies_to_msecs regardless of HZ).  Linux itself now
+	 * runs at HZ=1000 so jiffies/msecs_to_jiffies/delayed_work resolve 1 ms
+	 * for the compat tasks.  In a combo
 	 * profile the radio IRQ/HCI activity already queues this serialized pass
 	 * several times per RTOS tick; poll absolute esp_timer deadlines on those
 	 * passes as well so a BT phase cannot occupy an entire 10 ms Linux tick.
