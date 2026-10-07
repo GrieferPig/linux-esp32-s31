@@ -121,6 +121,7 @@ enum s31_direct_isr_result {
 };
 int s31_linux_blob_run_direct_isr(void (*handler)(void *), void *arg);
 bool s31_radio_payload_uses_fp(void);
+bool s31_radio_is_bt_only(void);
 bool s31_radio_blob_run_pending_isrs(void);
 void s31_linux_task_dump_all(void);
 extern void (*s31_blob_gate_wait_hook)(void);

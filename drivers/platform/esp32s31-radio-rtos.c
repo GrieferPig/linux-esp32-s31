@@ -13,6 +13,7 @@
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/mutex.h>
+#include <linux/moduleparam.h>
 #include <linux/sched.h>
 #include <linux/sched/cputime.h>
 #include <linux/slab.h>
@@ -180,6 +181,34 @@ static atomic_t s31_sync_stop_generation = ATOMIC_INIT(0);
 static struct s31_linux_task *s31_linux_current_task(void);
 static DEFINE_RAW_SPINLOCK(s31_critical_lock);
 static DEFINE_MUTEX(s31_blob_mutex);
+
+static DECLARE_WAIT_QUEUE_HEAD(s31_blob_sleep_waitq);
+static bool s31_bt_gate_sleep;
+module_param_named(bt_gate_sleep, s31_bt_gate_sleep, bool, 0600);
+MODULE_PARM_DESC(bt_gate_sleep, "BT-only gate contention sleeps instead of optimistic spinning (default off)");
+
+static void s31_blob_lock(void)
+{
+	/* Keep the mutex itself as the ownership domain inspected by native ISR
+	 * guards. Only the contended acquisition policy changes, and only in BT
+	 * mode. wait_event prepares its waiter before retrying the trylock, so
+	 * an unlock cannot be lost between the failed try and sleeping.
+	 */
+	if (READ_ONCE(s31_bt_gate_sleep) && s31_radio_is_bt_only())
+		wait_event(s31_blob_sleep_waitq, mutex_trylock(&s31_blob_mutex));
+	else
+		mutex_lock(&s31_blob_mutex);
+}
+
+static void s31_blob_unlock(void)
+{
+	mutex_unlock(&s31_blob_mutex);
+	/* Always take the waitqueue lock: this pairs publication with waiter
+	 * preparation, and also permits changing the knob while waiters exist.
+	 * Legacy mutex waiters are still woken by mutex_unlock itself.
+	 */
+	wake_up_all(&s31_blob_sleep_waitq);
+}
 static struct s31_linux_task *s31_task_list;
 static DEFINE_SPINLOCK(s31_task_list_lock);
 
@@ -442,7 +471,7 @@ static void s31_linux_task_cleanup(struct s31_linux_task *task)
 	if (task->blob_active) {
 		s31_blob_fpu_end();
 		s31_blob_restore_context(&task->blob);
-		mutex_unlock(&s31_blob_mutex);
+		s31_blob_unlock();
 		task->blob_active = false;
 	}
 	complete(&task->exited);
@@ -1181,7 +1210,7 @@ void s31_linux_blob_enter(void)
 			s31_blob_gate_wait_hook();
 			s31_gate_hook_busy = false;
 		}
-		mutex_lock(&s31_blob_mutex);
+		s31_blob_lock();
 	}
 
 	context = s31_blob_context_current();
@@ -1203,7 +1232,7 @@ void s31_linux_blob_leave(void)
 	s31_blob_fpu_end();
 	s31_blob_restore_context(context);
 	s31_blob_set_active(false);
-	mutex_unlock(&s31_blob_mutex);
+	s31_blob_unlock();
 	if (!s31_radio_native_current()) s31_radio_native_wake();
 }
 
@@ -1231,7 +1260,7 @@ void s31_linux_blob_suspend(u32 reason)
 		s31_blob_fpu_end();
 		s31_blob_restore_context(context);
 		s31_blob_set_active(false);
-		mutex_unlock(&s31_blob_mutex);
+		s31_blob_unlock();
 		if (!s31_radio_native_current()) s31_radio_native_wake();
 
 	}
@@ -1244,7 +1273,7 @@ void s31_linux_blob_resume(void)
 
 	if (!s31_blob_active()) {
 
-		mutex_lock(&s31_blob_mutex);
+		s31_blob_lock();
 
 		context = s31_blob_context_current();
 		s31_blob_install_context(context);

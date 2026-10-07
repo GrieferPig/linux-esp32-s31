@@ -920,6 +920,11 @@ static DECLARE_WORK(s31_radio_health_work, s31_radio_health_workfn);
 
 #define S31_IDF_INTR_DISABLED	BIT(5)
 
+bool s31_radio_is_bt_only(void)
+{
+	return READ_ONCE(s31_radio_features) == S31_RADIO_FEATURE_BLUETOOTH;
+}
+
 static bool s31_radio_bt_batching_active(void)
 {
 	return s31_radio_features == S31_RADIO_FEATURE_BLUETOOTH &&
