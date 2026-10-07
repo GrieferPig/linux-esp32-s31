@@ -4,6 +4,10 @@
 #define S31_RADIO_FEATURE_RX_LEAN16 (1U << 9)
 #define ESP32S31_RADIO_CONTROL_H
 
+/* Optional BT-only init argument: zero retains the SDK default. */
+#define S31_RADIO_BT_TX_BUFS_SHIFT 16U
+#define S31_RADIO_BT_TX_BUFS_MASK 0xffU
+
 #ifdef __KERNEL__
 #include <linux/types.h>
 #else

@@ -66,6 +66,10 @@ static bool s31_radio_disabled;
 static unsigned int s31_radio_bt_tick_ms = 40;
 module_param_named(bt_tick_ms, s31_radio_bt_tick_ms, uint, 0600);
 MODULE_PARM_DESC(bt_tick_ms, "Bluetooth-only timer batch, clamped to 1..40 ms (default 40)");
+static unsigned int s31_radio_bt_tx_buffers;
+module_param_named(bt_tx_buffers, s31_radio_bt_tx_buffers, uint, 0444);
+MODULE_PARM_DESC(bt_tx_buffers, "BT-only Classic TX buffers at init: 0=SDK default, or 3..10");
+
 
 #ifndef MODULE
 static int __init s31_radio_disable_setup(char *value)
@@ -919,6 +923,16 @@ static void s31_radio_health_workfn(struct work_struct *work);
 static DECLARE_WORK(s31_radio_health_work, s31_radio_health_workfn);
 
 #define S31_IDF_INTR_DISABLED	BIT(5)
+
+static void *s31_radio_init_args(void)
+{
+	u32 args = READ_ONCE(s31_radio_features);
+
+	if (args == S31_RADIO_FEATURE_BLUETOOTH)
+		args |= READ_ONCE(s31_radio_bt_tx_buffers) <<
+			S31_RADIO_BT_TX_BUFS_SHIFT;
+	return (void *)(uintptr_t)args;
+}
 
 bool s31_radio_is_bt_only(void)
 {
@@ -2774,7 +2788,7 @@ static void s31_radio_control_workfn(struct work_struct *work)
 		s31_native_started = true;
 		s31_rtos_init();
 		if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init", 8192,
-      (void *)(uintptr_t)s31_radio_features, 24, NULL, 0) != 1)
+      s31_radio_init_args(), 24, NULL, 0) != 1)
 			atomic_set(&s31_radio_state, ESP32S31_RADIO_FAILED);
 	}
 	s31_radio_sync_irq_registrations();
@@ -2914,7 +2928,7 @@ static void s31_radio_workfn(struct work_struct *work)
 		pr_info("esp32s31-radio: creating radio-init compatibility task\n");
 		if (xTaskCreatePinnedToCore(s31_radio_stack_task, "radio-init",
 					    8192,
-					    (void *)(uintptr_t)s31_radio_features,
+					    s31_radio_init_args(),
 					    24, NULL, 0) != 1) {
 			pr_err("esp32s31-radio: cannot create IDF init task\n");
 			goto hw_failed;
@@ -3014,6 +3028,10 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 		pr_info("esp32s31-radio: disabled by kernel command line\n");
 		return 0;
 	}
+
+	if (enable_bt && !enable_wifi && s31_radio_bt_tx_buffers &&
+	    (s31_radio_bt_tx_buffers < 3 || s31_radio_bt_tx_buffers > 10))
+		return -EINVAL;
 
 	pr_info("esp32s31-radio: late init entered\n");
 	/* Reload within one module lifetime must not reuse indices or pending
