@@ -66,6 +66,9 @@ static bool s31_radio_disabled;
 static unsigned int s31_radio_bt_tick_ms = 40;
 module_param_named(bt_tick_ms, s31_radio_bt_tick_ms, uint, 0600);
 MODULE_PARM_DESC(bt_tick_ms, "Bluetooth-only timer batch, clamped to 1..40 ms (default 40)");
+static int s31_radio_bt_worker_cpu = -1;
+module_param_named(bt_worker_cpu, s31_radio_bt_worker_cpu, int, 0444);
+MODULE_PARM_DESC(bt_worker_cpu, "BT-only ordered radio worker CPU: -1=default, 0 or 1");
 static unsigned int s31_radio_bt_tx_buffers;
 module_param_named(bt_tx_buffers, s31_radio_bt_tx_buffers, uint, 0444);
 MODULE_PARM_DESC(bt_tx_buffers, "BT-only Classic TX buffers at init: 0=SDK default, or 3..10");
@@ -3258,11 +3261,15 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	pr_info("esp32s31-radio: initializing compatibility RTOS\n");
 	s31_rtos_init();
 	pr_info("esp32s31-radio: compatibility RTOS base initialized\n");
-	s31_radio_wq = alloc_ordered_workqueue("s31-radio", WQ_HIGHPRI);
-	if (!s31_radio_wq) {
-		ret = -ENOMEM;
+	s31_radio_wq = esp32s31_alloc_radio_workqueue(
+		enable_bt && !enable_wifi ? s31_radio_bt_worker_cpu : -1);
+	if (IS_ERR(s31_radio_wq)) {
+		ret = PTR_ERR(s31_radio_wq);
+		s31_radio_wq = NULL;
 		goto free_rings;
 	}
+	pr_info("esp32s31-radio: ordered worker CPU=%d\n",
+		enable_bt && !enable_wifi ? s31_radio_bt_worker_cpu : -1);
 	INIT_DELAYED_WORK(&s31_radio_work, s31_radio_workfn);
 	hrtimer_setup(&s31_radio_hrtimer, s31_radio_hrtimer_fn, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL);

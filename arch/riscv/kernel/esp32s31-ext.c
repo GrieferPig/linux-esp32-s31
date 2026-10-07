@@ -2,6 +2,9 @@
 /* ESP32-S31 HWLoop and PIE task context management through OpenSBI. */
 
 #include <linux/bug.h>
+#include <linux/err.h>
+#include <linux/workqueue.h>
+#include <linux/sched/prio.h>
 #include <linux/kallsyms.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
@@ -64,6 +67,47 @@ int esp32s31_sched_setscheduler(struct task_struct *task, int policy,
 	return sched_setscheduler_nocheck(task, policy, &param);
 }
 EXPORT_SYMBOL_GPL(esp32s31_sched_setscheduler);
+
+/*
+ * Allocate the radio-owned ordered/high-priority queue with optional CPU
+ * placement before any work is queued. Do not change shared pool workers'
+ * affinity directly. Workqueue attribute helpers are built-in-only APIs.
+ */
+struct workqueue_struct *esp32s31_alloc_radio_workqueue(int cpu)
+{
+	struct workqueue_struct *wq;
+	struct workqueue_attrs *attrs;
+	int ret;
+
+	if (cpu < -1 || (cpu >= 0 &&
+	    (cpu >= nr_cpu_ids || !cpu_online(cpu))))
+		return ERR_PTR(-EINVAL);
+	wq = alloc_ordered_workqueue("s31-radio", WQ_HIGHPRI);
+	if (!wq)
+		return ERR_PTR(-ENOMEM);
+	if (cpu == -1)
+		return wq;
+
+	attrs = alloc_workqueue_attrs();
+	if (!attrs) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	/* Preserve alloc_ordered_workqueue(..., WQ_HIGHPRI) semantics. */
+	attrs->nice = MIN_NICE;
+	attrs->ordered = true;
+	attrs->affn_strict = true;
+	cpumask_clear(attrs->cpumask);
+	cpumask_set_cpu(cpu, attrs->cpumask);
+	ret = apply_workqueue_attrs(wq, attrs);
+	free_workqueue_attrs(attrs);
+	if (!ret)
+		return wq;
+fail:
+	destroy_workqueue(wq);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(esp32s31_alloc_radio_workqueue);
 
 static unsigned long s31_ext_pa(struct task_struct *task)
 {

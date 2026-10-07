@@ -8,7 +8,9 @@
 
 struct task_struct;
 struct pt_regs;
+struct workqueue_struct;
 
+struct workqueue_struct *esp32s31_alloc_radio_workqueue(int cpu);
 bool esp32s31_current_uses_init_mm(void);
 bool esp32s31_executable_address(unsigned long addr);
 u64 esp32s31_task_runtime(struct task_struct *task);
