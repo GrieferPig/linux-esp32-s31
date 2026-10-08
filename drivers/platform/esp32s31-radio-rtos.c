@@ -187,6 +187,19 @@ static bool s31_bt_gate_sleep;
 module_param_named(bt_gate_sleep, s31_bt_gate_sleep, bool, 0600);
 MODULE_PARM_DESC(bt_gate_sleep, "BT-only gate contention sleeps instead of optimistic spinning (default off)");
 
+static bool s31_bt_fast_wake;
+module_param_named(bt_fast_wake, s31_bt_fast_wake, bool, 0600);
+MODULE_PARM_DESC(bt_fast_wake, "BT-only skip wakes of empty waitqueues with publication barrier");
+
+static bool s31_waitqueue_needs_wake(wait_queue_head_t *wq)
+{
+	/* The full barrier pairs with waiter publication. A waiter not yet
+	 * listed must observe the changed condition before sleeping.
+	 */
+	return !READ_ONCE(s31_bt_fast_wake) || !s31_radio_is_bt_only() ||
+	       wq_has_sleeper(wq);
+}
+
 static void s31_blob_lock(void)
 {
 	/* Keep the mutex itself as the ownership domain inspected by native ISR
@@ -203,11 +216,12 @@ static void s31_blob_lock(void)
 static void s31_blob_unlock(void)
 {
 	mutex_unlock(&s31_blob_mutex);
-	/* Always take the waitqueue lock: this pairs publication with waiter
-	 * preparation, and also permits changing the knob while waiters exist.
+	/* Wake all listed gate waiters. The optional empty-queue check supplies
+	 * the publication barrier without taking the waitqueue lock.
 	 * Legacy mutex waiters are still woken by mutex_unlock itself.
 	 */
-	wake_up_all(&s31_blob_sleep_waitq);
+	if (s31_waitqueue_needs_wake(&s31_blob_sleep_waitq))
+		wake_up_all(&s31_blob_sleep_waitq);
 }
 static struct s31_linux_task *s31_task_list;
 static DEFINE_SPINLOCK(s31_task_list_lock);
@@ -1130,7 +1144,8 @@ void s31_linux_sync_wake(void *opaque)
 	/* A Wi-Fi RX interrupt usually makes exactly one queue consumable.  A
 	 * global waitqueue woke every compatibility task for every frame and
 	 * turned non-aggregated receive into a scheduler-bound 100 Hz path. */
-	wake_up_all(&sync->waitq);
+	if (s31_waitqueue_needs_wake(&sync->waitq))
+		wake_up_all(&sync->waitq);
 }
 
 u32 s31_linux_critical_enter(void)

@@ -112,6 +112,8 @@ int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
 void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
 				   void *context);
 int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length);
+/* 0xff followed by up to eight LE16-length-prefixed H4 frames. */
+int esp32s31_radio_hci_send_batch(const u8 *data, size_t length);
 bool esp32s31_radio_hci_tx_has_space(void);
 bool esp32s31_radio_hci_rx_pending(void);
 int esp32s31_radio_hci_dequeue(u8 *frame, size_t capacity);

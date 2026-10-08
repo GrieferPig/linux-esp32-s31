@@ -687,6 +687,20 @@ struct s31_idf_irq_registration {
 #define S31_RADIO_IRQ_SLOTS	7
 static struct s31_idf_irq_registration s31_idf_irqs[S31_RADIO_IRQ_SLOTS];
 static atomic_t s31_radio_pending_isrs = ATOMIC_INIT(0);
+static atomic_t s31_radio_immediate_pending = ATOMIC_INIT(0);
+static bool s31_bt_queue_coalesce;
+module_param_named(bt_queue_coalesce, s31_bt_queue_coalesce, bool, 0600);
+MODULE_PARM_DESC(bt_queue_coalesce, "BT-only coalesce immediate worker notifications");
+static bool s31_bt_blob_skip;
+module_param_named(bt_blob_skip, s31_bt_blob_skip, bool, 0600);
+MODULE_PARM_DESC(bt_blob_skip, "BT-only skip blob gate on event-only passes");
+static unsigned long s31_blob_skipped_passes;
+module_param_named(bt_blob_skipped, s31_blob_skipped_passes, ulong, 0400);
+static bool s31_bt_pass_skip_completions;
+module_param_named(bt_pass_skip_completions, s31_bt_pass_skip_completions, bool, 0600);
+MODULE_PARM_DESC(bt_pass_skip_completions, "BT-only skip worker pass for Number-of-Completed-Packets events");
+static unsigned long s31_pass_skipped_completions;
+module_param_named(bt_pass_skipped_completions, s31_pass_skipped_completions, ulong, 0400);
 
 enum s31_radio_command_type {
 	S31_RADIO_COMMAND_HEALTH,
@@ -1490,8 +1504,19 @@ static void s31_radio_queue(void)
 	 * parked permanently after terminal first-pass init failure. */
 	if (READ_ONCE(s31_radio_init_dead) || !READ_ONCE(s31_radio_wq))
 		return;
-	hrtimer_try_to_cancel(&s31_radio_hrtimer);
-	queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
+	if (READ_ONCE(s31_bt_queue_coalesce) && s31_radio_is_bt_only()) {
+		/* The first producer owns queueing; the worker consumes this
+		 * token before examining pending event state.
+		 */
+		if (atomic_xchg(&s31_radio_immediate_pending, 1))
+			return;
+		hrtimer_try_to_cancel(&s31_radio_hrtimer);
+		/* Promote an already delayed pass as well. */
+		mod_delayed_work(s31_radio_wq, &s31_radio_work, 0);
+	} else {
+		hrtimer_try_to_cancel(&s31_radio_hrtimer);
+		queue_delayed_work(s31_radio_wq, &s31_radio_work, 0);
+	}
 }
 
 static void s31_radio_wake(void)
@@ -1579,8 +1604,19 @@ int s31_radio_vhci_receive(u8 *frame, u16 length)
 	/* Command, pairing and link-state events stay latency sensitive.  A2DP media
 	 * arrives as ACL data and is intentionally coalesced until the next bridge
 	 * pass when the controller is in the BT-only low-overhead mode. */
-	if (frame[0] == HCI_EVENT_PKT)
-		s31_radio_wake();
+	if (frame[0] == HCI_EVENT_PKT) {
+		/* Number-of-Completed-Packets events only retire controller
+		 * credits the host already tracks on read: the reader is woken
+		 * above, and no blob work is pending for them.  Skipping the
+		 * worker pass here removes the dominant per-packet wakeup at
+		 * bulk rates; ticks, TX and other events still queue passes. */
+		if (READ_ONCE(s31_bt_pass_skip_completions) &&
+		    s31_radio_is_bt_only() && length >= 3 && frame[1] == 0x13 &&
+		    !s31_radio_hci_tx_pending())
+			s31_pass_skipped_completions++;
+		else
+			s31_radio_wake();
+	}
 	return 0;
 }
 
@@ -2149,7 +2185,13 @@ void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_hci_unregister);
 
-int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
+static unsigned long s31_tx_batch_calls, s31_tx_batch_frames, s31_tx_batch_partial;
+module_param_named(bt_tx_batch_calls, s31_tx_batch_calls, ulong, 0400);
+module_param_named(bt_tx_batch_frames, s31_tx_batch_frames, ulong, 0400);
+module_param_named(bt_tx_batch_partial, s31_tx_batch_partial, ulong, 0400);
+
+static int s31_hci_send(u8 packet_type, const u8 *data, size_t length,
+			bool wake)
 {
 	unsigned long flags;
 	unsigned int next;
@@ -2181,10 +2223,57 @@ int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
 		WRITE_ONCE(s31_coex_pending_op, data[4]);
 		WRITE_ONCE(s31_coex_pending_status, data[5]);
 	}
-	s31_radio_wake();
+	if (wake)
+		s31_radio_wake();
 	return 0;
 }
+int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length)
+{
+	return s31_hci_send(packet_type, data, length, true);
+}
 EXPORT_SYMBOL_GPL(esp32s31_radio_hci_send);
+
+/* Validate the complete batch before any side effect. Return a byte count
+ * ending at an accepted record boundary; caller retains the unsent suffix.
+ * Individual ring operations retain their original IRQ-off duration. */
+int esp32s31_radio_hci_send_batch(const u8 *data, size_t length)
+{
+	size_t pos = 1, accepted = 1;
+	unsigned int frames = 0;
+	int ret = -EINVAL;
+
+	if (length < 5 || data[0] != 0xff)
+		return -EINVAL;
+	while (pos < length) {
+		unsigned int n;
+		if (length - pos < 2 || ++frames > 8)
+			return -EINVAL;
+		n = data[pos] | (data[pos + 1] << 8);
+		pos += 2;
+		if (n < 2 || n > S31_HCI_FRAME_SIZE || n > length - pos)
+			return -EINVAL;
+		pos += n;
+	}
+	s31_tx_batch_calls++;
+	pos = 1;
+	while (pos < length) {
+		unsigned int n = data[pos] | (data[pos + 1] << 8);
+		ret = s31_hci_send(data[pos + 2], data + pos + 3, n - 1, false);
+		if (ret)
+			break;
+		pos += 2 + n;
+		accepted = pos;
+		s31_tx_batch_frames++;
+	}
+	if (accepted > 1) {
+		if (accepted < length)
+			s31_tx_batch_partial++;
+		s31_radio_wake();
+		return accepted;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_hci_send_batch);
 
 bool esp32s31_radio_hci_tx_has_space(void)
 {
@@ -2712,6 +2801,27 @@ static int s31_radio_run_linux_pass(u32 *timer_wait_us, bool rt_wake_armed,
 
 	s31_radio_process_commands();
 
+	/*
+	 * BT-only event passes usually carry only RX frames, which are
+	 * already delivered above.  Acquiring the blob gate (SBI extension
+	 * save/restore, RTOS tick scan, TX drains, compat-task herd) for
+	 * such passes costs milliseconds per frame at bulk rates.  Skip the
+	 * gate when no blob work is pending: no RTOS tick due, no IDF IRQ
+	 * callbacks, no HCI/Wi-Fi TX, no queued commands, and no esp_timer
+	 * due within 3 ms.  Ticks, combo cadence, init, and the workfn tail
+	 * (immediate requeue while work is pending, hrtimer otherwise) are
+	 * untouched, so delayed timers and leftover RX budgets still run.
+	 */
+	if (READ_ONCE(s31_bt_blob_skip) && s31_radio_is_bt_only() &&
+	    !tick_events && !s31_radio_irq_work_pending() &&
+	    !s31_radio_hci_tx_pending() && !s31_radio_wifi_tx_pending() &&
+	    !s31_radio_command_work_pending() &&
+	    s31_linux_timer_next_due_us() > 3000) {
+		s31_blob_skipped_passes++;
+		*timer_wait_us = 10000;
+		return 0;
+	}
+
 	if (s31_radio_worker_stack)
 		s31_linux_call_on_stack(s31_radio_worker_stack,
 					S31_RADIO_WORKER_STACK_SIZE,
@@ -2908,6 +3018,7 @@ static void s31_radio_workfn(struct work_struct *work)
 	int tick_events = 0;
 	int ret;
 
+	atomic_xchg(&s31_radio_immediate_pending, 0);
 	WRITE_ONCE(s31_radio_runner, current);
 	/* Pool workers are kthreads without an mm, like the old dedicated
 	 * thread: borrow init_mm for the pass so the low identity mappings
@@ -3088,6 +3199,7 @@ int s31_radio_runtime_init(bool enable_wifi, bool enable_bt)
 	s31_native_passes = 0;
 	atomic_set(&s31_native_generation, 0);
 	atomic_set(&s31_radio_worker_passes, 0);
+	atomic_set(&s31_radio_immediate_pending, 0);
 	WRITE_ONCE(s31_wifi_init_result, enable_wifi ? -EINPROGRESS : 0);
 	WRITE_ONCE(s31_bt_init_result, enable_bt ? -EINPROGRESS : 0);
 

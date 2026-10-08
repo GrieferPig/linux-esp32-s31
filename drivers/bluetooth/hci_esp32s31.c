@@ -5,6 +5,7 @@
 #include <linux/esp32s31-radio.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -31,7 +32,7 @@ struct s31_hci {
 	bool radio_registered;
 	bool suspended;
 	bool reset_pending;
-	u8 direct_write_buf[ESP32S31_RADIO_HCI_FRAME_MAX];
+	u8 direct_write_buf[1 + 8 * (2 + ESP32S31_RADIO_HCI_FRAME_MAX)];
 };
 
 static struct s31_hci s31_hci;
@@ -336,10 +337,12 @@ static ssize_t s31_hci_direct_write(struct file *file,
 		ret = -EFAULT;
 		goto out;
 	}
-	ret = esp32s31_radio_hci_send(radio->direct_write_buf[0],
-					 radio->direct_write_buf + 1, count - 1);
-	if (!ret)
-		ret = count;
+	/* Direct writers use the 0xff batch envelope unconditionally. */
+	if (radio->direct_write_buf[0] != 0xff) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = esp32s31_radio_hci_send_batch(radio->direct_write_buf, count);
 out:
 	mutex_unlock(&radio->direct_write_lock);
 	return ret;
@@ -360,6 +363,21 @@ static __poll_t s31_hci_direct_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+/* Batch capability for ACL write coalescing: maximum H4 records per
+ * 0xff-prefixed envelope. Legacy kernels lack this command (ENOTTY). */
+static long s31_hci_direct_ioctl(struct file *file, unsigned int cmd,
+				 unsigned long arg)
+{
+	u32 caps = 8;
+
+	if (cmd == _IOR('S', 0x31, u32)) {
+		if (put_user(caps, (u32 __user *)arg))
+			return -EFAULT;
+		return 0;
+	}
+	return -ENOTTY;
+}
+
 static const struct file_operations s31_hci_direct_fops = {
 	.owner = THIS_MODULE,
 	.open = s31_hci_direct_open,
@@ -367,6 +385,7 @@ static const struct file_operations s31_hci_direct_fops = {
 	.read = s31_hci_direct_read,
 	.write = s31_hci_direct_write,
 	.poll = s31_hci_direct_poll,
+	.unlocked_ioctl = s31_hci_direct_ioctl,
 	.llseek = noop_llseek,
 };
 
