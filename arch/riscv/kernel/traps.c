@@ -173,13 +173,13 @@ DO_ERROR_INFO(do_trap_insn_fault,
 
 static bool esp32s31_hart0_pie_insn(struct pt_regs *regs)
 {
-	u32 insn;
+	u16 insn;
 
 	if (!IS_ENABLED(CONFIG_ESP32S31_RADIO_SMODE))
 		return false;
 	if (raw_smp_processor_id() != 0 || !user_mode(regs))
 		return false;
-	if (get_user(insn, (u32 __user *)regs->epc))
+	if (get_user(insn, (u16 __user *)regs->epc))
 		return false;
 
 	/* ESP32-S31 PIE and HWLoop are only implemented on hart 1.
@@ -233,6 +233,13 @@ asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *re
 		local_irq_enable();
 
 		handled = riscv_v_first_use_handler(regs);
+		/* Enable an unused task before treating an OFF HWLoop trap as
+		 * an unsupported hart0 instruction. HWLoop works on hart0.
+		 * A genuine unsupported PIE retries once, then follows the
+		 * existing CPU1 migration path.
+		 */
+		if (!handled)
+			handled = esp32s31_ext_first_use(regs);
 
 		if (!handled && esp32s31_hart0_pie_insn(regs)) {
 			cpumask_t pie_cpus;

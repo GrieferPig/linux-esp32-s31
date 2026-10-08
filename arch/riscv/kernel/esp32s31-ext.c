@@ -12,11 +12,80 @@
 #include <linux/sched.h>
 #include <linux/sched/cputime.h>
 #include <linux/string.h>
+#include <linux/percpu.h>
+#include <linux/cpu.h>
+#include <linux/uaccess.h>
+#include <asm/ptrace.h>
+#include <asm/timex.h>
 
 #include <asm/esp32s31_ext.h>
 #include <asm/page.h>
 #include <asm/processor.h>
 #include <asm/sbi.h>
+
+/* Runtime controls permit same-image A/B without changing Linux scheduling. */
+static bool s31_ext_lazy_user = true;
+module_param_named(lazy_user, s31_ext_lazy_user, bool, 0600);
+MODULE_PARM_DESC(lazy_user, "Enable user HWLoop/PIE only after its first instruction");
+static bool s31_ext_diagnostics;
+module_param_named(diagnostics, s31_ext_diagnostics, bool, 0600);
+struct s31_ext_counts {
+	u32 suspend, restore, first_use, skipped;
+	u32 bt_syscall_suspend, bt_syscall_restore;
+	u64 bt_syscall_suspend_ticks, bt_syscall_restore_ticks;
+	u64 timer_pair_ticks;
+};
+static DEFINE_PER_CPU(struct s31_ext_counts, s31_ext_counts);
+#define S31_EXT_COUNT(member) do { \
+	if (READ_ONCE(s31_ext_diagnostics)) \
+		this_cpu_inc(s31_ext_counts.member); \
+} while (0)
+
+/* Trap entry and final user return run with local interrupts disabled.
+ * Freeze diagnostics before reading totals: RV32 u64 reads are not atomic.
+ * TIME ticks use the DT timebase (320 MHz), rather than CPU sample counts.
+ */
+static bool s31_ext_time_bt_syscall(struct pt_regs *regs)
+{
+	return READ_ONCE(s31_ext_diagnostics) &&
+	       regs->cause == EXC_SYSCALL &&
+	       !strncmp(current->comm, "s31-btstack", 11);
+}
+
+static int s31_ext_stats_get(char *buf, const struct kernel_param *kp)
+{
+	struct s31_ext_counts total = {};
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct s31_ext_counts *p = per_cpu_ptr(&s31_ext_counts, cpu);
+
+#define S31_EXT_SUM(member) total.member += READ_ONCE(p->member)
+		S31_EXT_SUM(suspend);
+		S31_EXT_SUM(restore);
+		S31_EXT_SUM(first_use);
+		S31_EXT_SUM(skipped);
+		S31_EXT_SUM(bt_syscall_suspend);
+		S31_EXT_SUM(bt_syscall_restore);
+		S31_EXT_SUM(bt_syscall_suspend_ticks);
+		S31_EXT_SUM(bt_syscall_restore_ticks);
+		S31_EXT_SUM(timer_pair_ticks);
+#undef S31_EXT_SUM
+	}
+	return scnprintf(buf, PAGE_SIZE,
+		"suspend=%u restore=%u first_use=%u skipped=%u "
+		"bt_syscall_suspend=%u bt_syscall_restore=%u "
+		"bt_syscall_suspend_ticks=%llu bt_syscall_restore_ticks=%llu "
+		"timer_pair_ticks=%llu\n",
+		total.suspend, total.restore, total.first_use, total.skipped,
+		total.bt_syscall_suspend, total.bt_syscall_restore,
+		total.bt_syscall_suspend_ticks, total.bt_syscall_restore_ticks,
+		total.timer_pair_ticks);
+}
+static const struct kernel_param_ops s31_ext_stats_ops = {
+	.get = s31_ext_stats_get,
+};
+module_param_cb(stats, &s31_ext_stats_ops, NULL, 0400);
 
 #define S31_SBI_EXT_COPROC	0x09000002
 #define S31_SBI_COPROC_SWITCH	0
@@ -120,6 +189,24 @@ static void s31_ext_check(struct sbiret ret)
 		  ret.error);
 }
 
+/* Firmware starts PIE enabled, including on non-retentive warmboot.
+ * Discard that firmware-owned state once per CPU bring-up/resume. Keep the
+ * suspended task's saved context untouched so user state can be restored.
+ */
+static DEFINE_PER_CPU_SHARED_ALIGNED(struct esp32s31_ext_state, s31_ext_boot_state);
+
+void esp32s31_ext_cpu_init(void)
+{
+	unsigned long flags;
+	struct sbiret ret;
+
+	local_irq_save(flags);
+	ret = sbi_ecall(S31_SBI_EXT_COPROC, S31_SBI_COPROC_SUSPEND,
+			__pa(this_cpu_ptr(&s31_ext_boot_state)), 0, 0, 0, 0, 0);
+	s31_ext_check(ret);
+	local_irq_restore(flags);
+}
+
 static void esp32s31_ext_suspend_hw(struct task_struct *task, bool deactivate)
 {
 	struct sbiret ret;
@@ -128,9 +215,14 @@ static void esp32s31_ext_suspend_hw(struct task_struct *task, bool deactivate)
 	if (!task->thread.esp32s31_ext_active)
 		return;
 
+	S31_EXT_COUNT(suspend);
 	ret = sbi_ecall(S31_SBI_EXT_COPROC, S31_SBI_COPROC_SUSPEND,
 			s31_ext_pa(task), 0, 0, 0, 0, 0);
 	s31_ext_check(ret);
+	/* Preserve dirty state when switching the runtime control to lazy. */
+	if (!ret.error && ((task->thread.esp32s31_ext.hwloop_state & 3) == 3 ||
+			  (task->thread.esp32s31_ext.pie_state & 3) == 3))
+		task->thread.esp32s31_ext_used = true;
 	if (deactivate)
 		task->thread.esp32s31_ext_active = false;
 }
@@ -139,6 +231,7 @@ static void esp32s31_ext_restore_hw(struct task_struct *task)
 {
 	struct sbiret ret;
 
+	S31_EXT_COUNT(restore);
 	ret = sbi_ecall(S31_SBI_EXT_COPROC, S31_SBI_COPROC_RESTORE,
 			s31_ext_pa(task), 0, 0, 0, 0, 0);
 	s31_ext_check(ret);
@@ -201,18 +294,70 @@ void esp32s31_ext_reset(struct task_struct *task)
 	memset(&task->thread.esp32s31_ext, 0,
 	       sizeof(task->thread.esp32s31_ext));
 	task->thread.esp32s31_ext_active = false;
+	task->thread.esp32s31_ext_used = false;
 }
 
 void esp32s31_ext_enter_kernel(struct pt_regs *regs)
 {
-	(void)regs;
+	bool measure;
+	u64 start;
+
+	if (!current->thread.esp32s31_ext_active)
+		return;
+	measure = s31_ext_time_bt_syscall(regs);
+	start = measure ? get_cycles64() : 0;
 	esp32s31_ext_suspend_hw(current, true);
+	if (measure) {
+		struct s31_ext_counts *p = this_cpu_ptr(&s31_ext_counts);
+		u64 end = get_cycles64();
+		u64 calibration_start = get_cycles64();
+		u64 calibration_end = get_cycles64();
+
+		p->bt_syscall_suspend++;
+		p->bt_syscall_suspend_ticks += end - start;
+		p->timer_pair_ticks += calibration_end - calibration_start;
+	}
+}
+
+bool esp32s31_ext_first_use(struct pt_regs *regs)
+{
+	u16 insn;
+
+	if (!READ_ONCE(s31_ext_lazy_user) || !user_mode(regs) ||
+	    current->thread.esp32s31_ext_used)
+		return false;
+	/* Instructions may start on a two-byte boundary after RVC. */
+	if (get_user(insn, (u16 __user *)regs->epc))
+		return false;
+	/* Match the vendor families in the existing hart0 migration check.
+	 * Retry once without advancing PC; ordinary SIGILL is unchanged.
+	 */
+	if ((insn & 0x7fU) != 0x2bU && (insn & 0x1bU) != 0x1bU)
+		return false;
+	current->thread.esp32s31_ext_used = true;
+	S31_EXT_COUNT(first_use);
+	return true;
 }
 
 void esp32s31_ext_exit_user(struct pt_regs *regs)
 {
-	(void)regs;
+	bool measure;
+	u64 start;
+
+	if (READ_ONCE(s31_ext_lazy_user) && !current->thread.esp32s31_ext_used) {
+		S31_EXT_COUNT(skipped);
+		return;
+	}
+	measure = s31_ext_time_bt_syscall(regs);
+	start = measure ? get_cycles64() : 0;
 	esp32s31_ext_restore(current);
+	if (measure) {
+		struct s31_ext_counts *p = this_cpu_ptr(&s31_ext_counts);
+		u64 end = get_cycles64();
+
+		p->bt_syscall_restore++;
+		p->bt_syscall_restore_ticks += end - start;
+	}
 }
 
 void esp32s31_ext_kernel_begin(void)

@@ -37,6 +37,7 @@
 #include <asm/smp.h>
 #include <uapi/asm/hwcap.h>
 #include <asm/vector.h>
+#include <asm/esp32s31_ext.h>
 
 #include "head.h"
 
@@ -53,6 +54,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	store_cpu_topology(curr_cpuid);
 	numa_store_cpu_info(curr_cpuid);
 	numa_add_cpu(curr_cpuid);
+	esp32s31_ext_cpu_init();
 
 	/* This covers non-smp usecase mandated by "nosmp" option */
 	if (max_cpus == 0)
@@ -233,6 +235,7 @@ asmlinkage __visible void smp_callin(void)
 	riscv_ipi_enable();
 
 	numa_add_cpu(curr_cpuid);
+	esp32s31_ext_cpu_init();
 
 	pr_debug("CPU%u: Booted secondary hartid %lu\n", curr_cpuid,
 		cpuid_to_hartid_map(curr_cpuid));

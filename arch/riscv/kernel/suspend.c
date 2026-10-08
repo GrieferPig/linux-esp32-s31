@@ -17,6 +17,7 @@
 #include <asm/pgtable.h>
 #include <asm/sbi.h>
 #include <asm/suspend.h>
+#include <asm/esp32s31_ext.h>
 
 void suspend_save_csrs(struct suspend_context *context)
 {
@@ -137,6 +138,7 @@ int cpu_suspend(unsigned long arg,
 
 	/* Restore additional CSRs */
 	suspend_restore_csrs(&context);
+	esp32s31_ext_cpu_init();
 
 	return rc;
 }

@@ -28,19 +28,23 @@ struct esp32s31_ext_state {
 } __aligned(16);
 
 #ifdef CONFIG_ESP32S31_COPROC_CONTEXT
+void esp32s31_ext_cpu_init(void);
 void esp32s31_ext_switch(struct task_struct *prev, struct task_struct *next);
 void esp32s31_ext_enter_kernel(struct pt_regs *regs);
 void esp32s31_ext_exit_user(struct pt_regs *regs);
+bool esp32s31_ext_first_use(struct pt_regs *regs);
 void esp32s31_ext_save(struct task_struct *task);
 void esp32s31_ext_restore(struct task_struct *task);
 void esp32s31_ext_reset(struct task_struct *task);
 void esp32s31_ext_kernel_begin(void);
 void esp32s31_ext_kernel_end(void);
 #else
+static inline void esp32s31_ext_cpu_init(void) { }
 static inline void esp32s31_ext_switch(struct task_struct *prev,
 				       struct task_struct *next) { }
 static inline void esp32s31_ext_enter_kernel(struct pt_regs *regs) { }
 static inline void esp32s31_ext_exit_user(struct pt_regs *regs) { }
+static inline bool esp32s31_ext_first_use(struct pt_regs *regs) { return false; }
 static inline void esp32s31_ext_save(struct task_struct *task) { }
 static inline void esp32s31_ext_restore(struct task_struct *task) { }
 static inline void esp32s31_ext_reset(struct task_struct *task) { }
