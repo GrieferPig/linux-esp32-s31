@@ -179,7 +179,8 @@ struct s31_sm {
 	bool tx_ba_requested, tx_ba_operational, tx_native_peer, tx_ba_flushing;
 	u32 tx_ampdu_submitted;
 	u8 channel;
-	struct ieee80211_channel channels[11];
+	/* 2.4 GHz channels 1 to 13; the radio firmware sets a 1-13 country. */
+	struct ieee80211_channel channels[13];
 	struct ieee80211_rate rates[12];
 	struct ieee80211_supported_band band;
 	struct ieee80211_sband_iftype_data iftype;
@@ -929,7 +930,7 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
 		   length >= sizeof(struct s31_softmac_rx_header) + 24 &&
 		   length <= sizeof(struct s31_softmac_rx_header) + S31_SOFTMAC_FRAME_MAX &&
 		   meta.encoding <= 2 && meta.rate_index < (meta.encoding == 1 ? 8 : meta.encoding == 2 ? 10 : ARRAY_SIZE(sm->rates)) &&
-		   channel >= 1 && channel <= 11) {
+		   channel >= 1 && channel <= ARRAY_SIZE(sm->channels)) {
 		u8 rate = meta.rate_index;
 		u8 encoding = meta.encoding, phy_flags = meta.flags;
 
