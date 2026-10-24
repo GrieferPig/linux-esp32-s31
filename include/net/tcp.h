@@ -657,10 +657,13 @@ static inline u32 tcp_cookie_time(void)
 /* Convert one nsec 64bit timestamp to ts (ms or usec resolution) */
 static inline u64 tcp_ns_to_ts(bool usec_ts, u64 val)
 {
+	/* Keep the divisor constant at do_div even in size-optimized RV32
+	 * builds where div_u64_rem may be emitted out of line. */
 	if (usec_ts)
-		return div_u64(val, NSEC_PER_USEC);
-
-	return div_u64(val, NSEC_PER_MSEC);
+		do_div(val, NSEC_PER_USEC);
+	else
+		do_div(val, NSEC_PER_MSEC);
+	return val;
 }
 
 u32 __cookie_v4_init_sequence(const struct iphdr *iph, const struct tcphdr *th,
@@ -906,12 +909,18 @@ static inline u64 tcp_clock_ns(void)
 
 static inline u64 tcp_clock_us(void)
 {
-	return div_u64(tcp_clock_ns(), NSEC_PER_USEC);
+	u64 stamp = tcp_clock_ns();
+
+	do_div(stamp, NSEC_PER_USEC);
+	return stamp;
 }
 
 static inline u64 tcp_clock_ms(void)
 {
-	return div_u64(tcp_clock_ns(), NSEC_PER_MSEC);
+	u64 stamp = tcp_clock_ns();
+
+	do_div(stamp, NSEC_PER_MSEC);
+	return stamp;
 }
 
 /* TCP Timestamp included in TS option (RFC 1323) can either use ms
@@ -926,7 +935,10 @@ static inline u32 tcp_clock_ts(bool usec_ts)
 
 static inline u32 tcp_time_stamp_ms(const struct tcp_sock *tp)
 {
-	return div_u64(tp->tcp_mstamp, USEC_PER_MSEC);
+	u64 stamp = tp->tcp_mstamp;
+
+	do_div(stamp, USEC_PER_MSEC);
+	return stamp;
 }
 
 static inline u32 tcp_time_stamp_ts(const struct tcp_sock *tp)
@@ -946,16 +958,23 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
 /* provide the departure time in us unit */
 static inline u64 tcp_skb_timestamp_us(const struct sk_buff *skb)
 {
-	return div_u64(skb->skb_mstamp_ns, NSEC_PER_USEC);
+	u64 stamp = skb->skb_mstamp_ns;
+
+	do_div(stamp, NSEC_PER_USEC);
+	return stamp;
 }
 
 /* Provide skb TSval in usec or ms unit */
 static inline u32 tcp_skb_timestamp_ts(bool usec_ts, const struct sk_buff *skb)
 {
+	u64 stamp;
+
 	if (usec_ts)
 		return tcp_skb_timestamp_us(skb);
 
-	return div_u64(skb->skb_mstamp_ns, NSEC_PER_MSEC);
+	stamp = skb->skb_mstamp_ns;
+	do_div(stamp, NSEC_PER_MSEC);
+	return stamp;
 }
 
 static inline u32 tcp_tw_tsval(const struct tcp_timewait_sock *tcptw)

@@ -974,7 +974,6 @@ static void ieee80211_verify_alignment(struct ieee80211_rx_data *rx)
 #endif
 }
 
-
 /* rx handlers */
 
 static int ieee80211_is_unicast_robust_mgmt_frame(struct sk_buff *skb)
@@ -987,7 +986,6 @@ static int ieee80211_is_unicast_robust_mgmt_frame(struct sk_buff *skb)
 	return ieee80211_is_robust_mgmt_frame(skb);
 }
 
-
 static int ieee80211_is_multicast_robust_mgmt_frame(struct sk_buff *skb)
 {
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
@@ -997,7 +995,6 @@ static int ieee80211_is_multicast_robust_mgmt_frame(struct sk_buff *skb)
 
 	return ieee80211_is_robust_mgmt_frame(skb);
 }
-
 
 /* Get the BIP key index from MMIE; return -1 if this is not a BIP frame */
 static int ieee80211_get_mmie_keyidx(struct sk_buff *skb)
@@ -1541,7 +1538,6 @@ ieee80211_rx_h_check(struct ieee80211_rx_data *rx)
 
 	return RX_CONTINUE;
 }
-
 
 static ieee80211_rx_result debug_noinline
 ieee80211_rx_h_check_more_data(struct ieee80211_rx_data *rx)
@@ -2665,8 +2661,10 @@ static void ieee80211_deliver_skb_to_local_stack(struct sk_buff *skb,
 		/* deliver to local stack */
 		if (rx->list)
 			list_add_tail(&skb->list, rx->list);
-		else
+		else {
+
 			netif_receive_skb(skb);
+		}
 	}
 }
 
@@ -4741,7 +4739,19 @@ void ieee80211_check_fast_rx_iface(struct ieee80211_sub_if_data *sdata)
 	__ieee80211_check_fast_rx_iface(sdata);
 }
 
-static void ieee80211_rx_8023(struct ieee80211_rx_data *rx,
+/* The S31 kernel is otherwise size-optimized to fit its XIP slot. These
+ * two packet-delivery bodies are in the measured CPU1 receive path and
+ * already execute from PSRAM. Optimize their integer processing for speed
+ * without expanding every cold mac80211/management path. This is the
+ * platform default, not a runtime execution mode or an admission bypass.
+ */
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_CC_IS_GCC)
+#define S31_RX_PACKET_OPT __attribute__((optimize("O2")))
+#else
+#define S31_RX_PACKET_OPT
+#endif
+
+static void S31_RX_PACKET_OPT ieee80211_rx_8023(struct ieee80211_rx_data *rx,
 			      struct ieee80211_fast_rx *fast_rx,
 			      int orig_len)
 {
@@ -4845,13 +4855,13 @@ static void ieee80211_rx_8023(struct ieee80211_rx_data *rx,
 	ieee80211_deliver_skb_to_local_stack(skb, rx);
 }
 
-static bool ieee80211_invoke_fast_rx(struct ieee80211_rx_data *rx,
+static bool S31_RX_PACKET_OPT ieee80211_invoke_fast_rx(struct ieee80211_rx_data *rx,
 				     struct ieee80211_fast_rx *fast_rx)
 {
 	struct sk_buff *skb = rx->skb;
 	struct ieee80211_hdr *hdr = (void *)skb->data;
 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
-	static ieee80211_rx_result res;
+	ieee80211_rx_result res;
 	int orig_len = skb->len;
 	int hdrlen = ieee80211_hdrlen(hdr->frame_control);
 	int snap_offs = hdrlen;
@@ -4865,22 +4875,9 @@ static bool ieee80211_invoke_fast_rx(struct ieee80211_rx_data *rx,
 	} addrs __aligned(2);
 	struct ieee80211_sta_rx_stats *stats;
 
-	/* for parallel-rx, we need to have DUP_VALIDATED, otherwise we write
-	 * to a common data structure; drivers can implement that per queue
-	 * but we don't have that information in mac80211
-	 */
-	if (!(status->flag & RX_FLAG_DUP_VALIDATED))
-		return false;
-
-#define FAST_RX_CRYPT_FLAGS	(RX_FLAG_PN_VALIDATED | RX_FLAG_DECRYPTED)
-
-	/* If using encryption, we also need to have:
-	 *  - PN_VALIDATED: similar, but the implementation is tricky
-	 *  - DECRYPTED: necessary for PN_VALIDATED
-	 */
-	if (fast_rx->key &&
-	    (status->flag & FAST_RX_CRYPT_FLAGS) != FAST_RX_CRYPT_FLAGS)
-		return false;
+	/* Callers establish duplicate/crypto status before entering this body.
+	 * The ordinary caller checks it before this function's large prologue;
+	 * S31's post-decrypt caller has just committed PN and set those flags. */
 
 	if (unlikely(!ieee80211_is_data_present(hdr->frame_control)))
 		return false;
@@ -5019,8 +5016,18 @@ static bool ieee80211_prepare_and_rx_handle(struct ieee80211_rx_data *rx,
 		struct ieee80211_fast_rx *fast_rx;
 
 		fast_rx = rcu_dereference(rx->sta->fast_rx);
-		if (fast_rx && ieee80211_invoke_fast_rx(rx, fast_rx))
-			return true;
+		if (fast_rx) {
+			u32 flags = IEEE80211_SKB_RXCB(skb)->flag;
+			u32 crypt = RX_FLAG_PN_VALIDATED | RX_FLAG_DECRYPTED;
+
+			/* S31 validates duplicate/PN state later in the normal RX
+			 * handlers. Avoid saving/restoring twelve registers merely
+			 * to reject that known-ineligible first fast-RX attempt. */
+			if ((flags & RX_FLAG_DUP_VALIDATED) &&
+			    (!fast_rx->key || (flags & crypt) == crypt) &&
+			    ieee80211_invoke_fast_rx(rx, fast_rx))
+				return true;
+		}
 	}
 
 	if (!ieee80211_accept_frame(rx))
@@ -5356,6 +5363,7 @@ static void __ieee80211_rx_handle_packet(struct ieee80211_hw *hw,
 void ieee80211_rx_list(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 		       struct sk_buff *skb, struct list_head *list)
 {
+
 	struct ieee80211_local *local = hw_to_local(hw);
 	struct ieee80211_rate *rate = NULL;
 	struct ieee80211_supported_band *sband;
@@ -5493,9 +5501,9 @@ EXPORT_SYMBOL(ieee80211_rx_list);
 void ieee80211_rx_napi(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 		       struct sk_buff *skb, struct napi_struct *napi)
 {
+
 	struct sk_buff *tmp;
 	LIST_HEAD(list);
-
 
 	/*
 	 * key references and virtual interfaces are protected using RCU
@@ -5507,7 +5515,9 @@ void ieee80211_rx_napi(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
 	rcu_read_unlock();
 
 	if (!napi) {
-		netif_receive_skb_list(&list);
+		{
+		  netif_receive_skb_list(&list);
+		}
 		return;
 	}
 

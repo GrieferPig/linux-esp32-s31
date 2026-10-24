@@ -59,7 +59,8 @@ void tcp_mstamp_refresh(struct tcp_sock *tp)
 	u64 val = tcp_clock_ns();
 
 	tp->tcp_clock_cache = val;
-	tp->tcp_mstamp = div_u64(val, NSEC_PER_USEC);
+	do_div(val, NSEC_PER_USEC);
+	tp->tcp_mstamp = val;
 }
 
 static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
@@ -1204,7 +1205,6 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
 	return size;
 }
 
-
 /* TCP SMALL QUEUES (TSQ)
  *
  * TSQ goal is to keep small amount of skbs per tcp flow in tx queues (qdisc+dev)
@@ -1227,6 +1227,7 @@ static DEFINE_PER_CPU(struct tsq_work, tsq_work);
 
 static void tcp_tsq_write(struct sock *sk)
 {
+
 	if ((1 << sk->sk_state) &
 	    (TCPF_ESTABLISHED | TCPF_FIN_WAIT1 | TCPF_CLOSING |
 	     TCPF_CLOSE_WAIT  | TCPF_LAST_ACK)) {
@@ -1245,7 +1246,10 @@ static void tcp_tsq_write(struct sock *sk)
 
 static void tcp_tsq_handler(struct sock *sk)
 {
+	{
+
 	bh_lock_sock(sk);
+	}
 	if (!sock_owned_by_user(sk))
 		tcp_tsq_write(sk);
 	else if (!test_and_set_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags))
@@ -1260,6 +1264,7 @@ static void tcp_tsq_handler(struct sock *sk)
  */
 static void tcp_tsq_workfn(struct work_struct *work)
 {
+
 	struct tsq_work *tsq = container_of(work, struct tsq_work, work);
 	LIST_HEAD(list);
 	unsigned long flags;
@@ -1447,6 +1452,7 @@ INDIRECT_CALLABLE_DECLARE(void tcp_v4_send_check(struct sock *sk, struct sk_buff
 static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			      int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
 {
+
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	struct inet_sock *inet;
 	struct tcp_sock *tp;
@@ -1625,9 +1631,12 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 	tcp_add_tx_delay(skb, tp);
 
+	{
+
 	err = INDIRECT_CALL_INET(icsk->icsk_af_ops->queue_xmit,
 				 inet6_csk_xmit, ip_queue_xmit,
 				 sk, skb, &inet->cork.fl);
+	}
 
 	if (unlikely(err > 0)) {
 		tcp_enter_cwr(sk);
@@ -2265,7 +2274,6 @@ static int tcp_init_tso_segs(struct sk_buff *skb, unsigned int mss_now)
 	return tso_segs;
 }
 
-
 /* Return true if the Nagle test allows this packet to be
  * sent now.
  */
@@ -2841,7 +2849,6 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
-
 	/* There are multiple conditions worthy of tracking in a
 	 * chronograph, so that the highest priority enum takes
 	 * precedence over the other conditions (see tcp_chrono_start).
@@ -2901,6 +2908,7 @@ static void tcp_grow_skb(struct sock *sk, struct sk_buff *skb, int amount)
 static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			   int push_one, gfp_t gfp)
 {
+
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
 	unsigned int tso_segs, sent_pkts;
