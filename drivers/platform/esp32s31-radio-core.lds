@@ -7,6 +7,7 @@ SECTIONS
 	 * translation unit. */
 	/* Fault recovery metadata must survive the composite garbage collection. */
 	__ex_table : { KEEP(*(__ex_table)) }
+	__bug_table : { KEEP(*(__bug_table)) }
 	__param : { KEEP(*(__param)) }
 	.modinfo : { KEEP(*(.modinfo)) }
 	.init.text : { KEEP(*(.init.text)) KEEP(*(.init.text.*)) }

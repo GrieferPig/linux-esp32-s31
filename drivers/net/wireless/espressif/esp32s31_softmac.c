@@ -24,7 +24,6 @@ static_assert(S31_SOFTMAC_PENDING &&
 
 /* The bounded source lease retains fragments until CPU0 copies directly
  * into the final vendor allocation. No intermediate linearization. */
-static const bool sm_tx_sg = true;
 
 /* Publish only bounded metadata/source leases from atomic context.
  * CPU0 reserves/fills/submits under its persistent radio owner. */
@@ -1641,11 +1640,6 @@ static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_
 	}
 	if (sm->running && !sm->tx_ba_flushing && skb_queue_len(&sm->tx) < SM_TX_QUEUED) {
 		__skb_queue_tail(&sm->tx, skb);
-		if (sm_tx_sg && (skb_shinfo(skb)->nr_frags ||
-		    (skb_shinfo(skb)->frag_list &&
-		     skb_shinfo(skb_shinfo(skb)->frag_list)->nr_frags)))
-
-
 		sm->tx_outstanding++;
 
 		if (sm_tx_pending_limit && !sm->tx_gate_stopped &&

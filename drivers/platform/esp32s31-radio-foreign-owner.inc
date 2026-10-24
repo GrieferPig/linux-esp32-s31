@@ -96,8 +96,6 @@ static int s31_foreign_owner_prepare_impl(void)
 
  /* This registry contains only the private Linux control executor. */
  if (s31_linux_current_task() || s31_current_service()) return 0;
- if ((current == s31_service_context.thread))
-
  if (!(current->flags & PF_KTHREAD) || in_interrupt() || in_atomic() || irqs_disabled())
   return -EWOULDBLOCK;
  /* Native exit callbacks run on this same owner after the window ends.
