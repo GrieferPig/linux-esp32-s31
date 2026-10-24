@@ -1871,7 +1871,9 @@ unsigned long s31_linux_sync_owner(void *opaque, u32 op)
         s31_radio_tx_credit_return(S31_TX_CREDIT_FLIGHT);
         return 1;
     }
-
+    /* SoftMAC startup requires the payload's PP repair notification contract. */
+    if (op == S31_SYNC_TX_REPAIR_CAP)
+        return IS_ENABLED(CONFIG_ESP32S31_WIFI_SOFTMAC);
     if (op == S31_SYNC_SOFTMAC_TX_COPY)
         return s31_radio_softmac_tx_copy(opaque);
     if (op == S31_SYNC_TIMER_CHANGED) {
