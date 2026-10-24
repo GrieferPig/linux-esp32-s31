@@ -17,6 +17,7 @@
 #include <asm/pgtable.h>
 #include <asm/sbi.h>
 #include <asm/suspend.h>
+#include <asm/esp32s31_ext.h>
 
 void suspend_save_csrs(struct suspend_context *context)
 {
@@ -66,7 +67,11 @@ static unsigned long esp32s31_suspend_satp(void)
 
 void suspend_restore_csrs(struct suspend_context *context)
 {
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	csr_write(CSR_SCRATCH, (unsigned long)current);
+#else
 	csr_write(CSR_SCRATCH, 0);
+#endif
 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_XLINUXENVCFG))
 		csr_write(CSR_ENVCFG, context->envcfg);
 	csr_write(CSR_TVEC, context->tvec);
@@ -137,6 +142,7 @@ int cpu_suspend(unsigned long arg,
 
 	/* Restore additional CSRs */
 	suspend_restore_csrs(&context);
+	esp32s31_ext_cpu_init();
 
 	return rc;
 }

@@ -2105,6 +2105,9 @@ void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
  */
 inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
+#ifdef CONFIG_ESP32S31_RADIO_PLACEMENT
+	bool dequeued;
+#endif
 	if (sched_core_enabled(rq))
 		sched_core_dequeue(rq, p, flags);
 
@@ -2121,7 +2124,13 @@ inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * and mark the task ->sched_delayed.
 	 */
 	uclamp_rq_dec(rq, p);
+#ifdef CONFIG_ESP32S31_RADIO_PLACEMENT
+	dequeued = p->sched_class->dequeue_task(rq, p, flags);
+
+	return dequeued;
+#else
 	return p->sched_class->dequeue_task(rq, p, flags);
+#endif
 }
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
@@ -4732,7 +4741,6 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 
 	init_entity_runnable_average(&p->se);
 
-
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))
 		memset(&p->sched_info, 0, sizeof(p->sched_info));
@@ -5070,6 +5078,7 @@ static inline void finish_lock_switch(struct rq *rq)
 	 */
 	spin_acquire(&__rq_lockp(rq)->dep_map, 0, 0, _THIS_IP_);
 	__balance_callbacks(rq);
+
 	raw_spin_rq_unlock_irq(rq);
 }
 
@@ -5322,6 +5331,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	prepare_lock_switch(rq, next, rf);
 
 	/* Here we just switch the register state and the stack. */
+
 	switch_to(prev, next, prev);
 	barrier();
 
@@ -5572,6 +5582,7 @@ __setup("resched_latency_warn_ms=", setup_resched_latency_warn_ms);
  */
 void sched_tick(void)
 {
+
 	int cpu = smp_processor_id();
 	struct rq *rq = cpu_rq(cpu);
 	/* accounting goes to the donor task */
@@ -5598,6 +5609,9 @@ void sched_tick(void)
 		resched_curr(rq);
 
 	donor->sched_class->task_tick(rq, donor, 0);
+#ifdef CONFIG_ESP32S31_RADIO_PLACEMENT
+
+#endif
 	if (sched_feat(LATENCY_WARN))
 		resched_latency = cpu_resched_latency(rq);
 	calc_global_load_tick(rq);
@@ -6811,6 +6825,7 @@ static void __sched notrace __schedule(int sched_mode)
 	klp_sched_try_switch(prev);
 
 	local_irq_disable();
+
 	rcu_note_context_switch(preempt);
 
 	/*
@@ -6831,6 +6846,7 @@ static void __sched notrace __schedule(int sched_mode)
 	 * system call exit.
 	 */
 	rq_lock(rq, &rf);
+
 	smp_mb__after_spinlock();
 
 	/* Promote REQ to ACT */
@@ -6877,6 +6893,7 @@ pick_again:
 			goto keep_resched;
 	}
 picked:
+
 	clear_tsk_need_resched(prev);
 	clear_preempt_need_resched();
 keep_resched:
@@ -6934,6 +6951,7 @@ keep_resched:
 
 		rq_unpin_lock(rq, &rf);
 		__balance_callbacks(rq);
+
 		raw_spin_rq_unlock_irq(rq);
 	}
 	trace_sched_exit_tp(is_switch);
@@ -7321,8 +7339,8 @@ void rt_mutex_post_schedule(void)
  * This function changes the 'effective' priority of a task. It does
  * not touch ->normal_prio like __setscheduler().
  *
- * Used by the rt_mutex code to implement priority inheritance
- * logic. Call site only calls if the priority of the task changed.
+ * Used by rt_mutex priority inheritance. Radio-role changes also propagate
+ * when the numerical effective priority stays the same.
  */
 void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 {
@@ -7338,7 +7356,8 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	/*
 	 * If nothing changed; bail early.
 	 */
-	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
+	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio) &&
+	    !s31_radio_sched_pi_changed(p, pi_task))
 		return;
 
 	rq = __task_rq_lock(p, &rf);
@@ -7354,6 +7373,11 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	 * points to a blocked task -- which guarantees the task is present.
 	 */
 	p->pi_top_task = pi_task;
+	/* A top donor can change its radio role without changing its priority.
+	 * Update before the equal-priority return and request a new class pick
+	 * on role loss too: an already queued fair server must regain service. */
+	if (p != rq->idle && s31_radio_sched_pi_update(p, pi_task))
+		resched_curr(rq);
 
 	/*
 	 * For FIFO/RR we only need to set prio, if that matches we're done.
@@ -7925,7 +7949,6 @@ state_filter_match(unsigned long state_filter, struct task_struct *p)
 
 	return true;
 }
-
 
 void show_state_filter(unsigned int state_filter)
 {

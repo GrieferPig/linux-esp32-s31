@@ -14,11 +14,13 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+#include <linux/ptrace.h>
 #include <linux/reset.h>
 #include <linux/serial_core.h>
 #include <linux/slab.h>
 #include <linux/tty_flip.h>
 #include <asm/serial.h>
+#include <asm/irq_regs.h>
 #include "../../dma/esp32s31-ahb-gdma.h"
 
 #define DRIVER_NAME	"esp32-uart"
@@ -63,6 +65,8 @@
 #define UART_RXFIFO_FULL_INT			BIT(0)
 #define UART_TXFIFO_EMPTY_INT			BIT(1)
 #define UART_BRK_DET_INT			BIT(7)
+#define UART_RXFIFO_OVF_INT		BIT(4)
+#define UART_RXFIFO_TOUT_INT		BIT(8)
 #define UART_CLKDIV_REG			0x14
 #define ESP32_UART_CLKDIV			GENMASK(19, 0)
 #define ESP32S3_UART_CLKDIV			GENMASK(11, 0)
@@ -113,6 +117,10 @@
 #define ESP32S31_UART_SW_RTS		BIT(21)
 #define ESP32S31_UART_TX_FLOW_EN		BIT(13)
 #define ESP32S31_UART_RX_FLOW_EN		BIT(8)
+#define ESP32S31_UART_HWFC_CONF_REG	0x2c
+#define ESP32S31_UART_TOUT_CONF_REG	0x64
+#define ESP32S31_UART_RX_TOUT_EN		BIT(0)
+#define ESP32S31_UART_RX_TOUT_THRHD	GENMASK(11, 2)
 #define ESP32S31_UART_RTS_INV		BIT(18)
 #define ESP32S31_UART_RS485_CONF_REG	0x4c
 #define ESP32S31_UART_RS485_EN		BIT(0)
@@ -191,6 +199,7 @@ struct esp32_uart_variant {
 	u32 txfifo_cnt_mask;
 	u32 txfifo_empty_thrhd_shift;
 	u32 rx_flow_en;
+	u32 rx_flow_reg;
 	const char *type;
 	bool has_clkconf;
 	bool needs_reg_update;
@@ -203,6 +212,7 @@ static const struct esp32_uart_variant esp32_variant = {
 	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
 	.rx_flow_en = ESP32_UART_RX_FLOW_EN,
+	.rx_flow_reg = UART_CONF1_REG,
 	.type = "ESP32 UART",
 };
 
@@ -212,6 +222,7 @@ static const struct esp32_uart_variant esp32s3_variant = {
 	.txfifo_cnt_mask = ESP32S3_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32S3_UART_TXFIFO_EMPTY_THRHD_SHIFT,
 	.rx_flow_en = ESP32S3_UART_RX_FLOW_EN,
+	.rx_flow_reg = UART_CONF1_REG,
 	.type = "ESP32S3 UART",
 	.has_clkconf = true,
 };
@@ -222,6 +233,7 @@ static const struct esp32_uart_variant esp32s31_variant = {
 	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
 	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
+	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
 	.type = "ESP32-S31 UART",
 	.needs_reg_update = true,
 };
@@ -233,6 +245,7 @@ static const struct esp32_uart_variant esp32s31_uhci_variant = {
 	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
 	.txfifo_empty_thrhd_shift = ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT,
 	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
+	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
 	.type = "ESP32-S31 UHCI UART",
 	.needs_reg_update = true,
 	.uhci_dma = true,
@@ -696,36 +709,65 @@ static void esp32_uart_stop_tx(struct uart_port *port)
 	esp32_uart_write(port, UART_INT_ENA_REG, int_ena);
 }
 
-static void esp32_uart_rxint(struct uart_port *port)
+static void esp32_uart_rxint(struct uart_port *port, u32 status, u32 irq_tick)
 {
 	struct tty_port *tty_port = &port->state->port;
 	u32 rx_fifo_cnt = esp32_uart_rx_fifo_cnt(port);
+	u32 initial_fifo_cnt = rx_fifo_cnt;
 	unsigned long flags;
 	u32 i;
 
-	if (!rx_fifo_cnt)
+	if (!rx_fifo_cnt && !(status & UART_RXFIFO_OVF_INT))
 		return;
 
 	spin_lock_irqsave(&port->lock, flags);
+	if (status & UART_RXFIFO_OVF_INT) {
+		u32 conf0 = esp32_uart_read(port, UART_CONF0_REG);
+
+		/* Overflow invalidates the FIFO state. Match the hardware reset
+		 * sequence before accepting another RX interrupt; do not drain
+		 * using the count sampled before the reset.
+		 */
+		esp32_uart_write(port, UART_CONF0_REG, conf0 | UART_RXFIFO_RST);
+		esp32_uart_sync_regs(port);
+		esp32_uart_write(port, UART_CONF0_REG, conf0 & ~UART_RXFIFO_RST);
+		esp32_uart_sync_regs(port);
+		rx_fifo_cnt = 0;
+		port->icount.overrun++;
+		tty_insert_flip_char(tty_port, 0, TTY_OVERRUN);
+	}
 
 	for (i = 0; i < rx_fifo_cnt; ++i) {
 		u32 rx = esp32_uart_read(port, UART_FIFO_REG);
 
-		if (!rx &&
-		    (esp32_uart_read(port, UART_INT_ST_REG) & UART_BRK_DET_INT)) {
-			esp32_uart_write(port, UART_INT_CLR_REG, UART_BRK_DET_INT);
+		if (!rx && (status & UART_BRK_DET_INT)) {
+			status &= ~UART_BRK_DET_INT;
 			++port->icount.brk;
 			uart_handle_break(port);
 		} else {
 			if (uart_handle_sysrq_char(port, (unsigned char)rx))
 				continue;
-			tty_insert_flip_char(tty_port, rx, TTY_NORMAL);
+			if (!tty_insert_flip_char(tty_port, rx, TTY_NORMAL))
+				port->icount.buf_overrun++;
 			++port->icount.rx;
 		}
 	}
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	tty_flip_buffer_push(tty_port);
+	if (status & UART_RXFIFO_OVF_INT) {
+		struct pt_regs *regs = get_irq_regs();
+
+		/* Report after dropping port->lock: this device may be the
+		 * console. Record the interrupted PC only on an actual overrun,
+		 * without a per-interrupt observer or logging from the FIFO loop.
+		 */
+
+		dev_warn_ratelimited(port->dev,
+			"RX FIFO overflow cpu=%u pc=%08lx pid=%d fifo=%u\n",
+			raw_smp_processor_id(), regs ? instruction_pointer(regs) : 0,
+			current->pid, initial_fifo_cnt);
+	}
 }
 
 static void esp32_uart_put_char(struct uart_port *port, u8 c)
@@ -783,16 +825,18 @@ static void esp32_uart_txint(struct uart_port *port)
 static irqreturn_t esp32_uart_int(int irq, void *dev_id)
 {
 	struct uart_port *port = dev_id;
-	u32 status;
+	u32 status, overflow_tick = 0;
 
 	status = esp32_uart_read(port, UART_INT_ST_REG);
 
-	if (status & (UART_RXFIFO_FULL_INT | UART_BRK_DET_INT))
-		esp32_uart_rxint(port);
+	/* A byte arriving after the RX count snapshot must retain its new
+	 * interrupt. Clearing after draining could erase that arrival's edge. */
+	esp32_uart_write(port, UART_INT_CLR_REG, status);
+	if (status & (UART_RXFIFO_FULL_INT | UART_RXFIFO_TOUT_INT |
+		      UART_BRK_DET_INT | UART_RXFIFO_OVF_INT))
+		esp32_uart_rxint(port, status, overflow_tick);
 	if (status & UART_TXFIFO_EMPTY_INT)
 		esp32_uart_txint(port);
-
-	esp32_uart_write(port, UART_INT_CLR_REG, status);
 
 	return IRQ_RETVAL(status);
 }
@@ -829,7 +873,8 @@ static void esp32_uart_stop_rx(struct uart_port *port)
 #endif
 
 	int_ena = esp32_uart_read(port, UART_INT_ENA_REG);
-	int_ena &= ~UART_RXFIFO_FULL_INT;
+	int_ena &= ~(UART_RXFIFO_FULL_INT | UART_RXFIFO_TOUT_INT |
+		     UART_RXFIFO_OVF_INT | UART_BRK_DET_INT);
 	esp32_uart_write(port, UART_INT_ENA_REG, int_ena);
 }
 
@@ -837,6 +882,9 @@ static int esp32_uart_startup(struct uart_port *port)
 {
 	int ret = 0;
 	unsigned long flags;
+	u32 rx_threshold = 1;
+	u32 rx_interrupts = UART_RXFIFO_FULL_INT | UART_BRK_DET_INT |
+			    UART_RXFIFO_OVF_INT;
 	struct esp32_port *sport = container_of(port, struct esp32_port, port);
 
 	ret = clk_prepare_enable(sport->clk);
@@ -877,12 +925,27 @@ static int esp32_uart_startup(struct uart_port *port)
 	if (port_variant(port)->has_clkconf)
 		esp32_uart_write(port, ESP32S3_UART_CLK_CONF_REG,
 				 ESP32S3_UART_CLK_CONF_DEFAULT);
+	if (port_variant(port)->needs_reg_update) {
+		u32 tout = esp32_uart_read(port, ESP32S31_UART_TOUT_CONF_REG);
+
+		/* Batch a continuous stream rather than interrupting per byte.
+		 * S31's timeout is in bit periods: two idle 8N1 characters flush
+		 * a short batch, including a single console keystroke. A 32-byte
+		 * threshold leaves 96 bytes of FIFO headroom for IRQ latency.
+		 */
+		rx_threshold = 32;
+		rx_interrupts |= UART_RXFIFO_TOUT_INT;
+		tout &= ~ESP32S31_UART_RX_TOUT_THRHD;
+		tout |= FIELD_PREP(ESP32S31_UART_RX_TOUT_THRHD, 20) |
+			ESP32S31_UART_RX_TOUT_EN;
+		esp32_uart_write(port, ESP32S31_UART_TOUT_CONF_REG, tout);
+	}
 	esp32_uart_write(port, UART_CONF1_REG,
-			 (1 << UART_RXFIFO_FULL_THRHD_SHIFT) |
+			 (rx_threshold << UART_RXFIFO_FULL_THRHD_SHIFT) |
 			 (1 << port_variant(port)->txfifo_empty_thrhd_shift));
 	esp32_uart_sync_regs(port);	/* latch the RX-FIFO-full threshold */
-	esp32_uart_write(port, UART_INT_CLR_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
-	esp32_uart_write(port, UART_INT_ENA_REG, UART_RXFIFO_FULL_INT | UART_BRK_DET_INT);
+	esp32_uart_write(port, UART_INT_CLR_REG, rx_interrupts);
+	esp32_uart_write(port, UART_INT_ENA_REG, rx_interrupts);
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	return ret;
@@ -953,9 +1016,10 @@ static void esp32_uart_set_termios(struct uart_port *port,
 				   const struct ktermios *old)
 {
 	unsigned long flags;
-	u32 conf0, conf1;
+	u32 conf0, flow_conf;
 	u32 baud;
 	const u32 rx_flow_en = port_variant(port)->rx_flow_en;
+	const u32 rx_flow_reg = port_variant(port)->rx_flow_reg;
 	u32 max_div = port_variant(port)->clkdiv_mask;
 
 	termios->c_cflag &= ~CMSPAR;
@@ -978,8 +1042,10 @@ static void esp32_uart_set_termios(struct uart_port *port,
 			conf0 |= ESP32S31_UART_IRDA_EN;
 	}
 
-	conf1 = esp32_uart_read(port, UART_CONF1_REG);
-	conf1 &= ~rx_flow_en;
+	/* S31 moved HW flow control out of CONF1. Its bit8 overlaps the TX
+	 * empty threshold in CONF1, so changing termios must not clear it. */
+	flow_conf = esp32_uart_read(port, rx_flow_reg);
+	flow_conf &= ~rx_flow_en;
 
 	if (termios->c_cflag & PARENB) {
 		conf0 |= UART_PARITY_EN;
@@ -1008,10 +1074,10 @@ static void esp32_uart_set_termios(struct uart_port *port,
 		conf0 |= FIELD_PREP(UART_STOP_BIT_NUM, UART_STOP_BIT_NUM_1);
 
 	if (termios->c_cflag & CRTSCTS)
-		conf1 |= rx_flow_en;
+		flow_conf |= rx_flow_en;
 
 	esp32_uart_write(port, UART_CONF0_REG, conf0);
-	esp32_uart_write(port, UART_CONF1_REG, conf1);
+	esp32_uart_write(port, rx_flow_reg, flow_conf);
 	esp32_uart_sync_regs(port);
 
 	if (baud) {
@@ -1471,7 +1537,6 @@ static void esp32_uart_remove(struct platform_device *pdev)
 	}
 #endif
 }
-
 
 static struct platform_driver esp32_uart_driver = {
 	.probe		= esp32_uart_probe,

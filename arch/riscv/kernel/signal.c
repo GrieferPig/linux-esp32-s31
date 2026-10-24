@@ -62,6 +62,15 @@ static long restore_esp32s31_ext_state(void __user *sc_ext)
 	if (unlikely(err))
 		return err;
 	current->thread.esp32s31_ext_active = false;
+	/* A handler may use extensions while the interrupted program does not.
+	 * Restore live/dirty user state, but leave an empty frame disabled.
+	 * Nonzero loop counts are honored even in a user-edited clean frame.
+	 */
+	current->thread.esp32s31_ext_used =
+		(current->thread.esp32s31_ext.hwloop_state & 3) == 3 ||
+		(current->thread.esp32s31_ext.pie_state & 3) == 3 ||
+		current->thread.esp32s31_ext.hwloop[2] ||
+		current->thread.esp32s31_ext.hwloop[5];
 	return 0;
 }
 #endif

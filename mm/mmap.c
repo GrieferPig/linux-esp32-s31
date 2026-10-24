@@ -53,6 +53,9 @@
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
 #include <asm/mmu_context.h>
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+#include <asm/esp32s31_radio_map.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmap.h>
@@ -663,11 +666,36 @@ static inline unsigned long stack_guard_placement(vm_flags_t vm_flags)
 unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info)
 {
 	unsigned long addr;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	struct vm_unmapped_area_info search = *info;
+	unsigned long low, high;
 
+	/* Search again beyond a platform hole, preserving the allocator's
+	 * alignment, guard gap and direction. No fake user VMA owns a leaf. */
+	for (;;) {
+		if (search.flags & VM_UNMAPPED_AREA_TOPDOWN)
+			addr = unmapped_area_topdown(&search);
+		else
+			addr = unmapped_area(&search);
+		if (IS_ERR_VALUE(addr) ||
+		    !s31_radio_reserved_range(addr, search.length, &low, &high))
+			break;
+		if (search.flags & VM_UNMAPPED_AREA_TOPDOWN)
+			search.high_limit = min(search.high_limit, low);
+		else
+			search.low_limit = max(search.low_limit, high);
+		if (search.high_limit <= search.low_limit ||
+		    search.length > search.high_limit - search.low_limit) {
+			addr = -ENOMEM;
+			break;
+		}
+	}
+#else
 	if (info->flags & VM_UNMAPPED_AREA_TOPDOWN)
 		addr = unmapped_area_topdown(info);
 	else
 		addr = unmapped_area(info);
+#endif
 
 	trace_vm_unmapped_area(addr, info);
 	return addr;
@@ -704,6 +732,9 @@ generic_get_unmapped_area(struct file *filp, unsigned long addr,
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma_prev(mm, addr, &prev);
 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+		    !s31_radio_reserved_range(addr, len, NULL, NULL) &&
+#endif
 		    (!vma || addr + len <= vm_start_gap(vma)) &&
 		    (!prev || addr >= vm_end_gap(prev)))
 			return addr;
@@ -755,6 +786,9 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma_prev(mm, addr, &prev);
 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+		    !s31_radio_reserved_range(addr, len, NULL, NULL) &&
+#endif
 				(!vma || addr + len <= vm_start_gap(vma)) &&
 				(!prev || addr >= vm_end_gap(prev)))
 			return addr;
@@ -858,6 +892,10 @@ __get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 		return -ENOMEM;
 	if (offset_in_page(addr))
 		return -EINVAL;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (s31_radio_reserved_range(addr, len, NULL, NULL))
+		return -EINVAL;
+#endif
 
 	error = security_mmap_addr(addr);
 	return error ? error : addr;

@@ -6,6 +6,14 @@
 #include <linux/sched.h>
 
 struct mm_struct;
+struct esp32s31_radio_stack;
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+__printf(4, 5)
+struct task_struct *kthread_create_on_s31_stack(int (*threadfn)(void *),
+		void *data, struct esp32s31_radio_stack *stack,
+		const char namefmt[], ...);
+#endif
 
 __printf(4, 5)
 struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),

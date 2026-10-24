@@ -9,6 +9,7 @@ lib-y			+= strlen.o
 lib-y			+= strncmp.o
 endif
 lib-y			+= csum.o
+lib-$(CONFIG_SOC_ESP32S31) += s31_csum_copy.o
 ifeq ($(CONFIG_MMU), y)
 lib-$(CONFIG_RISCV_ISA_V)	+= uaccess_vector.o
 endif
@@ -18,3 +19,9 @@ lib-$(CONFIG_RISCV_ISA_ZICBOZ)	+= clear_page.o
 obj-$(CONFIG_FUNCTION_ERROR_INJECTION) += error-inject.o
 lib-$(CONFIG_RISCV_ISA_V)	+= xor.o
 lib-$(CONFIG_RISCV_ISA_V)	+= riscv_v_helpers.o
+
+ifeq ($(CONFIG_SOC_ESP32S31)$(CONFIG_XIP_KERNEL),yy)
+lib-y += s31_memcpy_unaligned.o
+# A memcpy implementation must never synthesize a recursive memcpy call.
+CFLAGS_s31_memcpy_unaligned.o += -fno-tree-loop-distribute-patterns
+endif

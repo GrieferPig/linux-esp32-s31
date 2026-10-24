@@ -14,6 +14,20 @@
 
 #define INVALID_CONTEXT UINT_MAX
 
+#if defined(CONFIG_SOC_ESP32S31) && !defined(CONFIG_RISCV_M_MODE)
+void esp32s31_clic_irq_level_complete(void);
+static inline void arch_irq_exit_prepare(void)
+{
+	/* SIE does not lower CLIC SIL. Finish the outer hardware level before
+	 * generic IRQ exit enables interrupts for softirq processing. Nested
+	 * hardirq execution must retain its enclosing handler's protection.
+	 */
+	if (hardirq_count() == HARDIRQ_OFFSET)
+		esp32s31_clic_irq_level_complete();
+}
+#define arch_irq_exit_prepare arch_irq_exit_prepare
+#endif
+
 #ifdef CONFIG_SMP
 void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu);
 #define arch_trigger_cpumask_backtrace arch_trigger_cpumask_backtrace

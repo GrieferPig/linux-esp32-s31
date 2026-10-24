@@ -1707,6 +1707,21 @@ static struct task_struct *pick_task_rt(struct rq *rq)
 	return p;
 }
 
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+bool s31_radio_rt_candidate(struct rq *rq)
+{
+	struct task_struct *p;
+
+	lockdep_assert_rq_held(rq);
+	if (cpu_of(rq) != 0 || !sched_rt_runnable(rq))
+		return false;
+	p = _pick_next_task_rt(rq);
+	if (!p || p->sched_class != &rt_sched_class || task_is_blocked(p))
+		return false;
+	return s31_radio_sched_role(p);
+}
+#endif
+
 static void put_prev_task_rt(struct rq *rq, struct task_struct *p, struct task_struct *next)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -2522,7 +2537,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	if (--p->rt.time_slice)
 		return;
 
-	p->rt.time_slice = sched_rr_timeslice;
+	p->rt.time_slice = task_rr_timeslice(p, sched_rr_timeslice);
 
 	/*
 	 * Requeue to the end of queue if we (and all of our ancestors) are not
@@ -2543,7 +2558,7 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 	 * Time slice is 0 for SCHED_FIFO tasks
 	 */
 	if (task->policy == SCHED_RR)
-		return sched_rr_timeslice;
+		return task_rr_timeslice(task, sched_rr_timeslice);
 	else
 		return 0;
 }

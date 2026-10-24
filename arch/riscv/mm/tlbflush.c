@@ -6,6 +6,7 @@
 #include <linux/hugetlb.h>
 #include <linux/mmu_notifier.h>
 #include <asm/sbi.h>
+#include <asm/esp32s31_tlb_fence.h>
 #include <asm/mmu_context.h>
 #include <asm/cpufeature.h>
 
@@ -90,6 +91,8 @@ void flush_tlb_all(void)
 {
 	if (num_online_cpus() < 2)
 		local_flush_tlb_all();
+	else if (esp32s31_tlb_flush_remote(NULL))
+		return;
 	else if (riscv_use_sbi_for_rfence())
 		sbi_remote_sfence_vma_asid(NULL, 0, FLUSH_TLB_MAX_SIZE, FLUSH_TLB_NO_ASID);
 	else
@@ -131,6 +134,8 @@ static void __flush_tlb_range(struct mm_struct *mm,
 	/* Check if the TLB flush needs to be sent to other CPUs. */
 	if (cpumask_any_but(cmask, cpu) >= nr_cpu_ids) {
 		local_flush_tlb_range_asid(start, size, stride, asid);
+	} else if (esp32s31_tlb_flush_remote(cmask)) {
+		/* The S31 leaf invalidates all translations without a CALL_FUNC. */
 	} else if (riscv_use_sbi_for_rfence()) {
 		sbi_remote_sfence_vma_asid(cmask, start, size, asid);
 	} else {

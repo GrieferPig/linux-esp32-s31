@@ -2355,6 +2355,8 @@ static struct sched_dl_entity *pick_next_dl_entity(struct dl_rq *dl_rq)
  * __pick_next_task_dl - Helper to pick the next -deadline task to run.
  * @rq: The runqueue to pick the next task from.
  */
+#include "s31-radio-fair-server.inc"
+
 static struct task_struct *__pick_task_dl(struct rq *rq)
 {
 	struct sched_dl_entity *dl_se;
@@ -2366,7 +2368,11 @@ again:
 		return NULL;
 
 	dl_se = pick_next_dl_entity(dl_rq);
-	WARN_ON_ONCE(!dl_se);
+	if (WARN_ON_ONCE(!dl_se))
+		return NULL;
+	dl_se = s31_radio_fair_server_next(rq, dl_se);
+	if (!dl_se)
+		return NULL;
 
 	if (dl_server(dl_se)) {
 		p = dl_se->server_pick_task(dl_se);

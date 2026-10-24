@@ -21,6 +21,7 @@
 #include <linux/sched/stat.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
+#include <linux/sched/s31_radio_stack.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/ext.h>
 #include <linux/seq_file.h>
@@ -361,8 +362,13 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
 
 static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
-	struct page *page = alloc_pages_node(node, THREADINFO_GFP,
-					     THREAD_SIZE_ORDER);
+	struct page *page;
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (esp32s31_radio_stack_owned(tsk))
+		return esp32s31_radio_stack_install(tsk);
+#endif
+	page = alloc_pages_node(node, THREADINFO_GFP, THREAD_SIZE_ORDER);
 
 	if (likely(page)) {
 		tsk->stack = kasan_reset_tag(page_address(page));
@@ -373,6 +379,10 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 
 static void free_thread_stack(struct task_struct *tsk)
 {
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (esp32s31_radio_stack_release(tsk))
+		return;
+#endif
 	thread_stack_delayed_free(tsk);
 	tsk->stack = NULL;
 }
@@ -436,6 +446,10 @@ static struct kmem_cache *mm_cachep;
 
 static void account_kernel_stack(struct task_struct *tsk, int account)
 {
+	/* Internal SRAM has no normal struct page/memcg backing. Its reserved
+	 * bytes are accounted by the architecture stack lease instead. */
+	if (esp32s31_radio_stack_owned(tsk))
+		return;
 	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
 		struct vm_struct *vm_area = task_stack_vm_area(tsk);
 		int i;
@@ -863,7 +877,8 @@ void set_task_stack_end_magic(struct task_struct *tsk)
 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
 }
 
-static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+static struct task_struct *dup_task_struct(struct task_struct *orig, int node,
+					 struct kernel_clone_args *args)
 {
 	struct task_struct *tsk;
 	int err;
@@ -877,6 +892,14 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	err = arch_dup_task_struct(tsk, orig);
 	if (err)
 		goto free_tsk;
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (args->s31_radio_stack) {
+		if (!args->kthread)
+			goto free_tsk;
+		task_thread_info(tsk)->s31_radio_stack = args->s31_radio_stack;
+	}
+#endif
 
 	err = alloc_thread_stack_node(tsk, node);
 	if (err)
@@ -2009,7 +2032,7 @@ __latent_entropy struct task_struct *copy_process(
 		goto fork_out;
 
 	retval = -ENOMEM;
-	p = dup_task_struct(current, node);
+	p = dup_task_struct(current, node, args);
 	if (!p)
 		goto fork_out;
 	p->flags &= ~PF_KTHREAD;
@@ -2262,6 +2285,9 @@ __latent_entropy struct task_struct *copy_process(
 
 	p->pdeath_signal = 0;
 	p->task_works = NULL;
+	p->task_exit_works = NULL;
+	p->task_exit_work_active = NULL;
+	p->task_exit_work_closing = false;
 	clear_posix_cputimers_work(p);
 
 #ifdef CONFIG_KRETPROBES
@@ -2669,6 +2695,25 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, const char *name,
 
 	return kernel_clone(&args);
 }
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+pid_t kernel_thread_on_s31_stack(int (*fn)(void *), void *arg,
+		const char *name, unsigned long flags,
+		struct esp32s31_radio_stack *stack)
+{
+	struct kernel_clone_args args = {
+		.flags = ((flags | CLONE_VM | CLONE_UNTRACED) & ~CSIGNAL),
+		.exit_signal = flags & CSIGNAL,
+		.fn = fn,
+		.fn_arg = arg,
+		.name = name,
+		.kthread = 1,
+		.s31_radio_stack = stack,
+	};
+
+	return kernel_clone(&args);
+}
+#endif
 
 /*
  * Create a user mode thread.

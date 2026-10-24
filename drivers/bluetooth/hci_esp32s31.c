@@ -2,9 +2,11 @@
 /* ESP32-S31 Bluetooth controller HCI front end. */
 
 #include <linux/delay.h>
+#include <linux/completion.h>
 #include <linux/esp32s31-radio.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -18,6 +20,7 @@
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
+#include "../platform/esp32s31-radio-hci-frame.h"
 
 struct s31_hci {
 	struct hci_dev *hdev;
@@ -28,13 +31,25 @@ struct s31_hci {
 	struct mutex direct_write_lock;
 	atomic_t direct_open;
 	bool direct_hci;
+	bool direct_detached;
 	bool radio_registered;
 	bool suspended;
 	bool reset_pending;
-	u8 direct_write_buf[ESP32S31_RADIO_HCI_FRAME_MAX];
+	struct sk_buff_head tx_queue;
+	bool tx_stopped;
+	u8 direct_write_buf[1 + 8 * (2 + ESP32S31_RADIO_HCI_FRAME_MAX)];
 };
 
-static struct s31_hci s31_hci;
+/* Files can outlive platform unbind. Keep their synchronization objects
+ * stable until module unload, and refuse rebind until the last file closes. */
+static struct s31_hci s31_hci = {
+	.direct_waitq = __WAIT_QUEUE_HEAD_INITIALIZER(s31_hci.direct_waitq),
+	.direct_read_lock = __MUTEX_INITIALIZER(s31_hci.direct_read_lock),
+	.direct_write_lock = __MUTEX_INITIALIZER(s31_hci.direct_write_lock),
+	.direct_open = ATOMIC_INIT(0),
+};
+
+#include "hci_esp32s31_tx.inc"
 
 static int s31_hci_open(struct hci_dev *hdev)
 {
@@ -45,11 +60,13 @@ static int s31_hci_open(struct hci_dev *hdev)
 	ret = esp32s31_radio_bt_enable();
 	if (ret && ret != -EALREADY)
 		return ret;
+	s31_hci_native_tx_start(hci_get_drvdata(hdev));
 	return 0;
 }
 
 static int s31_hci_close(struct hci_dev *hdev)
 {
+	s31_hci_native_tx_purge(hci_get_drvdata(hdev), true);
 	/* The S31 controller is initialised for the lifetime of the unified radio
 	 * module.  Its closed Classic page-scan state is not restart-safe after
 	 * esp_bt_controller_disable(): the next enable asserts in olc_pscan.  Let
@@ -60,6 +77,7 @@ static int s31_hci_close(struct hci_dev *hdev)
 
 static int s31_hci_flush(struct hci_dev *hdev)
 {
+	s31_hci_native_tx_purge(hci_get_drvdata(hdev), false);
 	return 0;
 }
 
@@ -76,25 +94,10 @@ static int s31_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 			skb->len, (int)min_t(unsigned int, 3, skb->len - 3),
 			skb->data + 3);
 
-	ret = esp32s31_radio_hci_send(type, skb->data, skb->len);
-	if (ret) {
+	ret = s31_hci_native_tx_submit(hdev, skb);
+	if (ret)
 		hdev->stat.err_tx++;
-		return ret;
-	}
-	switch (type) {
-	case HCI_COMMAND_PKT:
-		hdev->stat.cmd_tx++;
-		break;
-	case HCI_ACLDATA_PKT:
-		hdev->stat.acl_tx++;
-		break;
-	case HCI_SCODATA_PKT:
-		hdev->stat.sco_tx++;
-		break;
-	}
-	hdev->stat.byte_tx += skb->len;
-	kfree_skb(skb);
-	return 0;
+	return ret;
 }
 
 static void s31_hci_receive(void *context, const u8 *frame, size_t length)
@@ -117,23 +120,8 @@ static void s31_hci_receive(void *context, const u8 *frame, size_t length)
 		pr_info_once("esp32s31-hci: dropped unsolicited initial NOP complete\n");
 		return;
 	}
-	/* Keep one compact record of the controller capability replies.  These
-	 * are the source of truth used by the HCI core to expose BR/EDR and LE
-	 * through the management API, and are invaluable on this serialized
-	 * transport where btmon is intentionally absent from the small rootfs. */
-	if (length >= 7 && frame[0] == HCI_EVENT_PKT && frame[1] == 0x0e) {
-		opcode = frame[4] | (frame[5] << 8);
-		if (opcode == 0x1003 && length >= 15)
-			pr_info("esp32s31-hci: local features status=%u %*ph\n",
-				frame[6], 8, frame + 7);
-		else if (opcode == 0x2003 && length >= 15)
-			pr_info("esp32s31-hci: LE features status=%u %*ph\n",
-				frame[6], 8, frame + 7);
-		else if (opcode == 0x1004 && length >= 8)
-			pr_info("esp32s31-hci: extended features status=%u page=%u %*ph\n",
-				frame[6], frame[7],
-				(int)min_t(size_t, 8, length - 9), frame + 9);
-	}
+	if (length >= 7 && frame[0] == HCI_EVENT_PKT && frame[1] == 0x0e)
+  opcode = frame[4] | (frame[5] << 8);
 	skb = bt_skb_alloc(length - 1, GFP_KERNEL);
 	if (!skb) {
 		radio->hdev->stat.err_rx++;
@@ -171,6 +159,7 @@ static void s31_hci_receive(void *context, const u8 *frame, size_t length)
 
 static const struct esp32s31_radio_hci_ops s31_hci_ops = {
 	.receive = s31_hci_receive,
+	.tx_ready = s31_hci_native_tx_ready,
 };
 
 static void s31_hci_direct_rx_ready(void *context)
@@ -224,9 +213,13 @@ static int s31_hci_direct_release(struct inode *inode, struct file *file)
 	 * IDF controller's disable/enable lifecycle leaves the Classic page-scan
 	 * state inconsistent, while unregistering the host endpoint is sufficient
 	 * to prevent delivery into a closing file. */
-	esp32s31_radio_hci_unregister(&s31_hci_direct_ops, radio);
-	esp32s31_radio_hci_purge();
+	mutex_lock(&radio->direct_write_lock);
+	if (!READ_ONCE(radio->direct_detached)) {
+		esp32s31_radio_hci_unregister(&s31_hci_direct_ops, radio);
+		esp32s31_radio_hci_purge();
+	}
 	atomic_set(&radio->direct_open, 0);
+	mutex_unlock(&radio->direct_write_lock);
 	wake_up_interruptible(&radio->direct_waitq);
 	return 0;
 }
@@ -336,10 +329,12 @@ static ssize_t s31_hci_direct_write(struct file *file,
 		ret = -EFAULT;
 		goto out;
 	}
-	ret = esp32s31_radio_hci_send(radio->direct_write_buf[0],
-					 radio->direct_write_buf + 1, count - 1);
-	if (!ret)
-		ret = count;
+	/* Direct writers use the 0xff batch envelope unconditionally. */
+	if (radio->direct_write_buf[0] != 0xff) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = esp32s31_radio_hci_send_batch(radio->direct_write_buf, count);
 out:
 	mutex_unlock(&radio->direct_write_lock);
 	return ret;
@@ -360,6 +355,21 @@ static __poll_t s31_hci_direct_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+/* Batch capability for ACL write coalescing: maximum H4 records per
+ * 0xff-prefixed envelope. Legacy kernels lack this command (ENOTTY). */
+static long s31_hci_direct_ioctl(struct file *file, unsigned int cmd,
+				 unsigned long arg)
+{
+	u32 caps = 8;
+
+	if (cmd == _IOR('S', 0x31, u32)) {
+		if (put_user(caps, (u32 __user *)arg))
+			return -EFAULT;
+		return 0;
+	}
+	return -ENOTTY;
+}
+
 static const struct file_operations s31_hci_direct_fops = {
 	.owner = THIS_MODULE,
 	.open = s31_hci_direct_open,
@@ -367,6 +377,7 @@ static const struct file_operations s31_hci_direct_fops = {
 	.read = s31_hci_direct_read,
 	.write = s31_hci_direct_write,
 	.poll = s31_hci_direct_poll,
+	.unlocked_ioctl = s31_hci_direct_ioctl,
 	.llseek = noop_llseek,
 };
 
@@ -436,23 +447,31 @@ int s31_radio_btdm_frontend_init(struct device *parent, bool direct_hci)
 		pr_info("esp32s31-hci: disabled with radio core\n");
 		return 0;
 	}
+	/* An unbound direct file must not acquire a newly loaded runtime through
+	 * this static object. Its release is still legal while disconnected. */
+	if (atomic_read(&s31_hci.direct_open))
+		return -EBUSY;
+	WRITE_ONCE(s31_hci.suspended, false);
+	WRITE_ONCE(s31_hci.reset_pending, false);
+	WRITE_ONCE(s31_hci.direct_detached, false);
 	s31_hci.direct_hci = direct_hci;
 	if (direct_hci) {
-		init_waitqueue_head(&s31_hci.direct_waitq);
-		mutex_init(&s31_hci.direct_read_lock);
-		mutex_init(&s31_hci.direct_write_lock);
-		atomic_set(&s31_hci.direct_open, 0);
 		s31_hci.direct_miscdev.minor = MISC_DYNAMIC_MINOR;
 		s31_hci.direct_miscdev.name = "s31-hci";
 		s31_hci.direct_miscdev.fops = &s31_hci_direct_fops;
 		s31_hci.direct_miscdev.mode = 0600;
 		pr_info("esp32s31-hci: using direct BTstack H4 transport\n");
 		ret = misc_register(&s31_hci.direct_miscdev);
-		if (ret)
+		if (ret) {
 			s31_hci.direct_hci = false;
+			WRITE_ONCE(s31_hci.direct_detached, true);
+			WRITE_ONCE(s31_hci.suspended, true);
+		}
 		return ret;
 	}
 
+	skb_queue_head_init(&s31_hci.tx_queue);
+	s31_hci.tx_stopped = true;
 	INIT_DELAYED_WORK(&s31_hci.register_work, s31_hci_register_work);
 	schedule_delayed_work(&s31_hci.register_work, 0);
 	return 0;
@@ -471,12 +490,15 @@ int s31_radio_btdm_frontend_suspend(void)
 			if (ret)
 				return ret;
 		}
+		s31_hci_native_tx_purge(&s31_hci, true);
 		WRITE_ONCE(s31_hci.suspended, true);
+		s31_radio_hci_rx_quiesce();
 		return 0;
 	}
 	mutex_lock(&s31_hci.direct_read_lock);
 	mutex_lock(&s31_hci.direct_write_lock);
 	WRITE_ONCE(s31_hci.suspended, true);
+	s31_radio_hci_rx_quiesce();
 	mutex_unlock(&s31_hci.direct_write_lock);
 	mutex_unlock(&s31_hci.direct_read_lock);
 	wake_up_interruptible(&s31_hci.direct_waitq);
@@ -504,7 +526,10 @@ int s31_radio_btdm_frontend_resume(void)
 			ret = esp32s31_radio_bt_enable();
 			if (ret && ret != -EALREADY)
 				return ret;
+			s31_hci_native_tx_start(&s31_hci);
 			ret = hci_resume_dev(s31_hci.hdev);
+			if (ret)
+				s31_hci_native_tx_purge(&s31_hci, true);
 			if (!ret) {
 				const u8 reset[] = { HCI_EVENT_PKT, HCI_EV_HARDWARE_ERROR, 1, 1 };
 
@@ -521,13 +546,17 @@ void s31_radio_btdm_frontend_exit(void)
 {
 	if (s31_hci.direct_hci) {
 		misc_deregister(&s31_hci.direct_miscdev);
+		mutex_lock(&s31_hci.direct_write_lock);
+		WRITE_ONCE(s31_hci.suspended, true);
+		WRITE_ONCE(s31_hci.direct_detached, true);
 		if (atomic_read(&s31_hci.direct_open)) {
 			esp32s31_radio_hci_unregister(&s31_hci_direct_ops,
 						       &s31_hci);
 			esp32s31_radio_hci_purge();
-			atomic_set(&s31_hci.direct_open, 0);
 		}
 		s31_hci.direct_hci = false;
+		mutex_unlock(&s31_hci.direct_write_lock);
+		wake_up_interruptible(&s31_hci.direct_waitq);
 		return;
 	}
 

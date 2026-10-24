@@ -19,6 +19,7 @@
 #include <linux/pm_domain.h>
 #include <linux/soc/espressif/esp32s31-pmu.h>
 #include <linux/sysfs.h>
+#include <linux/syscore_ops.h>
 
 #include <dt-bindings/power/esp32s31-power.h>
 
@@ -60,6 +61,7 @@ struct esp32s31_pmu {
 	struct genpd_onecell_data onecell;
 	bool allow_hpcnnt_off;
 	bool radio_active;
+	u32 early_resume_count;
 };
 
 static struct esp32s31_pmu *esp32s31_pmu_owner;
@@ -102,6 +104,7 @@ static int __esp32s31_domain_power_on(struct esp32s31_domain *domain)
 		return -EIO;
 	}
 	domain->powered = true;
+
 	return 0;
 }
 
@@ -129,7 +132,60 @@ static int __esp32s31_domain_power_off(struct esp32s31_domain *domain)
 		return -EIO;
 	}
 	domain->powered = false;
+
 	return 0;
+}
+
+/* Device-domain resume runs after secondary CPU startup. HSM startup needs
+ * the shared connectivity/cache path earlier, including the ROM cache
+ * publication operation. Permit normal domain-off during suspend, then
+ * restore hardware in syscore resume before bringing CPU1 back. Genpd's
+ * later power-on is idempotent and still owns its logical status/callbacks.
+ * All tasks are frozen and secondary CPUs are offline here: no sleepable
+ * PMU mutex or radio callback may be entered from this boundary. */
+static int esp32s31_pmu_syscore_suspend(void)
+{
+	struct esp32s31_pmu *pmu = READ_ONCE(esp32s31_pmu_owner);
+	struct esp32s31_domain *domain;
+	int ret;
+
+	if (!pmu)
+		return 0;
+	/* SBI entry performs cache writeback before moving to the retained
+	 * sleep path. Restore its infrastructure after consumer genpd-off,
+	 * without turning the radio vote back on or changing genpd status. */
+	domain = &pmu->domains[ESP32S31_PD_HPCNNT];
+
+	ret = __esp32s31_domain_power_on(domain);
+
+	return ret;
+}
+
+static void esp32s31_pmu_syscore_resume(void)
+{
+	struct esp32s31_pmu *pmu = READ_ONCE(esp32s31_pmu_owner);
+	struct esp32s31_domain *domain;
+
+	if (!pmu)
+		return;
+	domain = &pmu->domains[ESP32S31_PD_HPCNNT];
+
+	if (__esp32s31_domain_power_on(domain))
+		panic("esp32s31-pmu: cannot restore CPU restart connectivity");
+	pmu->early_resume_count++;
+
+}
+
+static struct syscore_ops esp32s31_pmu_syscore_ops = {
+	.suspend = esp32s31_pmu_syscore_suspend,
+	.resume = esp32s31_pmu_syscore_resume,
+};
+
+static void esp32s31_pmu_syscore_remove(void *opaque)
+{
+	unregister_syscore_ops(&esp32s31_pmu_syscore_ops);
+	if (READ_ONCE(esp32s31_pmu_owner) == opaque)
+		WRITE_ONCE(esp32s31_pmu_owner, NULL);
 }
 
 static int esp32s31_domain_power_on(struct generic_pm_domain *genpd)
@@ -204,6 +260,7 @@ void s31_linux_pmu_radio_vote(bool active)
 		return;
 	mutex_lock(&pmu->lock);
 	pmu->radio_active = active;
+
 	if (active)
 		(void)__esp32s31_domain_power_on(
 			&pmu->domains[ESP32S31_PD_HPCNNT]);
@@ -253,7 +310,7 @@ static ssize_t domains_show(struct device *dev,
 		u32 ctrl = readl(pmu->base + domain->reg);
 
 		len += sysfs_emit_at(buf, len,
-			"%s policy=%s software=%s hardware=%s force=0x%02x on=%u off=%u reclaim=%u errors=%u radio-vote=%u\n",
+			"%s policy=%s software=%s hardware=%s force=0x%02x on=%u off=%u reclaim=%u errors=%u radio-vote=%u early-resume=%u\n",
 			domain->genpd.name,
 			(domain->genpd.flags & GENPD_FLAG_ALWAYS_ON) ?
 				"always-on" : "automatic",
@@ -263,7 +320,8 @@ static ssize_t domains_show(struct device *dev,
 			domain->power_on_count,
 			domain->power_off_count, domain->reclaim_count,
 			domain->transition_errors,
-			i == ESP32S31_PD_HPCNNT && pmu->radio_active);
+			i == ESP32S31_PD_HPCNNT && pmu->radio_active,
+			i == ESP32S31_PD_HPCNNT ? pmu->early_resume_count : 0);
 	}
 	mutex_unlock(&pmu->lock);
 
@@ -364,6 +422,10 @@ static int esp32s31_pmu_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret,
 				     "failed to add domain state attributes\n");
 	WRITE_ONCE(esp32s31_pmu_owner, pmu);
+	register_syscore_ops(&esp32s31_pmu_syscore_ops);
+	ret = devm_add_action_or_reset(dev, esp32s31_pmu_syscore_remove, pmu);
+	if (ret)
+		return ret;
 	dev_info(dev,
 		 "HPCNNT runtime power-off %s, radio vote %s; modem domains firmware-owned\n",
 		 allow_hpcnnt_off ? "enabled" : "guarded",

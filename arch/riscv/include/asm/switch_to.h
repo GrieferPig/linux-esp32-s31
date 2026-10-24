@@ -15,6 +15,7 @@
 #include <asm/ptrace.h>
 #include <asm/csr.h>
 #include <asm/esp32s31_ext.h>
+#include <asm/esp32s31_blob_fp.h>
 
 #ifdef CONFIG_FPU
 extern void __fstate_save(struct task_struct *save_to);
@@ -55,8 +56,13 @@ static inline void __switch_to_fpu(struct task_struct *prev,
 	struct pt_regs *regs;
 
 	regs = task_pt_regs(prev);
-	fstate_save(prev, regs);
-	fstate_restore(next, task_pt_regs(next));
+	/* A process-owned active blob has already saved its user file. Neither
+	 * generic save nor restore may treat the physical blob bank as user FP.
+	 * The arch pre/post hooks exclusively checkpoint the active full file. */
+	if (!esp32s31_blob_fp_user_active(prev))
+		fstate_save(prev, regs);
+	if (!esp32s31_blob_fp_user_active(next))
+		fstate_restore(next, task_pt_regs(next));
 }
 
 static __always_inline bool has_fpu(void)
@@ -116,6 +122,7 @@ do {							\
 	struct task_struct *__prev = (prev);		\
 	struct task_struct *__next = (next);		\
 	__set_prev_cpu(__prev->thread);			\
+	esp32s31_blob_fp_pre_switch(__prev);		\
 	if (has_fpu())					\
 		__switch_to_fpu(__prev, __next);	\
 	if (has_vector() || has_xtheadvector())		\
@@ -124,6 +131,7 @@ do {							\
 	if (switch_to_should_flush_icache(__next))	\
 		local_flush_icache_all();		\
 	__switch_to_envcfg(__next);			\
+	esp32s31_blob_fp_post_switch(__next);		\
 	((last) = __switch_to(__prev, __next));		\
 } while (0)
 

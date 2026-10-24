@@ -107,6 +107,123 @@ int __sched rt_mutex_lock_interruptible(struct rt_mutex *lock)
 EXPORT_SYMBOL_GPL(rt_mutex_lock_interruptible);
 
 /**
+ * rt_mutex_lock_kthread_common - acquire with PI and native cancellation
+ * @lock: mutex to acquire
+ * @deadline: absolute CLOCK_MONOTONIC deadline, or KTIME_MAX for an infinite wait
+ * @cancelled: optional lifetime-pinned flag for object deletion
+ *
+ * A kernel thread created through the kthread API may sleep here. Stop wakes
+ * the normal PI waiter and returns -EINTR without requiring its owner to give.
+ * A successful acquisition always returns ownership, including acquisition
+ * racing with stop or expiry; callers must unlock before honouring cancellation.
+ * Ordinary rtmutex and PI-futex callers keep their existing wait semantics.
+ */
+static int __sched rt_mutex_lock_kthread_common(struct rt_mutex *lock,
+						ktime_t deadline,
+						const atomic_t *cancelled)
+{
+	struct rt_mutex_waiter waiter;
+	struct hrtimer_sleeper timer, *timeout = NULL;
+	DEFINE_WAKE_Q(wake_q);
+	unsigned long flags;
+	int ret;
+
+	might_sleep();
+	if (WARN_ON_ONCE(!(current->flags & PF_KTHREAD)))
+		return -EINVAL;
+	lockdep_assert(!current->pi_blocked_on);
+	if (cancelled && atomic_read_acquire(cancelled))
+		return -EIDRM;
+	if (kthread_should_stop())
+		return -EINTR;
+	mutex_acquire_nest(&lock->dep_map, 0, 0, NULL, _RET_IP_);
+	if (likely(rt_mutex_try_acquire(&lock->rtmutex)))
+		return 0;
+	if (deadline != KTIME_MAX && ktime_compare(ktime_get(), deadline) >= 0) {
+		ret = -ETIMEDOUT;
+		goto failed;
+	}
+	if (deadline != KTIME_MAX) {
+		timeout = &timer;
+		hrtimer_setup_sleeper_on_stack(timeout, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+		hrtimer_set_expires(&timeout->timer, deadline);
+		hrtimer_sleeper_start_expires(timeout, HRTIMER_MODE_ABS);
+	}
+	rt_mutex_pre_schedule();
+	rt_mutex_init_waiter(&waiter);
+	waiter.ww_ctx = NULL;
+	raw_spin_lock_irqsave(&lock->rtmutex.wait_lock, flags);
+	ret = __rt_mutex_slowlock(&lock->rtmutex, NULL, TASK_INTERRUPTIBLE,
+				  RT_MUTEX_FULL_CHAINWALK, &waiter, &wake_q,
+				  timeout, true, cancelled);
+	debug_rt_mutex_free_waiter(&waiter);
+	lockevent_cond_inc(rtmutex_slow_wake, !wake_q_empty(&wake_q));
+	raw_spin_unlock_irqrestore_wake(&lock->rtmutex.wait_lock, flags, &wake_q);
+	rt_mutex_post_schedule();
+	if (timeout) {
+		hrtimer_cancel(&timeout->timer);
+		destroy_hrtimer_on_stack(&timeout->timer);
+	}
+failed:
+	if (ret)
+		mutex_release(&lock->dep_map, _RET_IP_);
+	return ret;
+}
+int __sched rt_mutex_lock_kthread_until(struct rt_mutex *lock, ktime_t deadline)
+{
+	return rt_mutex_lock_kthread_common(lock, deadline, NULL);
+}
+EXPORT_SYMBOL_GPL(rt_mutex_lock_kthread_until);
+
+/**
+ * rt_mutex_lock_kthread_until_cancel - native wait with object cancellation
+ * @lock: mutex to acquire
+ * @deadline: absolute CLOCK_MONOTONIC time, or KTIME_MAX
+ * @cancelled: optional flag, pinned and not reset until this call returns
+ *
+ * The deleter publishes atomic_set_release(cancelled, 1), then calls
+ * rt_mutex_wake_waiters(). Cancellation returns -EIDRM without ownership.
+ * Acquiring the mutex during cancellation still returns owned success, so a
+ * caller must recheck object state and unlock before dropping its lifetime pin.
+ * The flag and mutex must remain alive until every admitted call has returned.
+ */
+int __sched rt_mutex_lock_kthread_until_cancel(struct rt_mutex *lock,
+					      ktime_t deadline,
+					      const atomic_t *cancelled)
+{
+	return rt_mutex_lock_kthread_common(lock, deadline, cancelled);
+}
+EXPORT_SYMBOL_GPL(rt_mutex_lock_kthread_until_cancel);
+
+/**
+ * rt_mutex_wake_waiters - wake waiters to recheck a published cancellation
+ * @lock: mutex whose admitted native waiters should recheck their flag
+ *
+ * This neither transfers nor releases ownership. Serialize with PI waiter
+ * insertion so a flag published before this operation cannot lose its wake.
+ * A regular rtmutex waiter may wake spuriously and retains its normal behavior.
+ * Queue task references under wait_lock and perform scheduler wakeups after
+ * releasing it. This rare deletion path adds no extra waitqueue to acquisition.
+ */
+void rt_mutex_wake_waiters(struct rt_mutex *lock)
+{
+	DEFINE_WAKE_Q(wake_q);
+	struct rb_node *node;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&lock->rtmutex.wait_lock, flags);
+	for (node = rb_first_cached(&lock->rtmutex.waiters); node; node = rb_next(node)) {
+		struct rt_mutex_waiter *waiter;
+
+		waiter = rb_entry(node, struct rt_mutex_waiter, tree.entry);
+		wake_q_add(&wake_q, waiter->task);
+	}
+	raw_spin_unlock_irqrestore(&lock->rtmutex.wait_lock, flags);
+	wake_up_q(&wake_q);
+}
+EXPORT_SYMBOL_GPL(rt_mutex_wake_waiters);
+
+/**
  * rt_mutex_lock_killable - lock a rt_mutex killable
  *
  * @lock:		the rt_mutex to be locked
@@ -135,6 +252,7 @@ EXPORT_SYMBOL_GPL(rt_mutex_lock_killable);
  */
 int __sched rt_mutex_trylock(struct rt_mutex *lock)
 {
+
 	int ret;
 
 	if (IS_ENABLED(CONFIG_DEBUG_RT_MUTEXES) && WARN_ON_ONCE(!in_task()))
@@ -155,6 +273,7 @@ EXPORT_SYMBOL_GPL(rt_mutex_trylock);
  */
 void __sched rt_mutex_unlock(struct rt_mutex *lock)
 {
+
 	mutex_release(&lock->dep_map, _RET_IP_);
 	__rt_mutex_unlock(&lock->rtmutex);
 }
@@ -401,7 +520,8 @@ int __sched rt_mutex_wait_proxy_lock(struct rt_mutex_base *lock,
 	raw_spin_lock_irq(&lock->wait_lock);
 	/* sleep on the mutex */
 	set_current_state(TASK_INTERRUPTIBLE);
-	ret = rt_mutex_slowlock_block(lock, NULL, TASK_INTERRUPTIBLE, to, waiter, NULL);
+	ret = rt_mutex_slowlock_block(lock, NULL, TASK_INTERRUPTIBLE,
+				    to, waiter, NULL, false, NULL);
 	/*
 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
 	 * have to fix that up.

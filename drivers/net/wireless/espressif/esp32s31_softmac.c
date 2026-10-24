@@ -4,6 +4,7 @@
 #include <linux/esp32s31-radio.h>
 #include <linux/workqueue.h>
 #include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/cpu.h>
 #include <linux/completion.h>
 #include <linux/bitmap.h>
@@ -18,19 +19,19 @@
 #include "esp32s31-rx-copy.h"
 
 static const unsigned int sm_io_cpu = 1;
-/* skb_copy_bits() in the SRAM bridge consumes page frags without retaining
- * them. Let TCP keep those frags until that single mandatory staging copy. */
+static_assert(S31_SOFTMAC_PENDING &&
+              !(S31_SOFTMAC_PENDING & (S31_SOFTMAC_PENDING - 1)));
+
+/* The bounded source lease retains fragments until CPU0 copies directly
+ * into the final vendor allocation. No intermediate linearization. */
 static const bool sm_tx_sg = true;
-static unsigned int sm_tx_sg_frames;
 
-
-/* Submit only to the Linux SRAM TX ring from mac80211's atomic context.
- * Native PP still runs exclusively under its existing owner/blob guards. */
+/* Publish only bounded metadata/source leases from atomic context.
+ * CPU0 reserves/fills/submits under its persistent radio owner. */
 /* Consume native completions on the sole RX/TX-status NAPI owner.
- * Submission still uses only the Linux SRAM ring, never PP or the blob gate. */
+ * Submission publishes metadata, never calls PP from NAPI. */
 
 static const bool sm_direct_status = true;
-static unsigned int sm_direct_status_calls;
 
 /* Consume scheduled TXQs on the existing sole NAPI owner. No retained TXQ
  * pointer, extra worker, timer delay, or additional packet pool. */
@@ -43,8 +44,10 @@ static const int sm_data_tx_mcs = 9;
 static const bool sm_tx_amsdu = true;
 static const unsigned int sm_tx_ampdu = 16;
 
-
-static const unsigned int sm_tx_pending_limit = 16;
+/* Allow the next aggregate to be prepared while one is outstanding.
+ * The source ring, native allocator and per-pass batch retain their own
+ * backpressure; this window uses the existing pending/flight tables. */
+static const unsigned int sm_tx_pending_limit = 64;
 
 static unsigned int sm_direct_tx_calls;
 
@@ -58,7 +61,6 @@ static const bool sm_rx_view = true;
 
 static unsigned int sm_rx_view_hits;
 
-static const bool sm_use_napi = true;
 /* Keep the measured CPU0 IRQ wake behavior only while associated. */
 static const bool sm_auto_idle_poll = true;
 
@@ -74,12 +76,17 @@ static const bool sm_hw_tx_ccmp = true;
 
 static const bool sm_hw_tx_ccmp_fast = true;
 
-
 static unsigned int sm_rx_buf_len = 1600;
 
 static const unsigned int sm_napi_budget = 64;
 
-static const unsigned int sm_gro_batch = 16;
+static const unsigned int sm_gro_batch = 32;
+
+/* The sole NAPI owner drains a small run per ring-lock round trip. The
+ * producer only advances head, so entries below tail stay owned by this
+ * consumer until the batch publishes replacements and advances tail. */
+#define SM_NAPI_RX_BATCH 8
+#define SM_NAPI_STATUS_BATCH 8
 
 static const bool sm_hw_bssid_filter = true;
 
@@ -93,21 +100,9 @@ static const bool sm_native_rx_error_filter = true;
 
 static const bool sm_native_bssid_filter = true;
 
-
-static const bool sm_tx_highpri = true;
-
-static struct workqueue_struct *sm_io_wq(void)
-{
-
- return sm_use_napi && sm_tx_highpri ? system_highpri_wq : system_percpu_wq;
-}
-static unsigned int sm_io_target(void)
-{
- unsigned int cpu=READ_ONCE(sm_io_cpu);
- return cpu<nr_cpu_ids && cpu_online(cpu)?cpu:0;
-}
-
 #define SM_RX_SLOTS 128
+#define SM_RX_LARGE_RESERVE 8
+#define SM_RX_LARGE_ROOM (S31_SOFTMAC_FRAME_MAX + 4)
 static const unsigned int sm_rx_ring_slots = 128;
 
 static const unsigned int sm_rx_idle_skb_limit = 64;
@@ -126,38 +121,48 @@ struct sm_pending {
 	struct sk_buff *skb;
 	u32 cookie;
 	unsigned long expires;
-	bool done, ack;
+	bool done, ack, timeout_requested;
 	u8 attempts, rate;
 };
 
 struct s31_sm {
 	struct ieee80211_hw *hw;
 	struct delayed_work register_work, timer;
-	struct work_struct io, rx_io, status_io, filter_io;
+	unsigned long timer_deadline;
+	bool timer_armed;
+	struct work_struct io, filter_io;
 	struct net_device *napi_dev;
 	struct napi_struct napi;
 	call_single_data_t rx_csd;
 	struct completion rx_kick_done;
-	bool rx_kick_pending;
+	struct completion tx_ba_drained;
+	struct mutex tx_ba_mutex;
+	bool tx_ba_waiting;
+	int tx_drain_error;
+	bool tx_native_stopped;
 
- bool scanning, associated;
+ bool scanning, associated, connecting;
 	u8 bssid[ETH_ALEN];
 	u8 rx_ba_tid[4];
 	u8 rx_ba_mask;
 	u8 tx_key_generation;
-	u32 tx_fast_frames, tx_fast_amsdu;
+
 	/* lock protects overlapping wake callbacks and the final flush. */
-	u32 txq_batch_users, txq_batch_frames, txq_batch_flushes;
+	u32 txq_batch_users;
  u8 txq_pending_ac; /* wake callbacks publish only AC bits, under lock */
- u32 txq_napi_wakes, txq_napi_passes, txq_napi_frames;
+
 	unsigned int filter_flags;
-	u32 rx_filtered, rx_kicks;
-	bool rx_need_refill;
+
+	bool rx_need_refill, rx_large_needed, rx_capture_active, rx_trim_pending;
+	u32 rx_large_ready[SM_RX_SLOTS / 32];
+	unsigned int rx_large_count;
 	struct ieee80211_sta __rcu *rx_sta;
 	bool napi_active;
-	u32 napi_polls, napi_budget_hits;
+
 	spinlock_t lock;
 	spinlock_t submit_lock;
+	/* RX producers reserve/copy/publish; stop joins before resetting skbs. */
+	spinlock_t rx_capture_lock;
 	struct sk_buff_head tx, status_queue;
 	/* Protected by lock, advanced with the FIFO skb queue. */
 	struct sm_pending pending[S31_SOFTMAC_PENDING];
@@ -166,33 +171,88 @@ struct s31_sm {
 	struct sm_rx rx[SM_RX_SLOTS];
 	unsigned int head, tail;
  unsigned int rx_slots, rx_mask;
-	unsigned int rx_idle_limit, rx_emergency_alloc;
+	unsigned int rx_idle_limit;
+
 	unsigned long rx_last_data;
 	bool rx_trimmed;
 	u32 cookie, epoch;
-	u32 rx_queued, rx_delivered, rx_dropped, rx_alloc_failed, rx_peak;
-	u32 tx_completed, tx_failed, tx_timeout;
-	u32 tx_outstanding, tx_depth_peak, tx_gate_stops, tx_gate_wakes;
+
+	u32 tx_outstanding;
 	bool tx_gate_stopped;
 	bool running, registered, radio_registered, has_vif;
+	/* Replay identity, owned only by mac80211's serialized interface hooks. */
+	struct ieee80211_vif *vif;
 	bool tx_ht_peer, tx_he_peer;
 	bool tx_ba_requested, tx_ba_operational, tx_native_peer, tx_ba_flushing;
-	u32 tx_ampdu_submitted;
+
 	u8 channel;
-	/* 2.4 GHz channels 1 to 13; the radio firmware sets a 1-13 country. */
+	u16 coex_beacon_interval;
+	u16 coex_aid;
 	struct ieee80211_channel channels[13];
 	struct ieee80211_rate rates[12];
 	struct ieee80211_supported_band band;
 	struct ieee80211_sband_iftype_data iftype;
 };
+
 /* Caller holds sm->lock, or producers/NAPI have been joined for stop. */
 static void sm_pending_clear(struct s31_sm *sm, unsigned int i)
 {
+ unsigned int n;
  sm->pending[i].skb = NULL;
  __clear_bit(i, sm->status_done);
+ /* Only the cold BA stop waiter needs an aggregate scan or a wake. The
+  * same lock protects waiter publication and every pending retirement. */
+ if (sm->tx_ba_waiting) {
+  for (n = 0; n < S31_SOFTMAC_PENDING; n++)
+   if (sm->pending[n].skb &&
+       (IEEE80211_SKB_CB(sm->pending[n].skb)->flags & IEEE80211_TX_CTL_AMPDU))
+    return;
+  complete_all(&sm->tx_ba_drained);
+ }
 }
 
 static struct s31_sm *s31_sm_frontend;
+/* Cold publication/snapshot ownership only. Packet paths never take this
+ * mutex. Unpublish before teardown joins; readers retain no frontend pointer.
+ */
+static DEFINE_MUTEX(s31_sm_frontend_mutex);
+
+/* Caller holds sm->lock. A newer earlier deadline must replace an idle
+ * deadline already pending. Later requests coalesce into that one wake. */
+static void sm_arm_deadline_locked(struct s31_sm *sm, unsigned long deadline)
+{
+	unsigned long delay, now = jiffies;
+
+	if (!sm->running || (sm->timer_armed &&
+	    !time_before(deadline, sm->timer_deadline)))
+		return;
+	delay = time_after(deadline, now) ? deadline - now : 1;
+	sm->timer_deadline = deadline;
+	sm->timer_armed = true;
+	mod_delayed_work(system_wq, &sm->timer, delay);
+}
+
+/* Only real packet expiry or an untrimmed RX idle window owns a deadline.
+ * A requested source cancellation completes through its existing status
+ * event; do not periodically poll the source lease while it is joined. */
+static void sm_idle_deadline_locked(struct s31_sm *sm)
+{
+	if (!sm->rx_trimmed && sm->rx_idle_limit < sm->rx_slots &&
+	    sm->head == sm->tail && !sm->rx_need_refill &&
+	    !sm->rx_large_needed && !sm->rx_capture_active && !sm->rx_trim_pending)
+		sm_arm_deadline_locked(sm, sm->rx_last_data + 5 * HZ);
+}
+
+static void sm_next_deadline_locked(struct s31_sm *sm)
+{
+	unsigned int i;
+
+	sm_idle_deadline_locked(sm);
+	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
+		if (sm->pending[i].skb && !sm->pending[i].done &&
+		    !sm->pending[i].timeout_requested)
+			sm_arm_deadline_locked(sm, sm->pending[i].expires);
+}
 
 /* Caller holds sm->lock. DRIVER wake schedules a mac80211 tasklet, never
  * invokes .tx inline; stop/wake ordering therefore stays under this lock. */
@@ -201,37 +261,37 @@ static void sm_tx_retire_locked(struct s31_sm *sm)
 	if (WARN_ON_ONCE(!sm->tx_outstanding)) return;
 	sm->tx_outstanding--;
 
+	/* A retired frame is usable credit immediately. Waiting for half the
+	 * window to retire withholds slots while a partial aggregate completes.
+	 * NAPI drains ready statuses before TXQ service, so completions still
+	 * coalesce into a refill batch without an artificial low watermark. */
 	if (sm->running && sm->tx_gate_stopped &&
-	    sm->tx_outstanding <= sm_tx_pending_limit / 2) {
+	    sm->tx_outstanding < sm_tx_pending_limit) {
 		sm->tx_gate_stopped = false;
-		sm->tx_gate_wakes++;
+
 		ieee80211_wake_queues(sm->hw);
 	}
 }
 
-/* A coalesced IPI only schedules the CPU1 NAPI, never runs the stack in
- * the radio callback. The producer lock serializes CSD submission and stop. */
-/* Publication-to-service latency includes requests made during a poll. It
- * does not claim CPU self time or that a new IRQ was required. sm->lock
- * serializes producers, the single poll owner, and stop. */
-/* Caller holds sm->lock with local IRQs disabled. Remote counters and
- * NAPI list fields are approximate READ_ONCE snapshots, not atomic pairs. */
-
+/* The completion is the sole CSD admission token: one means idle, zero
+ * means the submitted callback still owns it. Producers hold sm->lock, but
+ * the IPI never takes that contended RX/TX ring lock. Stop closes producers,
+ * joins the token, then disables NAPI. The callback's final access is complete;
+ * its waitqueue lock orders both token reuse and stop against that access. */
 static void sm_rx_kick(void *arg)
 {
  struct s31_sm *sm = arg;
- unsigned long flags;
- spin_lock_irqsave(&sm->lock, flags);
 
- if (sm->running) napi_schedule(&sm->napi);
- sm->rx_kick_pending = false;
+ /* This callback is invoked only by async CSD, with IRQs disabled. */
+ napi_schedule_irqoff(&sm->napi);
+ /* Record before the final completion access; stop joins that access. */
+
  complete(&sm->rx_kick_done);
- spin_unlock_irqrestore(&sm->lock, flags);
 }
 
 static void sm_schedule_rx_locked(struct s31_sm *sm)
 {
- unsigned int cpu = cpu_online(1) ? 1 : 0;
+ const unsigned int cpu = sm_io_cpu;
  int ret;
 
  if (test_bit(NAPI_STATE_SCHED, &sm->napi.state)) return;
@@ -239,37 +299,49 @@ static void sm_schedule_rx_locked(struct s31_sm *sm)
   napi_schedule(&sm->napi);
   return;
  }
- if (sm->rx_kick_pending) return;
- reinit_completion(&sm->rx_kick_done);
- sm->rx_kick_pending = true;
+ if (!try_wait_for_completion(&sm->rx_kick_done)) return;
  ret = smp_call_function_single_async(cpu, &sm->rx_csd);
  if (!ret) {
-  sm->rx_kicks++;
+
   return;
  }
- sm->rx_kick_pending = false;
- complete(&sm->rx_kick_done);
- queue_work_on(cpu, system_percpu_wq, &sm->rx_io);
+ /* CPU1 is protected by the active radio hotplug lease. The private
+  * CSD cannot be busy here: the token covers submission through callback,
+  * and the kernel unlocks an async CSD before invoking that callback.
+  * A failure is an ownership/admission defect, never a second RX path.
+  */
+ panic("esp32s31-softmac: mandatory CPU1 NAPI kick failed (%d)", ret);
 }
 
 /* Replacements are allocated on the Linux consumer stack. The radio callback
  * only copies into an already allocated skb; it never allocates or retains
  * a native buffer. Retry rare allocation failures without poisoning a slot. */
+/* Only empty, unpublished buffers are marked. A replacement in the current
+ * consumer slot is already empty even before tail advances. */
+static void sm_rx_mark_ready(struct s31_sm *sm, unsigned int i,
+                             struct sk_buff *skb)
+{
+ u32 bit = 1U << (i & 31);
+ bool old = !!(sm->rx_large_ready[i >> 5] & bit);
+ bool ready = skb && skb_tailroom(skb) >= SM_RX_LARGE_ROOM;
+ if (old == ready) return;
+ if (ready) { sm->rx_large_ready[i >> 5] |= bit; sm->rx_large_count++; }
+ else { sm->rx_large_ready[i >> 5] &= ~bit; sm->rx_large_count--; }
+}
 static struct sk_buff *sm_alloc_rx_skb(struct s31_sm *sm, bool use_napi)
 {
  unsigned int size = clamp_t(unsigned int, sm_rx_buf_len, 1600, S31_SOFTMAC_FRAME_MAX) + 8;
- struct sk_buff *skb = use_napi ? napi_alloc_skb(&sm->napi, size) :
-                                __dev_alloc_skb(size, GFP_KERNEL);
- /* Align the 802.11 payload, rather than relying on the Ethernet default
-  * headroom of napi_alloc_skb(). QoS's extra two bytes are handled at RX. */
- if (skb) skb_reserve(skb, -(unsigned long)skb->data & 3);
- return skb;
-}
-static struct sk_buff *sm_alloc_rx_skb_atomic(void)
-{
- unsigned int size = clamp_t(unsigned int, sm_rx_buf_len, 1600, S31_SOFTMAC_FRAME_MAX) + 8;
- struct sk_buff *skb = __dev_alloc_skb(size, GFP_ATOMIC);
-
+ bool large = READ_ONCE(sm->rx_large_count) < SM_RX_LARGE_RESERVE;
+ struct sk_buff *skb;
+ if (large) size = S31_SOFTMAC_FRAME_MAX + 8;
+ skb = use_napi ? napi_alloc_skb(&sm->napi, size) :
+                  __dev_alloc_skb(size, GFP_KERNEL);
+ /* Keep ordinary MPDUs moving if the larger allocation cannot be met. */
+ if (!skb && large) {
+  size = clamp_t(unsigned int, sm_rx_buf_len, 1600, S31_SOFTMAC_FRAME_MAX) + 8;
+  skb = use_napi ? napi_alloc_skb(&sm->napi, size) :
+                   __dev_alloc_skb(size, GFP_KERNEL);
+ }
  if (skb) skb_reserve(skb, -(unsigned long)skb->data & 3);
  return skb;
 }
@@ -278,7 +350,40 @@ static void sm_refill_empty(struct s31_sm *sm, bool use_napi)
  unsigned int i;
  unsigned long flags;
  bool failed = false;
- if (!READ_ONCE(sm->rx_need_refill)) return;
+ struct sk_buff *upgrade = NULL;
+ unsigned int upgrade_slot = 0;
+
+ /* Steady state has no empty slot: avoid the ring lock twice per poll. */
+ if (!READ_ONCE(sm->rx_need_refill) && !READ_ONCE(sm->rx_large_needed))
+  return;
+ spin_lock_irqsave(&sm->lock, flags);
+ if (!sm->rx_need_refill && !sm->rx_large_needed) {
+  spin_unlock_irqrestore(&sm->lock, flags);
+  return;
+ }
+ /* Clear before doing work: a concurrent producer's new request must survive. */
+ sm->rx_need_refill = false;
+ if (sm->rx_large_needed) {
+  if (sm->rx_large_count) sm->rx_large_needed = false;
+  else if (!sm->rx_capture_active) {
+   /* The producer cannot advance an unpublished head without its buffer.
+    * Expand this empty buffer on the consumer stack, outside the lock. */
+   upgrade_slot = sm->head;
+   upgrade = sm->rx[upgrade_slot].skb;
+   sm->rx[upgrade_slot].skb = NULL;
+  }
+ }
+ spin_unlock_irqrestore(&sm->lock, flags);
+
+ if (upgrade) {
+  int extra = SM_RX_LARGE_ROOM - skb_tailroom(upgrade);
+  if (extra > 0 && pskb_expand_head(upgrade, 0, extra, GFP_ATOMIC)) failed = true;
+  spin_lock_irqsave(&sm->lock, flags);
+  sm->rx[upgrade_slot].skb = upgrade;
+  sm_rx_mark_ready(sm, upgrade_slot, upgrade);
+  if (sm->rx_large_count) sm->rx_large_needed = false;
+  spin_unlock_irqrestore(&sm->lock, flags);
+ }
  for (i = 0; i < sm->rx_slots; i++) {
   struct sk_buff *skb;
   if (READ_ONCE(sm->rx[i].skb)) continue;
@@ -287,69 +392,145 @@ static void sm_refill_empty(struct s31_sm *sm, bool use_napi)
   spin_lock_irqsave(&sm->lock, flags);
   if (!sm->rx[i].skb) {
    sm->rx[i].skb = skb;
+   sm_rx_mark_ready(sm, i, skb);
    skb = NULL;
   }
   spin_unlock_irqrestore(&sm->lock, flags);
   if (skb) dev_kfree_skb(skb);
  }
- WRITE_ONCE(sm->rx_need_refill, failed);
- /* A failed replacement is exceptional. Restore a complete ring before
-  * trying the idle policy again. */
- if (!failed) WRITE_ONCE(sm->rx_trimmed, false);
+ spin_lock_irqsave(&sm->lock, flags);
+ sm->rx_need_refill |= failed;
+
+ if (!failed && !sm->rx_need_refill) sm->rx_trimmed = false;
+ spin_unlock_irqrestore(&sm->lock, flags);
 }
-static void sm_install_rx_replacement(struct s31_sm *sm, struct sm_rx *rx,
-                                      struct sk_buff *replacement)
+/* Peek a consecutive run of owned RX slots. Only the NAPI consumer advances
+ * tail, so the metadata stays valid until sm_finish_rx_batch() commits. The
+ * producer cannot overwrite these slots because tail has not moved. */
+static unsigned int __aligned(64) sm_napi_take_rx(struct s31_sm *sm, struct sm_rx *rx,
+                                    unsigned int max)
 {
  unsigned long flags;
- unsigned int target;
+ unsigned int n = 0, tail, head;
 
- if (READ_ONCE(sm->rx_trimmed)) {
-  /* Move the spare window with the producer instead of leaving all 64
-   * buffers behind after one lap of the logical 128-slot ring. */
-  target = (sm->tail + sm->rx_idle_limit) & sm->rx_mask;
-  spin_lock_irqsave(&sm->lock, flags);
-  if (sm->rx_trimmed && !sm->rx[target].skb) {
-   sm->rx[target].skb = replacement;
-   replacement = NULL;
-  }
-  spin_unlock_irqrestore(&sm->lock, flags);
+ spin_lock_irqsave(&sm->lock, flags);
+ if (!sm->running)
+  goto out;
+
+ head = sm->head;
+ tail = sm->tail;
+ while (n < max && tail != head) {
+  rx[n++] = sm->rx[tail];
+  tail = (tail + 1) & sm->rx_mask;
  }
- rx->skb = replacement;
+out:
+ spin_unlock_irqrestore(&sm->lock, flags);
+ return n;
 }
+
+/* The sole NAPI owner has consumed every metadata field before calling.
+ * Publish all replacements and advance tail in one fence, so capture cannot
+ * reuse a slot before status construction has finished. */
+static void __aligned(64) sm_finish_rx_batch(struct s31_sm *sm, struct sm_rx *rx,
+                               struct sk_buff **replacement, unsigned int n)
+{
+ unsigned long flags;
+ unsigned int i, target;
+
+ spin_lock_irqsave(&sm->lock, flags);
+ for (i = 0; i < n; i++) {
+  struct sk_buff *repl = replacement[i];
+  unsigned int slot = sm->tail;
+  bool allocation_failed = !repl;
+
+  if (sm->rx_trimmed && repl) {
+   target = (sm->tail + sm->rx_idle_limit) & sm->rx_mask;
+   if (!sm->rx[target].skb) {
+    sm->rx[target].skb = repl;
+    sm_rx_mark_ready(sm, target, repl);
+    repl = NULL;
+   }
+  }
+  sm->rx[slot].skb = repl;
+  sm_rx_mark_ready(sm, slot, repl);
+  if (allocation_failed) {
+
+   sm->rx_need_refill = true;
+
+  }
+  sm->tail = (sm->tail + 1) & sm->rx_mask;
+
+ }
+ spin_unlock_irqrestore(&sm->lock, flags);
+}
+/* Empty ring and no capture owner; caller holds sm->lock. Retain
+ * already prepared large buffers inside the idle window before freeing the
+ * rest. Only pointers move: no allocation or frame copy under the lock. */
+static void sm_keep_idle_rx_reserve(struct s31_sm *sm)
+{
+ unsigned int offset, cursor = 0, kept = 0;
+
+ for (offset = 0; offset < sm->rx_idle_limit; offset++) {
+  unsigned int slot = (sm->head + offset) & sm->rx_mask;
+  if (sm->rx_large_ready[slot >> 5] & BIT(slot & 31)) kept++;
+ }
+ for (offset = sm->rx_idle_limit;
+      offset < sm->rx_slots && kept < SM_RX_LARGE_RESERVE; offset++) {
+  unsigned int source = (sm->head + offset) & sm->rx_mask;
+  if (!(sm->rx_large_ready[source >> 5] & BIT(source & 31))) continue;
+  while (cursor < sm->rx_idle_limit) {
+   unsigned int target = (sm->head + cursor++) & sm->rx_mask;
+   struct sk_buff *small;
+   if (sm->rx_large_ready[target >> 5] & BIT(target & 31)) continue;
+   small = sm->rx[target].skb;
+   sm->rx[target].skb = sm->rx[source].skb;
+   sm->rx[source].skb = small;
+   sm_rx_mark_ready(sm, source, small);
+   sm_rx_mark_ready(sm, target, sm->rx[target].skb);
+   kept++;
+   break;
+  }
+ }
+}
+/* Only the sole NAPI owner allocates/refills/trims prepared RX slots. The
+ * deadline worker requests this cold operation; it never moves/free buffers
+ * concurrently with refill publication. Capture remains independently joined. */
+static bool sm_rx_idle_trim_due_locked(struct s31_sm *sm)
+{
+ return sm->running && !sm->rx_trimmed &&
+        sm->rx_idle_limit < sm->rx_slots && sm->head == sm->tail &&
+        !sm->rx_need_refill && !sm->rx_large_needed && !sm->rx_capture_active &&
+        time_after_eq(jiffies, sm->rx_last_data + 5 * HZ);
+}
+
 static void sm_trim_idle_rx_skbs(struct s31_sm *sm)
 {
  unsigned long flags;
  struct sk_buff *freed[SM_RX_SLOTS];
  unsigned int i, count = 0;
 
- if (sm->rx_idle_limit >= sm->rx_slots || READ_ONCE(sm->rx_trimmed) ||
-     !time_after(jiffies, READ_ONCE(sm->rx_last_data) + 5 * HZ))
-  return;
  spin_lock_irqsave(&sm->lock, flags);
- if (!sm->running || sm->head != sm->tail || sm->rx_trimmed ||
-     sm->rx_need_refill ||
-     !time_after(jiffies, sm->rx_last_data + 5 * HZ)) {
+ /* Keep the request published through the final state check, so a parallel
+  * TX deadline pass cannot rearm an already expired idle window meanwhile. */
+ sm->rx_trim_pending = false;
+ if (!sm_rx_idle_trim_due_locked(sm)) {
   spin_unlock_irqrestore(&sm->lock, flags);
   return;
  }
+ sm_keep_idle_rx_reserve(sm);
  for (i = 0; i < sm->rx_slots; i++) {
   if (((i - sm->head) & sm->rx_mask) >= sm->rx_idle_limit) {
    if (sm->rx[i].skb) freed[count++] = sm->rx[i].skb;
    sm->rx[i].skb = NULL;
+   sm_rx_mark_ready(sm, i, NULL);
   }
  }
  sm->rx_trimmed = true;
+
  spin_unlock_irqrestore(&sm->lock, flags);
  for (i = 0; i < count; i++) dev_kfree_skb(freed[i]);
 }
 
-static void sm_status_io(struct work_struct *work)
-{
- struct s31_sm *sm=container_of(work,struct s31_sm,status_io);
- struct sk_buff *skb;
- while ((skb=skb_dequeue(&sm->status_queue)))
-  ieee80211_tx_status_irqsafe(sm->hw,skb);
-}
 static bool sm_tx_rate_is_he(unsigned int rate)
 {
  return (rate & ~15U) == S31_SOFTMAC_TX_HE_RATE && (rate & 15) <= 9;
@@ -396,12 +577,13 @@ static void sm_status(struct s31_sm *sm, struct sk_buff *skb, bool ack, u8 attem
 /* submit_lock serializes Linux queue publication across .tx and
  * the fallback/status work item. This helper never enters native firmware,
  * sleeps, or acquires the blob gate. IRQs remain enabled outside sm->lock. */
-static void sm_submit_queued(struct s31_sm *sm)
+static void __aligned(64) sm_submit_queued(struct s31_sm *sm)
 {
  struct sk_buff *skb;
  unsigned long flags;
  unsigned int i;
  int ret;
+ bool published = false;
  spin_lock_bh(&sm->submit_lock);
 	for (;;) {
 		u32 cookie;
@@ -415,9 +597,18 @@ static void sm_submit_queued(struct s31_sm *sm)
 			spin_unlock_irqrestore(&sm->lock, flags);
 			break;
 		}
-		for (i = 0; i < S31_SOFTMAC_PENDING; i++)
-			if (!sm->pending[i].skb)
+		/* Keep cookies opaque to native code, but choose their low bits
+		 * as the Linux pending slot. Skip occupied slots without reserving
+		 * generation bits or overwriting an owner. The full nonzero cookie
+		 * is still checked when a completion returns. This rotates normal
+		 * allocation and removes the cross-hart completion's PSRAM scan. */
+		cookie = sm->cookie;
+		for (i = 0; i < S31_SOFTMAC_PENDING; i++) {
+			if (!++cookie)
+				++cookie;
+			if (!sm->pending[cookie & (S31_SOFTMAC_PENDING - 1)].skb)
 				break;
+		}
 		if (!sm->running || sm->tx_ba_flushing || i == S31_SOFTMAC_PENDING ||
 		    skb_queue_empty(&sm->tx)) {
 			spin_unlock_irqrestore(&sm->lock, flags);
@@ -430,8 +621,7 @@ static void sm_submit_queued(struct s31_sm *sm)
 		 * This is serialized with ampdu_action by submit_lock. */
 		if (!sm->tx_ba_operational)
 			IEEE80211_SKB_CB(skb)->flags &= ~IEEE80211_TX_CTL_AMPDU;
-		if (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_AMPDU)
-			sm->tx_ampdu_submitted++;
+
 		/* RX may be HT/HE aggregated. Initial QoS TX remains unaggregated
 		 * legacy OFDM; never interpret an MCS index as a legacy rate index. */
 		if (ieee80211_is_data(((struct ieee80211_hdr *)skb->data)->frame_control))
@@ -443,11 +633,13 @@ static void sm_submit_queued(struct s31_sm *sm)
 			continue;
 		}
 
-		cookie = ++sm->cookie ?: ++sm->cookie;
+		sm->cookie = cookie;
+		i = cookie & (S31_SOFTMAC_PENDING - 1);
 		sm->pending[i] = (struct sm_pending) {
 			.skb = skb, .cookie = cookie, .expires = jiffies + 2 * HZ,
 			.rate = rate,
 		};
+		sm_arm_deadline_locked(sm, sm->pending[i].expires);
 
 		spin_unlock_irqrestore(&sm->lock, flags);
 		header.cookie = cookie;
@@ -468,12 +660,21 @@ static void sm_submit_queued(struct s31_sm *sm)
 		}
 		header.reserved[2] = (unsigned long)IEEE80211_SKB_CB(skb)->rate_driver_data[0];
 		ret = esp32s31_radio_softmac_send_skb(&header, skb);
+		if (!ret) published = true;
 
 		if (ret) {
 			spin_lock_irqsave(&sm->lock, flags);
 			sm_pending_clear(sm, i);
 			if (ret == -ENOSPC) {
 				__skb_queue_head(&sm->tx, skb);
+				/* The CPU0 consumer may have returned space and notified
+				 * us between refusal and this requeue. Join that edge by
+				 * rechecking under the normal lock order. If still full,
+				 * the ring's published interest owns the next notification.
+				 * NAPI's completion recheck covers an already scheduled poll.
+				 */
+				if (esp32s31_radio_wifi_tx_has_space())
+					sm_schedule_rx_locked(sm);
 			} else sm_tx_retire_locked(sm);
 
 			spin_unlock_irqrestore(&sm->lock, flags);
@@ -484,21 +685,19 @@ static void sm_submit_queued(struct s31_sm *sm)
 		}
 	}
  spin_unlock_bh(&sm->submit_lock);
+ if (published) esp32s31_radio_softmac_tx_kick();
 }
 
-/* No native/blob entry: stage the ready burst, retaining the existing
- * event/work fallback only when SRAM publication is temporarily full. */
+/* Publish the ready metadata batch without entering vendor code. The
+ * source lease ring wakes NAPI on consumed entries. A full ring must not
+ * queue a second worker which immediately retries the same unavailable slot. */
 static void sm_flush_tx(struct s31_sm *sm)
 {
-	unsigned long flags;
 	sm_submit_queued(sm);
-	spin_lock_irqsave(&sm->lock, flags);
-	if (sm->running && !sm->txq_batch_users && !skb_queue_empty(&sm->tx))
-		queue_work_on(sm_io_target(), sm_io_wq(), &sm->io);
-	spin_unlock_irqrestore(&sm->lock, flags);
 }
 
 static int sm_tx_ba_flush(struct s31_sm *sm, const u8 *addr);
+static void sm_tx_drain_failed(struct s31_sm *sm, int error);
 
 static void sm_io(struct work_struct *work)
 {
@@ -507,6 +706,9 @@ static void sm_io(struct work_struct *work)
 	unsigned long flags;
 	unsigned int i;
 	bool aggregate_timeout = false;
+	u32 timeout_cookie = 0, timeout_epoch = 0, timeout_bytes = 0, timeout_depth = 0;
+	unsigned int timeout_slot = 0;
+	unsigned long timeout_late = 0;
 	u8 ap[ETH_ALEN];
 
 	/* A Linux timeout cannot release the native EB. Cancel the aggregate
@@ -515,17 +717,60 @@ static void sm_io(struct work_struct *work)
 	spin_lock_irqsave(&sm->lock, flags);
 	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
 		if (sm->pending[i].skb && !sm->pending[i].done &&
+		    !sm->pending[i].timeout_requested &&
 		    time_after_eq(jiffies, sm->pending[i].expires) &&
 		    (IEEE80211_SKB_CB(sm->pending[i].skb)->flags & IEEE80211_TX_CTL_AMPDU)) {
 			aggregate_timeout = true;
+			sm->pending[i].timeout_requested = true;
+			timeout_cookie = sm->pending[i].cookie;
+			timeout_slot = i;
+			timeout_epoch = sm->epoch;
+			timeout_bytes = sm->pending[i].skb->len;
+			timeout_depth = sm->tx_outstanding;
+			timeout_late = jiffies - sm->pending[i].expires;
 			ether_addr_copy(ap, sm->bssid);
-			sm->tx_timeout++;
+
 			break;
 		}
 	spin_unlock_irqrestore(&sm->lock, flags);
 	if (aggregate_timeout) {
-		int ret = sm_tx_ba_flush(sm, ap);
-		pr_warn_ratelimited("esp32s31-softmac: TX BA timed out, cancel rc=%d; reconnect required\n", ret);
+		int ret = 0;
+
+		mutex_lock(&sm->tx_ba_mutex);
+		/* Selection precedes the sleepable BA lock. While we wait, another
+		 * teardown may retire this cookie or a real completion may finish it.
+		 * A stale deadline must not drain a replacement slot/station or restart
+		 * a link whose old aggregate has already completed. The pending lock
+		 * pairs this recheck with status publication and retirement; the BA
+		 * mutex excludes another teardown until recovery owns publication.
+		 */
+		spin_lock_irqsave(&sm->lock, flags);
+		aggregate_timeout = sm->running && sm->epoch == timeout_epoch &&
+			!sm->tx_drain_error && !sm->tx_native_stopped &&
+			sm->pending[timeout_slot].skb &&
+			sm->pending[timeout_slot].cookie == timeout_cookie &&
+			!sm->pending[timeout_slot].done &&
+			sm->pending[timeout_slot].timeout_requested;
+		spin_unlock_irqrestore(&sm->lock, flags);
+		if (aggregate_timeout) {
+
+			ret = sm_tx_ba_flush(sm, ap);
+			/* A successful forced drain stops native SW/HW queues as well as
+			 * retiring buffers. It is not a running link: keep publication closed
+			 * and replay the normal hardware lifecycle. Failed drains already
+			 * requested this recovery from sm_tx_ba_flush(). Never silently leave
+			 * an associated interface waiting for credits from stopped hardware.
+			 */
+			if (!ret)
+				sm_tx_drain_failed(sm, -ETIMEDOUT);
+		} else {
+
+		}
+		mutex_unlock(&sm->tx_ba_mutex);
+		if (aggregate_timeout)
+			pr_warn_ratelimited("esp32s31-softmac: TX BA timed out cookie=%u epoch=%u bytes=%u depth=%u late_jiffies=%lu cancel_rc=%d; hardware recovery requested\n",
+				    timeout_cookie, timeout_epoch, timeout_bytes,
+				    timeout_depth, timeout_late, ret);
 	}
 
 	/* TX submission is serialized by submit_lock; RX callbacks use bounded rings. */
@@ -535,7 +780,8 @@ static void sm_io(struct work_struct *work)
 
 		spin_lock_irqsave(&sm->lock, flags);
 		if (!sm->pending[i].skb || (!sm->pending[i].done &&
-		    time_before(jiffies, sm->pending[i].expires))) {
+		    (sm->pending[i].timeout_requested ||
+		     time_before(jiffies, sm->pending[i].expires)))) {
 			spin_unlock_irqrestore(&sm->lock, flags);
 			continue;
 		}
@@ -544,24 +790,35 @@ static void sm_io(struct work_struct *work)
 			spin_unlock_irqrestore(&sm->lock, flags);
 			continue;
 		}
-        if (sm_direct_status && sm_use_napi && sm->running && sm->pending[i].done) {
+        if (sm_direct_status && sm->running && sm->pending[i].done) {
             sm_schedule_rx_locked(sm);
             spin_unlock_irqrestore(&sm->lock, flags);
             continue;
         }
-		if (!sm->pending[i].done) sm->tx_timeout++;
+		/* mac80211 may change skb layout during status reporting. A source
+		 * lease must finish reading before timeout gives that skb back. */
+		if (!sm->pending[i].done &&
+		    esp32s31_radio_softmac_tx_cancel(sm->pending[i].cookie, sm->epoch)) {
+			sm->pending[i].timeout_requested = true;
+			spin_unlock_irqrestore(&sm->lock, flags);
+			continue;
+		}
+
 		skb = sm->pending[i].skb;
 		ack = sm->pending[i].done && sm->pending[i].ack;
 		attempts = sm->pending[i].attempts;
 		rate = sm->pending[i].rate;
 		sm_pending_clear(sm, i);
 		sm_tx_retire_locked(sm);
-		if (ack) sm->tx_completed++; else sm->tx_failed++;
+
 		spin_unlock_irqrestore(&sm->lock, flags);
 
 		sm_status(sm, skb, ack, attempts, rate);
 	}
 	sm_submit_queued(sm);
+	spin_lock_irqsave(&sm->lock, flags);
+	sm_next_deadline_locked(sm);
+	spin_unlock_irqrestore(&sm->lock, flags);
 }
 /* Caller holds sm->lock. Used in the NAPI completion race recheck. */
 /* Same rotating fairness as the original scan; native32 reads two words. */
@@ -573,55 +830,56 @@ static unsigned int sm_pending_done_index(struct s31_sm *sm)
   return i < S31_SOFTMAC_PENDING ? i :
          find_first_bit(sm->status_done, S31_SOFTMAC_PENDING);
  }
- for (i = 0; i < S31_SOFTMAC_PENDING; i++) {
-  unsigned int slot = (sm->status_cursor + i) % S31_SOFTMAC_PENDING;
-  if (sm->pending[slot].skb && sm->pending[slot].done) return slot;
- }
- return S31_SOFTMAC_PENDING;
+
 }
 
 static bool sm_pending_status_ready_locked(struct s31_sm *sm)
 {
- unsigned int i;
- if (!sm->running || !sm_direct_status || !sm_use_napi) return false;
+ if (!sm->running) return false;
  return !bitmap_empty(sm->status_done, S31_SOFTMAC_PENDING);
- for (i=0; i<S31_SOFTMAC_PENDING; i++)
-  if (sm->pending[i].skb && sm->pending[i].done) return true;
- return false;
 }
-static struct sk_buff *sm_napi_take_status(struct s31_sm *sm)
+static unsigned int sm_napi_take_status(struct s31_sm *sm,
+                                        struct sm_pending *completed,
+                                        unsigned int max)
 {
- struct sm_pending completed;
  unsigned long flags;
- unsigned int i;
+ unsigned int i, n = 0;
+ /* Most downlink iterations have no TX completion. This is only an
+  * empty hint: take the lock before consuming any bit/record. A racing
+  * producer is observed by a later iteration or the locked NAPI completion
+  * recheck, so skipping this lock cannot strand a completion. */
+ for (i = 0; i < ARRAY_SIZE(sm->status_done); i++)
+  if (READ_ONCE(sm->status_done[i])) break;
+ if (i == ARRAY_SIZE(sm->status_done)) return 0;
  spin_lock_irqsave(&sm->lock, flags);
- if (!sm->running) goto empty;
+ if (!sm->running) goto out;
  /* Allocation reuses low slots. Rotate delivery so ongoing traffic cannot
   * indefinitely postpone a completed frame in a higher slot. */
- i = sm_pending_done_index(sm);
- if (i < S31_SOFTMAC_PENDING) {
-  completed=sm->pending[i];
+ while (n < max) {
+  i = sm_pending_done_index(sm);
+  if (i >= S31_SOFTMAC_PENDING) break;
+  completed[n] = sm->pending[i];
   sm_pending_clear(sm, i);
   sm_tx_retire_locked(sm);
   sm->status_cursor = (i + 1) % S31_SOFTMAC_PENDING;
-  if (completed.ack) sm->tx_completed++; else sm->tx_failed++;
-  sm_direct_status_calls++;
-  spin_unlock_irqrestore(&sm->lock, flags);
 
-  sm_prepare_status(completed.skb, completed.ack, completed.attempts, completed.rate);
-  return completed.skb;
+  n++;
  }
-empty:
+out:
  spin_unlock_irqrestore(&sm->lock, flags);
- return NULL;
+ for (i = 0; i < n; i++) {
+  sm_prepare_status(completed[i].skb, completed[i].ack,
+                    completed[i].attempts, completed[i].rate);
+ }
+ return n;
 }
 static void sm_rx_status(struct ieee80211_rx_status *status, const struct sm_rx *rx)
 {
 	status->rate_idx = rx->rate;
  if (rx->phy_flags & S31_SOFTMAC_RX_CCMP_VALID)
   status->flag |= RX_FLAG_DECRYPTED | RX_FLAG_MIC_STRIPPED;
- /* Deliberately retain CCMP IV and omit RX_FLAG_PN_VALIDATED: mac80211
-  * verifies replay counters even though TX keys remain software-only. */
+ /* Retain CCMP IV and omit RX_FLAG_PN_VALIDATED: mac80211 verifies RX
+  * replay counters even when the MAC provides CCMP encryption/decryption. */
 	if (!rx->encoding) return;
 	status->encoding = rx->encoding == 1 ? RX_ENC_HT : RX_ENC_HE;
 	status->nss = 1;
@@ -666,7 +924,7 @@ static void sm_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
  * each returned queue's station/vif use; no pointer survives this pass.
  * A stopped gate sleeps until the existing completion -> wake_queues path.
  * Preserve undrained ACs at a gate/budget boundary, never poll an empty TXQ. */
-static int sm_napi_txqs(struct s31_sm *sm, int budget)
+static int __aligned(64) sm_napi_txqs(struct s31_sm *sm, int budget)
 {
  struct ieee80211_hw *hw = sm->hw;
  struct ieee80211_txq *queue;
@@ -676,71 +934,88 @@ static int sm_napi_txqs(struct s31_sm *sm, int budget)
  bool flush;
 
  spin_lock_irqsave(&sm->lock, flags);
- if (!sm->running || !sm->txq_pending_ac || sm->tx_gate_stopped) {
+ if (!sm->running || !sm->txq_pending_ac || sm->tx_gate_stopped || sm->tx_ba_flushing) {
   spin_unlock_irqrestore(&sm->lock, flags);
   return 0;
  }
  ready = sm->txq_pending_ac;
  sm->txq_pending_ac = 0;
  sm->txq_batch_users++;
- sm->txq_napi_passes++;
+
  spin_unlock_irqrestore(&sm->lock, flags);
 
  rcu_read_lock();
  for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
   if (!(ready & BIT(ac))) continue;
-  if (count == budget || READ_ONCE(sm->tx_gate_stopped)) break;
+  if (count == budget || READ_ONCE(sm->tx_gate_stopped) || READ_ONCE(sm->tx_ba_flushing)) break;
   ieee80211_txq_schedule_start(hw, ac);
   while (count < budget && (queue = ieee80211_next_txq(hw, ac))) {
    struct ieee80211_tx_control ctl = { .sta = queue->sta };
    struct sk_buff *skb;
-   while (count < budget && (skb = ieee80211_tx_dequeue(hw, queue))) {
+   while (count < budget && !READ_ONCE(sm->tx_gate_stopped) && !READ_ONCE(sm->tx_ba_flushing) &&
+          (skb = ieee80211_tx_dequeue(hw, queue))) {
     sm_tx(hw, &ctl, skb);
     count++;
    }
    ieee80211_return_txq(hw, queue, false);
   }
   ieee80211_txq_schedule_end(hw, ac);
-  if (count < budget && !READ_ONCE(sm->tx_gate_stopped)) ready &= ~BIT(ac);
+  if (count < budget && !READ_ONCE(sm->tx_gate_stopped) && !READ_ONCE(sm->tx_ba_flushing)) ready &= ~BIT(ac);
  }
  rcu_read_unlock();
 
  spin_lock_irqsave(&sm->lock, flags);
  sm->txq_batch_users--;
- sm->txq_napi_frames += count;
+
  /* Preserve ACs not visited before the gate/budget closed. They may not
   * yet be marked DIRTY by dequeue. A full gate excludes these bits from
   * NAPI readiness; real completion reopens it before the next drain. */
  if (sm->running) sm->txq_pending_ac |= ready;
  flush = !sm->txq_batch_users && sm->running && !skb_queue_empty(&sm->tx);
- if (flush) sm->txq_batch_flushes++;
+
  spin_unlock_irqrestore(&sm->lock, flags);
  if (flush) sm_flush_tx(sm);
 
  return count;
 }
 
-static int sm_napi_poll(struct napi_struct *napi, int budget)
+/* Caller holds sm->lock. A full source ring sleeps until its consumption
+ * notification; queued metadata alone must never keep NAPI busy polling. */
+static bool sm_tx_batch_ready_locked(struct s31_sm *sm)
 {
+ return sm->running && !sm->tx_ba_flushing && !sm->txq_batch_users &&
+        !skb_queue_empty(&sm->tx) &&
+        esp32s31_radio_wifi_tx_has_space();
+}
+
+static int __aligned(64) sm_napi_poll(struct napi_struct *napi, int budget)
+{
+
  struct s31_sm *sm = container_of(napi, struct s31_sm, napi);
+
+ struct sm_pending status_batch[SM_NAPI_STATUS_BATCH];
+ struct sm_rx rx_batch[SM_NAPI_RX_BATCH];
+ struct sk_buff *replacement[SM_NAPI_RX_BATCH];
+ struct sk_buff *deliver_skb[SM_NAPI_RX_BATCH];
  unsigned long flags;
  int done = 0, rx_since_flush = 0;
 
- sm->napi_polls++;
  sm_refill_empty(sm, true);
+ if (!skb_queue_empty(&sm->tx)) sm_submit_queued(sm);
  while (done < budget) {
   struct sk_buff *skb;
-  struct sm_rx *rx;
-  struct ieee80211_rx_status *status;
+  unsigned int i, n;
 
-  {
-   skb=sm_napi_take_status(sm);
-   if (skb) {
-    sm_napi_status(sm, skb);
-    sm_submit_queued(sm);
-    done++;
-    continue;
+  n = sm_napi_take_status(sm, status_batch,
+                          min_t(unsigned int, SM_NAPI_STATUS_BATCH,
+                                budget - done));
+  if (n) {
+   for (i = 0; i < n; i++) {
+    sm_napi_status(sm, status_batch[i].skb);
    }
+   sm_submit_queued(sm);
+   done += n;
+   continue;
   }
   skb = skb_dequeue(&sm->status_queue);
   if (skb) {
@@ -751,25 +1026,115 @@ static int sm_napi_poll(struct napi_struct *napi, int budget)
   /* Avoid another driver-lock round trip on RX-only or gated iterations.
    * The helper and completion recheck validate readiness under lock. */
   if (sm_txq_napi && READ_ONCE(sm->txq_pending_ac) &&
-      !READ_ONCE(sm->tx_gate_stopped)) {
+      !READ_ONCE(sm->tx_gate_stopped) && !READ_ONCE(sm->tx_ba_flushing)) {
    int sent = sm_napi_txqs(sm, budget - done);
    if (sent) { done += sent; if (done >= budget) break; }
   }
+  if (!skb_queue_empty(&sm->tx)) sm_submit_queued(sm);
+
+  /* Drain one run of owned RX slots per ring-lock round trip. Replacements
+   * are allocated outside the lock; the producer cannot overwrite the
+   * peeked slots while tail is still behind them. */
+  n = sm_napi_take_rx(sm, rx_batch,
+                      min_t(unsigned int, SM_NAPI_RX_BATCH,
+                            budget - done));
+  if (n) {
+   for (i = 0; i < n; i++) {
+
+    replacement[i] = sm_alloc_rx_skb(sm, true);
+
+   }
+   for (i = 0; i < n; i++) {
+    struct ieee80211_rx_status *status;
+
+    skb = rx_batch[i].skb;
+    deliver_skb[i] = NULL;
+    if (!skb)
+     continue;
+    status = IEEE80211_SKB_RXCB(skb);
+    memset(status, 0, sizeof(*status));
+    status->band = NL80211_BAND_2GHZ;
+    status->freq = ieee80211_channel_to_frequency(rx_batch[i].channel,
+                                                  NL80211_BAND_2GHZ);
+    status->signal = rx_batch[i].signal;
+    sm_rx_status(status, &rx_batch[i]);
+    deliver_skb[i] = skb;
+   }
+   /* Free the producer slots before synchronous decrypt/stack processing. */
+   sm_finish_rx_batch(sm, rx_batch, replacement, n);
+   {
+    /* One RCU section for the run. mac80211's per-frame reorder/PN/
+     * decrypt, GRO and delivery semantics are unchanged. */
+
+    rcu_read_lock();
+    for (i = 0; i < n; i++) {
+     struct ieee80211_sta *sta;
+     struct ieee80211_hdr *hdr;
+
+     skb = deliver_skb[i];
+     if (!skb)
+      continue;
+     hdr = (void *)skb->data;
+     /* The pre-RCU removal callback withdraws this hint before mac80211's
+      * grace period. Unknown senders retain normal mac80211 lookup. */
+     sta = rcu_dereference(sm->rx_sta);
+     if (!sta || !ieee80211_is_data(hdr->frame_control) ||
+         !ether_addr_equal(hdr->addr2, sta->addr)) sta = NULL;
+     {
+       ieee80211_rx_napi(sm->hw, sta, skb, napi);
+     }
+    }
+    rcu_read_unlock();
+
+   }
+   rx_since_flush += n;
+   if (READ_ONCE(sm_gro_batch) &&
+       rx_since_flush >= READ_ONCE(sm_gro_batch)) {
+    /* Same sole NAPI owner; no driver lock or RCU read section held. */
+
+    {
+      napi_gro_flush(napi, false);
+      if (napi->gro.rx_count) {
+       netif_receive_skb_list(&napi->gro.rx_list);
+       INIT_LIST_HEAD(&napi->gro.rx_list);
+       napi->gro.rx_count = 0;
+      }
+    }
+
+    rx_since_flush = 0;
+   }
+   done += n;
+   continue;
+  }
+
   spin_lock_irqsave(&sm->lock, flags);
   if (!sm->running || sm->head == sm->tail) {
+   /* Service the idle request at the same ownership boundary as refill.
+    * A request arriving after this check is caught by completion's locked
+    * recheck below; it must not leave an already scheduled NAPI spinning. */
+   if (sm->rx_trim_pending) {
+    spin_unlock_irqrestore(&sm->lock, flags);
+    sm_trim_idle_rx_skbs(sm);
+    continue;
+   }
    if (skb_queue_empty(&sm->status_queue) && !sm_pending_status_ready_locked(sm) &&
-       !(sm_txq_napi && sm->txq_pending_ac && !sm->tx_gate_stopped)) {
+       !sm_tx_batch_ready_locked(sm) &&
+       !(sm_txq_napi && sm->txq_pending_ac && !sm->tx_gate_stopped && !sm->tx_ba_flushing)) {
     spin_unlock_irqrestore(&sm->lock, flags);
     /* Completion can flush GRO and generate TX; never hold sm->lock.
      * Recheck after completion so a producer racing SCHED clear cannot
      * lose the final wakeup. All delivery remains on this one NAPI.
      */
+
     napi_complete_done(napi, done);
+
     spin_lock_irqsave(&sm->lock, flags);
-    if (sm->running && (sm->head != sm->tail ||
+    if (sm->running && (sm->rx_trim_pending || sm->head != sm->tail ||
         !skb_queue_empty(&sm->status_queue) || sm_pending_status_ready_locked(sm) ||
-        (sm_txq_napi && sm->txq_pending_ac && !sm->tx_gate_stopped)))
+        sm_tx_batch_ready_locked(sm) ||
+        (sm_txq_napi && sm->txq_pending_ac && !sm->tx_gate_stopped && !sm->tx_ba_flushing)))
      napi_schedule(napi);
+    sm_idle_deadline_locked(sm);
     spin_unlock_irqrestore(&sm->lock, flags);
 
     return done;
@@ -777,73 +1142,12 @@ static int sm_napi_poll(struct napi_struct *napi, int budget)
    spin_unlock_irqrestore(&sm->lock, flags);
    continue;
   }
-  rx = &sm->rx[sm->tail];
   spin_unlock_irqrestore(&sm->lock, flags);
-
-  skb = rx->skb;
-  {
-   struct sk_buff *replacement = sm_alloc_rx_skb(sm, true);
-   if (replacement) sm_install_rx_replacement(sm, rx, replacement);
-   else { rx->skb = NULL; sm->rx_alloc_failed++; WRITE_ONCE(sm->rx_need_refill, true); }
-  }
-
-  if (skb) {
-   status = IEEE80211_SKB_RXCB(skb);
-   memset(status, 0, sizeof(*status));
-   status->band = NL80211_BAND_2GHZ;
-   status->freq = ieee80211_channel_to_frequency(rx->channel, NL80211_BAND_2GHZ);
-   status->signal = rx->signal;
-   sm_rx_status(status, rx);
-  }
-
-  /* Free the producer slot before synchronous decrypt/stack processing. */
-  spin_lock_irqsave(&sm->lock, flags);
-  sm->tail = (sm->tail + 1) & sm->rx_mask;
-  s31_radio_softmac_rx_pending_set(sm->head != sm->tail);
-  if (skb) sm->rx_delivered++; else sm->rx_alloc_failed++;
-  spin_unlock_irqrestore(&sm->lock, flags);
-  if (skb) {
-   struct ieee80211_sta *sta;
-   struct ieee80211_hdr *hdr = (void *)skb->data;
-
-   /* The pre-RCU removal callback withdraws this hint before mac80211's
-    * grace period. Unknown senders retain normal mac80211 lookup. */
-   rcu_read_lock();
-   sta = rcu_dereference(sm->rx_sta);
-   if (!sta || !ieee80211_is_data(hdr->frame_control) ||
-       !ether_addr_equal(hdr->addr2, sta->addr)) sta = NULL;
-
-    ieee80211_rx_napi(sm->hw, sta, skb, napi);
-   rcu_read_unlock();
-   if (READ_ONCE(sm_gro_batch) &&
-       ++rx_since_flush >= READ_ONCE(sm_gro_batch)) {
-    /* Same sole NAPI owner; no driver lock or RCU read section held. */
-    napi_gro_flush(napi, false);
-    if (napi->gro.rx_count) {
-     netif_receive_skb_list(&napi->gro.rx_list);
-     INIT_LIST_HEAD(&napi->gro.rx_list);
-     napi->gro.rx_count = 0;
-    }
-    rx_since_flush = 0;
-   }
-
-  }
-  done++;
  }
- sm->napi_budget_hits++;
 
  return done;
 }
 
-static void sm_rx_io(struct work_struct *work)
-{
- struct s31_sm *sm = container_of(work, struct s31_sm, rx_io);
- unsigned long flags;
-
- spin_lock_irqsave(&sm->lock, flags);
- if (sm->running) napi_schedule(&sm->napi);
- spin_unlock_irqrestore(&sm->lock, flags);
-}
 /* TX acceptance, watchdog rearm and stop all serialize on sm->lock. */
 
 static void sm_timer(struct work_struct *work)
@@ -851,50 +1155,65 @@ static void sm_timer(struct work_struct *work)
 	struct s31_sm *sm = container_of(to_delayed_work(work), struct s31_sm, timer);
 
 	unsigned long flags;
+	unsigned int i;
+	bool expired = false;
 
-	if (!READ_ONCE(sm->running))
-		return;
-	sm_trim_idle_rx_skbs(sm);
 	spin_lock_irqsave(&sm->lock, flags);
-	if (sm->running) {
-		queue_work_on(sm_io_target(), sm_io_wq(), &sm->io);
-		/* Stop prevents rearm before cancel_delayed_work_sync(). */
-		schedule_delayed_work(&sm->timer, msecs_to_jiffies(100));
+	sm->timer_armed = false;
+	if (!sm->running) {
+		spin_unlock_irqrestore(&sm->lock, flags);
+		return;
 	}
+	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
+		if (sm->pending[i].skb && !sm->pending[i].done &&
+		    !sm->pending[i].timeout_requested &&
+		    time_after_eq(jiffies, sm->pending[i].expires)) {
+			expired = true;
+			break;
+		}
+	if (expired)
+		queue_work_on(sm_io_cpu, system_highpri_wq, &sm->io);
+	if (!sm->rx_trim_pending && sm_rx_idle_trim_due_locked(sm)) {
+		sm->rx_trim_pending = true;
+
+		sm_schedule_rx_locked(sm);
+	}
+	/* The expiry worker arms remaining TX deadlines after joining sources;
+	 * do not rearm an already expired packet while that worker is queued. */
+	if (!expired)
+		sm_next_deadline_locked(sm);
 	spin_unlock_irqrestore(&sm->lock, flags);
 }
 /* One value status; caller holds sm->lock. No packet/native pointer retained. */
 static bool sm_tx_status_locked(struct s31_sm *sm, struct s31_softmac_tx_status status)
 {
- unsigned int i;
-		for (i = 0; i < S31_SOFTMAC_PENDING; i++) {
-			if (sm->pending[i].skb && sm->pending[i].cookie == status.cookie) {
-				sm->pending[i].ack = status.success;
-				sm->pending[i].attempts = status.attempts;
-				if (status.rate < ARRAY_SIZE(sm->rates) ||
-				    ((status.rate & ~7U) == S31_SOFTMAC_TX_HT_RATE) ||
-				    sm_tx_rate_is_he(status.rate))
-					sm->pending[i].rate = status.rate;
+	unsigned int i = status.cookie & (S31_SOFTMAC_PENDING - 1);
+	struct sm_pending *pending = &sm->pending[i];
 
-				sm->pending[i].done = true;
-                __set_bit(i, sm->status_done);
-
-				return true;
-			}
-		}
- return false;
+	/* Indexing is only a lookup. Stale/zero/retired cookies must never
+	 * complete another frame after the slot has been reused. */
+	if (!pending->skb || pending->cookie != status.cookie)
+		return false;
+	pending->ack = status.success;
+	pending->attempts = status.attempts;
+	if (status.rate < ARRAY_SIZE(sm->rates) ||
+	    ((status.rate & ~7U) == S31_SOFTMAC_TX_HT_RATE) ||
+	    sm_tx_rate_is_he(status.rate))
+		pending->rate = status.rate;
+	pending->done = true;
+	__set_bit(i, sm->status_done);
+	return true;
 }
-static void sm_aux(void *context, u8 interface, const u8 *frame,
+
+static void __aligned(64) sm_aux(void *context, u8 interface, const u8 *frame,
 		   size_t length, u8 channel, s8 signal)
 {
 	struct s31_sm *sm = context;
 	unsigned long flags;
 	unsigned int next;
 	struct s31_softmac_rx_header meta = {0};
-	bool borrowed = false;
+	bool borrowed = false, capture_locked;
 
-	if (!sm)
-		return;
 	if (interface == S31_WIFI_IF_SOFTMAC_VIEW) {
 		const struct s31_softmac_rx_view *view = (const void *)frame;
 
@@ -909,7 +1228,13 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
 		memcpy(&meta, frame, sizeof(meta));
 	}
 
-	spin_lock_irqsave(&sm->lock, flags);
+	/* One IRQ-mask span, and no vendor execution gate. TX status needs only
+	 * the short ring lock. RX holds its resource lock across the borrowed
+	 * copy so another producer and .stop cannot reuse the reserved skb. */
+	capture_locked = interface == S31_WIFI_IF_SOFTMAC;
+	local_irq_save(flags);
+	if (capture_locked) spin_lock(&sm->rx_capture_lock);
+	spin_lock(&sm->lock);
 
 	if (!sm->running)
 		goto out;
@@ -922,7 +1247,7 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
 			goto out;
 		memcpy(&status, frame, sizeof(status));
 		matched = sm_tx_status_locked(sm, status);
-		if (sm_direct_status && sm_use_napi && matched) {
+		if (sm_direct_status && matched) {
 			sm_schedule_rx_locked(sm);
 			goto out;
 		}
@@ -957,7 +1282,7 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
               (ieee80211_is_beacon(hdr->frame_control) ||
                ieee80211_is_probe_resp(hdr->frame_control)) &&
               !ether_addr_equal(hdr->addr3, sm->bssid))) {
-          sm->rx_filtered++;
+
           goto out;
          }
         }
@@ -974,32 +1299,37 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
 			}
 		}
         next = (sm->head + 1) & sm->rx_mask;
-		if (!sm->rx[sm->head].skb && sm->rx_idle_limit < sm->rx_slots) {
-			sm->rx[sm->head].skb = sm_alloc_rx_skb_atomic();
-			if (sm->rx[sm->head].skb) {
-				sm->rx_emergency_alloc++;
-				sm->rx_trimmed = false;
-			}
-		}
-		if (!sm->rx[sm->head].skb) {
-			sm->rx_alloc_failed++;
-			sm_schedule_rx_locked(sm);
-			goto out;
-		}
-		if (next == sm->tail) {
-			sm->rx_dropped++;
+        if (next == sm->tail) {  goto out; }
+        if (!sm->rx[sm->head].skb) {
 
-			goto out;
-		}
-		/* The common MPDU uses the small preallocated slab. Only a larger
-		 * A-MSDU needs an atomic expansion; failure drops this frame before
-		 * copying and leaves the producer slot reusable. */
-		if (length + 4 > skb_tailroom(sm->rx[sm->head].skb) &&
-		    pskb_expand_head(sm->rx[sm->head].skb, 0,
-			length + 4 - skb_tailroom(sm->rx[sm->head].skb), GFP_ATOMIC)) {
-			sm->rx_alloc_failed++;
-			goto out;
-		}
+         sm->rx_need_refill = true;
+         sm_schedule_rx_locked(sm);
+         goto out;
+        }
+        if (length + 4 > skb_tailroom(sm->rx[sm->head].skb)) {
+         unsigned int word;
+         for (word = 0; word < ARRAY_SIZE(sm->rx_large_ready); word++) {
+          u32 ready = sm->rx_large_ready[word];
+          if (ready) {
+           unsigned int slot = word * 32 + __ffs(ready);
+           struct sk_buff *small = sm->rx[sm->head].skb;
+           sm->rx[sm->head].skb = sm->rx[slot].skb;
+           sm->rx[slot].skb = small;
+           sm_rx_mark_ready(sm, slot, small);
+
+           break;
+          }
+         }
+         if (word == ARRAY_SIZE(sm->rx_large_ready)) {
+
+          sm->rx_large_needed = true;
+
+          sm_schedule_rx_locked(sm);
+          goto out;
+         }
+        }
+        /* No allocation/expansion or retained vendor ownership in capture. */
+        sm_rx_mark_ready(sm, sm->head, NULL);
 		sm->rx[sm->head].length = length;
 		sm->rx[sm->head].channel = channel;
 		sm->rx[sm->head].signal = signal;
@@ -1009,26 +1339,51 @@ static void sm_aux(void *context, u8 interface, const u8 *frame,
 		if (ieee80211_hdrlen(get_unaligned((const __le16 *)frame)) & 2)
 			skb_reserve(sm->rx[sm->head].skb, 2);
 
-        s31_sm_rx_copy(skb_put(sm->rx[sm->head].skb, length), frame, length);
+        {
+         struct sm_rx *rx = &sm->rx[sm->head];
+         struct sk_buff *skb = rx->skb;
 
-        /* Only verified plaintext IP/TCP checksums can bypass the later
-         * transport checksum. CCMP replay and normal MAC checks still run. */
-        sm->rx[sm->head].skb->ip_summed=CHECKSUM_NONE;
+         /* head is unpublished until the copy completes. CPU1 can consume
+          * older slots/status while this producer retains the borrowed view.
+          * Refill must not steal/expand this active head. */
+         sm->rx_capture_active = true;
+         spin_unlock(&sm->lock);
+
+         s31_sm_rx_copy(skb_put(skb, length), frame, length);
+         skb->ip_summed = CHECKSUM_NONE;
+         spin_lock(&sm->lock);
+         sm->rx_capture_active = false;
+
+         if (!sm->running) {
+          /* .stop has closed admission and is joining rx_capture_lock. */
+          skb_trim(skb, 0);
+          skb->data = PTR_ALIGN_DOWN(skb->data, 4);
+          skb_reset_tail_pointer(skb);
+          sm_rx_mark_ready(sm, sm->head, skb);
+
+          goto out;
+         }
+        }
 
 		sm->head = next;
-		s31_radio_softmac_rx_pending_set(true);
-		sm->rx_queued++;
-		sm->rx_peak = max(sm->rx_peak, (sm->head + sm->rx_slots - sm->tail) & sm->rx_mask);
+
 		sm_schedule_rx_locked(sm);
 		goto out;
 	} else {
 		goto out;
 	}
 	/* Queue while locked so .stop can forbid all new work before cancelling. */
-	queue_work_on(sm_io_target(), sm_io_wq(), &sm->io);
+	queue_work_on(sm_io_cpu, system_highpri_wq, &sm->io);
 out:
 
-	spin_unlock_irqrestore(&sm->lock, flags);
+	/* Restore IRQs before the final preempt-enable, as irqrestore normally
+	 * does, so a higher-priority wakeup is not left until another interrupt. */
+	if (capture_locked) {
+		spin_unlock(&sm->lock);
+		spin_unlock_irqrestore(&sm->rx_capture_lock, flags);
+	} else {
+		spin_unlock_irqrestore(&sm->lock, flags);
+	}
 
 }
 static void sm_wakeup(void *context)
@@ -1036,28 +1391,48 @@ static void sm_wakeup(void *context)
 	struct s31_sm *sm = context;
 	unsigned long flags;
 
-	if (!sm)
-		return;
 	spin_lock_irqsave(&sm->lock, flags);
 	if (sm->running && !skb_queue_empty(&sm->tx))
-		queue_work_on(sm_io_target(), sm_io_wq(), &sm->io);
+		sm_schedule_rx_locked(sm);
 	spin_unlock_irqrestore(&sm->lock, flags);
 }
 static void sm_scan(void *ctx, int rc, const struct esp32s31_radio_wifi_ap *aps,
 		    size_t count) {}
 static void sm_unused_rx(void *ctx) {}
-static void sm_connected(void *ctx, int rc, const u8 *bssid, u8 channel) {}
-static void sm_disconnected(void *ctx, u16 reason) {}
 static const struct esp32s31_radio_wifi_ops sm_radio_ops = {
-	.scan_complete = sm_scan, .connected = sm_connected,
-	.disconnected = sm_disconnected, .rx_ready = sm_unused_rx,
+	/* mac80211 owns auth/assoc and cfg80211 notifications. Firmware STA
+	 * lifecycle events must not clear its connection during hardware replay. */
+	.scan_complete = sm_scan, .rx_ready = sm_unused_rx,
 	.tx_wakeup = sm_wakeup, .receive_aux = sm_aux,
 };
+static void sm_stop(struct ieee80211_hw *hw, bool suspend);
 static int sm_start(struct ieee80211_hw *hw)
 {
 	struct s31_sm *sm = hw->priv;
 	struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_START };
 	int ret;
+	unsigned long flags;
+
+	/* CPU1 is the sole Linux NAPI/TX-status owner. The radio lease pins
+	 * its online lifetime while this interface runs; refuse cold admission
+	 * without it rather than moving network work onto the radio CPU.
+	 */
+	if (!cpu_online(sm_io_cpu))
+		return -EHOSTDOWN;
+	/* mac80211 hardware reconfiguration calls .start without .stop. Join
+	 * Linux producers/NAPI and native ownership before replay; enabling an
+	 * already enabled NAPI instance is a BUG, not an idempotent operation. */
+	if (READ_ONCE(sm->running))
+		sm_stop(hw, false);
+	/* A failed PP drain is not a completed hardware stop. Retry the full
+	 * native stop before replaying a new epoch or replacing its peer/keys. */
+	if (READ_ONCE(sm->tx_drain_error)) {
+		ctl.operation = S31_WIFI_SOFTMAC_STOP;
+		ret = esp32s31_radio_wifi_control(&ctl);
+		if (ret) return ret < 0 ? ret : -EIO;
+		WRITE_ONCE(sm->tx_drain_error, 0);
+		ctl.operation = S31_WIFI_SOFTMAC_START;
+	}
 	if (sm_data_tx_mcs < -1 || sm_data_tx_mcs > 9 ||
 	    (sm_data_tx_mcs > 7 && !sm_he_tx)) return -EINVAL;
 	/* Without a credit gate generic TXQ drain is unbounded. */
@@ -1068,30 +1443,33 @@ static int sm_start(struct ieee80211_hw *hw)
 	if (sm_tx_ampdu && (!sm_ht || sm_data_tx_mcs < 0 ||
 	    (sm_tx_ampdu != 2 && sm_tx_ampdu != 4 &&
 	     sm_tx_ampdu != 8 && sm_tx_ampdu != 16) ||
-        sm_tx_pending_limit < sm_tx_ampdu ||
-        sm_tx_pending_limit > (sm_tx_sg && sm_hw_tx_ccmp && sm_hw_tx_ccmp_fast ? 16 : 8)))
+        sm_tx_pending_limit < sm_tx_ampdu))
 		return -EINVAL;
 
 	{
 		ctl.operation = sm_data_tx_mcs > 7 ? S31_WIFI_SOFTMAC_TX_HE9_CAP :
 		                                  S31_WIFI_SOFTMAC_TX_HE_CAP;
 		ret = esp32s31_radio_wifi_control(&ctl);
-		if (ret) return -EOPNOTSUPP;
+		if (ret) return ret == -EIO ? -EOPNOTSUPP : ret;
 		ctl.operation = S31_WIFI_SOFTMAC_START;
 	}
+	ctl.operation = S31_WIFI_SOFTMAC_TX_BATCH_CAP;
+	ret = esp32s31_radio_wifi_control(&ctl);
+	if (ret) return ret == -EIO ? -EOPNOTSUPP : ret;
+	ctl.operation = S31_WIFI_SOFTMAC_START;
 	WRITE_ONCE(sm->tx_he_peer, false);
 
 	{
 		ctl.operation = S31_WIFI_SOFTMAC_TX_AGG_CAP;
 		ret = esp32s31_radio_wifi_control(&ctl);
-		if (ret) return -EOPNOTSUPP;
+		if (ret) return ret == -EIO ? -EOPNOTSUPP : ret;
 		ctl.operation = S31_WIFI_SOFTMAC_START;
 	}
 
 	{
 		ctl.operation = S31_WIFI_SOFTMAC_TX_HT_CAP;
 		ret = esp32s31_radio_wifi_control(&ctl);
-		if (ret) return -EOPNOTSUPP;
+		if (ret) return ret == -EIO ? -EOPNOTSUPP : ret;
 		ctl.operation = S31_WIFI_SOFTMAC_START;
 	}
 	WRITE_ONCE(sm->tx_ht_peer, false);
@@ -1110,13 +1488,19 @@ static int sm_start(struct ieee80211_hw *hw)
 	ret = esp32s31_radio_wifi_control(&ctl);
 	if (ret)
 		return ret;
+	WRITE_ONCE(sm->tx_native_stopped, false);
 	{
 		napi_enable(&sm->napi);
 		sm->napi_active = true;
 	}
 	WRITE_ONCE(sm->running, true);
+
 	sm->rx_ba_mask = 0;
-	schedule_delayed_work(&sm->timer, msecs_to_jiffies(100));
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->rx_last_data = jiffies;
+	sm->rx_trim_pending = false;
+	sm_next_deadline_locked(sm);
+	spin_unlock_irqrestore(&sm->lock, flags);
 	return 0;
 }
 /* NAPI and producers are stopped. Keep the retained skb window anchored
@@ -1125,7 +1509,6 @@ static int sm_start(struct ieee80211_hw *hw)
 static void sm_restart_rx_ring(struct s31_sm *sm)
 {
 	sm->head = sm->tail;
-	s31_radio_softmac_rx_pending_set(false);
 }
 
 static void sm_stop(struct ieee80211_hw *hw, bool suspend)
@@ -1138,32 +1521,43 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 
 	spin_lock_irqsave(&sm->lock, flags);
 	sm->running = false;
+ sm->rx_trim_pending = false;
+ complete_all(&sm->tx_ba_drained);
  sm->txq_pending_ac = 0;
-	s31_radio_softmac_rx_pending_set(false);
  sm->associated = false;
  sm->scanning = false;
+ sm->connecting = false;
 	spin_unlock_irqrestore(&sm->lock, flags);
+	/* A reserved head may be copying without the shared ring lock. Join it
+	 * before disabling NAPI, stopping firmware or resetting retained buffers.
+	 * Never wait for this producer while holding sm->lock. */
+	spin_lock_irqsave(&sm->rx_capture_lock, flags);
+	spin_unlock_irqrestore(&sm->rx_capture_lock, flags);
 	/* Join an atomic .tx submission before stopping payload/rings. New
          * submissions see running=false and cannot reserve another skb. */
         spin_lock_bh(&sm->submit_lock);
         spin_unlock_bh(&sm->submit_lock);
-	/* No producer can submit after running=false. Completion occurs under
-         * sm->lock; acquire it once more before disabling/freeing NAPI. */
+
+	/* No producer can submit after running=false. Join the callback's last
+	 * memory access and return the idle token for the next .start epoch. */
 	wait_for_completion(&sm->rx_kick_done);
-	spin_lock_irqsave(&sm->lock, flags);
-	spin_unlock_irqrestore(&sm->lock, flags);
+	complete(&sm->rx_kick_done);
 	cancel_delayed_work_sync(&sm->timer);
+	sm->timer_armed = false;
 	cancel_work_sync(&sm->io);
-	cancel_work_sync(&sm->rx_io);
-	cancel_work_sync(&sm->status_io);
  cancel_work_sync(&sm->filter_io);
  WRITE_ONCE(sm_hw_bssid_filter_active,false);
 	if (sm->napi_active) {
 		napi_disable(&sm->napi);
 		sm->napi_active = false;
 	}
-	if (esp32s31_radio_wifi_control(&ctl))
-		pr_warn("esp32s31-softmac: radio stop failed\n");
+	esp32s31_radio_softmac_tx_quiesce(sm->epoch);
+	{
+		int ret = esp32s31_radio_wifi_control(&ctl);
+		WRITE_ONCE(sm->tx_drain_error, ret);
+		if (!ret) WRITE_ONCE(sm->tx_native_stopped, true);
+		if (ret) pr_warn("esp32s31-softmac: radio stop failed: %d; replay requires native stop\n", ret);
+	}
 	esp32s31_radio_idle_poll_set(false);
 	while ((skb = __skb_dequeue(&sm->tx)))
 		ieee80211_free_txskb(hw, skb);
@@ -1175,11 +1569,20 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 	while ((skb=skb_dequeue(&sm->status_queue)))
 		ieee80211_free_txskb(hw,skb);
 	sm->tx_outstanding = 0;
+	/* A successful STA_STOP joins native EBs/callbacks; quiesce above joined
+	 * source leases, and every driver-owned skb has now been discarded.
+	 * No old plaintext token can cross the next .start epoch. Bound token
+	 * uniqueness to this retired hardware lifetime, rather than exhausting
+	 * the seven-bit space after127 otherwise successful hardware restarts.
+	 * A failed stop retains the generation and its ownership protection. */
+	if (!READ_ONCE(sm->tx_drain_error) && READ_ONCE(sm->tx_native_stopped))
+		sm->tx_key_generation = 0;
 	if (sm->tx_gate_stopped) {
 		sm->tx_gate_stopped = false;
 		ieee80211_wake_queues(hw);
 	}
 	sm->status_cursor = 0;
+
 	sm_restart_rx_ring(sm);
 	for (i = 0; i < sm->rx_slots; i++) {
 		struct sk_buff *skb = sm->rx[i].skb;
@@ -1188,9 +1591,10 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 		/* Undo the per-frame QoS alignment for a retained empty slot. */
 		skb->data = PTR_ALIGN_DOWN(skb->data, 4);
 		skb_reset_tail_pointer(skb);
+		sm_rx_mark_ready(sm, i, skb);
 	}
 }
-static void sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
+static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
 		  struct sk_buff *skb)
 {
 	struct s31_sm *sm = hw->priv;
@@ -1240,24 +1644,18 @@ static void sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ct
 		if (sm_tx_sg && (skb_shinfo(skb)->nr_frags ||
 		    (skb_shinfo(skb)->frag_list &&
 		     skb_shinfo(skb_shinfo(skb)->frag_list)->nr_frags)))
-			sm_tx_sg_frames++;
-		if (txinfo->control.flags & IEEE80211_TX_CTRL_FAST_XMIT) {
-			sm->tx_fast_frames++;
-			if (ieee80211_is_data_qos(hdr->frame_control) &&
-			    (*ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_A_MSDU_PRESENT))
-				sm->tx_fast_amsdu++;
-		}
+
+
 		sm->tx_outstanding++;
 
-		sm->tx_depth_peak = max(sm->tx_depth_peak, sm->tx_outstanding);
 		if (sm_tx_pending_limit && !sm->tx_gate_stopped &&
 		    sm->tx_outstanding >= sm_tx_pending_limit) {
 			sm->tx_gate_stopped = true;
-			sm->tx_gate_stops++;
+
 			ieee80211_stop_queues(hw);
 		}
 		defer_submit = sm->txq_batch_users != 0;
-		if (defer_submit) sm->txq_batch_frames++;
+
 		sm_direct_tx_calls++;
 		accepted = true;
 	}
@@ -1273,61 +1671,53 @@ static void sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ct
 static void sm_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
                   struct sk_buff *skb)
 {
+
  sm_tx_inner(hw, ctl, skb);
 
 }
 static void sm_wake_txq(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
 {
+
  struct s31_sm *sm = hw->priv;
  unsigned long flags;
- bool flush = false;
- {
-  spin_lock_irqsave(&sm->lock, flags);
-  if (sm->running && txq->ac < IEEE80211_NUM_ACS) {
-   sm->txq_pending_ac |= BIT(txq->ac);
-   sm->txq_napi_wakes++;
-   sm_schedule_rx_locked(sm);
-  }
-  spin_unlock_irqrestore(&sm->lock, flags);
-  return;
- }
- {
-  spin_lock_irqsave(&sm->lock, flags);
-  sm->txq_batch_users++;
-  spin_unlock_irqrestore(&sm->lock, flags);
- }
- /* Generic dequeue retains airtime fairness and queue-stop handling. Its
-  * existing credit gate bounds this burst; singleton traffic flushes now. */
- ieee80211_handle_wake_tx_queue(hw, txq);
- {
-  spin_lock_irqsave(&sm->lock, flags);
-  if (!WARN_ON_ONCE(!sm->txq_batch_users)) {
-   sm->txq_batch_users--;
-   flush = !sm->txq_batch_users && sm->running && !skb_queue_empty(&sm->tx);
-   if (flush) sm->txq_batch_flushes++;
-  }
-  spin_unlock_irqrestore(&sm->lock, flags);
-  if (flush) sm_flush_tx(sm);
- }
 
+ spin_lock_irqsave(&sm->lock, flags);
+ if (sm->running && txq->ac < IEEE80211_NUM_ACS) {
+  sm->txq_pending_ac |= BIT(txq->ac);
+
+  sm_schedule_rx_locked(sm);
+ }
+ spin_unlock_irqrestore(&sm->lock, flags);
 }
 
 static int sm_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 {
 	struct s31_sm *sm = hw->priv;
 
-	if (vif->type != NL80211_IFTYPE_STATION || sm->has_vif ||
+	if (vif->type != NL80211_IFTYPE_STATION ||
 	    !ether_addr_equal(vif->addr, hw->wiphy->perm_addr))
 		return -EOPNOTSUPP;
+	/* Hardware reconfiguration replays the same persistent vif; it does
+	 * not call .remove_interface first. Still reject a second interface. */
+	if (sm->has_vif && sm->vif != vif) {
+		return -EBUSY;
+	}
 	/* Include MAC/LLC plus software CCMP IV (8) and MIC (8). */
 	ieee80211_vif_to_wdev(vif)->netdev->max_mtu = S31_SOFTMAC_FRAME_MAX - 48;
-	ieee80211_vif_to_wdev(vif)->netdev->mtu = ETH_DATA_LEN;
+	if (!sm->has_vif)
+		ieee80211_vif_to_wdev(vif)->netdev->mtu = ETH_DATA_LEN;
+	sm->vif = vif;
 	sm->has_vif = true;
 	return 0;
 }
 static void sm_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
 {
-	((struct s31_sm *)hw->priv)->has_vif = false;
+	struct s31_sm *sm = hw->priv;
+
+	if (sm->vif == vif) {
+		sm->vif = NULL;
+		sm->has_vif = false;
+	}
 }
 static int sm_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
@@ -1352,17 +1742,27 @@ static int sm_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 static void sm_filter_io(struct work_struct *work)
 {
  struct s31_sm *sm=container_of(work,struct s31_sm,filter_io);
- struct s31_wifi_control ctl={.operation=S31_WIFI_SOFTMAC_BSSID_FILTER};
+ struct s31_wifi_control ctl={.operation=S31_WIFI_SOFTMAC_COEX_BSS};
  unsigned long flags;
- bool running;
+ bool running, filter;
  spin_lock_irqsave(&sm->lock,flags);
  running=sm->running;
- ctl.field=running && sm->associated && !sm->scanning &&
+ ctl.field=sm->scanning ? 1 : sm->connecting ? 3 : sm->associated ? 2 : 0;
+ ctl.beacon_interval=sm->coex_beacon_interval;
+ ctl.offset=sm->coex_aid;
+ filter=running && sm->associated && !sm->scanning &&
    !(sm->filter_flags & (FIF_OTHER_BSS | FIF_BCN_PRBRESP_PROMISC)) &&
    is_valid_ether_addr(sm->bssid);
  ether_addr_copy(ctl.mac,sm->bssid);
  spin_unlock_irqrestore(&sm->lock,flags);
- if (!running || !sm_hw_bssid_filter) return;
+ if (!running) return;
+ /* Reuse the existing cold BSS/filter owner. Firmware coalesces unchanged
+  * state; no per-packet work or duplicate MLME/power-save timers are added. */
+ if (esp32s31_radio_wifi_control(&ctl))
+  pr_warn("esp32s31-softmac: coexistence BSS update failed\n");
+ if (!sm_hw_bssid_filter) return;
+ ctl.operation=S31_WIFI_SOFTMAC_BSSID_FILTER;
+ ctl.field=filter;
  if (esp32s31_radio_wifi_control(&ctl))
   pr_warn("esp32s31-softmac: hardware BSSID filter update failed\n");
  else {
@@ -1372,7 +1772,7 @@ static void sm_filter_io(struct work_struct *work)
 }
 static void sm_queue_filter_locked(struct s31_sm *sm)
 {
- if (sm_hw_bssid_filter && sm->running)
+ if (sm->running)
   queue_work(system_dfl_wq,&sm->filter_io);
 }
 static void sm_filter(struct ieee80211_hw *hw, unsigned int changed,
@@ -1408,16 +1808,59 @@ static void sm_sw_scan_complete(struct ieee80211_hw *hw, struct ieee80211_vif *v
  sm_queue_filter_locked(sm);
  spin_unlock_irqrestore(&sm->lock, flags);
 }
+/* mac80211 calls this sleepable hook before publishing each auth/(re)assoc
+ * frame. Join the existing cold filter/coex owner so the shared radio policy
+ * reserves connecting airtime before that frame can reach PP. */
+static void sm_mgd_prepare_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+                             struct ieee80211_prep_tx_info *info)
+{
+ struct s31_sm *sm = hw->priv;
+ unsigned long flags;
+ if (info->subtype != IEEE80211_STYPE_AUTH &&
+     info->subtype != IEEE80211_STYPE_ASSOC_REQ &&
+     info->subtype != IEEE80211_STYPE_REASSOC_REQ) return;
+ spin_lock_irqsave(&sm->lock, flags);
+ if (!sm->associated) {
+  sm->connecting = true;
+  sm_queue_filter_locked(sm);
+ }
+ spin_unlock_irqrestore(&sm->lock, flags);
+ flush_work(&sm->filter_io);
+}
+static void sm_mgd_complete_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+                              struct ieee80211_prep_tx_info *info)
+{
+ struct s31_sm *sm = hw->priv;
+ unsigned long flags;
+ /* Successful auth must retain connecting policy through association.
+  * Successful association is published by BSS_CHANGED_ASSOC. */
+ if (info->success || (info->subtype != IEEE80211_STYPE_AUTH &&
+     info->subtype != IEEE80211_STYPE_ASSOC_REQ &&
+     info->subtype != IEEE80211_STYPE_REASSOC_REQ)) return;
+ spin_lock_irqsave(&sm->lock, flags);
+ sm->connecting = false;
+ sm_queue_filter_locked(sm);
+ spin_unlock_irqrestore(&sm->lock, flags);
+ flush_work(&sm->filter_io);
+}
 static void sm_bss_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                            struct ieee80211_bss_conf *info, u64 changed)
 {
  struct s31_sm *sm = hw->priv;
  unsigned long flags;
  spin_lock_irqsave(&sm->lock,flags);
- if (changed & BSS_CHANGED_ASSOC) sm->associated=vif->cfg.assoc;
+ if (changed & BSS_CHANGED_ASSOC) {
+  sm->associated=vif->cfg.assoc;
+  if (!sm->associated) sm->connecting=false;
+ }
+ if (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_BEACON_INT)) {
+  sm->coex_beacon_interval=info->beacon_int;
+  sm->coex_aid=vif->cfg.assoc ? vif->cfg.aid : 0;
+ }
  if (changed & BSS_CHANGED_BSSID) {
   if (info->bssid) ether_addr_copy(sm->bssid,info->bssid);
   else eth_zero_addr(sm->bssid);
+  if (!is_valid_ether_addr(sm->bssid)) sm->connecting=false;
  }
  if ((changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc)
   sm_queue_filter_locked(sm);
@@ -1425,7 +1868,7 @@ static void sm_bss_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
  if (changed & BSS_CHANGED_ASSOC)
   esp32s31_radio_idle_poll_set(sm_auto_idle_poll && vif->cfg.assoc &&
                                 READ_ONCE(sm->running));
- if (sm_hw_bssid_filter && (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc)
+ if ((changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc)
   flush_work(&sm->filter_io);
  if ((sm_hw_ccmp || sm_hw_tx_ccmp) && (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc && READ_ONCE(sm->running)) {
   struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_RX_KEY_DEL, .length = 16 };
@@ -1449,36 +1892,74 @@ static void sm_bss_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
  spin_lock_irqsave(&sm->lock,flags);
  sm_queue_filter_locked(sm);
  spin_unlock_irqrestore(&sm->lock,flags);
+ if (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_BEACON_INT | BSS_CHANGED_BSSID))
+  flush_work(&sm->filter_io);
 }
 /* Single AP frontend. Join SRAM publication before any native cancel.
  * No submit/spin lock is held while entering the sleeping control API. */
 static void sm_tx_ba_disable(struct s31_sm *sm, bool flushing)
 {
 	unsigned long flags;
+	bool was_flushing;
 	spin_lock_bh(&sm->submit_lock);
 	spin_lock_irqsave(&sm->lock, flags);
 	sm->tx_ba_operational = false;
-	sm->tx_ba_flushing = flushing;
+	was_flushing = sm->tx_ba_flushing;
+	sm->tx_ba_flushing = flushing || sm->tx_drain_error;
+	if (was_flushing && !sm->tx_ba_flushing && sm->running &&
+	    (sm->txq_pending_ac || !skb_queue_empty(&sm->tx)))
+		sm_schedule_rx_locked(sm);
 	spin_unlock_irqrestore(&sm->lock, flags);
 	spin_unlock_bh(&sm->submit_lock);
 }
 
-static bool sm_tx_ba_pending(struct s31_sm *sm)
+static int sm_tx_ba_wait(struct s31_sm *sm)
 {
 	unsigned long flags;
 	unsigned int i;
-	bool busy = false;
+	bool busy = false, running;
 	spin_lock_irqsave(&sm->lock, flags);
+	reinit_completion(&sm->tx_ba_drained);
+	sm->tx_ba_waiting = true;
 	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
 		if (sm->pending[i].skb &&
 		    (IEEE80211_SKB_CB(sm->pending[i].skb)->flags & IEEE80211_TX_CTL_AMPDU)) {
 			busy = true; break;
 		}
 	spin_unlock_irqrestore(&sm->lock, flags);
-	return busy;
+	if (busy)
+		wait_for_completion_timeout(&sm->tx_ba_drained, msecs_to_jiffies(2200));
+	/* Recheck under the publication lock: completion can race the timeout. */
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->tx_ba_waiting = false;
+	busy = false;
+	for (i = 0; i < S31_SOFTMAC_PENDING; i++)
+		if (sm->pending[i].skb &&
+		    (IEEE80211_SKB_CB(sm->pending[i].skb)->flags & IEEE80211_TX_CTL_AMPDU)) {
+			busy = true; break;
+		}
+	running = sm->running;
+	spin_unlock_irqrestore(&sm->lock, flags);
+	return !running ? -ESHUTDOWN : busy ? -ETIMEDOUT : 0;
 }
 
-static int sm_tx_ba_flush(struct s31_sm *sm, const u8 *addr)
+static void sm_tx_drain_failed(struct s31_sm *sm, int error)
+{
+	unsigned long flags;
+	bool restart;
+
+	spin_lock_irqsave(&sm->lock, flags);
+	restart = !sm->tx_drain_error && sm->running;
+	sm->tx_drain_error = error;
+	sm->tx_ba_flushing = true;
+
+	spin_unlock_irqrestore(&sm->lock, flags);
+	pr_warn_ratelimited("esp32s31-softmac: native TX retirement failed: %d, publication closed, restart=%u\n",
+			    error, restart);
+	if (restart) ieee80211_restart_hw(sm->hw);
+}
+
+static noinline int sm_tx_ba_flush(struct s31_sm *sm, const u8 *addr)
 {
 	struct s31_wifi_control c = { .operation = S31_WIFI_SOFTMAC_TX_BA_FLUSH };
 	struct sk_buff_head dropped;
@@ -1487,11 +1968,17 @@ static int sm_tx_ba_flush(struct s31_sm *sm, const u8 *addr)
 	unsigned int i;
 	int ret = 0;
 	sm_tx_ba_disable(sm, true);
-	if (sm->tx_native_peer) {
+
+	esp32s31_radio_softmac_tx_quiesce(sm->epoch);
+	/* Peerless/unaggregated flights still need the real PP drain before
+	 * keys or BSS ownership can retire. Never infer empty from BA state. */
+	if (!READ_ONCE(sm->tx_native_stopped)) {
 		memcpy(c.mac, addr, ETH_ALEN);
 		ret = esp32s31_radio_wifi_control(&c);
-		if (ret) return ret;
 	}
+	if (ret)
+		pr_warn_ratelimited("esp32s31-softmac: TX drain control rejected, frames dropped locally: %d\n",
+				    ret);
 	skb_queue_head_init(&dropped);
 	spin_lock_irqsave(&sm->lock, flags);
 	while ((skb = __skb_dequeue(&sm->tx))) {
@@ -1507,15 +1994,20 @@ static int sm_tx_ba_flush(struct s31_sm *sm, const u8 *addr)
 	spin_unlock_irqrestore(&sm->lock, flags);
 	/* A later SRAM-ring rejection/old cookie is harmless after unpublish. */
 	while ((skb = __skb_dequeue(&dropped))) ieee80211_free_txskb(sm->hw, skb);
-	return 0;
+	/* Local skb retirement is separate from the native PP ownership result.
+	 * Never reopen publication merely because mac80211 must finish teardown. */
+	if (ret) sm_tx_drain_failed(sm, ret);
+	return ret;
 }
 
-static int sm_tx_ba_action(struct s31_sm *sm, struct ieee80211_vif *vif,
+static noinline int sm_tx_ba_action_locked(struct s31_sm *sm, struct ieee80211_vif *vif,
 			   struct ieee80211_ampdu_params *p)
 {
 	struct s31_wifi_control c = {0};
-	unsigned long deadline;
 	int ret = 0;
+	if (READ_ONCE(sm->tx_drain_error) &&
+	    (p->action == IEEE80211_AMPDU_TX_START ||
+	     p->action == IEEE80211_AMPDU_TX_OPERATIONAL)) return -EIO;
 	if (!sm_tx_ampdu || p->tid || !READ_ONCE(sm->tx_ht_peer)) {
 		/* Stop callbacks remain valid after sta_pre_rcu_remove. */
 		if (p->action == IEEE80211_AMPDU_TX_START ||
@@ -1541,7 +2033,12 @@ static int sm_tx_ba_action(struct s31_sm *sm, struct ieee80211_vif *vif,
 		if (!ret) ret = IEEE80211_AMPDU_TX_START_IMMEDIATE;
 		break;
 	case IEEE80211_AMPDU_TX_OPERATIONAL:
-		if (p->buf_size < sm_tx_pending_limit) return -EOPNOTSUPP;
+		/* The aggregate cap must fit the negotiated buffer. This check
+		 * alone does not establish the native retry sequence window: the
+		 * shim enables TRC BA without conveying the full buffer size.
+		 * Small-window/retry-hole qualification remains separate from
+		 * the frontend's global pending/source/descriptor ownership. */
+		if (p->buf_size < sm_tx_ampdu) return -EOPNOTSUPP;
 		c.operation = S31_WIFI_SOFTMAC_TX_BA_ON;
 		c.length = p->buf_size;
 		ret = esp32s31_radio_wifi_control(&c);
@@ -1555,29 +2052,43 @@ static int sm_tx_ba_action(struct s31_sm *sm, struct ieee80211_vif *vif,
 		sm_tx_ba_disable(sm, false);
 		/* Existing native EBs finish before BA is disabled. The native
 		 * check also covers cookies already expired by the Linux timer. */
-		deadline = jiffies + msecs_to_jiffies(2200);
 		c.operation = S31_WIFI_SOFTMAC_TX_BA_OFF;
-		while (sm->tx_native_peer) {
-			ret = sm_tx_ba_pending(sm) ? -EBUSY : esp32s31_radio_wifi_control(&c);
-			if (!ret) break;
-			if (time_after_eq(jiffies, deadline)) {
-				ret = sm_tx_ba_flush(sm, p->sta->addr);
-				if (!ret) sm_tx_ba_disable(sm, false);
-				break;
-			}
-			usleep_range(1000, 2000);
+		if (sm->tx_native_peer) {
+			ret = sm_tx_ba_wait(sm);
+			if (!ret) ret = esp32s31_radio_wifi_control(&c);
+			if (ret == -ESHUTDOWN) { ret = 0; break; }
+			/* A native EB may outlive its Linux timeout. One synchronous PP
+			 * drain resolves it; do not poll the closed native flight table. */
+			if (ret) ret = sm_tx_ba_flush(sm, p->sta->addr);
+			if (!ret) sm_tx_ba_disable(sm, false);
 		}
-		if (!ret) ieee80211_stop_tx_ba_cb_irqsafe(vif, p->sta->addr, p->tid);
+		ieee80211_stop_tx_ba_cb_irqsafe(vif, p->sta->addr, p->tid);
+		/* The failed native drain is quarantined/restarted separately. */
+		ret = 0;
 		break;
 	case IEEE80211_AMPDU_TX_STOP_FLUSH:
 	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
 		ret = sm_tx_ba_flush(sm, p->sta->addr);
+		/* mac80211 must finish destroying its session even if the backend
+		 * needs recovery. tx_drain_error keeps native publication closed. */
+		ret = 0;
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
-	pr_info("esp32s31-softmac: TX BA action=%u tid=%u ssn=%u window=%u cap=%u aid=%u rc=%d\n",
-		p->action, p->tid, p->ssn, p->buf_size, sm_tx_ampdu, vif->cfg.aid, ret);
+
+	return ret;
+}
+
+/* Only cold BA/control retirement is serialized. The packet path never
+ * takes this mutex; a timeout worker cannot reopen a concurrent teardown. */
+static int sm_tx_ba_action(struct s31_sm *sm, struct ieee80211_vif *vif,
+			   struct ieee80211_ampdu_params *p)
+{
+	int ret;
+	mutex_lock(&sm->tx_ba_mutex);
+	ret = sm_tx_ba_action_locked(sm, vif, p);
+	mutex_unlock(&sm->tx_ba_mutex);
 	return ret;
 }
 
@@ -1593,9 +2104,7 @@ static int sm_sta_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
             (le16_to_cpu(sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80) & 3) != 3 &&
             (sm_data_tx_mcs <= 7 ||
              (le16_to_cpu(sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80) & 3) >= 1));
- pr_info("esp32s31-softmac: peer HT=%u HE=%u rxHE=%04x selectedHE=%u\n",
-         sta->deflink.ht_cap.ht_supported, sta->deflink.he_cap.has_he,
-         le16_to_cpu(sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80), sm->tx_he_peer);
+
  /* A single associated AP is an RX lookup hint, never a substitute for
   * mac80211's address, key, duplicate or replay checks. */
  if (!rcu_access_pointer(sm->rx_sta)) rcu_assign_pointer(sm->rx_sta, sta);
@@ -1609,24 +2118,63 @@ static void sm_sta_pre_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif
  WRITE_ONCE(sm->tx_he_peer, false);
  if (rcu_access_pointer(sm->rx_sta) == sta) RCU_INIT_POINTER(sm->rx_sta, NULL);
 }
-static int sm_sta_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+static int sm_sta_remove_locked(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                          struct ieee80211_sta *sta)
 {
  struct s31_sm *sm = hw->priv;
  struct s31_wifi_control c = { .operation = S31_WIFI_SOFTMAC_TX_PEER_DEL };
  int ret = 0;
- if (sm->tx_native_peer) {
-  ret = sm_tx_ba_flush(sm, sta->addr);
-  if (!ret) {
+ ret = sm_tx_ba_flush(sm, sta->addr);
+ if (!ret && sm->tx_native_peer && !READ_ONCE(sm->tx_native_stopped)) {
    memcpy(c.mac, sta->addr, ETH_ALEN);
    ret = esp32s31_radio_wifi_control(&c);
-  }
-  if (ret) return ret;
-  sm->tx_native_peer = false;
  }
+ if (!ret) sm->tx_native_peer = false;
+ else sm_tx_drain_failed(sm, ret);
  sm->tx_ba_requested = false;
  sm_tx_ba_disable(sm, false);
+ /* Native failure remains sticky; the Linux station can retire safely
+  * after source join because PP owns final copies, not Linux skb data. */
+ return 0;
+}
+static int sm_sta_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+                         struct ieee80211_sta *sta)
+{
+ struct s31_sm *sm = hw->priv;
+ int ret;
+ mutex_lock(&sm->tx_ba_mutex);
+ ret = sm_sta_remove_locked(hw, vif, sta);
+ mutex_unlock(&sm->tx_ba_mutex);
  return ret;
+}
+static int sm_sta_state(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+                        struct ieee80211_sta *sta,
+                        enum ieee80211_sta_state old,
+                        enum ieee80211_sta_state new)
+{
+ struct s31_sm *sm = hw->priv;
+ unsigned long flags;
+ int ret = 0;
+ /* Preserve the old sta_add/remove timing used by mac80211's fallback.
+  * Peer capabilities and native BA retirement keep their existing owners. */
+ if (old == IEEE80211_STA_AUTH && new == IEEE80211_STA_ASSOC)
+  ret = sm_sta_add(hw, vif, sta);
+ else if (old == IEEE80211_STA_ASSOC && new == IEEE80211_STA_AUTH)
+  ret = sm_sta_remove(hw, vif, sta);
+ if (ret) return ret;
+ if (new == IEEE80211_STA_AUTHORIZED || old == IEEE80211_STA_AUTHORIZED ||
+     new == IEEE80211_STA_NOTEXIST) {
+  /* Association alone does not complete a WPA/802.1X connection. Keep
+   * connecting airtime through the key exchange; authorization is the
+   * controlled-port boundary for both protected and open networks. */
+  spin_lock_irqsave(&sm->lock, flags);
+  sm->connecting = new != IEEE80211_STA_AUTHORIZED &&
+                   new != IEEE80211_STA_NOTEXIST && sm->associated;
+  sm_queue_filter_locked(sm);
+  spin_unlock_irqrestore(&sm->lock, flags);
+  flush_work(&sm->filter_io);
+ }
+ return 0;
 }
 static int sm_rts(struct ieee80211_hw *hw, int radio_idx, u32 threshold)
 {
@@ -1640,11 +2188,16 @@ static int sm_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	struct s31_wifi_control ctl = {0};
 	struct s31_sm *sm = hw->priv;
 	bool pairwise = key->flags & IEEE80211_KEY_FLAG_PAIRWISE;
-	bool tx_offload = sm_hw_tx_ccmp && pairwise && sm->tx_key_generation < 127;
+	bool tx_offload = sm_hw_tx_ccmp && pairwise;
 	u8 token = 0;
 	int ret;
 	if (key->cipher != WLAN_CIPHER_SUITE_CCMP)
 		return -EOPNOTSUPP;
+	/* Reusing a token while old plaintext may still be queued is unsafe.
+	 * Do not silently change crypto policy when a live epoch exhausts it.
+	 * Only the fully joined stop boundary above permits token reuse. */
+	if (cmd != DISABLE_KEY && tx_offload && sm->tx_key_generation >= 127)
+		return -ENOSPC;
 	{
 		if (key->keylen != 16 || key->keyidx > 3 || (pairwise && !sta))
 			return -EOPNOTSUPP;
@@ -1655,8 +2208,7 @@ static int sm_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		ctl.length = key->keylen;
 		ctl.total = (sm_hw_ccmp || sm_hw_tx_ccmp) ? S31_SOFTMAC_KEY_RX_CCMP : 0;
 		if (cmd != DISABLE_KEY && tx_offload) {
-			/* Never wrap a token during one frontend lifetime. At exhaustion
-			 * new keys retain software TX; old queued plaintext is rejected. */
+			/* Never wrap a token within an active hardware lifetime. */
 			token = ((sm->tx_key_generation + 1) << 1) | S31_SOFTMAC_TX_MAC_CCMP;
 			ctl.beacon_interval = token;
 			ctl.total |= S31_SOFTMAC_KEY_TX_CCMP;
@@ -1675,12 +2227,10 @@ static int sm_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		key->hw_key_idx = token;
 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV |
 			IEEE80211_KEY_FLAG_SW_MGMT_TX;
-		pr_info("esp32s31-softmac: pairwise MAC TX CCMP, Linux IV/PN\n");
+
 		return 0;
 	}
-	pr_info("esp32s31-softmac: CCMP %s key index=%u uses software crypto\n",
-		key->flags & IEEE80211_KEY_FLAG_PAIRWISE ? "pairwise" : "group",
-		key->keyidx);
+
 	return 1;
 }
 static int sm_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
@@ -1725,8 +2275,7 @@ static int sm_ampdu(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		if (p->action == IEEE80211_AMPDU_RX_START) { sm->rx_ba_mask |= BIT(slot); sm->rx_ba_tid[slot] = p->tid; }
 		else sm->rx_ba_mask &= ~BIT(slot);
 	}
-	pr_info("esp32s31-softmac: RX BA action=%u tid=%u ssn=%u window=%u slot=%u rc=%d\n",
-		p->action, p->tid, p->ssn, p->buf_size, slot, ret);
+
 	return ret;
 }
 /* skb_copy_bits() already flattens the accepted frag_list directly into the
@@ -1746,8 +2295,9 @@ static const struct ieee80211_ops sm_ops = {
 	.add_interface = sm_add, .remove_interface = sm_remove,
 	.config = sm_config, .configure_filter = sm_filter,
  .sw_scan_start = sm_sw_scan_start, .sw_scan_complete = sm_sw_scan_complete,
+ .mgd_prepare_tx = sm_mgd_prepare_tx, .mgd_complete_tx = sm_mgd_complete_tx,
 	.bss_info_changed = sm_bss_changed,
-	.sta_add = sm_sta_add, .sta_remove = sm_sta_remove,
+	.sta_state = sm_sta_state,
 	.sta_pre_rcu_remove = sm_sta_pre_remove,
 	.wake_tx_queue = sm_wake_txq,
 	.can_aggregate_in_amsdu = sm_can_aggregate,
@@ -1780,7 +2330,7 @@ static void sm_register(struct work_struct *work)
 	if (ret)
 		goto failed;
 	sm->registered = true;
-	pr_info("esp32s31-softmac: experimental mac80211 frontend registered\n");
+
 	return;
 failed:
 	pr_err("esp32s31-softmac: registration failed: %d\n", ret);
@@ -1810,15 +2360,20 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	sm->rx_trimmed = sm->rx_idle_limit < sm->rx_slots;
 	spin_lock_init(&sm->lock);
 	spin_lock_init(&sm->submit_lock);
+	spin_lock_init(&sm->rx_capture_lock);
+	mutex_init(&sm->tx_ba_mutex);
 
 	INIT_CSD(&sm->rx_csd, sm_rx_kick, sm);
 	init_completion(&sm->rx_kick_done);
+	init_completion(&sm->tx_ba_drained);
+	sm->tx_native_stopped = true;
 	complete(&sm->rx_kick_done);
 	skb_queue_head_init(&sm->tx);
 	skb_queue_head_init(&sm->status_queue);
 	for (i = 0; i < sm->rx_slots; i++) {
 		if (i >= sm->rx_idle_limit) continue;
 		sm->rx[i].skb = sm_alloc_rx_skb(sm, false);
+		sm_rx_mark_ready(sm, i, sm->rx[i].skb);
 		if (!sm->rx[i].skb) {
 			while (i) dev_kfree_skb(sm->rx[--i].skb);
 			ieee80211_free_hw(hw);
@@ -1834,8 +2389,6 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	netif_napi_add_weight(sm->napi_dev, &sm->napi, sm_napi_poll, clamp_t(unsigned int, sm_napi_budget, 1, 64));
 
 	INIT_WORK(&sm->io, sm_io);
-	INIT_WORK(&sm->rx_io, sm_rx_io);
-	INIT_WORK(&sm->status_io, sm_status_io);
  INIT_WORK(&sm->filter_io, sm_filter_io);
 	INIT_DELAYED_WORK(&sm->timer, sm_timer);
 	INIT_DELAYED_WORK(&sm->register_work, sm_register);
@@ -1871,7 +2424,9 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 		hw->max_tx_aggregation_subframes = sm_tx_ampdu ? 64 : 1;
 		{
 			ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
-			hw->netdev_features |= NETIF_F_SG;
+			/* Finish Internet checksums at the final private SRAM copy,
+			 * before native publication/CCMP. Avoid a second PSRAM payload pass. */
+			hw->netdev_features |= NETIF_F_SG | NETIF_F_HW_CSUM;
 			{
 				ieee80211_hw_set(hw, TX_AMSDU);
 				ieee80211_hw_set(hw, TX_FRAG_LIST);
@@ -1884,10 +2439,12 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 		sm->iftype.he_cap.he_cap_elem.phy_cap_info[1] =
 			IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
 			IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US;
-		sm->iftype.he_cap.he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(0xfffc); /* NSS1 MCS0..7 */
+		/* S31 HE20 is one stream, MCS0..9. The native HE decoder accepts
+		 * indices0..9; do not artificially restrict AP downlink to MCS7. */
+		sm->iftype.he_cap.he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(0xfffd);
 		sm->iftype.he_cap.he_mcs_nss_supp.tx_mcs_80 =
 			cpu_to_le16(sm_he_tx && sm_data_tx_mcs > 7 ? 0xfffd : 0xfffc);
-		/* RX remains NSS1 MCS0..7; TX advertises MCS0..9. */
+		/* HE160 and80+80 are unsupported by this20MHz radio. */
 		sm->iftype.he_cap.he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xffff);
 		sm->iftype.he_cap.he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(0xffff);
 		sm->iftype.he_cap.he_mcs_nss_supp.rx_mcs_80p80 = cpu_to_le16(0xffff);
@@ -1912,6 +2469,9 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 		(u32)-1 : IEEE80211_MAX_FRAG_THRESHOLD;
 	hw->wiphy->rts_threshold = IEEE80211_MAX_RTS_THRESHOLD;
 	ieee80211_hw_set(hw, SIGNAL_DBM);
+	/* Group keys deliberately use mac80211 TX crypto (set_key returns1).
+	 * A failed pairwise hardware install must not silently select it too. */
+	ieee80211_hw_set(hw, SW_CRYPTO_CONTROL);
 
 	{
 		static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
@@ -1920,15 +2480,20 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	}
 	SET_IEEE80211_DEV(hw, parent);
 
+	mutex_lock(&s31_sm_frontend_mutex);
 	s31_sm_frontend = sm;
+	mutex_unlock(&s31_sm_frontend_mutex);
 	schedule_delayed_work(&sm->register_work, 0);
 	return 0;
 }
 void s31_radio_wifi_frontend_exit(void)
 {
-	struct s31_sm *sm = xchg(&s31_sm_frontend, NULL);
+	struct s31_sm *sm;
 	unsigned int i;
 
+	mutex_lock(&s31_sm_frontend_mutex);
+	sm = xchg(&s31_sm_frontend, NULL);
+	mutex_unlock(&s31_sm_frontend_mutex);
 	if (!sm)
 		return;
 	cancel_delayed_work_sync(&sm->register_work);
@@ -1937,8 +2502,6 @@ void s31_radio_wifi_frontend_exit(void)
 		ieee80211_unregister_hw(sm->hw);
 	cancel_delayed_work_sync(&sm->timer);
 	cancel_work_sync(&sm->io);
-	cancel_work_sync(&sm->rx_io);
-	cancel_work_sync(&sm->status_io);
  cancel_work_sync(&sm->filter_io);
  WRITE_ONCE(sm_hw_bssid_filter_active,false);
 	if (sm->napi_active) {
@@ -1955,7 +2518,8 @@ void s31_radio_wifi_frontend_exit(void)
 }
 int s31_radio_wifi_frontend_suspend(void)
 {
-	/* Radio reset/replay while MLME is active is outside this prototype. */
+	/* The wiphy child's PM callback stops mac80211 before the parent radio
+	 * resets. Refuse an out-of-order reset while its producer is still live. */
 	return s31_sm_frontend && READ_ONCE(s31_sm_frontend->running) ? -EBUSY : 0;
 }
 int s31_radio_wifi_frontend_resume(void)

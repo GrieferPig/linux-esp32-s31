@@ -10,6 +10,9 @@
 #include <linux/mm.h>
 #include <asm/sbi.h>
 #include <asm/tlb.h>
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+#include <asm/esp32s31_radio_map.h>
+#endif
 
 #ifdef CONFIG_MMU
 #define __HAVE_ARCH_PUD_FREE
@@ -108,24 +111,14 @@ static inline void sync_kernel_mappings(pgd_t *pgd)
 	       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
 
 #ifdef CONFIG_ESP32S31_RADIO_SMODE
-	/*
-	 * The ESP32-S31 radio payload and mask ROM live below PAGE_OFFSET in
-	 * physical address space.  Their identity mappings are installed in
-	 * swapper_pg_dir during setup_vm_final(), but the generic RISC-V
-	 * pgd_alloc() only copies the upper-half kernel mappings.  Copy these
-	 * platform low-window PGD entries as well so any kernel thread (not
-	 * just init_mm borrowers) can access HP SRAM and ROM while in S mode.
-	 */
+	/* Immutable supervisor-only identity windows must survive every mm
+	 * switch, including peripheral access from an interrupted user task.
+	 * User allocation and teardown exclude these root slots. */
 	{
-		static const unsigned long s31_platform_low_pgds[] = {
-			0x2c000000UL,
-			0x2f000000UL,
-			0x2f800000UL,
-		};
-		int i;
+		unsigned int i;
 
-		for (i = 0; i < ARRAY_SIZE(s31_platform_low_pgds); i++) {
-			unsigned long idx = pgd_index(s31_platform_low_pgds[i]);
+		for (i = 0; i < S31_RADIO_WINDOW_COUNT; i++) {
+			unsigned long idx = pgd_index(s31_radio_window_base[i]);
 
 			pgd[idx] = init_mm.pgd[idx];
 		}

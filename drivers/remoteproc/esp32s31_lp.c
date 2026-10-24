@@ -13,6 +13,7 @@
 #include <linux/kfifo.h>
 #include <linux/ktime.h>
 #include <linux/mailbox_controller.h>
+#include <linux/irq.h>
 #include <linux/math64.h>
 #include <linux/mfd/syscon.h>
 #include <linux/miscdevice.h>
@@ -1444,7 +1445,14 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	lp->irq = platform_get_irq(pdev, 0);
 	if (lp->irq < 0)
 		return lp->irq;
-	ret = devm_request_irq(dev, lp->irq, esp32s31_lp_irq, 0,
+	/* The LP mailbox is IPC, not background peripheral work. Keep its
+	 * CPU0 owner when ordinary device interrupts default to CPU1. */
+	ret = irq_set_affinity(lp->irq, cpumask_of(0));
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot place LP IPC IRQ on CPU0\n");
+	if (!cpumask_equal(irq_get_effective_affinity_mask(lp->irq), cpumask_of(0)))
+		return dev_err_probe(dev, -EAGAIN, "LP IPC IRQ is not on CPU0\n");
+	ret = devm_request_irq(dev, lp->irq, esp32s31_lp_irq, IRQF_NOBALANCING,
 			       dev_name(dev), lp);
 	if (ret)
 		return ret;

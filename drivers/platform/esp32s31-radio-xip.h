@@ -9,7 +9,7 @@
 #define S31_XIP_BASE 0xbe06e000U
 #define S31_XIP_PHYS 0x4006e000U
 #define S31_XIP_HEADER_SIZE 4096U
-#define S31_XIP_SLOT_SIZE 0x180000U
+#define S31_XIP_SLOT_SIZE 0x1c0000U
 #define S31_XIP_RAM_SIZE 40960U
 #define S31_XIP_WIFI_IRAM_BASE 0xbe420000U
 #define S31_XIP_WIFI_IRAM_PHYS 0x2f060000U
@@ -46,7 +46,7 @@ static inline bool s31_xip_valid(const struct s31_xip_header *h, u32 ram)
 	u32 i, body_end;
 
 	if (h->magic != S31_XIP_MAGIC ||
-	    h->version != 2 || h->abi != 1 ||
+	    h->version != 2 || h->abi != 2 ||
 	    h->base != S31_XIP_BASE || h->ram != ram ||
 	    h->ram_capacity != S31_XIP_RAM_SIZE ||
 	    h->image_size <= S31_XIP_HEADER_SIZE ||

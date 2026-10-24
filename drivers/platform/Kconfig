@@ -12,23 +12,27 @@ config ESP32S31_DT_OVERLAY
 config ESP32S31_RADIO_SMODE_DRIVER
 	tristate "ESP32-S31 S-mode radio runtime"
 	depends on ESP32S31_RADIO_SMODE
+	depends on ESP32S31_COPROC_CONTEXT && FPU
+	depends on SMP && PREEMPTION
 	depends on BT && WLAN
 	select FUTEX
+	select RT_MUTEXES
+	select ESP32S31_RADIO_SCHEDULER
 	select CFG80211
-	select MAC80211
 	help
 	  Build the reloadable esp32s31-radio.ko. It owns the shared PHY, SRAM,
 	  clocks and interrupts and exposes cfg80211 plus direct HCI from one
 	  module. mode=wifi, mode=bt, or mode=combo selects the runtime profile.
-	  The prelinked ESP-IDF closure runs from its fixed flash-XIP slot.
+	  Native persistent contexts, PI mutexes and radio scheduling are
+	  mandatory; no legacy execution backend is provided. The prelinked
+	  ESP-IDF closure runs from its fixed flash-XIP slot.
 
 config ESP32S31_WIFI_SOFTMAC
 	bool
 	depends on ESP32S31_RADIO_SMODE_DRIVER && MAC80211
 	default y
 	help
-	  Single-STA mac80211 bridge with native MAC CCMP, bounded TX
-	  aggregation and software replay/reorder checks on received frames.
+	  Native mac80211 frontend on the simplified Linux radio runtime.
 
 config ESP32S31_RADIO_XIP
 	bool

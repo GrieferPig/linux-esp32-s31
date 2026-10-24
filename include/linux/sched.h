@@ -1208,6 +1208,10 @@ struct task_struct {
 	unsigned int			sas_ss_flags;
 
 	struct callback_head		*task_works;
+	struct callback_head		*task_exit_works;
+	/* Only the running owner may add finite guards during exit delivery. */
+	struct task_exit_work		*task_exit_work_active;
+	bool				task_exit_work_closing;
 
 #ifdef CONFIG_AUDIT
 #ifdef CONFIG_AUDITSYSCALL

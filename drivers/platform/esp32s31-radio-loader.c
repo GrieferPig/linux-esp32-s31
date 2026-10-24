@@ -36,7 +36,7 @@ struct s31_radio_fw_exports {
 	int (*wifi_try_send)(u8 *frame, u16 length);
 	void (*rtos_init)(void);
 	void (*rtos_tick)(void);
-	u32 (*timer_next_due_us)(void);
+	u64 (*timer_next_deadline_ns)(void);
 	void (*rtos_hard_tick)(void);
 	void (*rtos_free)(void *ptr);
 	void (*rtos_task_release)(void *cookie);
@@ -125,6 +125,20 @@ size_t s31_radio_fw_wifi_iram_size(void)
 	return s31_xip_image ? s31_xip_image->wifi_iram_size : 0;
 }
 
+bool s31_radio_fw_errno_slot_valid(const int *slot)
+{
+	unsigned long address = (unsigned long)slot;
+	unsigned long base = (unsigned long)esp32s31_radio_xip_ram;
+	const struct s31_xip_header *h = s31_xip_image;
+
+	/* This built-in BSS arena has a stable linear mapping in every mm.
+	 * Reject physical SRAM, vmalloc, and unrelated kernel allocations before
+	 * allowing scheduler hooks to touch the relocated cell after switch_mm. */
+	return h && !(address & (sizeof(*slot) - 1)) && address >= base &&
+		address - base < S31_XIP_RAM_SIZE &&
+		s31_xip_range(address - base, sizeof(*slot), h->bss_offset + h->bss_size);
+}
+
 int s31_radio_fw_reset(void)
 {
 	return s31_xip_image ? s31_fw_xip_reset() : -ENODEV;
@@ -173,8 +187,7 @@ int s31_radio_wifi_try_send(u8 *frame, u16 length)
 }
 void s31_rtos_init(void) { s31_fw.rtos_init(); }
 void s31_rtos_tick(void) { s31_fw.rtos_tick(); }
-u32 s31_linux_timer_next_due_us(void) { return s31_fw.timer_next_due_us(); }
-void s31_rtos_hard_tick(void) { s31_fw.rtos_hard_tick(); }
+u64 s31_linux_timer_next_deadline_ns(void) { return s31_fw.timer_next_deadline_ns(); }
 void s31_rtos_free(void *ptr) { s31_fw.rtos_free(ptr); }
 void s31_rtos_task_release(void *cookie) { s31_fw.rtos_task_release(cookie); }
 int xTaskCreatePinnedToCore(void (*task)(void *), const char *name,

@@ -24,44 +24,6 @@ MODULE_PARM_DESC(mode, "radio profile: wifi, bt, or combo");
 module_param_named(direct_hci, s31_radio_direct_hci, bool, 0400);
 MODULE_PARM_DESC(direct_hci, "expose /dev/s31-hci instead of Linux hci0");
 
-static ssize_t radio_health_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct esp32s31_radio_health health;
-	int ret;
-
-	ret = esp32s31_radio_get_health(&health);
-	if (ret)
-		return ret;
-	return sysfs_emit(buf,
-		"abi=%u state=%u wifi_init=%d bt_init=%d bt_enable=%d "
-		"ticks=%u worker_passes=%u commands=%u irqs=%u "
-		"heap_used=%u heap_peak=%u heap_total=%u "
-		"wifi_rx_dropped=%u wifi_tx_dropped=%u "
-		"hci_rx_dropped=%u hci_tx_dropped=%u "
-		"acl_rx_packets=%llu acl_rx_bytes=%llu "
-		"acl_tx_packets=%llu acl_tx_bytes=%llu "
-		"acl_packet_type_events=%u acl_packet_type=0x%04x "
-		"coex_cmd_completes=%u coex_last_status=%d "
-		"coex_bt_status=0x%02x\n",
-		ESP32S31_RADIO_CORE_ABI_VERSION, health.state,
-		health.wifi_init_result, health.bt_init_result,
-		health.bt_enable_result, health.tick_irqs,
-		health.worker_passes, health.commands_completed,
-		health.radio_irqs, health.heap_used, health.heap_peak,
-		health.heap_total, health.wifi_rx_dropped,
-		health.wifi_tx_dropped, health.hci_rx_dropped,
-		health.hci_tx_dropped,
-		(unsigned long long)health.hci_acl_rx_packets,
-		(unsigned long long)health.hci_acl_rx_bytes,
-		(unsigned long long)health.hci_acl_tx_packets,
-		(unsigned long long)health.hci_acl_tx_bytes,
-		health.acl_packet_type_events, health.acl_packet_type,
-		health.coex_cmd_completes, health.coex_last_status,
-		health.coex_bt_status);
-}
-static DEVICE_ATTR_RO(radio_health);
-
 static int s31_radio_parse_mode(bool *enable_wifi, bool *enable_bt)
 {
 	if (!strcmp(s31_radio_mode, "wifi")) {
@@ -99,15 +61,13 @@ static int esp32s31_radio_probe(struct platform_device *pdev)
 	ret = s31_radio_fw_load(&pdev->dev);
 	if (ret)
 		goto clear_core;
+	/* Establish the power lease before publishing the init task: its
+	 * post-IDF reclaim uses the same PMU lock. */
+	s31_linux_pmu_radio_vote(true);
 	ret = s31_radio_runtime_init(enable_wifi, enable_bt);
 	if (ret)
-		goto unload_firmware;
-	s31_linux_pmu_radio_vote(true);
+		goto release_power;
 	s31_radio_started = true;
-	ret = device_create_file(&pdev->dev, &dev_attr_radio_health);
-	if (ret)
-		dev_warn(&pdev->dev, "cannot create radio health attribute: %d\n",
-			 ret);
 	if (enable_wifi) {
 		ret = s31_radio_wifi_frontend_init(&pdev->dev);
 		if (ret)
@@ -129,11 +89,10 @@ detach_wifi:
 	if (enable_wifi)
 		s31_radio_wifi_frontend_exit();
 stop_runtime:
-	device_remove_file(&pdev->dev, &dev_attr_radio_health);
 	s31_radio_started = false;
-	s31_linux_pmu_radio_vote(false);
 	s31_radio_runtime_shutdown();
-unload_firmware:
+release_power:
+	s31_linux_pmu_radio_vote(false);
 	s31_radio_fw_unload();
 clear_core:
 	s31_radio_configured_features = 0;
@@ -142,18 +101,18 @@ clear_core:
 
 static void esp32s31_radio_remove(struct platform_device *pdev)
 {
-	if (s31_radio_started) {
-		if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
-			s31_radio_wifi_frontend_suspend();
-		if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
-			s31_radio_btdm_frontend_suspend();
-		s31_radio_runtime_shutdown();
-	}
+
+	/* Unregister while command admission and the payload are still alive.
+	 * ieee80211_unregister_hw invokes .stop for an active interface; its
+	 * synchronous stop must finish before terminal shutdown closes the
+	 * command queue and retires the radio domain. suspend() may return
+	 * -EBUSY and therefore cannot substitute for this producer drain. */
 	if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
 		s31_radio_btdm_frontend_exit();
 	if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
 		s31_radio_wifi_frontend_exit();
-	device_remove_file(&pdev->dev, &dev_attr_radio_health);
+	if (s31_radio_started)
+		s31_radio_runtime_shutdown();
 	s31_radio_started = false;
 	s31_radio_suspended = false;
 	s31_linux_pmu_radio_vote(false);
@@ -208,8 +167,9 @@ static int esp32s31_radio_suspend(struct device *dev)
 
 	if (!s31_radio_started)
 		return 0;
-	/* SoftMAC cannot replay a running MLME after a radio reset. Honor its
-	 * veto before stopping another frontend or freeing the live payload. */
+
+	/* The wiphy child quiesces mac80211 before parent suspend and replays it
+	 * after parent resume. Check that ordering before retiring the runtime. */
 	if (wifi) {
 		ret = s31_radio_wifi_frontend_suspend();
 		if (ret)
@@ -239,12 +199,13 @@ static int esp32s31_radio_suspend(struct device *dev)
 			dev_err(dev, "radio rollback also failed: %d\n", recover);
 		return -EIO;
 	}
-	s31_linux_pmu_radio_vote(false);
+		s31_linux_pmu_radio_vote(false);
 	return 0;
 }
 
 static void esp32s31_radio_shutdown(struct platform_device *pdev)
 {
+
 	if (s31_radio_started) {
 		if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
 			s31_radio_wifi_frontend_suspend();

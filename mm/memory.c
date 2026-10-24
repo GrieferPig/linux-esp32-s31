@@ -41,6 +41,9 @@
 
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+#include <asm/esp32s31_radio_map.h>
+#endif
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
@@ -364,6 +367,12 @@ void free_pgd_range(struct mmu_gather *tlb,
 	pgd = pgd_offset(tlb->mm, addr);
 	do {
 		next = pgd_addr_end(addr, end);
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+		/* These immutable supervisor leaves have no VMA/page-table owner
+		 * in this mm. Never descend into a leaf as a user table. */
+		if (s31_radio_reserved_range(addr, 1, NULL, NULL))
+			continue;
+#endif
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
 		free_p4d_range(tlb, pgd, addr, next, floor, ceiling);

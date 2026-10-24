@@ -225,10 +225,14 @@ secondary_start_sbi:
 	csrw CSR_TVEC, a0
 
 	/*
-	 * Set sup0 scratch register to 0, indicating to exception vector that
-	 * we are presently executing in kernel.
+	 * Establish trap identity. S31 native entry keeps canonical TP in
+	 * scratch; generic entry uses the zero-kernel sentinel.
 	 */
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	csrw CSR_SCRATCH, tp
+#else
 	csrw CSR_SCRATCH, zero
+#endif
 	ret
 
 SYM_CODE_END(_start)
@@ -375,11 +379,12 @@ SYM_CODE_START(_start_kernel)
 	call relocate_enable_mmu
 #endif /* CONFIG_MMU */
 
-	call .Lsetup_trap_vector
-	/* Restore C environment */
+	/* Restore virtual pointers before publishing canonical trap identity.
+	 * Before MMU relocation tp still held a physical XIP data alias. */
 	la tp, init_task
 	la sp, init_thread_union + THREAD_SIZE
 	addi sp, sp, -PT_SIZE_ON_STACK
+	call .Lsetup_trap_vector
 	scs_load_current
 
 #ifdef CONFIG_KASAN

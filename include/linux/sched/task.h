@@ -16,6 +16,7 @@ struct task_struct;
 struct rusage;
 union thread_union;
 struct css_set;
+struct esp32s31_radio_stack;
 
 /* All the bits taken by the old clone syscall. */
 #define CLONE_LEGACY_FLAGS 0xffffffffULL
@@ -44,6 +45,9 @@ struct kernel_clone_args {
 	struct cgroup *cgrp;
 	struct css_set *cset;
 	unsigned int kill_seq;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	struct esp32s31_radio_stack *s31_radio_stack;
+#endif
 };
 
 /*
@@ -102,6 +106,11 @@ struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node);
 struct task_struct *fork_idle(int);
 extern pid_t kernel_thread(int (*fn)(void *), void *arg, const char *name,
 			    unsigned long flags);
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+pid_t kernel_thread_on_s31_stack(int (*fn)(void *), void *arg,
+		const char *name, unsigned long flags,
+		struct esp32s31_radio_stack *stack);
+#endif
 extern pid_t user_mode_thread(int (*fn)(void *), void *arg, unsigned long flags);
 extern long kernel_wait4(pid_t, int __user *, int, struct rusage *);
 int kernel_wait(pid_t pid, int *stat);

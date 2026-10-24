@@ -14,6 +14,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/rseq_api.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/s31_radio.h>
 #include <linux/sched/smt.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/sysctl.h>
@@ -961,7 +962,6 @@ static inline long se_weight(struct sched_entity *se)
 {
 	return scale_load_down(se->load.weight);
 }
-
 
 static inline bool sched_asym_prefer(int a, int b)
 {
@@ -2581,6 +2581,11 @@ static inline bool sched_fair_runnable(struct rq *rq)
 
 extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
 extern struct task_struct *pick_task_idle(struct rq *rq);
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+bool s31_radio_rt_candidate(struct rq *rq);
+#else
+static inline bool s31_radio_rt_candidate(struct rq *rq) { return false; }
+#endif
 
 #define SCA_CHECK		0x01
 #define SCA_MIGRATE_DISABLE	0x02
@@ -3262,7 +3267,6 @@ unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
 				 unsigned long min,
 				 unsigned long max);
 
-
 /*
  * Verify the fitness of task @p to run on @cpu taking into account the
  * CPU original capacity and the runtime/deadline ratio of the task.
@@ -3287,7 +3291,6 @@ static inline unsigned long cpu_util_dl(struct rq *rq)
 {
 	return READ_ONCE(rq->avg_dl.util_avg);
 }
-
 
 extern unsigned long cpu_util_cfs(int cpu);
 extern unsigned long cpu_util_cfs_boost(int cpu);
@@ -3362,7 +3365,6 @@ static inline bool uclamp_rq_is_capped(struct rq *rq)
 	for ((clamp_id) = 0; (clamp_id) < UCLAMP_CNT; (clamp_id)++)
 
 extern unsigned int sysctl_sched_uclamp_util_min_rt_default;
-
 
 static inline unsigned int uclamp_none(enum uclamp_id clamp_id)
 {

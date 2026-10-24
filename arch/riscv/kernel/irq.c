@@ -113,6 +113,71 @@ static void init_irq_stacks(void)
 }
 #endif /* CONFIG_VMAP_STACK */
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+static ulong *s31_radio_irq_stack;
+static ulong *s31_previous_irq_stack;
+#define S31_IRQ_STACK_MAGIC 0x53314951UL
+
+int esp32s31_radio_irq_stack_install(void *base, unsigned long size)
+{
+	unsigned long start = (unsigned long)base, flags;
+	int ret = 0;
+
+	if (in_interrupt() || in_atomic() || irqs_disabled() ||
+	    size != IRQ_STACK_SIZE || (start & 15) ||
+	    start < 0x2f000000UL || start > 0x2f080000UL - size)
+		return -EINVAL;
+	preempt_disable();
+	local_irq_save(flags);
+	if (smp_processor_id() != 0)
+		ret = -EXDEV;
+	else if (READ_ONCE(s31_radio_irq_stack))
+		ret = -EBUSY;
+	else {
+		*(ulong *)base = S31_IRQ_STACK_MAGIC;
+		s31_previous_irq_stack = this_cpu_read(irq_stack_ptr);
+		WRITE_ONCE(s31_radio_irq_stack, base);
+		this_cpu_write(irq_stack_ptr, base);
+	}
+	local_irq_restore(flags);
+	preempt_enable();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_irq_stack_install);
+
+void esp32s31_radio_irq_stack_restore(void *base)
+{
+	unsigned long flags;
+
+	if (in_interrupt() || in_atomic() || irqs_disabled())
+		panic("s31 IRQ stack: restore outside schedulable task");
+	preempt_disable();
+	local_irq_save(flags);
+	if (smp_processor_id() != 0 || base != READ_ONCE(s31_radio_irq_stack) ||
+	    this_cpu_read(irq_stack_ptr) != base ||
+	    *(ulong *)base != S31_IRQ_STACK_MAGIC)
+		panic("s31 IRQ stack: lease or stack guard corrupted");
+	/* A CPU0 task cannot run until its preceding IRQ frame has returned.
+	 * Local IRQ exclusion then makes the pointer replacement indivisible. */
+	this_cpu_write(irq_stack_ptr, s31_previous_irq_stack);
+	WRITE_ONCE(s31_radio_irq_stack, NULL);
+	s31_previous_irq_stack = NULL;
+	local_irq_restore(flags);
+	preempt_enable();
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_irq_stack_restore);
+
+bool esp32s31_radio_on_irq_stack(void)
+{
+	unsigned long sp, base = (unsigned long)READ_ONCE(s31_radio_irq_stack);
+
+	asm volatile("mv %0, sp" : "=r"(sp));
+	return raw_smp_processor_id() == 0 && base &&
+	       sp > base && sp < base + IRQ_STACK_SIZE;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_on_irq_stack);
+#endif
+
 #ifdef CONFIG_SOFTIRQ_ON_OWN_STACK
 static void ___do_softirq(struct pt_regs *regs)
 {

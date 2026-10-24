@@ -9,11 +9,15 @@
 /* void *memcpy(void *, const void *, size_t) */
 /* Share the exact scalar implementation between early Flash and runtime
  * PSRAM entries. __pi_* must remain executable before the XIP data copy. */
-.macro S31_MEMCPY_BODY
+.macro S31_MEMCPY_BODY runtime=0
 	move t6, a0  /* Preserve return value */
 
 	/* Defer to byte-oriented copy for small sizes */
+	.if \runtime
+	sltiu a3, a2, 16*SZREG
+	.else
 	sltiu a3, a2, 128
+	.endif
 	bnez a3, 4f
 	/* Use word-oriented copy only if low-order bits match */
 	andi a3, t6, SZREG-1
@@ -84,6 +88,24 @@
 	beqz a2, 6f
 	add a3, a1, a2
 
+	.if \runtime
+	/* A partial final word does not make the preceding aligned words
+	 * unsafe. Copy them first, then exactly the remaining bytes. The
+	 * early __pi_* entry retains its original implementation below. */
+	or a5, a1, t6
+	andi a5, a5, 3
+	bnez a5, 5f
+	andi t0, a3, ~3
+	bgeu a1, t0, 5f
+7:
+	lw a4, 0(a1)
+	addi a1, a1, 4
+	sw a4, 0(t6)
+	addi t6, t6, 4
+	bltu a1, t0, 7b
+	beq a1, a3, 6f
+	j 5f
+	.else
 	/* Use word-oriented copy if co-aligned to word boundary */
 	or a5, a1, t6
 	or a5, a5, a3
@@ -97,6 +119,7 @@
 	bltu a1, a3, 7b
 
 	ret
+	.endif
 
 5:
 	lb a4, 0(a1)
@@ -115,7 +138,16 @@ SYM_FUNC_END(__memcpy)
 #if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL)
 .pushsection .s31_rx_ram.text,"ax",@progbits
 SYM_FUNC_START(memcpy)
- S31_MEMCPY_BODY
+ /* Runtime PSRAM entry only. Keep the pre-data-copy __pi_* closure intact.
+  * Fragment payload and final radio buffer often have different alignments. */
+ xor t0, a0, a1
+ andi t0, t0, 3
+ beqz t0, .Ls31_memcpy_existing
+ sltiu t0, a2, 32
+ bnez t0, .Ls31_memcpy_existing
+ tail __s31_memcpy_unaligned
+.Ls31_memcpy_existing:
+ S31_MEMCPY_BODY runtime=1
 SYM_FUNC_END(memcpy)
 .popsection
 #else

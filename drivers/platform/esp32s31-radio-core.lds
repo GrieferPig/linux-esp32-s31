@@ -5,6 +5,8 @@ SECTIONS
 	/* The composite link uses --gc-sections.  Keep every parameter record and
 	 * its description, including parameters declared outside the module entry
 	 * translation unit. */
+	/* Fault recovery metadata must survive the composite garbage collection. */
+	__ex_table : { KEEP(*(__ex_table)) }
 	__param : { KEEP(*(__param)) }
 	.modinfo : { KEEP(*(.modinfo)) }
 	.init.text : { KEEP(*(.init.text)) KEEP(*(.init.text.*)) }

@@ -4,6 +4,7 @@
  * Copyright (C) 2017 SiFive
  */
 
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/linkage.h>
 
@@ -32,6 +33,35 @@
 #ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
 	li \scratch, CAUSE_IRQ_FLAG | 0xFFF
 	and \reg, \reg, \scratch
+#endif
+.endm
+
+.macro esp32s31_clic_switch_level_reset
+#if defined(CONFIG_SOC_ESP32S31) && !defined(CONFIG_RISCV_M_MODE)
+	/* Linux can switch from an IRQ/exception continuation before its sret.
+	 * SIE alone does not clear CLIC SIL: the new kernel continuation must
+	 * not inherit that source's level (or the exception's 0xff sentinel).
+	 * Recover on the new task's Linux stack, still IRQ-disabled. Preserve
+	 * all trap CSRs and a0/a1; only ABI caller-saved t0..t4 are scratch.
+	 * No ecall, pending-source poll, acknowledgement or IRQ enable.
+	 */
+	csrr t0, CSR_STATUS
+	csrci CSR_STATUS, SR_IE
+	csrr t1, CSR_EPC
+	csrr t2, CSR_CAUSE
+	li t3, CAUSE_IRQ_FLAG
+	csrw CSR_CAUSE, t3
+	ori t3, t0, SR_SPP
+	li t4, ~(SR_IE | SR_PIE)
+	and t3, t3, t4
+	csrw CSR_STATUS, t3
+	lla t3, 991f
+	csrw CSR_EPC, t3
+	sret
+991:
+	csrw CSR_CAUSE, t2
+	csrw CSR_EPC, t1
+	csrw CSR_STATUS, t0
 #endif
 .endm
 
@@ -107,7 +137,6 @@
 	REG_L	a0, TASK_TI_A0(tp)
 .endm
 
-
 #ifdef CONFIG_SOC_ESP32S31
 	/*
 	 * ESP32-S31 runs with stvec forced to CLIC mode, whose BASE field is
@@ -118,15 +147,33 @@
 #endif
 SYM_CODE_START(handle_exception)
 	/*
-	 * If coming from userspace, preserve the user thread pointer and load
-	 * the kernel thread pointer.  If we came from the kernel, the scratch
-	 * register will contain 0, and we should continue on the current TP.
+	 * Preserve the interrupted thread pointer and recover Linux identity.
+	 * The generic path uses zero scratch for kernel origin; the S31 native
+	 * path below uses a permanent canonical pointer and the saved privilege.
 	 */
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* Native closed code may use tp as scratch/TLS. sscratch is always
+	 * canonical, on both harts and in both U/S contexts. Classify origin
+	 * from SPP, never from the interrupted tp or a zero scratch sentinel.
+	 * Only t0 is used before the complete integer frame has been saved. */
+	csrrw tp, CSR_SCRATCH, tp
+	REG_S t0, TASK_TI_S31_BLOB_TRAP_T0(tp)
+	csrr t0, CSR_SCRATCH
+	REG_S t0, TASK_TI_S31_BLOB_TRAP_TP(tp)
+	csrw CSR_SCRATCH, tp
+	csrr t0, CSR_STATUS
+	andi t0, t0, SR_SPP
+	bnez t0, .Ls31_kernel_tp_ready
+	REG_L t0, TASK_TI_S31_BLOB_TRAP_T0(tp)
+	j .Lsave_context
+.Ls31_kernel_tp_ready:
+#else
 	csrrw tp, CSR_SCRATCH, tp
 	bnez tp, .Lsave_context
 
 .Lrestore_kernel_tpsp:
 	csrr tp, CSR_SCRATCH
+#endif
 
 #ifdef CONFIG_64BIT
 	/*
@@ -141,6 +188,28 @@ SYM_CODE_START(handle_exception)
 	new_vmalloc_check
 #endif
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* Explicit alternate-stack entries can publish a dormant Linux SP.
+	 * Native radio tasks already run on their registered SRAM Linux stack
+	 * and leave this anchor zero. SRAM survives ordinary switch_mm().
+	 * Keep PT_SP as the interrupted SP when an alternate entry pivots the
+	 * trap frame; nested traps already on a Linux stack use their live SP.
+	 */
+	REG_S sp, TASK_TI_USER_SP(tp)
+	li t0, 0x2f000000
+	bltu sp, t0, .Ls31_kernel_sp_ready
+	li t0, 0x2f400000
+	bgeu sp, t0, .Ls31_kernel_sp_ready
+	/* Startup, foreign and critical spans retain SRAM trap frames.
+	 * Only a span permitted to schedule may touch its Linux anchor.
+	 */
+	REG_L t0, TASK_TI_PREEMPT_COUNT(tp)
+	bnez t0, .Ls31_kernel_sp_ready
+	REG_L t0, TASK_TI_S31_BLOB_LINUX_SP(tp)
+	beqz t0, .Ls31_kernel_sp_ready
+	mv sp, t0
+.Ls31_kernel_sp_ready:
+#endif
 	REG_S sp, TASK_TI_KERNEL_SP(tp)
 
 #ifdef CONFIG_VMAP_STACK
@@ -151,8 +220,13 @@ SYM_CODE_START(handle_exception)
 	REG_L sp, TASK_TI_KERNEL_SP(tp)
 #endif
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	REG_L t0, TASK_TI_S31_BLOB_TRAP_T0(tp)
+	j .Ls31_save_kernel_context
+#endif
 .Lsave_context:
 	REG_S sp, TASK_TI_USER_SP(tp)
+.Ls31_save_kernel_context:
 	REG_L sp, TASK_TI_KERNEL_SP(tp)
 	addi sp, sp, -(PT_SIZE_ON_STACK)
 	REG_S x1,  PT_RA(sp)
@@ -178,7 +252,11 @@ SYM_CODE_START(handle_exception)
 	REG_S s4, PT_CAUSE_RAW(sp)	/* raw scause (SPP/SPIL) for sret level restore */
 #endif
 	mask_clic_scause s4, t0	/* ESP32-S31: strip CLIC SPP/SPIL bits */
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	REG_L s5, TASK_TI_S31_BLOB_TRAP_TP(tp)
+#else
 	csrr s5, CSR_SCRATCH
+#endif
 	REG_S s0, PT_SP(sp)
 	REG_S s1, PT_STATUS(sp)
 	REG_S s2, PT_EPC(sp)
@@ -187,10 +265,12 @@ SYM_CODE_START(handle_exception)
 	REG_S s5, PT_TP(sp)
 
 	/*
-	 * Set the scratch register to 0, so that if a recursive exception
-	 * occurs, the exception vector knows it came from the kernel
+	 * Generic recursive entry uses the zero-kernel sentinel. S31 already
+	 * restored its canonical pointer before touching the exception stack.
 	 */
+#ifndef CONFIG_ESP32S31_RADIO_SMODE
 	csrw CSR_SCRATCH, x0
+#endif
 
 	/* Load the global pointer */
 	load_global_pointer
@@ -289,8 +369,14 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	move a0, sp
 	call esp32s31_ext_exit_user
 #endif
+#ifndef CONFIG_ESP32S31_RADIO_SMODE
 	csrw CSR_SCRATCH, tp
+#endif
 1:
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* Install canonical identity before restoring interrupted vendor/user TP. */
+	csrw CSR_SCRATCH, tp
+#endif
 #ifdef CONFIG_RISCV_ISA_V_PREEMPTIVE
 	move a0, sp
 	call riscv_v_context_nesting_end
@@ -349,14 +435,18 @@ ASM_NOKPROBE(ret_from_exception)
 
 #ifdef CONFIG_VMAP_STACK
 SYM_CODE_START_LOCAL(handle_kernel_stack_overflow)
-	/* we reach here from kernel context, sscratch must be 0 */
+	/* Preserve x31 in scratch while selecting the overflow stack. */
 	csrrw x31, CSR_SCRATCH, x31
 	asm_per_cpu sp, overflow_stack, x31
 	li x31, OVERFLOW_STACK_SIZE
 	add sp, sp, x31
 	/* zero out x31 again and restore x31 */
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	csrrw x31, CSR_SCRATCH, tp
+#else
 	xor x31, x31, x31
 	csrrw x31, CSR_SCRATCH, x31
+#endif
 
 	addi sp, sp, -(PT_SIZE_ON_STACK)
 
@@ -372,7 +462,11 @@ SYM_CODE_START_LOCAL(handle_kernel_stack_overflow)
 	csrr s3, CSR_TVAL
 	csrr s4, CSR_CAUSE
 	mask_clic_scause s4, t0	/* ESP32-S31: strip CLIC SPP/SPIL bits */
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	REG_L s5, TASK_TI_S31_BLOB_TRAP_TP(tp)
+#else
 	csrr s5, CSR_SCRATCH
+#endif
 	REG_S s0, PT_SP(sp)
 	REG_S s1, PT_STATUS(sp)
 	REG_S s2, PT_EPC(sp)
@@ -419,6 +513,11 @@ SYM_FUNC_START(call_on_irq_stack)
 	scs_save_current
 	scs_load_irq_stack t0
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* Include do_irq() and this live bridge frame in the parked boundary.
+	 * A closed ISR borrowing SRAM must not overwrite either frame. */
+	REG_S sp, TASK_TI_S31_IRQ_STACK_SP(tp)
+#endif
 	/* Switch to the per-CPU IRQ stack and call the handler */
 	load_per_cpu t0, irq_stack_ptr, t1
 	li	t1, IRQ_STACK_SIZE
@@ -428,6 +527,9 @@ SYM_FUNC_START(call_on_irq_stack)
 	/* Switch back to the thread shadow call stack */
 	scs_load_current
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	REG_S zero, TASK_TI_S31_IRQ_STACK_SP(tp)
+#endif
 	/* Switch back to the thread stack and restore ra and s0 */
 	addi	sp, s0, -STACKFRAME_SIZE_ON_STACK
 	REG_L	ra, STACKFRAME_RA(sp)
@@ -495,10 +597,26 @@ SYM_FUNC_START(__switch_to)
 	REG_L s11, TASK_THREAD_S11_RA(a4)
 	/* The offset of thread_info in task_struct is zero. */
 	move tp, a1
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	csrw CSR_SCRATCH, tp
+#endif
 	/* Switch to the next shadow call stack */
 	scs_load_current
+	esp32s31_clic_switch_level_reset
 	ret
 SYM_FUNC_END(__switch_to)
+
+#if defined(CONFIG_SOC_ESP32S31) && !defined(CONFIG_RISCV_M_MODE)
+/* Complete the outer CLIC level after its Linux flow handler has returned,
+ * before generic IRQ exit may run interruptible softirqs or reschedule.
+ * Reuse the task-switch sequence: preserve trap CSRs, retain IRQ exclusion,
+ * and never enter M-mode or change the interrupted exception frame.
+ */
+SYM_FUNC_START(esp32s31_clic_irq_level_complete)
+	esp32s31_clic_switch_level_reset
+	ret
+SYM_FUNC_END(esp32s31_clic_irq_level_complete)
+#endif
 
 #ifndef CONFIG_MMU
 #define do_page_fault do_trap_unknown
@@ -533,3 +651,61 @@ SYM_DATA_START(__user_rt_sigreturn)
 	ecall
 SYM_DATA_END(__user_rt_sigreturn)
 #endif
+
+#if defined(CONFIG_ESP32S31_RADIO_SMODE) && defined(CONFIG_PREEMPTION)
+/*
+ * Explicit alternate-stack callers can reach generic preempt-enable.
+ * Use their published Linux anchor so scheduling and stack inspection see
+ * the registered task stack. Native radio tasks use their registered SRAM
+ * stack directly and leave the alternate-stack anchor zero.
+ *
+ * No C prologue, instrumentation, allocation or locking precedes the pivot.
+ * s0 retains the alternate frame across schedule(). Leave tp/gp and the
+ * published anchor unchanged; nested traps use the live Linux SP.
+ */
+	.pushsection .text, "ax"
+
+.macro s31_preempt_stack_bridge name, target
+SYM_FUNC_START(\name)
+	li t0, 0x2f000000
+	bltu sp, t0, .Ls31_preempt_plain\@
+	li t0, 0x2f400000
+	bgeu sp, t0, .Ls31_preempt_plain\@
+	REG_L t0, TASK_TI_S31_BLOB_LINUX_SP(tp)
+	beqz t0, .Ls31_preempt_plain\@
+
+	/* Both SRAM and published Linux SP obey the 16-byte ABI alignment. */
+	addi sp, sp, -16
+	REG_S ra, 0(sp)
+	REG_S s0, SZREG(sp)
+	mv s0, sp
+	addi sp, t0, -16
+	call \target
+	mv sp, s0
+	REG_L ra, 0(sp)
+	REG_L s0, SZREG(sp)
+	addi sp, sp, 16
+	ret
+
+.Ls31_preempt_plain\@:
+	tail \target
+SYM_FUNC_END(\name)
+ASM_NOKPROBE(\name)
+.endm
+
+/*
+ * Preserve the exact target selected by asm-generic/preempt.h.  In a dynamic
+ * key build the target retains the existing boot/runtime preemption policy.
+ */
+#if defined(CONFIG_PREEMPT_DYNAMIC) && defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)
+s31_preempt_stack_bridge esp32s31_preempt_schedule, dynamic_preempt_schedule
+s31_preempt_stack_bridge esp32s31_preempt_schedule_notrace, dynamic_preempt_schedule_notrace
+#else
+s31_preempt_stack_bridge esp32s31_preempt_schedule, preempt_schedule
+s31_preempt_stack_bridge esp32s31_preempt_schedule_notrace, preempt_schedule_notrace
+#endif
+
+EXPORT_SYMBOL(esp32s31_preempt_schedule)
+EXPORT_SYMBOL_GPL(esp32s31_preempt_schedule_notrace)
+	.popsection
+#endif /* CONFIG_ESP32S31_RADIO_SMODE && CONFIG_PREEMPTION */

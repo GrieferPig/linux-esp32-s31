@@ -914,13 +914,13 @@
 
 				partition@6e000 {
 					label = "radio-bundle";
-					reg = <0x06e000 0x180000>;
+					reg = <0x06e000 0x1c0000>;
 					read-only;
 				};
 
-				partition@1ee000 {
+				partition@22e000 {
 					label = "persist";
-					reg = <0x1ee000 0x212000>;
+					reg = <0x22e000 0x1d2000>;
 				};
 
 				partition@400000 {

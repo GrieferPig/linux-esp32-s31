@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/espressif,esp32s31-ahb-gdma.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 AHB GDMA controller
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  AHB GDMA engine with five RX and five TX channels. The second register
+  window is the descriptor pool in loader-reserved HP SRAM.
+
+properties:
+  compatible:
+    const: espressif,esp32s31-ahb-gdma
+
+  reg:
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: dma
+      - const: descriptors
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 10
+
+  interrupt-names:
+    items:
+      - const: rx0
+      - const: rx1
+      - const: rx2
+      - const: rx3
+      - const: rx4
+      - const: tx0
+      - const: tx1
+      - const: tx2
+      - const: tx3
+      - const: tx4
+
+  '#dma-cells':
+    const: 2
+
+  dma-channels:
+    const: 5
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/clock/esp32s31-clk.h>
+    dma-controller@20343000 {
+        compatible = "espressif,esp32s31-ahb-gdma";
+        reg = <0x20343000 0x628>, <0x2f075380 0x1000>;
+        reg-names = "dma", "descriptors";
+        clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
+        resets = <&clkc ESP32S31_RST_AHB_GDMA>;
+        interrupts = <36 IRQ_TYPE_LEVEL_HIGH>,
+                     <37 IRQ_TYPE_LEVEL_HIGH>,
+                     <38 IRQ_TYPE_LEVEL_HIGH>,
+                     <39 IRQ_TYPE_LEVEL_HIGH>,
+                     <40 IRQ_TYPE_LEVEL_HIGH>,
+                     <41 IRQ_TYPE_LEVEL_HIGH>,
+                     <42 IRQ_TYPE_LEVEL_HIGH>,
+                     <43 IRQ_TYPE_LEVEL_HIGH>,
+                     <44 IRQ_TYPE_LEVEL_HIGH>,
+                     <45 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "rx0", "rx1", "rx2", "rx3", "rx4",
+                          "tx0", "tx1", "tx2", "tx3", "tx4";
+        #dma-cells = <2>;
+        dma-channels = <5>;
+    };
+...

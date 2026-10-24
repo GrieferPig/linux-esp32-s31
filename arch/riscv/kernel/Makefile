@@ -117,6 +117,11 @@ obj-$(CONFIG_CFI)		+= cfi.o
 
 obj-$(CONFIG_EFI)		+= efi.o
 obj-$(CONFIG_ESP32S31_COPROC_CONTEXT)	+= esp32s31-ext.o
+obj-$(CONFIG_ESP32S31_RADIO_SMODE)	+= esp32s31-radio-stack.o
+ifeq ($(CONFIG_FPU),y)
+obj-$(CONFIG_ESP32S31_COPROC_CONTEXT)	+= esp32s31-blob-fp.o
+esp32s31-blob-fp-y := s31-blob-fp-core.o s31-blob-fp-adapter.o s31-blob-fp-bank.o
+endif
 obj-$(CONFIG_COMPAT)		+= compat_syscall_table.o
 obj-$(CONFIG_COMPAT)		+= compat_signal.o
 obj-$(CONFIG_COMPAT)		+= compat_vdso/

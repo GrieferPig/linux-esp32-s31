@@ -26,6 +26,9 @@
 #include <linux/sched/debug.h>
 #include <linux/jump_label.h>
 #include <linux/string_choices.h>
+#ifdef CONFIG_SOC_ESP32S31
+#include <asm/esp32s31_tlb_fence.h>
+#endif
 
 #include <trace/events/ipi.h>
 #define CREATE_TRACE_POINTS
@@ -328,6 +331,9 @@ static void __csd_lock_wait(call_single_data_t *csd)
 	for (;;) {
 		if (csd_lock_wait_toolong(csd, ts0, &ts1, &bug_id, &nmessages))
 			break;
+#ifdef CONFIG_SOC_ESP32S31
+		esp32s31_tlb_flush_poll();
+#endif
 		cpu_relax();
 	}
 	smp_acquire__after_ctrl_dep();
@@ -340,7 +346,14 @@ static __always_inline void csd_lock_wait(call_single_data_t *csd)
 		return;
 	}
 
+#ifdef CONFIG_SOC_ESP32S31
+	while (smp_load_acquire(&csd->node.u_flags) & CSD_FLAG_LOCK) {
+		esp32s31_tlb_flush_poll();
+		cpu_relax();
+	}
+#else
 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
+#endif
 }
 #else
 static void csd_lock_record(call_single_data_t *csd)
@@ -349,7 +362,14 @@ static void csd_lock_record(call_single_data_t *csd)
 
 static __always_inline void csd_lock_wait(call_single_data_t *csd)
 {
+#ifdef CONFIG_SOC_ESP32S31
+	while (smp_load_acquire(&csd->node.u_flags) & CSD_FLAG_LOCK) {
+		esp32s31_tlb_flush_poll();
+		cpu_relax();
+	}
+#else
 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
+#endif
 }
 #endif
 
@@ -461,6 +481,7 @@ static int generic_exec_single(int cpu, call_single_data_t *csd)
  */
 void generic_smp_call_function_single_interrupt(void)
 {
+
 	__flush_smp_call_function_queue(true);
 }
 
@@ -594,7 +615,6 @@ static void __flush_smp_call_function_queue(bool warn_cpu_offline)
 		csd_do_func(sched_ttwu_pending, entry, csd);
 	}
 }
-
 
 /**
  * flush_smp_call_function_queue - Flush pending smp-call-function callbacks
@@ -928,7 +948,6 @@ EXPORT_SYMBOL(smp_call_function);
 /* Setup configured maximum number of CPUs to activate */
 unsigned int setup_max_cpus = NR_CPUS;
 EXPORT_SYMBOL(setup_max_cpus);
-
 
 /*
  * Setup routine for controlling SMP activation

@@ -32,6 +32,7 @@
 #include <linux/interrupt.h>
 #include <linux/signal.h>
 #include <linux/completion.h>
+#include <linux/task_work.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/cpu.h>
@@ -2709,7 +2710,6 @@ static void unbind_worker(struct worker *worker)
 		WARN_ON_ONCE(set_cpus_allowed_ptr(worker->task, cpu_possible_mask) < 0);
 }
 
-
 static void detach_worker(struct worker *worker)
 {
 	lockdep_assert_held(&wq_pool_attach_mutex);
@@ -3292,8 +3292,12 @@ __acquires(&pool->lock)
 	 * stop_machine. At the same time, report a quiescent RCU state so
 	 * the same condition doesn't freeze RCU.
 	 */
-	if (worker->task)
+	if (worker->task) {
 		cond_resched();
+		/* Process targeted owner work with no pool lock or workfn frame. */
+		if (task_work_pending(current))
+			task_work_run();
+	}
 
 	raw_spin_lock_irq(&pool->lock);
 
@@ -3377,6 +3381,8 @@ static int worker_thread(void *__worker)
 	/* tell the scheduler that this is a workqueue worker */
 	set_pf_worker(true);
 woke_up:
+	if (task_work_pending(current))
+		task_work_run();
 	raw_spin_lock_irq(&pool->lock);
 
 	/* am I supposed to die? */
@@ -3439,7 +3445,14 @@ sleep:
 	worker_enter_idle(worker);
 	__set_current_state(TASK_IDLE);
 	raw_spin_unlock_irq(&pool->lock);
-	schedule();
+	/* Publish TASK_IDLE first, then check: a concurrent request either is
+	 * observed here or wakes the published sleeper. No lost request. */
+	if (task_work_pending(current)) {
+		__set_current_state(TASK_RUNNING);
+		task_work_run();
+	} else {
+		schedule();
+	}
 	goto woke_up;
 }
 
@@ -3629,6 +3642,7 @@ done:
  */
 void workqueue_softirq_action(bool highpri)
 {
+
 	struct worker_pool *pool =
 		&per_cpu(bh_worker_pools, smp_processor_id())[highpri];
 	if (need_more_worker(pool))
@@ -7613,7 +7627,6 @@ static void wq_watchdog_timer_fn(struct timer_list *unused)
 			pr_cont(" stuck for %us!\n",
 				jiffies_to_msecs(now - pool_ts) / 1000);
 		}
-
 
 	}
 

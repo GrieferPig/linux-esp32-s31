@@ -173,25 +173,25 @@ DO_ERROR_INFO(do_trap_insn_fault,
 
 static bool esp32s31_hart0_pie_insn(struct pt_regs *regs)
 {
-	u32 insn;
+	u16 insn;
 
 	if (!IS_ENABLED(CONFIG_ESP32S31_RADIO_SMODE))
 		return false;
 	if (raw_smp_processor_id() != 0 || !user_mode(regs))
 		return false;
-	if (get_user(insn, (u32 __user *)regs->epc))
+	if (get_user(insn, (u16 __user *)regs->epc))
 		return false;
 
-	/* ESP32-S31 PIE and HWLoop are only implemented on hart 1.
-	 * On hart 0 the same opcodes trap as illegal instructions.
-	 * PIE uses a vendor pattern (low bits 0b11011), while HWLoop
-	 * uses opcode 0x2b (custom-1).  The previous check that also
+	/* HWLoop executes on both harts (board 20261008-a1: CPU0 setupi
+	 * returns 5 without migration, first_use+1, sched_getcpu()==0).
+	 * PIE is only implemented on hart 1; on hart 0 its opcodes trap
+	 * as illegal.  Migrate only the PIE vendor family (low bits
+	 * 0b11011).  HWLoop uses opcode 0x2b (custom-1) and must stay on
+	 * hart 0 after first-use activation.  The previous check that also
 	 * matched every standard R-type (opcode 0x33) would migrate
 	 * any normal add/mul that spuriously faults, creating a storm
 	 * under SMP load that starves CFS and trips RCU stalls.
 	 */
-	if ((insn & 0x7fU) == 0x2bU)
-		return true;
 	if ((insn & 0x1bU) == 0x1bU)
 		return true;
 
@@ -233,6 +233,13 @@ asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *re
 		local_irq_enable();
 
 		handled = riscv_v_first_use_handler(regs);
+		/* Enable an unused task before treating an OFF HWLoop trap as
+		 * an unsupported hart0 instruction. HWLoop works on hart0.
+		 * A genuine unsupported PIE retries once, then follows the
+		 * existing CPU1 migration path.
+		 */
+		if (!handled)
+			handled = esp32s31_ext_first_use(regs);
 
 		if (!handled && esp32s31_hart0_pie_insn(regs)) {
 			cpumask_t pie_cpus;
@@ -451,14 +458,19 @@ static void noinstr handle_riscv_irq(struct pt_regs *regs)
 
 	irq_enter_rcu();
 	old_regs = set_irq_regs(regs);
+
 	handle_arch_irq(regs);
+
 	set_irq_regs(old_regs);
 	irq_exit_rcu();
 }
 
 asmlinkage void noinstr do_irq(struct pt_regs *regs)
 {
-	irqentry_state_t state = irqentry_enter(regs);
+
+	irqentry_state_t state;
+
+	state = irqentry_enter(regs);
 
 	if (IS_ENABLED(CONFIG_IRQ_STACKS) && on_thread_stack())
 		call_on_irq_stack(regs, handle_riscv_irq);

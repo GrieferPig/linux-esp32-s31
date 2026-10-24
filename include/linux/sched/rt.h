@@ -75,6 +75,22 @@ static inline struct task_struct *rt_mutex_get_top_task(struct task_struct *task
 extern void normalize_rt_tasks(void);
 
 
+/* Native radio tasks use a caller-admitted interval; an ordinary task
+ * always follows the global sysctl. No module pointer or low SRAM metadata
+ * is dereferenced by the scheduler or sched_rr_get_interval().
+ */
+static inline unsigned int task_rr_timeslice(struct task_struct *p,
+                                            unsigned int default_slice)
+{
+#if defined(CONFIG_ESP32S31_COPROC_CONTEXT) && defined(CONFIG_FPU)
+	unsigned int slice = READ_ONCE(task_thread_info(p)->s31_radio_rr_slice);
+
+	if (slice)
+		return slice;
+#endif
+	return default_slice;
+}
+
 /*
  * default timeslice is 100 msecs (used only for SCHED_RR tasks).
  * Timeslices get refilled after they expire.

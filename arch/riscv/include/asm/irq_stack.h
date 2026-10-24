@@ -15,6 +15,14 @@ DECLARE_PER_CPU(ulong *, irq_stack_ptr);
 asmlinkage void call_on_irq_stack(struct pt_regs *regs,
 				  void (*func)(struct pt_regs *));
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+/* CPU0 task-context lease of its real Linux IRQ stack. Hardware actions
+ * must be joined before restore/free; neither API is an IPI callback. */
+int esp32s31_radio_irq_stack_install(void *base, unsigned long size);
+void esp32s31_radio_irq_stack_restore(void *base);
+bool esp32s31_radio_on_irq_stack(void);
+#endif
+
 #ifdef CONFIG_VMAP_STACK
 /*
  * To ensure that VMAP'd stack overflow detection works correctly, all VMAP'd

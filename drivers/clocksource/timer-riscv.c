@@ -210,7 +210,8 @@ static int __init riscv_timer_init_common(void)
 	 * systimer's 16 MHz and reject it -- hence the hard skip rather than relying
 	 * on rate arbitration.
 	 */
-	if (!IS_ENABLED(CONFIG_ESP32S31_SYSTIMER))
+	if (!IS_ENABLED(CONFIG_ESP32S31_SYSTIMER) &&
+	    !IS_ENABLED(CONFIG_ESP32S31_SYSTIMER_CLOCKSOURCE))
 		sched_clock_register(riscv_sched_clock, 64, riscv_timebase);
 
 	error = request_percpu_irq(riscv_clock_event_irq,

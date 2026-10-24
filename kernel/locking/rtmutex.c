@@ -16,11 +16,13 @@
  *
  *  See Documentation/locking/rt-mutex-design.rst for details.
  */
+#include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/deadline.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/rt.h>
+#include <linux/sched/s31_radio.h>
 #include <linux/sched/wake_q.h>
 #include <linux/ww_mutex.h>
 
@@ -356,6 +358,26 @@ static __always_inline int __waiter_prio(struct task_struct *task)
 	return prio;
 }
 
+/* The cached role detects a same-priority dependency change in a blocked
+ * task. It is not part of either tree's priority/deadline comparison. */
+static inline bool rt_mutex_radio_role_changed(struct rt_mutex_waiter *waiter,
+					       struct task_struct *task)
+{
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	return waiter->s31_radio_role != s31_radio_sched_role(task);
+#else
+	return false;
+#endif
+}
+
+static inline void rt_mutex_radio_role_snapshot(struct rt_mutex_waiter *waiter,
+					       struct task_struct *task)
+{
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	waiter->s31_radio_role = s31_radio_sched_role(task);
+#endif
+}
+
 /*
  * Update the waiter->tree copy of the sort keys.
  */
@@ -367,6 +389,7 @@ waiter_update_prio(struct rt_mutex_waiter *waiter, struct task_struct *task)
 
 	waiter->tree.prio = __waiter_prio(task);
 	waiter->tree.deadline = task->dl.deadline;
+	rt_mutex_radio_role_snapshot(waiter, task);
 }
 
 /*
@@ -425,6 +448,18 @@ static __always_inline int rt_waiter_node_equal(struct rt_waiter_node *left,
 		return left->deadline == right->deadline;
 
 	return 1;
+}
+
+static inline bool rt_mutex_radio_priority_requeue(struct rt_mutex_waiter *waiter,
+						 struct task_struct *task)
+{
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	return !rt_waiter_node_equal(&waiter->tree, task_to_waiter_node(task));
+#else
+	/* Without role propagation, the earlier equal-priority shortcut already
+	 * proves a normal requeue is needed; preserve the old compiled path. */
+	return true;
+#endif
 }
 
 static inline bool rt_mutex_steal(struct rt_mutex_waiter *waiter,
@@ -688,6 +723,7 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	struct rt_mutex_base *lock;
 	bool detect_deadlock;
 	bool requeue = true;
+	bool priority_requeue;
 
 	detect_deadlock = rt_mutex_cond_detect_deadlock(orig_waiter, chwalk);
 
@@ -804,9 +840,14 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 		 * If deadlock detection is off, we stop here if we
 		 * are not the top pi waiter of the task. If deadlock
 		 * detection is enabled we continue, but stop the
-		 * requeueing in the chain walk.
+		 * requeueing in the chain walk. A changed donor may already
+		 * have changed task's effective priority or radio role. In that
+		 * case its blocked waiter still needs updating even if another
+		 * equal-key PI waiter became first in this owner's other tree.
 		 */
-		if (top_waiter != task_top_pi_waiter(task)) {
+		if (top_waiter != task_top_pi_waiter(task) &&
+		    rt_waiter_node_equal(&waiter->tree, task_to_waiter_node(task)) &&
+		    !rt_mutex_radio_role_changed(waiter, task)) {
 			if (!detect_deadlock)
 				goto out_unlock_pi;
 			else
@@ -821,7 +862,8 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	 * enabled we continue, but stop the requeueing in the chain
 	 * walk.
 	 */
-	if (rt_waiter_node_equal(&waiter->tree, task_to_waiter_node(task))) {
+	if (rt_waiter_node_equal(&waiter->tree, task_to_waiter_node(task)) &&
+	    !rt_mutex_radio_role_changed(waiter, task)) {
 		if (!detect_deadlock)
 			goto out_unlock_pi;
 		else
@@ -931,23 +973,17 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 	 */
 	prerequeue_top_waiter = rt_mutex_top_waiter(lock);
 
-	/* [7] Requeue the waiter in the lock waiter tree. */
-	rt_mutex_dequeue(lock, waiter);
-
-	/*
-	 * Update the waiter prio fields now that we're dequeued.
-	 *
-	 * These values can have changed through either:
-	 *
-	 *   sys_sched_set_scheduler() / sys_sched_setattr()
-	 *
-	 * or
-	 *
-	 *   DL CBS enforcement advancing the effective deadline.
-	 */
-	waiter_update_prio(waiter, task);
-
-	rt_mutex_enqueue(lock, waiter);
+	/* A role-only change must propagate, but must not move an equal-priority
+	 * waiter to the tail of either tree. Retain the existing ordering keys. */
+	priority_requeue = rt_mutex_radio_priority_requeue(waiter, task);
+	if (priority_requeue) {
+		/* [7] Requeue only when priority/deadline ordering changed. */
+		rt_mutex_dequeue(lock, waiter);
+		waiter_update_prio(waiter, task);
+		rt_mutex_enqueue(lock, waiter);
+	} else {
+		rt_mutex_radio_role_snapshot(waiter, task);
+	}
 
 	/*
 	 * [8] Release the (blocking) task in preparation for
@@ -996,9 +1032,11 @@ static int __sched rt_mutex_adjust_prio_chain(struct task_struct *task,
 		 * in the owner tasks pi waiters tree with this waiter
 		 * and adjust the priority of the owner.
 		 */
-		rt_mutex_dequeue_pi(task, prerequeue_top_waiter);
-		waiter_clone_prio(waiter, task);
-		rt_mutex_enqueue_pi(task, waiter);
+		if (priority_requeue) {
+			rt_mutex_dequeue_pi(task, prerequeue_top_waiter);
+			waiter_clone_prio(waiter, task);
+			rt_mutex_enqueue_pi(task, waiter);
+		}
 		rt_mutex_adjust_prio(lock, task);
 
 	} else if (prerequeue_top_waiter == waiter) {
@@ -1598,6 +1636,8 @@ static void __sched remove_waiter(struct rt_mutex_base *lock,
  * @timeout:		 the pre-initialized and started timer, or NULL for none
  * @waiter:		 the pre-initialized rt_mutex_waiter
  * @wake_q:		 wake_q of tasks to wake when we drop the lock->wait_lock
+ * @kthread_cancel: check kthread stop requests and skip owner spinning
+ * @cancelled: optional lifetime-pinned object cancellation flag
  *
  * Must be called with lock->wait_lock held and interrupts disabled
  */
@@ -1606,7 +1646,9 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
 					   unsigned int state,
 					   struct hrtimer_sleeper *timeout,
 					   struct rt_mutex_waiter *waiter,
-					   struct wake_q_head *wake_q)
+					   struct wake_q_head *wake_q,
+					   bool kthread_cancel,
+					   const atomic_t *cancelled)
 	__releases(&lock->wait_lock) __acquires(&lock->wait_lock)
 {
 	struct rt_mutex *rtm = container_of(lock, struct rt_mutex, rtmutex);
@@ -1621,6 +1663,14 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
 			break;
 		}
 
+		if (kthread_cancel && kthread_should_stop()) {
+			ret = -EINTR;
+			break;
+		}
+		if (cancelled && atomic_read_acquire(cancelled)) {
+			ret = -EIDRM;
+			break;
+		}
 		if (timeout && !timeout->task) {
 			ret = -ETIMEDOUT;
 			break;
@@ -1642,7 +1692,12 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
 			owner = NULL;
 		raw_spin_unlock_irq_wake(&lock->wait_lock, wake_q);
 
-		if (!owner || !rtmutex_spin_on_owner(lock, waiter, owner)) {
+		/*
+		 * A stop request must not wait for a remotely running owner
+		 * to stop running. Native cancellable waits sleep directly.
+		 */
+		if (kthread_cancel || !owner ||
+		    !rtmutex_spin_on_owner(lock, waiter, owner)) {
 			lockevent_inc(rtmutex_slow_sleep);
 			rt_mutex_schedule();
 		}
@@ -1687,13 +1742,19 @@ static void __sched rt_mutex_handle_deadlock(int res, int detect_deadlock,
  * @chwalk:	Indicator whether full or partial chainwalk is requested
  * @waiter:	Initializer waiter for blocking
  * @wake_q:	The wake_q to wake tasks after we release the wait_lock
+ * @timeout:	Optional started deadline timer
+ * @kthread_cancel: Check kthread stop requests while waiting
+ * @cancelled: Optional lifetime-pinned object cancellation flag
  */
 static int __sched __rt_mutex_slowlock(struct rt_mutex_base *lock,
 				       struct ww_acquire_ctx *ww_ctx,
 				       unsigned int state,
 				       enum rtmutex_chainwalk chwalk,
 				       struct rt_mutex_waiter *waiter,
-				       struct wake_q_head *wake_q)
+				       struct wake_q_head *wake_q,
+				       struct hrtimer_sleeper *timeout,
+				       bool kthread_cancel,
+					   const atomic_t *cancelled)
 {
 	struct rt_mutex *rtm = container_of(lock, struct rt_mutex, rtmutex);
 	struct ww_mutex *ww = ww_container_of(rtm);
@@ -1718,7 +1779,8 @@ static int __sched __rt_mutex_slowlock(struct rt_mutex_base *lock,
 
 	ret = task_blocks_on_rt_mutex(lock, waiter, current, ww_ctx, chwalk, wake_q);
 	if (likely(!ret))
-		ret = rt_mutex_slowlock_block(lock, ww_ctx, state, NULL, waiter, wake_q);
+		ret = rt_mutex_slowlock_block(lock, ww_ctx, state, timeout,
+					    waiter, wake_q, kthread_cancel, cancelled);
 
 	if (likely(!ret)) {
 		/* acquired the lock */
@@ -1758,7 +1820,7 @@ static inline int __rt_mutex_slowlock_locked(struct rt_mutex_base *lock,
 	waiter.ww_ctx = ww_ctx;
 
 	ret = __rt_mutex_slowlock(lock, ww_ctx, state, RT_MUTEX_MIN_CHAINWALK,
-				  &waiter, wake_q);
+				  &waiter, wake_q, NULL, false, NULL);
 
 	debug_rt_mutex_free_waiter(&waiter);
 	lockevent_cond_inc(rtmutex_slow_wake, !wake_q_empty(wake_q));

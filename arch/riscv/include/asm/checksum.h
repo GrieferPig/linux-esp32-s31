@@ -15,6 +15,19 @@
 extern unsigned int do_csum(const unsigned char *buff, int len);
 #define do_csum do_csum
 
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_32BIT)
+#include <linux/kasan-checks.h>
+extern __wsum __s31_csum_copy(const void *src, void *dst, int len);
+#define _HAVE_ARCH_CSUM_AND_COPY
+static __always_inline __wsum
+csum_partial_copy_nocheck(const void *src, void *dst, int len)
+{
+	kasan_check_read(src, len);
+	kasan_check_write(dst, len);
+	return __s31_csum_copy(src, dst, len);
+}
+#endif
+
 /* Default version is sufficient for 32 bit */
 #ifndef CONFIG_32BIT
 #define _HAVE_ARCH_IPV6_CSUM

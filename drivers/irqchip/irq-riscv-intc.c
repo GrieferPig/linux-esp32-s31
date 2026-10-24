@@ -12,6 +12,7 @@
 #include <linux/cpu.h>
 #include <linux/irq.h>
 #include <linux/irqchip.h>
+#include <linux/irqchip/irq-esp32s31-clic.h>
 #include <linux/irqdomain.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -30,6 +31,8 @@ static void riscv_intc_irq(struct pt_regs *regs)
 {
 	unsigned long cause = regs->cause & ~CAUSE_IRQ_FLAG;
 
+	if (IS_ENABLED(CONFIG_ESP32S31_CLIC) && esp_clic_handle_direct(cause))
+		return;
 	if (generic_handle_domain_irq(intc_domain, cause))
 		pr_warn_ratelimited("Failed to handle interrupt (cause: %ld)\n", cause);
 }

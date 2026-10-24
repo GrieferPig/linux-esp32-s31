@@ -16,6 +16,7 @@ obj-y += init.o
 obj-$(CONFIG_MMU) += extable.o fault.o pageattr.o pgtable.o tlbflush.o
 obj-y += cacheflush.o
 obj-y += context.o
+obj-$(CONFIG_ESP32S31_RADIO_SMODE) += esp32s31-radio-view.o
 obj-y += pmem.o
 
 obj-$(CONFIG_HUGETLB_PAGE) += hugetlbpage.o

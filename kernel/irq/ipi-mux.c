@@ -13,6 +13,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
+#include <linux/irqdesc.h>
 #include <linux/jump_label.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
@@ -24,6 +25,10 @@ struct ipi_mux_cpu {
 
 static struct ipi_mux_cpu __percpu *ipi_mux_pcpu;
 static struct irq_domain *ipi_mux_domain;
+/* The single mux domain and its descriptors live for the life of the kernel.
+ * Resolve them once when creating it, rather than on every virtual IPI.
+ * Dispatch still uses the normal IRQ flow handler and IRQ-context checks. */
+static struct irq_desc *ipi_mux_desc[BITS_PER_TYPE(int)];
 static void (*ipi_mux_send)(unsigned int cpu);
 
 static void ipi_mux_mask(struct irq_data *d)
@@ -138,7 +143,7 @@ void ipi_mux_process(void)
 	ipis = atomic_fetch_andnot(en, &icpu->bits) & en;
 
 	for_each_set_bit(hwirq, &ipis, BITS_PER_TYPE(int))
-		generic_handle_domain_irq(ipi_mux_domain, hwirq);
+		handle_irq_desc(ipi_mux_desc[hwirq]);
 }
 
 /**
@@ -172,7 +177,7 @@ int ipi_mux_create(unsigned int nr_ipi, void (*mux_send)(unsigned int cpu))
 {
 	struct fwnode_handle *fwnode;
 	struct irq_domain *domain;
-	int rc, cpu;
+	int rc, cpu, i;
 
 	if (ipi_mux_domain)
 		return -EEXIST;
@@ -217,6 +222,14 @@ int ipi_mux_create(unsigned int nr_ipi, void (*mux_send)(unsigned int cpu))
 		goto fail_free_domain;
 	}
 
+	for (i = 0; i < nr_ipi; i++) {
+		ipi_mux_desc[i] = irq_to_desc(rc + i);
+		if (WARN_ON_ONCE(!ipi_mux_desc[i])) {
+			irq_domain_free_irqs(rc, nr_ipi);
+			rc = -EINVAL;
+			goto fail_free_domain;
+		}
+	}
 	ipi_mux_domain = domain;
 	ipi_mux_send = mux_send;
 

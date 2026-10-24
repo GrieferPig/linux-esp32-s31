@@ -10,6 +10,7 @@
 #include <linux/bitfield.h>
 #include <linux/cpu.h>
 #include <linux/kernel.h>
+#include <linux/instrumentation.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task_stack.h>
@@ -27,6 +28,7 @@
 #include <asm/stacktrace.h>
 #include <asm/string.h>
 #include <asm/switch_to.h>
+#include <asm/esp32s31_radio_view.h>
 #include <asm/thread_info.h>
 #include <asm/cpuidle.h>
 #include <asm/vector.h>
@@ -86,6 +88,12 @@ void noinstr arch_cpu_idle(void)
 #ifdef CONFIG_SOC_ESP32S31
 	if (esp32s31_sbi_idle_enabled()) {
 		esp32s31_sbi_wfi();
+		/* A pending source can wake firmware WFI while the cross-privilege
+		 * CLIC sentinel still suppresses S-mode entry. Recover on this
+		 * actual wake edge; no periodic radio-service tick is needed. */
+		instrumentation_begin();
+		esp32s31_irq_poll();
+		instrumentation_end();
 		return;
 	}
 #endif
@@ -213,6 +221,8 @@ void start_thread(struct pt_regs *regs, unsigned long pc,
 
 void flush_thread(void)
 {
+	esp32s31_radio_mm_user_return_check();
+	esp32s31_blob_fp_user_return_check();
 #ifdef CONFIG_FPU
 	/*
 	 * Reset FPU state and context
@@ -248,9 +258,31 @@ void arch_release_task_struct(struct task_struct *tsk)
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 {
+	/* A clone inside an active process blob would snapshot physical blob FP
+	 * into the parent user bank. Ordinary fork happens after retirement. */
+	if (esp32s31_radio_mm_active(src) || esp32s31_blob_fp_user_active(src))
+		return -EBUSY;
 	fstate_save(src, task_pt_regs(src));
 	esp32s31_ext_save(src);
 	*dst = *src;
+#if defined(CONFIG_ESP32S31_COPROC_CONTEXT) && defined(CONFIG_FPU)
+	/* A child never shares the parent's live bank/lifetime. */
+	dst->thread_info.s31_blob_fp = NULL;
+	dst->thread_info.s31_radio_context = NULL;
+	dst->thread_info.s31_radio_rr_slice = 0;
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	dst->thread_info.s31_radio_sched = 0;
+#endif
+#endif
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* A child cannot inherit its parent's live trampoline/entry scratch. */
+	dst->thread_info.s31_blob_linux_sp = 0;
+	dst->thread_info.s31_blob_trap_t0 = 0;
+	dst->thread_info.s31_blob_trap_tp = 0;
+	dst->thread_info.s31_radio_mm_view = NULL;
+	dst->thread_info.s31_radio_stack = NULL;
+	dst->thread_info.s31_irq_stack_sp = 0;
+#endif
 #ifdef CONFIG_SOC_ESP32S31
 	dst->thread.esp32s31_ext_active = false;
 #endif
@@ -297,6 +329,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 		p->thread.s[0] = (unsigned long)args->fn;
 		p->thread.s[1] = (unsigned long)args->fn_arg;
 		p->thread.ra = (unsigned long)ret_from_fork_kernel_asm;
+#ifdef CONFIG_SOC_ESP32S31
+		/* Kernel threads must not inherit user HWLoop/PIE state.
+		 * arch_dup_task_struct() copies the parent's saved state;
+		 * a kthread would otherwise resume the parent's user
+		 * extensions via kernel_begin/end.  Start clean; the
+		 * radio blob uses explicit kernel_begin/end ownership.
+		 */
+		esp32s31_ext_reset(p);
+#endif
 	} else {
 		*childregs = *(current_pt_regs());
 		/* Turn off status.VS */

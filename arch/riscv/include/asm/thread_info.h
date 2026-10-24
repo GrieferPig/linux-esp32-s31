@@ -50,6 +50,11 @@
  * - thread_info is included in task_struct at an offset of 0.  This means that
  *   tp points to both thread_info and task_struct.
  */
+struct s31_fp_state;
+struct s31_radio_task_context;
+struct s31_radio_mm_view;
+struct esp32s31_radio_stack;
+
 struct thread_info {
 	unsigned long		flags;		/* low level flags */
 	int                     preempt_count;  /* 0=>preemptible, <0=>BUG */
@@ -62,6 +67,28 @@ struct thread_info {
 	long			user_sp;	/* User stack pointer */
 	int			cpu;
 	unsigned long		syscall_work;	/* SYSCALL_WORK_ flags */
+#if defined(CONFIG_ESP32S31_COPROC_CONTEXT) && defined(CONFIG_FPU)
+	/* Task-owned checkpoint in a globally mapped kernel allocation. */
+	struct s31_fp_state	*s31_blob_fp;
+	/* Canonical radio identity/lifetime survives FP bank detachment. */
+	struct s31_radio_task_context *s31_radio_context;
+	/* Explicit dormant-kthread admission; zero preserves generic RR. */
+	unsigned int s31_radio_rr_slice;
+#endif
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/* Task-owned, globally mapped stack anchor for BT SRAM trap entry.
+	 * Zero outside an anchored Linux -> SRAM trampoline. */
+	unsigned long		s31_blob_linux_sp;
+	unsigned long		s31_blob_trap_t0;
+	/* Original interrupted TP; sscratch always retains canonical Linux TP. */
+	unsigned long s31_blob_trap_tp;
+	/* Globally mapped, owner-local supervisor view; never inherited. */
+	struct s31_radio_mm_view *s31_radio_mm_view;
+	/* Borrowed SRAM registered as the actual Linux task stack. */
+	struct esp32s31_radio_stack *s31_radio_stack;
+	/* Lowest live thread-stack frame while executing on the IRQ stack. */
+	unsigned long s31_irq_stack_sp;
+#endif
 #ifdef CONFIG_SHADOW_CALL_STACK
 	void			*scs_base;
 	void			*scs_sp;
@@ -72,6 +99,10 @@ struct thread_info {
 	 * can access the kernel stack.
 	 */
 	unsigned long		a0, a1, a2;
+#endif
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	/* Kernel-owned scheduling roles follow every existing trap/stack field. */
+	unsigned int s31_radio_sched;
 #endif
 };
 

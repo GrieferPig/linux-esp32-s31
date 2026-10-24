@@ -21,6 +21,8 @@ $(obj)/esp32s31-radio-imports.o: $(S31_RADIO_IMPORTS) FORCE
 # RX buffer processing and ACK submission are throughput critical on S31.
 CFLAGS_esp32s31-radio-wifi.o += -Os
 
+$(obj)/esp32s31-radio.o: $(src)/esp32s31-radio-core.lds
+
 LDFLAGS_esp32s31-radio.o += --gc-sections \
 	-T $(src)/esp32s31-radio-core.lds --undefined=init_module \
 	--undefined=s31_radio_modinfo_anchor

@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/espressif,esp32s31-axi-gdma.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 AXI GDMA controller
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  AXI GDMA engine with three RX and three TX channels. The third register
+  window is the 12 KiB descriptor pool in loader-reserved HP SRAM. The pair
+  index selects the AXI peripheral trigger (LCD=0 .. SHA=5).
+
+properties:
+  compatible:
+    const: espressif,esp32s31-axi-gdma
+
+  reg:
+    maxItems: 3
+
+  reg-names:
+    items:
+      - const: dma
+      - const: clkrst
+      - const: descriptors
+
+  interrupts:
+    maxItems: 6
+
+  interrupt-names:
+    items:
+      - const: rx0
+      - const: rx1
+      - const: rx2
+      - const: tx0
+      - const: tx1
+      - const: tx2
+
+  '#dma-cells':
+    const: 2
+
+  dma-channels:
+    const: 3
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    dma-controller@20348000 {
+        compatible = "espressif,esp32s31-axi-gdma";
+        reg = <0x20348000 0x1000>, <0x20587078 0x4>,
+              <0x2f072380 0x3000>;
+        reg-names = "dma", "clkrst", "descriptors";
+        interrupts = <48 IRQ_TYPE_LEVEL_HIGH>,
+                     <49 IRQ_TYPE_LEVEL_HIGH>,
+                     <50 IRQ_TYPE_LEVEL_HIGH>,
+                     <51 IRQ_TYPE_LEVEL_HIGH>,
+                     <52 IRQ_TYPE_LEVEL_HIGH>,
+                     <53 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "rx0", "rx1", "rx2",
+                          "tx0", "tx1", "tx2";
+        #dma-cells = <2>;
+        dma-channels = <3>;
+    };
+...

@@ -9,6 +9,11 @@
  */
 
 #include <linux/types.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
+#include <linux/sched/task.h>
 #include <linux/cpu.h>
 #include <linux/init.h>
 #include <linux/clocksource/esp32s31-systimer.h>
@@ -25,9 +30,13 @@
 #include <linux/string.h>
 
 #include <asm/irq_regs.h>
+#include <asm/irq_stack.h>
+#include <asm/stacktrace.h>
 #include <asm/ptrace.h>
 #include <asm/sbi.h>
 #include <asm/smp.h>
+#include <asm/tlbflush.h>
+#include <asm/esp32s31_tlb_fence.h>
 
 #include "irq-esp32s31-internal.h"
 
@@ -164,8 +173,11 @@ static void esp32s31_ipi_send(unsigned int cpu)
 	writel(1, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
 }
 
+#include "irq-esp32s31-tlb-fence.inc"
+
 static void esp32s31_ipi_chained(struct irq_desc *desc)
 {
+
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	unsigned int cpu = raw_smp_processor_id();
 	unsigned int off = esp32s31_doorbell_offset(cpu);
@@ -173,8 +185,13 @@ static void esp32s31_ipi_chained(struct irq_desc *desc)
 	chained_irq_enter(chip, desc);
 	if (readl(esp32s31_doorbells + off)) {
 		do {
+
 			writel(0, esp32s31_doorbells + off);
+
+			esp32s31_tlb_flush_poll();
+
 			ipi_mux_process();
+
 			/* Pair the doorbell clear with a sender that races while its
 			 * mux bit is already set and therefore does not ring again. */
 			smp_mb();
@@ -185,6 +202,7 @@ static void esp32s31_ipi_chained(struct irq_desc *desc)
 
 static void esp32s31_timer_chained(struct irq_desc *desc)
 {
+
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	unsigned int cpu = raw_smp_processor_id();
 
@@ -201,45 +219,64 @@ static void esp32s31_timer_chained(struct irq_desc *desc)
  * pending but refuses CLIC entry, drain that same source through its normal
  * Linux handler without manufacturing an xret boundary.
  */
-void esp32s31_irq_poll(void)
-{
-	struct pt_regs regs = { };
-	struct pt_regs *old_regs;
-	unsigned long flags;
-	unsigned int cpu = raw_smp_processor_id();
-	unsigned int off;
+struct esp32s31_irq_poll_pass {
+	struct pt_regs regs;
+	unsigned int cpu, off;
 	u32 device_pending;
 	bool ipi_pending, timer_pending;
+};
 
-	if (unlikely(!esp32s31_doorbells || cpu > 1))
-		return;
+static void esp32s31_irq_poll_dispatch(struct pt_regs *regs)
+{
 
-	off = esp32s31_doorbell_offset(cpu);
-	local_irq_save(flags);
-	ipi_pending = readl(esp32s31_doorbells + off);
-	timer_pending = esp32s31_systimer_irq_pending(cpu);
-	device_pending = esp_clic_pending_mask(cpu);
-	if (!ipi_pending && !timer_pending && !device_pending) {
-		local_irq_restore(flags);
-		return;
-	}
+	struct esp32s31_irq_poll_pass *pass = container_of(regs,
+		struct esp32s31_irq_poll_pass, regs);
 
-	regs.status = SR_SPP;
-	old_regs = set_irq_regs(&regs);
 	irq_enter();
-	if (ipi_pending) {
+
+	if (pass->ipi_pending) {
 		do {
-			writel(0, esp32s31_doorbells + off);
+			writel(0, esp32s31_doorbells + pass->off);
+			esp32s31_tlb_flush_poll();
 			ipi_mux_process();
 			smp_mb();
-		} while (readl(esp32s31_doorbells + off) || ipi_mux_pending());
+		} while (readl(esp32s31_doorbells + pass->off) || ipi_mux_pending());
 	}
-	if (timer_pending)
+	if (pass->timer_pending)
 		esp32s31_riscv_timer_interrupt();
-	if (device_pending)
-		esp_clic_handle_pending(device_pending);
+	if (pass->device_pending)
+		esp_clic_handle_pending(pass->device_pending);
+
 	irq_exit();
+
+}
+
+void esp32s31_irq_poll(void)
+{
+	struct esp32s31_irq_poll_pass pass = { };
+	struct pt_regs *old_regs;
+	unsigned long flags;
+
+	pass.cpu = raw_smp_processor_id();
+	if (unlikely(!esp32s31_doorbells || pass.cpu > 1))
+		return;
+	pass.off = esp32s31_doorbell_offset(pass.cpu);
+	local_irq_save(flags);
+	pass.ipi_pending = readl(esp32s31_doorbells + pass.off);
+	pass.timer_pending = esp32s31_systimer_irq_pending(pass.cpu);
+	pass.device_pending = esp_clic_pending_mask(pass.cpu);
+	if (!pass.ipi_pending && !pass.timer_pending && !pass.device_pending)
+		goto out;
+	pass.regs.status = SR_SPP;
+	old_regs = set_irq_regs(&pass.regs);
+#ifdef CONFIG_IRQ_STACKS
+	if (on_thread_stack())
+		call_on_irq_stack(&pass.regs, esp32s31_irq_poll_dispatch);
+	else
+#endif
+		esp32s31_irq_poll_dispatch(&pass.regs);
 	set_irq_regs(old_regs);
+out:
 	local_irq_restore(flags);
 }
 EXPORT_SYMBOL_GPL(esp32s31_irq_poll);
@@ -253,12 +290,14 @@ static int esp32s31_local_irq_starting(unsigned int cpu)
 	esp_intmtx_route_local(cpu, esp32s31_ipi_source(cpu),
 				ESP32S31_CLIC_IPI_SLOT);
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, true);
+	esp32s31_tlb_cpu_ready(cpu, true);
 	esp32s31_clic_log_state(cpu);
 	return 0;
 }
 
 static int esp32s31_local_irq_dying(unsigned int cpu)
 {
+	esp32s31_tlb_cpu_ready(cpu, false);
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, false);
 	esp_intmtx_unroute_local(cpu, esp32s31_ipi_source(cpu));
 	writel(0, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
@@ -296,6 +335,7 @@ int __init esp32s31_smp_irq_init(void)
 				      ESP32S31_IPI_DOORBELL_SIZE);
 	if (!esp32s31_doorbells)
 		return -ENOMEM;
+	esp32s31_tlb_fence_init();
 	ret = esp_clic_install_local(ESP32S31_CLIC_IPI_SLOT,
 				     esp32s31_ipi_chained, NULL);
 	if (ret)

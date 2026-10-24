@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/export.h>
+#include <linux/interrupt.h>
 #include <linux/irq_work.h>
+#include <linux/sched/signal.h>
 #include <linux/spinlock.h>
 #include <linux/task_work.h>
 #include <linux/resume_user_mode.h>
@@ -229,4 +232,135 @@ void task_work_run(void)
 			cond_resched();
 		} while (work);
 	}
+}
+
+/* An exit callback has exactly one executor: the target's exit continuation
+ * or its task_work safe point after a request. pi_lock serializes transfer
+ * against exit detachment, never callback execution. */
+static void task_exit_work_callback(struct callback_head *cb)
+{
+ struct task_exit_work *work = container_of(cb, struct task_exit_work, cb);
+ struct task_exit_work *previous = current->task_exit_work_active;
+
+ current->task_exit_work_active = work;
+ work->func(work);
+ current->task_exit_work_active = previous;
+ /* Diagnostics and teardown can both join the same owner. A one-shot
+  * completion is consumed by the first wait and strands later joiners. */
+ complete_all(&work->done);
+}
+
+int task_exit_work_add(struct task_struct *task, struct task_exit_work *work,
+                      void (*func)(struct task_exit_work *))
+{
+ unsigned long flags;
+ int ret = 0;
+
+ init_task_work(&work->cb, task_exit_work_callback);
+ work->func = func;
+ init_completion(&work->done);
+ raw_spin_lock_irqsave(&task->pi_lock, flags);
+ if (task->flags & PF_EXITING ||
+     ((task->task_exit_work_closing || task->task_exit_works == &work_exited) &&
+      (task != current || !current->task_exit_work_active)))
+  ret = -ESRCH;
+ else {
+  work->cb.next = task->task_exit_works == &work_exited ? NULL : task->task_exit_works;
+  task->task_exit_works = &work->cb;
+ }
+ raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+ return ret;
+}
+EXPORT_SYMBOL_GPL(task_exit_work_add);
+
+/* A live non-user kthread must implement task_work safe points (workqueue
+ * workers do). An exiting thread executes transferred work in exit_task_work.
+ * Success includes a callback already detached by exit or completed: callers
+ * must always wait for work->done rather than infer completion from return. */
+int task_exit_work_request(struct task_struct *task, struct task_exit_work *work)
+{
+ struct callback_head **link;
+ unsigned long flags;
+ int ret = 0;
+
+ raw_spin_lock_irqsave(&task->pi_lock, flags);
+ link = &task->task_exit_works;
+ while (*link && *link != &work_exited && *link != &work->cb)
+  link = &(*link)->next;
+ if (*link == &work->cb) {
+  *link = work->cb.next;
+  ret = task_work_add(task, &work->cb, TWA_NONE);
+  if (ret) {
+   /* Preserve owner delivery if task_work was already closed. */
+   work->cb.next = *link;
+   *link = &work->cb;
+  }
+ }
+ raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+ /* Queue under pi_lock, but notify only after dropping it: the signal
+  * notification path can acquire that lock while waking an interruptible
+  * userspace owner. Kthreads keep their existing explicit safe points. */
+ if (!ret) {
+  if (task->flags & PF_KTHREAD)
+   wake_up_process(task);
+  else
+   set_notify_signal(task);
+ }
+ return ret;
+}
+EXPORT_SYMBOL_GPL(task_exit_work_request);
+
+int task_exit_work_finish_current(struct task_exit_work *work)
+{
+ int ret;
+
+ /* request serializes removal/transfer with exit under current->pi_lock.
+  * Only current executes its task_work; cancel claims this exact object,
+  * leaving unrelated callbacks queued. Never infer done from request. */
+ if (in_interrupt() || in_atomic() || irqs_disabled())
+  return -EWOULDBLOCK;
+ ret = task_exit_work_request(current, work);
+ if (ret)
+  return ret;
+ if (!task_work_cancel(current, &work->cb))
+  return completion_done(&work->done) ? 0 : -EBUSY;
+ task_exit_work_callback(&work->cb);
+ return 0;
+}
+EXPORT_SYMBOL_GPL(task_exit_work_finish_current);
+
+void task_exit_work_run(void)
+{
+ struct callback_head *work, *next;
+ unsigned long flags;
+
+ /* Close external admission before any callback. An owner continuation
+  * may still register finite child guards for its own FP/MM cleanup; those
+  * must finish or be delivered before PF_EXITING and exit_mm below. */
+ raw_spin_lock_irqsave(&current->pi_lock, flags);
+ current->task_exit_work_closing = true;
+ raw_spin_unlock_irqrestore(&current->pi_lock, flags);
+ for (;;) {
+  raw_spin_lock_irqsave(&current->pi_lock, flags);
+  work = current->task_exit_works;
+  current->task_exit_works = &work_exited;
+  raw_spin_unlock_irqrestore(&current->pi_lock, flags);
+  if (work && work != &work_exited) {
+   do {
+    next = work->next;
+    work->func(work);
+    work = next;
+    cond_resched();
+   } while (work && work != &work_exited);
+   continue;
+  }
+  /* request() transfers while holding pi_lock. After the empty-list
+   * snapshot above, every earlier transfer is visible here, and no late
+   * external add can create another. Preserve unrelated task_work. */
+  work = task_work_cancel_func(current, task_exit_work_callback);
+  if (!work)
+   break;
+  work->func(work);
+  cond_resched();
+ }
 }

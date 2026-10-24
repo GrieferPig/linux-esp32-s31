@@ -45,6 +45,9 @@ struct kthread_create_info
 	int (*threadfn)(void *data);
 	void *data;
 	int node;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	struct esp32s31_radio_stack *s31_radio_stack;
+#endif
 
 	/* Result passed back to kthread_create() from kthreadd. */
 	struct task_struct *result;
@@ -483,8 +486,14 @@ static void create_kthread(struct kthread_create_info *create)
 	current->pref_node_fork = create->node;
 #endif
 	/* We want our own signal handler (we take no signals by default). */
-	pid = kernel_thread(kthread, create, create->full_name,
-			    CLONE_FS | CLONE_FILES | SIGCHLD);
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (create->s31_radio_stack)
+		pid = kernel_thread_on_s31_stack(kthread, create, create->full_name,
+			CLONE_FS | CLONE_FILES | SIGCHLD, create->s31_radio_stack);
+	else
+#endif
+		pid = kernel_thread(kthread, create, create->full_name,
+				    CLONE_FS | CLONE_FILES | SIGCHLD);
 	if (pid < 0) {
 		/* Release the structure when caller killed by a fatal signal. */
 		struct completion *done = xchg(&create->done, NULL);
@@ -503,7 +512,8 @@ static __printf(4, 0)
 struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
 						    void *data, int node,
 						    const char namefmt[],
-						    va_list args)
+						    va_list args,
+						    struct esp32s31_radio_stack *stack)
 {
 	DECLARE_COMPLETION_ONSTACK(done);
 	struct task_struct *task;
@@ -515,6 +525,9 @@ struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
 	create->threadfn = threadfn;
 	create->data = data;
 	create->node = node;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	create->s31_radio_stack = stack;
+#endif
 	create->done = &done;
 	create->full_name = kvasprintf(GFP_KERNEL, namefmt, args);
 	if (!create->full_name) {
@@ -532,7 +545,11 @@ struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
 	 * the OOM killer while kthreadd is trying to allocate memory for
 	 * new kernel thread.
 	 */
-	if (unlikely(wait_for_completion_killable(&done))) {
+	/* Externally owned stack storage cannot be orphaned when a creator
+	 * receives a fatal signal. Join publication before returning its lease. */
+	if (stack)
+		wait_for_completion(&done);
+	else if (unlikely(wait_for_completion_killable(&done))) {
 		/*
 		 * If I was killed by a fatal signal before kthreadd (or new
 		 * kernel thread) calls complete(), leave the cleanup of this
@@ -584,12 +601,31 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
 	va_list args;
 
 	va_start(args, namefmt);
-	task = __kthread_create_on_node(threadfn, data, node, namefmt, args);
+	task = __kthread_create_on_node(threadfn, data, node, namefmt, args, NULL);
 	va_end(args);
 
 	return task;
 }
 EXPORT_SYMBOL(kthread_create_on_node);
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+struct task_struct *kthread_create_on_s31_stack(int (*threadfn)(void *),
+		void *data, struct esp32s31_radio_stack *stack,
+		const char namefmt[], ...)
+{
+	struct task_struct *task;
+	va_list args;
+
+	if (!stack || IS_ERR(stack))
+		return ERR_PTR(-EINVAL);
+	va_start(args, namefmt);
+	task = __kthread_create_on_node(threadfn, data, NUMA_NO_NODE,
+					namefmt, args, stack);
+	va_end(args);
+	return task;
+}
+EXPORT_SYMBOL_GPL(kthread_create_on_s31_stack);
+#endif
 
 static void __kthread_bind_mask(struct task_struct *p, const struct cpumask *mask, unsigned int state)
 {
@@ -1044,7 +1080,7 @@ __kthread_create_worker_on_node(unsigned int flags, int node,
 	kthread_init_worker(worker);
 
 	task = __kthread_create_on_node(kthread_worker_fn, worker,
-					node, namefmt, args);
+					node, namefmt, args, NULL);
 	if (IS_ERR(task))
 		goto fail_task;
 

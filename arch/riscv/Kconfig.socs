@@ -122,13 +122,28 @@ config ESP32S31_COPROC_CONTEXT
 	  ecall cannot restore the cross-privilege SIL=0xff sentinel into S-mode.
 	  PIE state is saved only on hart 1; users of XespV must stay CPU1-bound.
 
+config ESP32S31_RADIO_SCHEDULER
+	bool "ESP32-S31 explicit radio scheduling admission"
+	depends on SOC_ESP32S31 && SMP && ESP32S31_COPROC_CONTEXT && FPU
+	depends on RT_MUTEXES && PREEMPTION
+	default n
+	help
+	  Permit an owner to admit a dormant fixed-CPU0 radio kthread. Its
+	  scheduler role is not inherited by fork. An actually selected admitted
+	  RT task, or its top-PI dependency, may precede the deadline fair server;
+	  real deadline tasks and ordinary RT reservations retain their policy.
+	  This does not bypass configured RT-group quotas, make cache-off code
+	  preemptible, or authorize a vendor callback in an unsafe IRQ context.
+
 config ESP32S31_RADIO_SMODE
 	bool "ESP32-S31 S-mode radio runtime"
-	depends on SOC_ESP32S31 && MMU
+	depends on SOC_ESP32S31 && MMU && 32BIT && !RISCV_M_MODE
+	select IRQ_STACKS
 	help
-	  Prepare a private, identity-mapped address space for the ESP32-S31
-	  Wi-Fi, Bluetooth and PHY firmware libraries.  The mappings are present
-	  only in init_mm and are consumed by a dedicated kernel thread; user
-	  address spaces do not inherit them.
+	  Support native ESP32-S31 radio tasks in supervisor mode, including
+	  registered SRAM stacks and canonical sscratch thread identity at traps
+	  and firmware imports. Immutable peripheral/cache/SRAM/ROM supervisor
+	  leaves are shared by every address space. Native radio IRQ execution
+	  leases CPU0's independent Linux IRQ stack in internal SRAM.
 
 endmenu # "SoC selection"

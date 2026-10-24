@@ -910,6 +910,10 @@ void __noreturn do_exit(long code)
 	user_events_exit(tsk);
 
 	io_uring_files_cancel();
+	/* TLS callbacks retain live native lock identity as well as MM/SP.
+	 * External admission closes first; finite guards added by the current
+	 * owner are also drained before PF_EXITING and address-space teardown. */
+	task_exit_work_run();
 	exit_signals(tsk);  /* sets PF_EXITING */
 
 	seccomp_filter_release(tsk);

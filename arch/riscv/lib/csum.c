@@ -87,6 +87,26 @@ do_csum_common(const unsigned long *ptr, const unsigned long *end,
 	unsigned int shift;
 	unsigned long csum = 0, carry = 0;
 
+#ifdef CONFIG_SOC_ESP32S31
+	/* The upload profile lands in this per-word carry loop. Amortize its
+	 * branch and pointer update over eight words, using the same carry
+	 * accounting and preloaded-word convention as the tail below. Keep
+	 * the existing alignment/partial-word handling outside this loop.
+	 */
+	while ((long)((unsigned long)end - (unsigned long)ptr) >=
+	       8 * (long)sizeof(*ptr)) {
+		unsigned int i;
+
+#pragma GCC unroll 8
+		for (i = 0; i < 8; i++) {
+			csum += data;
+			carry += csum < data;
+			data = ptr[i];
+		}
+		ptr += 8;
+	}
+#endif
+
 	/*
 	 * Do 32-bit reads on RV32 and 64-bit reads otherwise. This should be
 	 * faster than doing 32-bit reads on architectures that support larger

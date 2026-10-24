@@ -56,6 +56,10 @@ struct rt_mutex_waiter {
 	struct rt_mutex_base	*lock;
 	unsigned int		wake_state;
 	struct ww_acquire_ctx	*ww_ctx;
+#ifdef CONFIG_ESP32S31_RADIO_SCHEDULER
+	/* Propagation snapshot only; never a waiter ordering key. */
+	bool s31_radio_role;
+#endif
 };
 
 /**

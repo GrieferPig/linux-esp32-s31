@@ -6,10 +6,14 @@
 #include <asm/stacktrace.h>
 #include <asm/thread_info.h>
 #include <asm/vector.h>
+#include <asm/esp32s31_blob_fp.h>
+#include <asm/esp32s31_radio_view.h>
 
 static inline void arch_exit_to_user_mode_prepare(struct pt_regs *regs,
 						  unsigned long ti_work)
 {
+	esp32s31_radio_mm_user_return_check();
+	esp32s31_blob_fp_user_return_check();
 	if (ti_work & _TIF_RISCV_V_DEFER_RESTORE) {
 		clear_thread_flag(TIF_RISCV_V_DEFER_RESTORE);
 		/*

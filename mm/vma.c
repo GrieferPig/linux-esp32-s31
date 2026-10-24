@@ -6,6 +6,9 @@
 
 #include "vma_internal.h"
 #include "vma.h"
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+#include <asm/esp32s31_radio_map.h>
+#endif
 
 struct mmap_state {
 	struct mm_struct *mm;
@@ -3081,6 +3084,11 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
 	mmap_assert_write_locked(mm);
 
 	address &= PAGE_MASK;
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	if (address < vma->vm_start &&
+	    s31_radio_reserved_range(address, vma->vm_start - address, NULL, NULL))
+		return -ENOMEM;
+#endif
 	if (address < mmap_min_addr || address < FIRST_USER_ADDRESS)
 		return -EPERM;
 

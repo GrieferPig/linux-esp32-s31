@@ -11,7 +11,6 @@ struct sk_buff;
 /* The SoftMAC association toggles the CPU0 IRQ-latency idle policy. */
 void esp32s31_radio_idle_poll_set(bool active);
 /* Internal frontend hint; publish while holding the RX ring lock. */
-void s31_radio_softmac_rx_pending_set(bool pending);
 
 #define ESP32S31_RADIO_CORE_ABI_VERSION	1U
 
@@ -23,36 +22,12 @@ enum esp32s31_radio_state {
 };
 
 /* A stable, blob-independent snapshot for Linux radio front ends. */
-struct esp32s31_radio_health {
-	enum esp32s31_radio_state state;
-	s32 wifi_init_result;
-	s32 bt_init_result;
-	s32 bt_enable_result;
-	u32 tick_irqs;
-	u32 worker_passes;
-	u32 commands_completed;
-	u32 heap_used;
-	u32 heap_peak;
-	u32 heap_total;
-	u32 wifi_rx_dropped;
-	u32 wifi_tx_dropped;
-	u32 radio_irqs;
-	u32 hci_rx_dropped;
-	u32 hci_tx_dropped;
-	u64 hci_acl_rx_packets;
-	u64 hci_acl_rx_bytes;
-	u64 hci_acl_tx_packets;
-	u64 hci_acl_tx_bytes;
-	u32 acl_packet_type_events;
-	u16 acl_packet_type;
-	u32 coex_cmd_completes;
-	s32 coex_last_status;
-	u8 coex_bt_status;
-};
 
 struct esp32s31_radio_hci_ops {
 	void (*receive)(void *context, const u8 *frame, size_t length);
 	void (*rx_ready)(void *context);
+	/* Owner callback after SRAM/foreign context is restored to Linux. */
+	void (*tx_ready)(void *context);
 };
 
 #define ESP32S31_RADIO_HCI_FRAME_MAX	1029
@@ -80,12 +55,17 @@ struct esp32s31_radio_wifi_connect_params {
 	bool has_psk;
 	bool has_password;
 	bool enterprise;
+	u8 akm;
+	u8 mfp;
+	u8 sae_pwe;
 };
 
 struct esp32s31_radio_wifi_ops {
 	void (*scan_complete)(void *context, int status,
 			      const struct esp32s31_radio_wifi_ap *aps,
 			      size_t count);
+	/* Firmware-managed association notifications only. SoftMAC clients
+	 * leave these NULL: mac80211 owns the cfg80211 connection state. */
 	void (*connected)(void *context, int status, const u8 *bssid,
 			  u8 channel);
 	void (*disconnected)(void *context, u16 reason);
@@ -98,41 +78,56 @@ struct esp32s31_radio_wifi_ops {
 	void (*receive_aux)(void *context, u8 interface, const u8 *frame,
 			    size_t length, u8 channel, s8 signal);
 	void (*ap_station)(void *context, const u8 *mac, bool joined);
+	/* Borrowed management body (no 802.11 header/FCS), consumed before
+	 * callback return. Used only during FullMAC scan/connection setup. */
+	void (*mgmt)(void *context, const u8 *bssid, u8 subtype,
+		     const u8 *body, size_t length, u8 channel, s8 signal);
 };
 
-#define ESP32S31_RADIO_WIFI_FRAME_MAX	4144
+#define ESP32S31_RADIO_WIFI_FRAME_MAX	1600
 
 bool esp32s31_radio_is_disabled(void);
 void s31_linux_pmu_radio_vote(bool active);
 
 /* Keep Linux frontends on typed operations rather than raw payload calls. */
-int esp32s31_radio_get_health(struct esp32s31_radio_health *health);
 int esp32s31_radio_hci_register(const struct esp32s31_radio_hci_ops *ops,
 				void *context);
 void esp32s31_radio_hci_unregister(const struct esp32s31_radio_hci_ops *ops,
 				   void *context);
 int esp32s31_radio_hci_send(u8 packet_type, const u8 *data, size_t length);
+/* 0xff followed by up to eight LE16-length-prefixed H4 frames. */
+int esp32s31_radio_hci_send_batch(const u8 *data, size_t length);
 bool esp32s31_radio_hci_tx_has_space(void);
 bool esp32s31_radio_hci_rx_pending(void);
 int esp32s31_radio_hci_dequeue(u8 *frame, size_t capacity);
 int esp32s31_radio_hci_peek(const u8 **frame, size_t *length);
 void esp32s31_radio_hci_consume(void);
 void esp32s31_radio_hci_purge(void);
+/* Close RX admission only when retiring the controller generation. */
+void s31_radio_hci_rx_quiesce(void);
 int esp32s31_radio_wifi_register(const struct esp32s31_radio_wifi_ops *ops,
 				 void *context);
 void esp32s31_radio_wifi_unregister(const struct esp32s31_radio_wifi_ops *ops,
 				    void *context);
 int esp32s31_radio_wifi_get_mac(u8 mac[6]);
-int esp32s31_radio_wifi_scan(void);
+int esp32s31_radio_wifi_scan(const struct s31_wifi_scan_params *params);
 int esp32s31_radio_wifi_connect(
 		const struct esp32s31_radio_wifi_connect_params *params);
 int esp32s31_radio_wifi_disconnect(u16 reason);
 int esp32s31_radio_wifi_send(const u8 *frame, size_t length);
 int esp32s31_radio_wifi_send_interface(u8 interface, const u8 *frame, size_t length);
-/* Copies header and skb directly into the owned SRAM staging slot.
- * No skb reference survives this call; publication follows a complete copy. */
+/* Publishes bounded metadata and retains a source skb reference. CPU0 fills
+ * the final vendor buffer directly from skb fragments before PP submission.
+ * Source reference is released after submission/cancellation, separately from
+ * mac80211 completion ownership. Retryable resource failure retains it. */
 int esp32s31_radio_softmac_send_skb(const struct s31_softmac_tx_header *header,
                                  const struct sk_buff *skb);
+/* Required after publishing one or more SoftMAC source leases. */
+void esp32s31_radio_softmac_tx_kick(void);
+/* Retain original skb while cancellation reports a pending source lease. */
+bool esp32s31_radio_softmac_tx_cancel(u32 cookie, u32 epoch);
+/* Sleepable cold drain; callers close/join submitters before calling. */
+void esp32s31_radio_softmac_tx_quiesce(u32 epoch);
 int esp32s31_radio_wifi_control(const struct s31_wifi_control *control);
 bool esp32s31_radio_wifi_tx_has_space(void);
 bool esp32s31_radio_wifi_rx_pending(void);

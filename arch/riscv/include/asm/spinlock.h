@@ -5,6 +5,7 @@
 #ifdef CONFIG_SOC_ESP32S31
 
 #include <linux/atomic.h>
+#include <asm/esp32s31_tlb_fence.h>
 #include <asm-generic/spinlock_types.h>
 
 /*
@@ -61,8 +62,13 @@ static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
 	 * a runqueue lock and recurse into this path. CALL_FUNC dispatch must stay
 	 * in the normal IRQ/idle context.
 	 */
-	while (esp32s31_spin_acquire(lock))
+	unsigned int spins = 0;
+	while (esp32s31_spin_acquire(lock)) {
 		__asm__ __volatile__("nop");
+		/* Only the CSR-only shootdown leaf is legal under this raw lock.
+		 * It never dispatches generic CALL_FUNC/TTWU or device callbacks. */
+		if (unlikely(!(++spins & 0xff))) esp32s31_tlb_flush_poll();
+	}
 }
 
 static __always_inline bool arch_spin_trylock(arch_spinlock_t *lock)

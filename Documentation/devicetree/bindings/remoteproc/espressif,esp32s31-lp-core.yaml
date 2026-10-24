@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/remoteproc/espressif,esp32s31-lp-core.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 low-power core remote processor
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  LP core brought up through the remoteproc framework. SRAM, mailbox and
+  clock-reset windows are loader-reserved; the mailbox interrupt wakes the
+  host side, and the PMU reference keeps the shared domain powered.
+
+properties:
+  compatible:
+    const: espressif,esp32s31-lp-core
+
+  reg:
+    maxItems: 5
+
+  reg-names:
+    items:
+      - const: sram
+      - const: mailbox
+      - const: lp-sys
+      - const: lp-clkrst
+      - const: rtc-timer
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    const: mailbox
+
+  firmware-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Default LP firmware image; the driver falls back to it.
+
+  espressif,pmu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMU controller for the shared power domain.
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: cpu
+
+  '#mbox-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/clock/esp32s31-clk.h>
+    remoteproc@2e000000 {
+        compatible = "espressif,esp32s31-lp-core";
+        reg = <0x2e000000 0x8000>, <0x20817000 0x100>,
+              <0x20700000 0x100>, <0x20710000 0x100>,
+              <0x20800000 0x400>;
+        reg-names = "sram", "mailbox", "lp-sys", "lp-clkrst",
+                    "rtc-timer";
+        interrupts = <139 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "mailbox";
+        firmware-name = "esp32s31/s31-lp-core.elf";
+        espressif,pmu = <&pmu>;
+        clocks = <&clkc ESP32S31_CLK_CPU>;
+        clock-names = "cpu";
+        #mbox-cells = <0>;
+    };
+...

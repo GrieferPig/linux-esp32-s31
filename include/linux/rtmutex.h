@@ -13,8 +13,10 @@
 #ifndef __LINUX_RT_MUTEX_H
 #define __LINUX_RT_MUTEX_H
 
+#include <linux/atomic.h>
 #include <linux/compiler.h>
 #include <linux/linkage.h>
+#include <linux/ktime.h>
 #include <linux/rbtree_types.h>
 #include <linux/spinlock_types_raw.h>
 
@@ -125,6 +127,12 @@ extern void rt_mutex_lock(struct rt_mutex *lock);
 
 extern int rt_mutex_lock_interruptible(struct rt_mutex *lock);
 extern int rt_mutex_lock_killable(struct rt_mutex *lock);
+/* Kernel-thread-only wait; KTIME_MAX means no deadline. */
+extern int rt_mutex_lock_kthread_until(struct rt_mutex *lock, ktime_t deadline);
+extern int rt_mutex_lock_kthread_until_cancel(struct rt_mutex *lock,
+					     ktime_t deadline,
+					     const atomic_t *cancelled);
+extern void rt_mutex_wake_waiters(struct rt_mutex *lock);
 extern int rt_mutex_trylock(struct rt_mutex *lock);
 
 extern void rt_mutex_unlock(struct rt_mutex *lock);

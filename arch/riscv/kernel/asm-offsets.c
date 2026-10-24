@@ -41,6 +41,12 @@ void asm_offsets(void)
 	OFFSET(TASK_TI_PREEMPT_COUNT, task_struct, thread_info.preempt_count);
 	OFFSET(TASK_TI_KERNEL_SP, task_struct, thread_info.kernel_sp);
 	OFFSET(TASK_TI_USER_SP, task_struct, thread_info.user_sp);
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	OFFSET(TASK_TI_S31_BLOB_LINUX_SP, task_struct, thread_info.s31_blob_linux_sp);
+	OFFSET(TASK_TI_S31_BLOB_TRAP_T0, task_struct, thread_info.s31_blob_trap_t0);
+	OFFSET(TASK_TI_S31_BLOB_TRAP_TP, task_struct, thread_info.s31_blob_trap_tp);
+	OFFSET(TASK_TI_S31_IRQ_STACK_SP, task_struct, thread_info.s31_irq_stack_sp);
+#endif
 #ifdef CONFIG_SHADOW_CALL_STACK
 	OFFSET(TASK_TI_SCS_SP, task_struct, thread_info.scs_sp);
 #endif

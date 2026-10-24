@@ -17,18 +17,23 @@
  * with the slot number as parent hwirq. mask/unmask/set_type pass through
  * to the parent (CLIC) chip; INTMTX itself has no per-source gate.
  *
- * Generic device routes use the official core0-only path. The SMP companion
- * owns the parallel core1 matrix solely for per-hart timer and IPI routes.
+ * Device routes start on core0 and can migrate to an online hart through
+ * the IRQ affinity callback. Timer/IPI slots remain owned by the SMP layer.
  */
 
 #include <linux/bitmap.h>
+#include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#include <linux/init.h>
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/irqchip.h>
 #include <linux/irqdomain.h>
+#include <linux/irqdesc.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/spinlock.h>
 #include <linux/syscore_ops.h>
 
@@ -55,11 +60,20 @@
  * assumption. */
 #define INTMTX_MAX_SRC		177U
 
+struct esp_intmtx_radio_claim {
+	void *owner;
+	unsigned long status;
+	cpumask_t affinity;
+};
+
 struct esp_intmtx {
 	void __iomem		*base;
 	raw_spinlock_t		lock;
 	DECLARE_BITMAP(slots_in_use, CLIC_SLOT_COUNT);
 	u8			src_to_slot[INTMTX_MAX_SRC + 1];
+	/* Explicit direct-radio admission, protected by each IRQ descriptor.
+	 * The action owns this cookie; last-action resource release clears it. */
+	struct esp_intmtx_radio_claim claims[CLIC_SLOT_COUNT];
 };
 
 static struct esp_intmtx *intmtx;
@@ -114,14 +128,144 @@ static void esp_intmtx_free_slot(struct esp_intmtx *priv, unsigned int slot)
 	clear_bit(slot - CLIC_SLOT_FIRST, priv->slots_in_use);
 }
 
+static struct esp_intmtx_radio_claim *esp_intmtx_claim(struct irq_data *data)
+{
+	struct esp_intmtx *priv = irq_data_get_irq_chip_data(data);
+	struct irq_data *parent = data->parent_data;
+
+	if (!priv || !parent || parent->hwirq < CLIC_SLOT_FIRST ||
+	    parent->hwirq > CLIC_SLOT_LAST)
+		return NULL;
+	return &priv->claims[parent->hwirq - CLIC_SLOT_FIRST];
+}
+
+static bool esp_intmtx_cpu0_owner(struct irq_data *data)
+{
+	struct esp_intmtx_radio_claim *claim = esp_intmtx_claim(data);
+
+	/* IRQ_NO_BALANCING is a generic device property, not radio ownership.
+	 * LP IPC alone has a fixed source exception before its action exists. */
+	return data->hwirq == 139 || (claim && claim->owner);
+}
+
+static bool esp_intmtx_pm_migration(void)
+{
+	/* CPU hotplug retains the last tasks_frozen value after resume.
+	 * Only the actual suspend window permits quiesced CPU0 migration. */
+	return READ_ONCE(cpuhp_tasks_frozen) && pm_suspend_in_progress();
+}
+
 static int esp_intmtx_set_affinity(struct irq_data *d,
 				    const struct cpumask *mask, bool force)
 {
-	if (!cpumask_test_cpu(0, mask))
-		return -EINVAL;
+	struct esp_intmtx *priv = irq_data_get_irq_chip_data(d);
+	unsigned int cpu, old_cpu, slot, src = d->hwirq;
+	unsigned long flags;
+	int enabled;
 
-	irq_data_update_effective_affinity(d, cpumask_of(0));
+	/* Linux adds the boot CPU to irqaffinity=, even when it names only
+	 * CPU1. Prefer CPU1 within a multi-CPU mask so ordinary peripherals
+	 * actually leave CPU0. Explicit radio/IPC CPU0 requests still win.
+	 * Hotplug migration must only choose a hart that remains online. */
+	cpu = cpumask_test_cpu(1, mask) && cpu_online(1) ? 1 :
+		cpumask_any_and(mask, cpu_online_mask);
+	if (cpu > 1 || src > INTMTX_MAX_SRC)
+		return -EINVAL;
+	/* Explicit source admission marks CPU0 radio owners. Ordinary
+	 * peripherals may not consume the radio admission budget on CPU0.
+	 * Suspend's frozen-CPU migration follows device/IRQ quiescence and is
+	 * restored by the CPU1 online callback before normal device resume. */
+	if (!cpu && !esp_intmtx_cpu0_owner(d) &&
+	    esp_clic_radio_isolation_active() && !esp_intmtx_pm_migration())
+		/* EBUSY is converted into a deferred affinity request by genirq. */
+		return -EINVAL;
+	old_cpu = cpumask_first(irq_data_get_effective_affinity_mask(d));
+	if (old_cpu == cpu)
+		return IRQ_SET_MASK_OK_DONE;
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	slot = priv->src_to_slot[src];
+	if (!slot) {
+		raw_spin_unlock_irqrestore(&priv->lock, flags);
+		return -EINVAL;
+	}
+	enabled = esp_clic_move_prepare(d->parent_data, old_cpu, cpu);
+	if (enabled < 0) {
+		raw_spin_unlock_irqrestore(&priv->lock, flags);
+		return enabled;
+	}
+	writel_relaxed(0, priv->base + old_cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
+	/* CPU0 preserves its qualified delegation path. CPU1 device delivery
+	 * uses the S-mode route, just like its existing local timer and IPI. */
+	writel_relaxed(slot | (cpu ? INTMTX_PASS_LEVEL_S : 0),
+		       priv->base + cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
+	irq_data_update_effective_affinity(d, cpumask_of(cpu));
+	esp_clic_move_finish(d->parent_data, old_cpu, cpu, enabled);
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return IRQ_SET_MASK_OK_DONE;
+}
+
+static int esp_intmtx_request_resources(struct irq_data *data)
+{
+	struct esp_intmtx_radio_claim *claim = esp_intmtx_claim(data);
+	struct irq_desc *desc = irq_data_to_desc(data);
+	unsigned long flags;
+	int ret = 0;
+
+	if (!claim)
+		return -ENODEV;
+	/* irq_startup ignores irq_setup_affinity errors. Refuse a conflicting
+	 * new action here, before it can be unmasked on its allocation CPU. */
+	raw_spin_lock_irqsave(&desc->lock, flags);
+	claim->status = desc->status_use_accessors &
+		(IRQ_NO_BALANCING | IRQ_DISABLE_UNLAZY);
+	cpumask_copy(&claim->affinity, irq_data_get_affinity_mask(data));
+	if (esp_clic_radio_isolation_active() && !esp_intmtx_pm_migration() &&
+	    !esp_intmtx_cpu0_owner(data)) {
+		if (!cpu_online(1) ||
+		    !cpumask_test_cpu(1, irq_data_get_affinity_mask(data)))
+			ret = -EBUSY;
+		else {
+			/* No action is installed yet. Program our controller now;
+			 * genirq's ordinary setter may defer an inactive IRQ move. */
+			ret = esp_intmtx_set_affinity(data,
+					irq_data_get_affinity_mask(data), false);
+			if (ret >= 0)
+				ret = 0;
+		}
+		if (!ret && !cpumask_equal(
+			irq_data_get_effective_affinity_mask(data), cpumask_of(1)))
+			ret = -EIO;
+	}
+	raw_spin_unlock_irqrestore(&desc->lock, flags);
+	return ret;
+}
+
+static void esp_intmtx_release_resources(struct irq_data *data)
+{
+	struct esp_intmtx_radio_claim *claim = esp_intmtx_claim(data);
+	struct irq_desc *desc = irq_data_to_desc(data);
+	unsigned long flags;
+	unsigned long saved;
+	bool radio;
+	int ret;
+
+	if (WARN_ON_ONCE(!claim))
+		return;
+
+	/* Last action is removed and joined; request_mutex prevents reuse until
+	 * the generic IRQ core finishes releasing this source's resources. */
+	raw_spin_lock_irqsave(&desc->lock, flags);
+	radio = !!claim->owner;
+	saved = claim->status;
+	claim->owner = NULL;
+	if (radio) {
+		ret = irq_set_affinity_locked(data, &claim->affinity, false);
+		WARN_ON_ONCE(ret);
+	}
+	raw_spin_unlock_irqrestore(&desc->lock, flags);
+	if (radio)
+		irq_modify_status(data->irq, IRQ_NO_BALANCING | IRQ_DISABLE_UNLAZY,
+				  saved);
 }
 
 static struct irq_chip esp_intmtx_chip = {
@@ -130,8 +274,153 @@ static struct irq_chip esp_intmtx_chip = {
 	.irq_unmask	= irq_chip_unmask_parent,
 	.irq_set_type	= irq_chip_set_type_parent,
 	.irq_set_affinity = esp_intmtx_set_affinity,
-	.flags		= IRQCHIP_SKIP_SET_WAKE,
+	.irq_request_resources = esp_intmtx_request_resources,
+	.irq_release_resources = esp_intmtx_release_resources,
+	.flags		= IRQCHIP_SKIP_SET_WAKE | IRQCHIP_AFFINITY_PRE_STARTUP,
 };
+
+/* Caller holds desc->lock and has verified its exclusive, disabled action
+ * and owner cookie. No unowned mapping or generic IRQ flag grants CPU0. */
+int esp_intmtx_radio_bind(struct irq_data *data, void *owner)
+{
+	struct esp_intmtx_radio_claim *claim = esp_intmtx_claim(data);
+	int ret;
+
+	if (!owner || !claim || irq_data_get_irq_chip(data) != &esp_intmtx_chip ||
+	    data->hwirq > INTMTX_MAX_SRC || claim->owner)
+		return -EINVAL;
+	claim->owner = owner;
+	ret = irq_set_affinity_locked(data, cpumask_of(0), false);
+	if (ret || !cpumask_equal(irq_data_get_effective_affinity_mask(data),
+				 cpumask_of(0))) {
+		/* The exclusive action still owns its failed admission attempt.
+		 * free_irq's resource release must restore its pre-request flags
+		 * and affinity even when direct registration never publishes. */
+		return ret ?: -EIO;
+	}
+	return 0;
+}
+
+/* Cold radio admission only, never an execution/packet admission scan.
+ * The caller holds cpus_read_lock and has published the policy, preventing
+ * CPU1 removal and new conflicting affinity requests during this walk. */
+int esp_intmtx_radio_isolation_validate(void)
+{
+	struct irq_desc *desc;
+	unsigned int irq;
+	int ret = 0;
+
+	if (!intmtx)
+		return -ENODEV;
+	irq_lock_sparse();
+	for_each_irq_desc(irq, desc) {
+		struct irq_data *data = irq_desc_get_irq_data(desc);
+		unsigned long flags;
+
+		/* Join an installation that passed resource admission just before
+		 * policy publication, but has not yet published its action. */
+		if (irq_data_get_irq_chip(data) != &esp_intmtx_chip)
+			continue;
+		mutex_lock(&desc->request_mutex);
+		raw_spin_lock_irqsave(&desc->lock, flags);
+		if (irq_data_get_irq_chip(data) == &esp_intmtx_chip &&
+		    desc->action && !esp_intmtx_cpu0_owner(data)) {
+			if (!cpumask_test_cpu(1, irq_data_get_affinity_mask(data)))
+				ret = -EBUSY;
+			else if (!cpumask_equal(
+				irq_data_get_effective_affinity_mask(data), cpumask_of(1))) {
+				if (irqd_affinity_is_managed(data))
+					ret = -EBUSY;
+				else
+					ret = irq_set_affinity_locked(data,
+						irq_data_get_affinity_mask(data), false);
+				if (!ret && !cpumask_equal(
+					irq_data_get_effective_affinity_mask(data), cpumask_of(1)))
+					ret = -EIO;
+			}
+		}
+		raw_spin_unlock_irqrestore(&desc->lock, flags);
+		mutex_unlock(&desc->request_mutex);
+		if (ret) {
+			pr_err("esp-intmtx: radio admission needs IRQ%u on CPU1: %d\n",
+			       irq, ret);
+			break;
+		}
+	}
+	irq_unlock_sparse();
+	return ret;
+}
+
+/* Generic online restoration covers managed IRQs only. Reapply CPU1 to
+ * this controller's active unmanaged peripherals after CPU1 comes back.
+ * Radio/LP IPC are unbalanceable CPU0 owners; explicit CPU0 affinity wins. */
+static int esp_intmtx_cpu_online(unsigned int cpu)
+{
+	struct irq_desc *desc;
+	unsigned int irq, moved = 0;
+	int ret = 0;
+
+	if (cpu != 1)
+		return 0;
+	/* Same lifetime/lock order as IRQ core online restoration: sparse IRQ
+	 * mutex, descriptor, chip policy. Disposal cannot invalidate this walk. */
+	irq_lock_sparse();
+	for_each_irq_desc(irq, desc) {
+		struct irq_data *data = irq_desc_get_irq_data(desc);
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&desc->lock, flags);
+		if (irq_data_get_irq_chip(data) == &esp_intmtx_chip &&
+		    desc->action && !esp_intmtx_cpu0_owner(data) &&
+		    !irqd_affinity_is_managed(data) &&
+		    cpumask_test_cpu(cpu, irq_data_get_affinity_mask(data)) &&
+		    !cpumask_equal(irq_data_get_effective_affinity_mask(data),
+				   cpumask_of(cpu))) {
+			ret = irq_set_affinity_locked(data,
+					irq_data_get_affinity_mask(data), false);
+			if (!ret && !cpumask_equal(
+				    irq_data_get_effective_affinity_mask(data),
+				    cpumask_of(cpu)))
+				ret = -EIO;
+			if (!ret)
+				moved++;
+		}
+		raw_spin_unlock_irqrestore(&desc->lock, flags);
+		if (ret) {
+			pr_err("esp-intmtx: CPU1 IRQ%u affinity restore failed: %d\n",
+			       irq, ret);
+			break;
+		}
+	}
+	irq_unlock_sparse();
+	if (!ret)
+		pr_info("esp-intmtx: CPU1 online restored %u peripheral IRQs\n", moved);
+	return ret;
+}
+
+static int esp_intmtx_cpu_down(unsigned int cpu)
+{
+	/* AP_ONLINE teardown can refuse before IRQ affinity migration or CPU
+	 * death. Ordinary hotplug cannot break an active radio isolation lease.
+	 * Frozen system suspend has already quiesced the devices and IRQs. */
+	if (cpu == 1 && esp_clic_radio_isolation_active() && !esp_intmtx_pm_migration())
+		return -EBUSY;
+	return 0;
+}
+
+static int __init esp_intmtx_hotplug_init(void)
+{
+	int ret;
+
+	if (!intmtx)
+		return 0;
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/esp-intmtx:online",
+			       esp_intmtx_cpu_online, esp_intmtx_cpu_down);
+	if (ret < 0)
+		panic("esp-intmtx: required peripheral hotplug policy failed: %d", ret);
+	return 0;
+}
+subsys_initcall(esp_intmtx_hotplug_init);
 
 void esp_intmtx_route_local(unsigned int cpu, unsigned int source,
 			    unsigned int slot)
@@ -228,6 +517,7 @@ static int esp_intmtx_domain_alloc(struct irq_domain *domain,
 		return ret;
 	}
 
+	irq_data_update_effective_affinity(irq_get_irq_data(virq), cpumask_of(0));
 	return 0;
 
 out:
@@ -253,6 +543,7 @@ static void esp_intmtx_domain_free(struct irq_domain *domain,
 	raw_spin_lock_irqsave(&priv->lock, flags);
 	slot = priv->src_to_slot[src];
 	writel_relaxed(0, priv->base + INTMTX_SRC_REG(src));
+	writel_relaxed(0, priv->base + INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
 	priv->src_to_slot[src] = 0;
 	esp_intmtx_free_slot(priv, slot);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
@@ -331,7 +622,7 @@ static int __init esp_intmtx_init(struct device_node *node,
 		}
 	}
 
-	pr_info("esp-intmtx: %u sources, parent %pOF; %u device slots, hart0 pinned\n",
+	pr_info("esp-intmtx: %u sources, parent %pOF; %u device slots, CPU1 preferred\n",
 		 INTMTX_MAX_SRC + 1, parent, CLIC_SLOT_COUNT - 2);
 	return 0;
 }

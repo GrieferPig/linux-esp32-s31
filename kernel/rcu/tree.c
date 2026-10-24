@@ -2237,7 +2237,7 @@ static noinline void rcu_gp_cleanup(void)
 
 		// We get here either if there is no need for an
 		// additional grace period or if rcu_accelerate_cbs() has
-		// already set the RCU_GP_FLAG_INIT bit in ->gp_flags. 
+		// already set the RCU_GP_FLAG_INIT bit in ->gp_flags.
 		// So all we need to do is to clear all of the other
 		// ->gp_flags bits.
 

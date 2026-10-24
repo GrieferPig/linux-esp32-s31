@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Fixed flash-XIP and writable SRAM mapping for the S31 radio. */
+/* Fixed flash-XIP, instruction-SRAM alias and writable kernel arena. */
 #include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
@@ -77,9 +77,9 @@ static int __init esp32s31_radio_xip_init(void)
 		S31_XIP_MAP_BASE + S31_XIP_MAP_SIZE);
 	esp32s31_radio_xip_mapping = (const void *)S31_XIP_BASE;
 	/* The Wi-Fi-specific IDF IRAM sections execute from the unused upper
-	 * part of the private SRAM heap.  A high alias keeps PC-relative calls
-	 * near radio XIP, and unlike the init_mm-only physical mapping it remains
-	 * reachable when an interrupt arrives in a user process page table.
+	 * part of the private SRAM heap. A high alias keeps PC-relative calls
+	 * near radio XIP. Both this alias and the supervisor physical radio
+	 * windows remain reachable across user process page-table switches.
 	 * Leave a gap for the XIP vmalloc area's guard page.  VM_IOREMAP
 	 * aligns this 72 KiB request to 128 KiB, so the alias must be aligned
 	 * to that boundary as well. */
@@ -117,11 +117,7 @@ static int __init esp32s31_radio_xip_init(void)
 	flush_tlb_kernel_range(S31_XIP_WIFI_IRAM_BASE,
 		S31_XIP_WIFI_IRAM_BASE + S31_XIP_WIFI_IRAM_MAP_SIZE);
 	esp32s31_radio_wifi_iram_mapping = area->addr;
-	pr_info("esp32s31-radio: reserved XIP %px, RAM %px/%u bytes\n",
-		esp32s31_radio_xip_mapping, esp32s31_radio_xip_ram, S31_XIP_RAM_SIZE);
-	pr_info("esp32s31-radio: Wi-Fi IRAM %px -> %#x (%u bytes)\n",
-		esp32s31_radio_wifi_iram_mapping, S31_XIP_WIFI_IRAM_PHYS,
-		S31_XIP_WIFI_IRAM_CAPACITY);
+
 	return 0;
 }
 postcore_initcall(esp32s31_radio_xip_init);
