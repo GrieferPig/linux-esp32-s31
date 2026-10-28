@@ -19,7 +19,7 @@ static bool s31_radio_started;
 static bool s31_radio_suspended;
 static u32 s31_radio_configured_features;
 static char *s31_radio_mode = "combo";
-static bool s31_radio_direct_hci = true;
+static bool s31_radio_direct_hci;
 module_param_named(mode, s31_radio_mode, charp, 0400);
 MODULE_PARM_DESC(mode, "radio profile: wifi, bt, or combo");
 module_param_named(direct_hci, s31_radio_direct_hci, bool, 0400);

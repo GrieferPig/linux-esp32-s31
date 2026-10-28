@@ -661,8 +661,25 @@ static void esp32s31_axi_complete_desc(struct esp32s31_axi_chan *chan,
 {
 	list_del_init(&desc->running_node);
 	desc->residue = 0;
+	if (result == DMA_TRANS_NOERROR && desc->direction == DMA_DEV_TO_MEM) {
+		size_t received = 0;
+		unsigned int i;
+
+		dma_rmb();
+		for (i = 0; i < desc->rx_count; i++) {
+			u32 control = readl(desc->rx[i].hw);
+
+			if (control & ESP32S31_DESC_OWNER_DMA)
+				break;
+			received += min_t(size_t, desc->rx[i].len,
+				FIELD_GET(ESP32S31_DESC_LENGTH, control));
+			if (control & ESP32S31_DESC_SUC_EOF)
+				break;
+		}
+		desc->residue = desc->len - min(desc->len, received);
+	}
 	desc->vd.tx_result.result = result;
-	desc->vd.tx_result.residue = 0;
+	desc->vd.tx_result.residue = desc->residue;
 	if (result != DMA_TRANS_NOERROR)
 		chan->error_cookie = desc->vd.tx.cookie;
 	else

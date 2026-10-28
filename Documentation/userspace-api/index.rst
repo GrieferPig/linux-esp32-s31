@@ -44,6 +44,7 @@ Devices and I/O
    :maxdepth: 1
 
    accelerators/ocxl
+   esp32s31-accelerators
    dma-buf-heaps
    dma-buf-alloc-exchange
    fwctl/index

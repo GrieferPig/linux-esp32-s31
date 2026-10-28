@@ -169,7 +169,7 @@
 
 		ahb_gdma: dma-controller@20343000 {
 			compatible = "espressif,esp32s31-ahb-gdma";
-			reg = <0x20343000 0x628>, <0x2f075380 0x1000>;
+			reg = <0x20343000 0x628>, <0x2f075380 0xf00>;
 			reg-names = "dma", "descriptors";
 			clocks = <&clkc ESP32S31_CLK_AHB_GDMA>;
 			resets = <&clkc ESP32S31_RST_AHB_GDMA>;
@@ -317,6 +317,65 @@
 			reg = <0x20814000 0x100>, <0x2071003c 0x4>;
 			reg-names = "trng", "clkrst";
 			status = "okay";
+		};
+
+		jpeg: jpeg@20344000 {
+			compatible = "espressif,esp32s31-jpeg";
+			reg = <0x20344000 0x1000>, <0x205862a0 0x4>;
+			reg-names = "codec", "memory-power";
+			clocks = <&clkc ESP32S31_CLK_JPEG>;
+			resets = <&clkc ESP32S31_RST_JPEG>;
+			espressif,dma2d = <&dma2d>;
+		};
+
+		ppa: image-processor@20345000 {
+			compatible = "espressif,esp32s31-ppa";
+			reg = <0x20345000 0x1000>, <0x2058629c 0x4>;
+			reg-names = "processor", "memory-power";
+			clocks = <&clkc ESP32S31_CLK_PPA>;
+			resets = <&clkc ESP32S31_RST_PPA>;
+			espressif,dma2d = <&dma2d>;
+		};
+
+		dma2d: dma-controller@20346000 {
+			compatible = "espressif,esp32s31-dma2d";
+			/* 256 bytes from the existing AHB descriptor reservation. */
+			reg = <0x20346000 0xa30>, <0x2f076280 0x100>, <0x20586210 0x4>;
+			reg-names = "dma", "descriptors", "memory-power";
+			clocks = <&clkc ESP32S31_CLK_DMA2D>;
+			resets = <&clkc ESP32S31_RST_DMA2D>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <105 IRQ_TYPE_LEVEL_HIGH>, <108 IRQ_TYPE_LEVEL_HIGH>,
+				     <109 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx", "tx", "foreground";
+			#dma-cells = <1>;
+			dma-channels = <1>;
+		};
+
+		cordic: cordic@2039b000 {
+			compatible = "espressif,esp32s31-cordic";
+			reg = <0x2039b000 0x44>;
+			clocks = <&clkc ESP32S31_CLK_CORDIC>;
+			resets = <&clkc ESP32S31_RST_CORDIC>;
+		};
+
+		etm: event-router@20393000 {
+			compatible = "espressif,esp32s31-etm";
+			reg = <0x20393000 0x1000>;
+			clocks = <&clkc ESP32S31_CLK_ETM>;
+			resets = <&clkc ESP32S31_RST_ETM>;
+		};
+
+		bitscrambler: bitscrambler@20356000 {
+			compatible = "espressif,esp32s31-bitscrambler";
+			reg = <0x20356000 0x100>, <0x20586140 0x4>, <0x20586220 0x4>;
+			reg-names = "bitscrambler", "route", "memory-power";
+			clocks = <&clkc ESP32S31_CLK_BITSCRAMBLER>;
+			resets = <&clkc ESP32S31_RST_BITSCRAMBLER>;
+			/* Reserve the otherwise unused LCD trigger for memory loopback. */
+			dmas = <&axi_gdma ESP32S31_AXI_GDMA_ANY 0>,
+			       <&axi_gdma ESP32S31_AXI_GDMA_ANY 0>;
+			dma-names = "tx", "rx";
 		};
 
 		crypto: crypto@20508000 {
@@ -948,13 +1007,13 @@
 
 				partition@400000 {
 					label = "linux";
-					reg = <0x400000 0x610000>;
+					reg = <0x400000 0x650000>;
 					read-only;
 				};
 
-				partition@a10000 {
+				partition@a50000 {
 					label = "rootfs";
-					reg = <0xa10000 0x5f0000>;
+					reg = <0xa50000 0x5b0000>;
 					linux,rootfs;
 					read-only;
 				};
@@ -988,7 +1047,7 @@
 
 		ledc0: pwm@20392000 {
 			compatible = "espressif,esp32s31-ledc";
-			reg = <0x20392000 0x600>, <0x20586208 0x4>;
+			reg = <0x20392000 0x600>, <0x20586400 0x4>;
 			clocks = <&clkc ESP32S31_CLK_LEDC0>;
 			resets = <&clkc ESP32S31_RST_LEDC0>;
 			#pwm-cells = <3>;

@@ -312,6 +312,12 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 	[ESP32S31_RST_WDT1] = { HP_TIMERGRP1_CTRL0, HP_TIMERGRP_RST_EN,
 		HP_TIMERGRP_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_SYSTIMER] = { 0x120, BIT(1), BIT(2), ESP32S31_BANK_HP },
+	[ESP32S31_RST_DMA2D] = { 0xb0, BIT(1), BIT(2), ESP32S31_BANK_HP },
+	[ESP32S31_RST_JPEG] = { 0xb8, BIT(1), BIT(2), ESP32S31_BANK_HP },
+	[ESP32S31_RST_PPA] = { 0xb4, BIT(1), BIT(2), ESP32S31_BANK_HP },
+	[ESP32S31_RST_BITSCRAMBLER] = { 0xa4, BIT(1) | BIT(4) | BIT(7), BIT(2) | BIT(5) | BIT(8), ESP32S31_BANK_HP },
+	[ESP32S31_RST_ETM] = { 0xa8, BIT(2), BIT(3), ESP32S31_BANK_HP },
+	[ESP32S31_RST_CORDIC] = { 0x1b4, BIT(1), BIT(6), ESP32S31_BANK_HP },
 	[ESP32S31_RST_AXI_GDMA] = { 0x78, BIT(1), BIT(2), ESP32S31_BANK_HP },
 	[ESP32S31_RST_AHB_GDMA] = { 0x7c, BIT(1), BIT(2), ESP32S31_BANK_HP },
 	[ESP32S31_RST_UHCI] = { 0x84, BIT(2), BIT(3), ESP32S31_BANK_HP },
@@ -717,6 +723,11 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 		}
 		break;
 	case ESP32S31_CLK_KIND_GENERIC:
+		/* Match the SDK default sources: CORDIC 160 MHz, ETM 80 MHz. */
+		if (clk->reg == 0x1b4)
+			esp32s31_rmw(priv->hp, clk->reg, GENMASK(8, 7), BIT(8));
+		else if (clk->reg == 0xa8)
+			esp32s31_rmw(priv->hp, clk->reg, GENMASK(5, 4), BIT(5));
 		if (!clk->initialized) {
 			esp32s31_rmw(priv->hp, clk->reg, clk->reset_mask,
 				     clk->enable_mask | clk->force_norst_mask);
@@ -1437,6 +1448,8 @@ static const char * const esp32s31_cpu_parents[] = {
 };
 static const char * const esp32s31_cpu_parent[] = { "cpu" };
 static const char * const esp32s31_sys_parent[] = { "sys" };
+static const char * const esp32s31_f160_parent[] = { "pll-f160" };
+static const char * const esp32s31_f80_parent[] = { "pll-f80" };
 
 static ssize_t clocks_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
@@ -1709,6 +1722,36 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_SYSTIMER,
 				     "systimer", 16000000UL, 0x120,
 				     BIT(0) | BIT(4), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_DMA2D,
+				     "dma2d", esp32s31_sys_parent, 0xb0,
+				     BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_JPEG,
+				     "jpeg", esp32s31_sys_parent, 0xb8,
+				     BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_PPA,
+				     "ppa", esp32s31_sys_parent, 0xb4,
+				     BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_BITSCRAMBLER,
+				     "bitscrambler", esp32s31_sys_parent, 0xa4,
+				     BIT(0) | BIT(3) | BIT(6), BIT(1) | BIT(4) | BIT(7), BIT(2) | BIT(5) | BIT(8));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_ETM,
+				     "etm", esp32s31_f80_parent, 0xa8,
+				     BIT(1) | BIT(6), BIT(2), BIT(3));
+	if (ret)
+		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_CORDIC,
+				     "cordic", esp32s31_f160_parent, 0x1b4,
+				     BIT(0) | BIT(4), BIT(1), BIT(6));
 	if (ret)
 		return ret;
 	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_AXI_GDMA,

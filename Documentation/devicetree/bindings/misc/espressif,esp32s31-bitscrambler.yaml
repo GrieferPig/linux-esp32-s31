@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/espressif,esp32s31-bitscrambler.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 BitScrambler memory loopback
+
+maintainers:
+  - GrieferPig <grieferpig@163.com>
+
+properties:
+  compatible:
+    enum:
+      - espressif,esp32s31-bitscrambler
+  reg:
+    minItems: 3
+    maxItems: 3
+  clocks:
+    maxItems: 1
+  resets:
+    maxItems: 1
+  reg-names:
+    items:
+      - const: bitscrambler
+      - const: route
+      - const: memory-power
+  dmas:
+    minItems: 2
+    maxItems: 2
+  dma-names:
+    items:
+      - const: tx
+      - const: rx
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - resets
+  - reg-names
+  - dmas
+  - dma-names
+additionalProperties: false
+...

@@ -75,3 +75,6 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
 obj-y				+= keba/
 obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
+obj-$(CONFIG_ESP32S31_CORDIC) += esp32s31-cordic.o
+obj-$(CONFIG_ESP32S31_ETM) += esp32s31-etm.o
+obj-$(CONFIG_ESP32S31_BITSCRAMBLER) += esp32s31-bitscrambler.o

@@ -89,6 +89,17 @@ static int s31_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 
 	if (type == HCI_COMMAND_PKT && skb->len >= 3)
 		opcode = skb->data[0] | (skb->data[1] << 8);
+	/* This integrated controller accepts ACL host flow control only; SCO
+	 * flow control is not implemented by its VHCI endpoint. Preserve the
+	 * standard host command and completion while selecting its supported
+	 * mode at the controller boundary.
+	 */
+	if (opcode == 0x0c31 && skb->len == 4 && skb->data[2] == 1) {
+		ret = skb_ensure_writable(skb, 4);
+		if (ret)
+			return ret;
+		skb->data[3] &= 1;
+	}
 	if (opcode == HCI_OP_WRITE_CLASS_OF_DEV)
 		pr_info("esp32s31-hci: TX 0x0c24 len=%u cod=%*ph\n",
 			skb->len, (int)min_t(unsigned int, 3, skb->len - 3),

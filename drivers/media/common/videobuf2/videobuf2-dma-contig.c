@@ -38,6 +38,7 @@ struct vb2_dc_buf {
 	struct vb2_vmarea_handler	handler;
 	refcount_t			refcount;
 	struct sg_table			*sgt_base;
+	struct sg_table			*cpu_sgt;
 
 	/* DMABUF related */
 	struct dma_buf_attachment	*db_attach;
@@ -171,6 +172,13 @@ static void vb2_dc_put(void *buf_priv)
 	if (!refcount_dec_and_test(&buf->refcount))
 		return;
 
+	if (buf->cpu_sgt) {
+		dma_unmap_sgtable(buf->dev, buf->cpu_sgt, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+		sg_free_table(buf->cpu_sgt);
+		kfree(buf->cpu_sgt);
+	}
+
 	if (buf->non_coherent_mem) {
 		if (buf->vaddr)
 			dma_vunmap_noncontiguous(buf->dev, buf->vaddr);
@@ -258,6 +266,7 @@ static void *vb2_dc_alloc(struct vb2_buffer *vb,
 
 	if (ret) {
 		dev_err(dev, "dma alloc of size %lu failed\n", size);
+		put_device(buf->dev);
 		kfree(buf);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -427,6 +436,14 @@ static int
 vb2_dc_dmabuf_ops_begin_cpu_access(struct dma_buf *dbuf,
 				   enum dma_data_direction direction)
 {
+	struct vb2_dc_buf *buf = dbuf->priv;
+
+	if (buf->cpu_sgt) {
+		if (buf->vaddr)
+			invalidate_kernel_vmap_range(buf->vaddr, buf->size);
+		dma_sync_sgtable_for_cpu(buf->dev, buf->cpu_sgt,
+					DMA_BIDIRECTIONAL);
+	}
 	return 0;
 }
 
@@ -434,7 +451,56 @@ static int
 vb2_dc_dmabuf_ops_end_cpu_access(struct dma_buf *dbuf,
 				 enum dma_data_direction direction)
 {
+	struct vb2_dc_buf *buf = dbuf->priv;
+
+	if (buf->cpu_sgt) {
+		if (buf->vaddr)
+			flush_kernel_vmap_range(buf->vaddr, buf->size);
+		dma_sync_sgtable_for_device(buf->dev, buf->cpu_sgt,
+					   DMA_BIDIRECTIONAL);
+	}
 	return 0;
+}
+
+/* Exported non-coherent buffers may be written by an importer even when
+ * their original queue was OUTPUT. Keep a bidirectional mapping for the
+ * DMA-BUF CPU access contract without widening the normal queue's DMA
+ * direction. Mapping itself does not transfer ownership; only the explicit
+ * CPU access callbacks synchronize it. The mapping survives release of the
+ * original queue and context.
+ */
+static int vb2_dc_prepare_export(struct vb2_dc_buf *buf)
+{
+	struct sg_table *sgt;
+	struct scatterlist *src, *dst;
+	unsigned int i;
+	int ret;
+
+	if (!buf->non_coherent_mem || buf->cpu_sgt)
+		return 0;
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return -ENOMEM;
+	ret = sg_alloc_table(sgt, buf->sgt_base->orig_nents, GFP_KERNEL);
+	if (ret)
+		goto free;
+	dst = sgt->sgl;
+	for_each_sgtable_sg(buf->sgt_base, src, i) {
+		sg_set_page(dst, sg_page(src), src->length, src->offset);
+		dst = sg_next(dst);
+	}
+	ret = dma_map_sgtable(buf->dev, sgt, DMA_BIDIRECTIONAL,
+			      DMA_ATTR_SKIP_CPU_SYNC);
+	if (ret)
+		goto free_table;
+	buf->cpu_sgt = sgt;
+	return 0;
+
+free_table:
+	sg_free_table(sgt);
+free:
+	kfree(sgt);
+	return ret;
 }
 
 static int vb2_dc_dmabuf_ops_vmap(struct dma_buf *dbuf, struct iosys_map *map)
@@ -512,6 +578,9 @@ static struct dma_buf *vb2_dc_get_dmabuf(struct vb2_buffer *vb,
 		buf->sgt_base = vb2_dc_get_base_sgt(buf);
 
 	if (WARN_ON(!buf->sgt_base))
+		return NULL;
+
+	if (vb2_dc_prepare_export(buf))
 		return NULL;
 
 	dbuf = dma_buf_export(&exp_info);

@@ -661,4 +661,22 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+config ESP32S31_CORDIC
+ tristate "ESP32-S31 CORDIC fixed-point accelerator"
+ depends on SOC_ESP32S31 && OF
+ help
+   Batched Q15/Q31 register-mode operations through /dev/s31-cordic.
+
+config ESP32S31_ETM
+ tristate "ESP32-S31 event/task routing"
+ depends on SOC_ESP32S31 && OF
+ help
+   Privileged file-owned event/task channels through /dev/s31-etm.
+
+config ESP32S31_BITSCRAMBLER
+ tristate "ESP32-S31 BitScrambler memory transforms"
+ depends on SOC_ESP32S31 && OF && ESP32S31_AXI_GDMA
+ help
+   Bounded bsasm-v1 memory jobs through /dev/s31-bitscrambler.
+
 endmenu

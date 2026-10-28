@@ -451,6 +451,9 @@ static void v4l2_m2m_cancel_job(struct v4l2_m2m_ctx *m2m_ctx)
 static void v4l2_m2m_schedule_next_job(struct v4l2_m2m_dev *m2m_dev,
 				       struct v4l2_m2m_ctx *m2m_ctx)
 {
+	unsigned long flags;
+	bool pending;
+
 	/*
 	 * This instance might have more buffers ready, but since we do not
 	 * allow more than one job on the job_queue per instance, each has
@@ -462,7 +465,17 @@ static void v4l2_m2m_schedule_next_job(struct v4l2_m2m_dev *m2m_dev,
 	 * We might be running in atomic context,
 	 * but the job must be run in non-atomic context.
 	 */
-	schedule_work(&m2m_dev->job_work);
+	/*
+	 * QBUF and resume call try_run themselves. If they race this check,
+	 * they either run the newly queued job or its completion schedules
+	 * the following one. No worker is needed for an empty queue or a
+	 * job that another caller has already started.
+	 */
+	spin_lock_irqsave(&m2m_dev->job_spinlock, flags);
+	pending = !m2m_dev->curr_ctx && !list_empty(&m2m_dev->job_queue);
+	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
+	if (pending)
+		schedule_work(&m2m_dev->job_work);
 }
 
 /*
@@ -1213,6 +1226,7 @@ EXPORT_SYMBOL_GPL(v4l2_m2m_init);
 
 void v4l2_m2m_release(struct v4l2_m2m_dev *m2m_dev)
 {
+	cancel_work_sync(&m2m_dev->job_work);
 	kfree(m2m_dev);
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_release);

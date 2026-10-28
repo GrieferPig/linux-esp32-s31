@@ -101,9 +101,9 @@
 			interrupt-names = "target0";
 		};
 
-		rootflash: flash@40a10000 {
+		rootflash: flash@40a50000 {
 			compatible = "mtd-rom";
-			reg = <0x40a10000 0x005f0000>;
+			reg = <0x40a50000 0x005b0000>;
 			bank-width = <4>;
 			linux,mtd-name = "rootfs";
 			#address-cells = <1>;

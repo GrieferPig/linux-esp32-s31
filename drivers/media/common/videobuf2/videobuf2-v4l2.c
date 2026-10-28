@@ -356,11 +356,13 @@ static void set_buffer_cache_hints(struct vb2_queue *q,
 		return;
 	}
 
-	if (b->flags & V4L2_BUF_FLAG_NO_CACHE_INVALIDATE)
-		vb->skip_cache_sync_on_finish = 1;
-
-	if (b->flags & V4L2_BUF_FLAG_NO_CACHE_CLEAN)
-		vb->skip_cache_sync_on_prepare = 1;
+	/* Hints describe this ownership transfer, not every future use of the
+	 * allocation. Preserve the DMA_TO_DEVICE finish optimization, but let a
+	 * later ordinary queue operation restore required cache maintenance.
+	 */
+	vb->skip_cache_sync_on_finish = q->dma_dir == DMA_TO_DEVICE ||
+		(b->flags & V4L2_BUF_FLAG_NO_CACHE_INVALIDATE);
+	vb->skip_cache_sync_on_prepare = !!(b->flags & V4L2_BUF_FLAG_NO_CACHE_CLEAN);
 }
 
 static int vb2_queue_or_prepare_buf(struct vb2_queue *q, struct media_device *mdev,

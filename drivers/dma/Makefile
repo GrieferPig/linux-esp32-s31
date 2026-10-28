@@ -94,3 +94,4 @@ obj-y += qcom/
 obj-y += stm32/
 obj-y += ti/
 obj-y += xilinx/
+obj-$(CONFIG_ESP32S31_DMA2D) += esp32s31-dma2d.o

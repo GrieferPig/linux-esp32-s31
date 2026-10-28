@@ -215,6 +215,7 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		"Solarization",
 		"Antique",
 		"Set Cb/Cr",
+		"Set RGB",
 		NULL
 	};
 	static const char * const auto_n_preset_white_balance[] = {

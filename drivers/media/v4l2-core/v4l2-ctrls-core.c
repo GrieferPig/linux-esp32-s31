@@ -1300,7 +1300,8 @@ static int std_validate_elem(const struct v4l2_ctrl *ctrl, u32 idx,
 		    (ctrl->menu_skip_mask & BIT_ULL(ptr.p_s32[idx])))
 			return -EINVAL;
 		if (ctrl->type == V4L2_CTRL_TYPE_MENU &&
-		    ctrl->qmenu[ptr.p_s32[idx]][0] == '\0')
+		    (!ctrl->qmenu[ptr.p_s32[idx]] ||
+		     ctrl->qmenu[ptr.p_s32[idx]][0] == '\0'))
 			return -EINVAL;
 		return 0;
 

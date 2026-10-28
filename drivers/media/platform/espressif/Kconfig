@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ESP32S31
+ tristate "ESP32-S31 JPEG and PPA memory engines"
+ depends on SOC_ESP32S31 && OF && VIDEO_DEV && ESP32S31_DMA2D
+ select VIDEOBUF2_DMA_CONTIG
+ select V4L2_MEM2MEM_DEV
+ select V4L2_JPEG_HELPER
+ select MEDIA_CONTROLLER
+ select VIDEO_V4L2_SUBDEV_API
+ help
+   Standard V4L2 memory-to-memory JPEG encode/decode and PPA image
+   scaling, rotation, mirroring, blending and color conversion. No camera or
+   display is needed. Frame buffers are allocated on request.
