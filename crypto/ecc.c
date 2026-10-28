@@ -412,31 +412,67 @@ static uint128_t add_128_128(uint128_t a, uint128_t b)
 	return result;
 }
 
+/* Propagate the complete carry, including overflow from the low-half carry.
+ * Comparing only the new high half with an addend misses equality after wrap.
+ */
+#ifndef CONFIG_64BIT
+static u32 vli_add_carry32(u32 a, u32 b, u32 carry, u32 *overflow)
+{
+	u32 sum = a + b, result = sum + carry;
+
+	*overflow = (sum < a) | (result < sum);
+	return result;
+}
+#endif
+
+static uint128_t add_128_128_carry(uint128_t a, uint128_t b, u32 *upper)
+{
+	uint128_t result;
+
+#ifdef CONFIG_64BIT
+	result = add_128_128(a, b);
+	*upper += (result.m_high < a.m_high) ||
+		  (result.m_high == a.m_high && result.m_low < a.m_low);
+#else
+	u32 carry, w0, w1, w2, w3;
+
+	w0 = vli_add_carry32(a.m_low, b.m_low, 0, &carry);
+	w1 = vli_add_carry32(a.m_low >> 32, b.m_low >> 32, carry, &carry);
+	w2 = vli_add_carry32(a.m_high, b.m_high, carry, &carry);
+	w3 = vli_add_carry32(a.m_high >> 32, b.m_high >> 32, carry, &carry);
+	result.m_low = ((u64)w1 << 32) | w0;
+	result.m_high = ((u64)w3 << 32) | w2;
+	*upper += carry;
+#endif
+	return result;
+}
+
 static void vli_mult(u64 *result, const u64 *left, const u64 *right,
 		     unsigned int ndigits)
 {
 	uint128_t r01 = { 0, 0 };
-	u64 r2 = 0;
+	/* A column has at most ndigits products; its upper carry fits u32. */
+	u32 r2 = 0;
 	unsigned int i, k;
 
 	/* Compute each digit of result in sequence, maintaining the
 	 * carries.
 	 */
 	for (k = 0; k < ndigits * 2 - 1; k++) {
-		unsigned int min;
+		unsigned int min, last;
 
 		if (k < ndigits)
 			min = 0;
 		else
 			min = (k + 1) - ndigits;
 
-		for (i = min; i <= k && i < ndigits; i++) {
+		last = min_t(unsigned int, k, ndigits - 1);
+		for (i = min; i <= last; i++) {
 			uint128_t product;
 
 			product = mul_64_64(left[i], right[k - i]);
 
-			r01 = add_128_128(r01, product);
-			r2 += (r01.m_high < product.m_high);
+			r01 = add_128_128_carry(r01, product, &r2);
 		}
 
 		result[k] = r01.m_low;
@@ -473,18 +509,20 @@ static void vli_umult(u64 *result, const u64 *left, u32 right,
 static void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
 {
 	uint128_t r01 = { 0, 0 };
-	u64 r2 = 0;
+	/* A column has at most ndigits products; its upper carry fits u32. */
+	u32 r2 = 0;
 	int i, k;
 
 	for (k = 0; k < ndigits * 2 - 1; k++) {
-		unsigned int min;
+		unsigned int min, last;
 
 		if (k < ndigits)
 			min = 0;
 		else
 			min = (k + 1) - ndigits;
 
-		for (i = min; i <= k && i <= k - i; i++) {
+		last = k / 2;
+		for (i = min; i <= last; i++) {
 			uint128_t product;
 
 			product = mul_64_64(left[i], left[k - i]);
@@ -496,8 +534,7 @@ static void vli_square(u64 *result, const u64 *left, unsigned int ndigits)
 				product.m_low <<= 1;
 			}
 
-			r01 = add_128_128(r01, product);
-			r2 += (r01.m_high < product.m_high);
+			r01 = add_128_128_carry(r01, product, &r2);
 		}
 
 		result[k] = r01.m_low;
@@ -710,6 +747,42 @@ static void vli_mmod_barrett(u64 *result, u64 *product, const u64 *mod,
  * See algorithm 5 and 6 from
  * http://www.isys.uni-klu.ac.at/PDF/2001-0126-MT.pdf
  */
+#ifdef CONFIG_SOC_ESP32S31
+/* Fold 2^192 = 2^64 + 1 (mod p) in RV32 columns. Signed 64-bit
+ * accumulators retain every carry; u64 storage and normalization are unchanged.
+ */
+static void vli_mmod_fast_192(u64 *result, const u64 *product,
+			      const u64 *curve_prime, u64 *tmp)
+{
+	const u32 *w = (const u32 *)product;
+	u32 *r = (u32 *)result;
+	s64 acc, carry = 0;
+
+	acc = (s64)w[0] + (s64)w[6] + (s64)w[10] + carry;
+	r[0] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[1] + (s64)w[7] + (s64)w[11] + carry;
+	r[1] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[2] + (s64)w[6] + (s64)w[8] + (s64)w[10] + carry;
+	r[2] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[3] + (s64)w[7] + (s64)w[9] + (s64)w[11] + carry;
+	r[3] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[4] + (s64)w[8] + (s64)w[10] + carry;
+	r[4] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[5] + (s64)w[9] + (s64)w[11] + carry;
+	r[5] = acc;
+	carry = acc >> 32;
+
+	while (carry < 0)
+		carry += vli_add(result, result, curve_prime, 3);
+	while (carry || vli_cmp(curve_prime, result, 3) != 1)
+		carry -= vli_sub(result, result, curve_prime, 3);
+}
+#else
 static void vli_mmod_fast_192(u64 *result, const u64 *product,
 			      const u64 *curve_prime, u64 *tmp)
 {
@@ -733,10 +806,66 @@ static void vli_mmod_fast_192(u64 *result, const u64 *product,
 	while (carry || vli_cmp(curve_prime, result, ndigits) != 1)
 		carry -= vli_sub(result, result, curve_prime, ndigits);
 }
+#endif
 
 /* Computes result = product % curve_prime
  * from http://www.nsa.gov/ia/_files/nist-routines.pdf
  */
+#ifdef CONFIG_SOC_ESP32S31
+/* S31 is little-endian RV32. Fold the same NIST s1--s4/d1--d4 terms
+ * directly in 32-bit columns instead of materializing and adding eight
+ * temporary 256-bit vectors. Each signed column is bounded by 2^36; a
+ * signed 64-bit accumulator retains its carry without overflow. Its upper
+ * word fits a signed int. Shared high-word sums avoid repeated fold terms;
+ * the u64 storage contract and final modular normalization stay unchanged.
+ */
+static void vli_mmod_fast_256(u64 *result, const u64 *product,
+			      const u64 *curve_prime, u64 *tmp)
+{
+	const u32 *w = (const u32 *)product;
+	u32 *r = (u32 *)result;
+	s64 acc;
+	s64 sum8_9 = (s64)w[8] + w[9];
+	s64 sum10_11 = (s64)w[10] + w[11];
+	s64 sum12_13 = (s64)w[12] + w[13];
+	s64 sum14_15 = (s64)w[14] + w[15];
+	int carry;
+
+	acc = (s64)w[0] + sum8_9 - w[11] - sum12_13 - w[14];
+	r[0] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[1] + w[9] + w[10] - sum12_13 - sum14_15 + carry;
+	r[1] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[2] + sum10_11 - w[13] - sum14_15 + carry;
+	r[2] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[3] + 2 * (s64)w[11] + 2 * (s64)w[12] +
+	      w[13] - w[15] - sum8_9 + carry;
+	r[3] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[4] + 2 * sum12_13 +
+	      w[14] - w[9] - w[10] + carry;
+	r[4] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[5] + 2 * (s64)w[13] + 2 * (s64)w[14] +
+	      w[15] - sum10_11 + carry;
+	r[5] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[6] + 3 * (s64)w[14] + 2 * (s64)w[15] +
+	      w[13] - sum8_9 + carry;
+	r[6] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[7] + 3 * (s64)w[15] + w[8] - sum10_11 - sum12_13 + carry;
+	r[7] = acc;
+	carry = acc >> 32;
+
+	while (carry < 0)
+		carry += (int)vli_add(result, result, curve_prime, 4);
+	while (carry || vli_cmp(curve_prime, result, 4) != 1)
+		carry -= (int)vli_sub(result, result, curve_prime, 4);
+}
+#else
 static void vli_mmod_fast_256(u64 *result, const u64 *product,
 			      const u64 *curve_prime, u64 *tmp)
 {
@@ -812,6 +941,7 @@ static void vli_mmod_fast_256(u64 *result, const u64 *product,
 			carry -= vli_sub(result, result, curve_prime, ndigits);
 	}
 }
+#endif
 
 #define SL32OR32(x32, y32) (((u64)x32 << 32) | y32)
 #define AND64H(x64)  (x64 & 0xffFFffFF00000000ull)
@@ -820,6 +950,64 @@ static void vli_mmod_fast_256(u64 *result, const u64 *product,
 /* Computes result = product % curve_prime
  * from "Mathematical routines for the NIST prime elliptic curves"
  */
+#ifdef CONFIG_SOC_ESP32S31
+/* Fold 2^384 = 2^128 + 2^96 - 2^32 + 1 (mod p) in RV32 columns. Signed 64-bit
+ * accumulators retain every carry; u64 storage and normalization are unchanged.
+ */
+static void vli_mmod_fast_384(u64 *result, const u64 *product,
+				const u64 *curve_prime, u64 *tmp)
+{
+	const u32 *w = (const u32 *)product;
+	u32 *r = (u32 *)result;
+	s64 acc, carry = 0;
+
+	acc = (s64)w[0] + (s64)w[12] + (s64)w[20] + (s64)w[21] - (s64)w[23] + carry;
+	r[0] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[1] - (s64)w[12] + (s64)w[13] - (s64)w[20] + (s64)w[22] + (s64)w[23] + carry;
+	r[1] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[2] - (s64)w[13] + (s64)w[14] - (s64)w[21] + (s64)w[23] + carry;
+	r[2] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[3] + (s64)w[12] - (s64)w[14] + (s64)w[15] + (s64)w[20] + (s64)w[21] - (s64)w[22] -
+	      (s64)w[23] + carry;
+	r[3] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[4] + (s64)w[12] + (s64)w[13] - (s64)w[15] + (s64)w[16] + (s64)w[20] + 2 *
+	      (s64)w[21] + (s64)w[22] - 2 * (s64)w[23] + carry;
+	r[4] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[5] + (s64)w[13] + (s64)w[14] - (s64)w[16] + (s64)w[17] + (s64)w[21] + 2 *
+	      (s64)w[22] + (s64)w[23] + carry;
+	r[5] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[6] + (s64)w[14] + (s64)w[15] - (s64)w[17] + (s64)w[18] + (s64)w[22] + 2 *
+	      (s64)w[23] + carry;
+	r[6] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[7] + (s64)w[15] + (s64)w[16] - (s64)w[18] + (s64)w[19] + (s64)w[23] + carry;
+	r[7] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[8] + (s64)w[16] + (s64)w[17] - (s64)w[19] + (s64)w[20] + carry;
+	r[8] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[9] + (s64)w[17] + (s64)w[18] - (s64)w[20] + (s64)w[21] + carry;
+	r[9] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[10] + (s64)w[18] + (s64)w[19] - (s64)w[21] + (s64)w[22] + carry;
+	r[10] = acc;
+	carry = acc >> 32;
+	acc = (s64)w[11] + (s64)w[19] + (s64)w[20] - (s64)w[22] + (s64)w[23] + carry;
+	r[11] = acc;
+	carry = acc >> 32;
+
+	while (carry < 0)
+		carry += vli_add(result, result, curve_prime, 6);
+	while (carry || vli_cmp(curve_prime, result, 6) != 1)
+		carry -= vli_sub(result, result, curve_prime, 6);
+}
+#else
 static void vli_mmod_fast_384(u64 *result, const u64 *product,
 				const u64 *curve_prime, u64 *tmp)
 {
@@ -921,6 +1109,7 @@ static void vli_mmod_fast_384(u64 *result, const u64 *product,
 	}
 
 }
+#endif
 
 #undef SL32OR32
 #undef AND64H
@@ -956,12 +1145,17 @@ static void vli_mmod_fast_521(u64 *result, const u64 *product,
 static bool vli_mmod_fast(u64 *result, u64 *product,
 			  const struct ecc_curve *curve)
 {
-	u64 tmp[2 * ECC_MAX_DIGITS];
+	/* NIST reductions use at most ndigits temporary limbs; the other
+	 * reduction helpers allocate their own workspace.
+	 */
+	u64 tmp[ECC_MAX_DIGITS];
 	const u64 *curve_prime = curve->p;
 	const unsigned int ndigits = curve->g.ndigits;
 
-	/* All NIST curves have name prefix 'nist_' */
-	if (strncmp(curve->name, "nist_", 5) != 0) {
+	/* The built-in P256 object needs no repeated name-prefix lookup.
+	 * Other NIST curves have name prefix 'nist_'.
+	 */
+	if (curve != &nist_p256 && strncmp(curve->name, "nist_", 5) != 0) {
 		/* Try to handle Pseudo-Marsenne primes. */
 		if (curve_prime[ndigits - 1] == -1ull) {
 			vli_mmod_special(result, product, curve_prime,
@@ -1398,6 +1592,34 @@ static void ecc_point_add(const struct ecc_point *result,
 	u64 py[ECC_MAX_DIGITS];
 	unsigned int ndigits = curve->g.ndigits;
 
+	if (ecc_point_is_zero(p)) {
+		vli_set(result->x, q->x, ndigits);
+		vli_set(result->y, q->y, ndigits);
+		return;
+	}
+	if (ecc_point_is_zero(q)) {
+		vli_set(result->x, p->x, ndigits);
+		vli_set(result->y, p->y, ndigits);
+		return;
+	}
+	/* Co-Z addition requires distinct x coordinates. Equal valid points
+	 * need doubling; opposite points produce the identity.
+	 */
+	if (!vli_cmp(p->x, q->x, ndigits)) {
+		if (vli_cmp(p->y, q->y, ndigits)) {
+			vli_clear(result->x, ndigits);
+			vli_clear(result->y, ndigits);
+			return;
+		}
+		vli_set(result->x, p->x, ndigits);
+		vli_set(result->y, p->y, ndigits);
+		vli_clear(z, ndigits);
+		z[0] = 1;
+		ecc_point_double_jacobian(result->x, result->y, z, curve);
+		vli_mod_inv(z, z, curve->p, ndigits);
+		apply_z(result->x, result->y, z, curve);
+		return;
+	}
 	vli_set(result->x, q->x, ndigits);
 	vli_set(result->y, q->y, ndigits);
 	vli_mod_sub(z, result->x, p->x, curve->p, ndigits);
@@ -1428,22 +1650,32 @@ void ecc_point_mult_shamir(const struct ecc_point *result,
 	unsigned int idx;
 	int i;
 
+	num_bits = max(vli_num_bits(u1, ndigits), vli_num_bits(u2, ndigits));
+	if (!num_bits) {
+		vli_clear(rx, ndigits);
+		vli_clear(ry, ndigits);
+		return;
+	}
 	ecc_point_add(&sum, p, q, curve);
 	points[0] = NULL;
-	points[1] = p;
-	points[2] = q;
-	points[3] = &sum;
+	points[1] = ecc_point_is_zero(p) ? NULL : p;
+	points[2] = ecc_point_is_zero(q) ? NULL : q;
+	points[3] = ecc_point_is_zero(&sum) ? NULL : &sum;
 
-	num_bits = max(vli_num_bits(u1, ndigits), vli_num_bits(u2, ndigits));
 	i = num_bits - 1;
 	idx = !!vli_test_bit(u1, i);
 	idx |= (!!vli_test_bit(u2, i)) << 1;
 	point = points[idx];
 
-	vli_set(rx, point->x, ndigits);
-	vli_set(ry, point->y, ndigits);
-	vli_clear(z + 1, ndigits - 1);
-	z[0] = 1;
+	vli_clear(z, ndigits);
+	if (point) {
+		vli_set(rx, point->x, ndigits);
+		vli_set(ry, point->y, ndigits);
+		z[0] = 1;
+	} else {
+		vli_clear(rx, ndigits);
+		vli_clear(ry, ndigits);
+	}
 
 	for (--i; i >= 0; i--) {
 		ecc_point_double_jacobian(rx, ry, z, curve);
@@ -1455,10 +1687,26 @@ void ecc_point_mult_shamir(const struct ecc_point *result,
 			u64 ty[ECC_MAX_DIGITS];
 			u64 tz[ECC_MAX_DIGITS];
 
+			if (vli_is_zero(z, ndigits)) {
+				vli_set(rx, point->x, ndigits);
+				vli_set(ry, point->y, ndigits);
+				z[0] = 1;
+				continue;
+			}
 			vli_set(tx, point->x, ndigits);
 			vli_set(ty, point->y, ndigits);
 			apply_z(tx, ty, z, curve);
 			vli_mod_sub(tz, rx, tx, curve->p, ndigits);
+			if (vli_is_zero(tz, ndigits)) {
+				if (!vli_cmp(ry, ty, ndigits)) {
+					ecc_point_double_jacobian(rx, ry, z, curve);
+				} else {
+					vli_clear(rx, ndigits);
+					vli_clear(ry, ndigits);
+					vli_clear(z, ndigits);
+				}
+				continue;
+			}
 			xycz_add(tx, ty, rx, ry, curve);
 			vli_mod_mult_fast(z, z, tz, curve);
 		}

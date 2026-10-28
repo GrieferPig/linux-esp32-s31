@@ -22,6 +22,9 @@ lib-$(CONFIG_RISCV_ISA_V)	+= riscv_v_helpers.o
 
 ifeq ($(CONFIG_SOC_ESP32S31)$(CONFIG_XIP_KERNEL),yy)
 lib-y += s31_memcpy_unaligned.o
+ifneq ($(CONFIG_KASAN),y)
+lib-y += s31_memcmp.o
+endif
 # A memcpy implementation must never synthesize a recursive memcpy call.
 CFLAGS_s31_memcpy_unaligned.o += -fno-tree-loop-distribute-patterns
 endif

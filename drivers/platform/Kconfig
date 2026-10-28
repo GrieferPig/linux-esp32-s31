@@ -16,6 +16,7 @@ config ESP32S31_RADIO_SMODE_DRIVER
 	depends on SMP && PREEMPTION
 	depends on BT && WLAN
 	select FUTEX
+	select CRYPTO_DEV_ESP32S31
 	select RT_MUTEXES
 	select ESP32S31_RADIO_SCHEDULER
 	select CFG80211

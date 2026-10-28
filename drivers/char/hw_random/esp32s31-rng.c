@@ -3,7 +3,8 @@
  * ESP32-S31 true random number generator
  *
  * Keep the enable sequence and sampling cadence aligned with ESP-IDF's
- * esp32s31 rng_ll implementation.  The hardware has no data-ready flag;
+ * updated S31 rng_ll implementation, including conditioned hardware output
+ * and startup health tests needed by Key Manager. The CRC output has no ready flag;
  * IDF limits reads so the entropy source is not drained faster than it is
  * replenished.
  */
@@ -17,6 +18,12 @@
 #include <linux/platform_device.h>
 
 #define ESP32S31_TRNG_CONF		0x00
+#define ESP32S31_TRNG_HEALTH 0x04
+#define ESP32S31_TRNG_RANDOM_OUTPUT BIT(29)
+#define ESP32S31_TRNG_HEALTH_ERROR GENMASK(28, 26)
+#define ESP32S31_TRNG_HEALTH_BYPASS BIT(30)
+#define ESP32S31_TRNG_HEALTH_END BIT(29)
+#define ESP32S31_TRNG_HEALTH_START BIT(0)
 #define ESP32S31_TRNG_DATA		0x48
 #define ESP32S31_TRNG_DATE		0xfc
 
@@ -38,19 +45,29 @@ static void esp32s31_rng_enable(struct esp32s31_rng *priv)
 	u32 val;
 
 	val = readl(priv->clkrst);
-	writel(val | ESP32S31_RNG_BUS_CLK_EN | ESP32S31_RNG_BUS_RST_EN,
-	       priv->clkrst);
-	writel((val | ESP32S31_RNG_BUS_CLK_EN) & ~ESP32S31_RNG_BUS_RST_EN,
-	       priv->clkrst);
-
-	val = readl(priv->base + ESP32S31_TRNG_DATE);
-	writel(val | ESP32S31_TRNG_CLK_EN,
+	writel(val | ESP32S31_RNG_BUS_CLK_EN, priv->clkrst);
+	writel(readl(priv->base + ESP32S31_TRNG_DATE) | ESP32S31_TRNG_CLK_EN,
 	       priv->base + ESP32S31_TRNG_DATE);
+	writel(val | ESP32S31_RNG_BUS_CLK_EN | ESP32S31_RNG_BUS_RST_EN, priv->clkrst);
+	writel((val | ESP32S31_RNG_BUS_CLK_EN) & ~ESP32S31_RNG_BUS_RST_EN, priv->clkrst);
 
+	/* SDK S31 setup: one-hot source/position 4, RCT cutoff 31,
+	 * adaptive cutoff 18, startup window 1024. Never bypass health tests.
+	 * CRC sampling alone supplies software reads but leaves hardware crypto
+	 * consumers waiting for conditioned random data indefinitely.
+	 */
 	val = readl(priv->base + ESP32S31_TRNG_CONF);
-	writel(val | ESP32S31_TRNG_SAMPLE_ENABLE |
-	       ESP32S31_TRNG_NOISE_CRC_EN,
-	       priv->base + ESP32S31_TRNG_CONF);
+	val &= ~GENMASK(29, 0);
+	val |= BIT(4) | (BIT(4) << 5) | (0x1f << 10) | (0x12 << 19) |
+	       ESP32S31_TRNG_RANDOM_OUTPUT | ESP32S31_TRNG_SAMPLE_ENABLE |
+	       ESP32S31_TRNG_NOISE_CRC_EN;
+	writel(val, priv->base + ESP32S31_TRNG_CONF);
+	val = readl(priv->base + ESP32S31_TRNG_HEALTH);
+	val &= ~(GENMASK(16, 1) | ESP32S31_TRNG_HEALTH_BYPASS |
+		 ESP32S31_TRNG_HEALTH_END | BIT(25));
+	writel(val | (1024 << 1) | ESP32S31_TRNG_HEALTH_START,
+	       priv->base + ESP32S31_TRNG_HEALTH);
+
 }
 
 static void esp32s31_rng_disable(void *data)
@@ -58,8 +75,10 @@ static void esp32s31_rng_disable(void *data)
 	struct esp32s31_rng *priv = data;
 	u32 val;
 
+	val = readl(priv->base + ESP32S31_TRNG_HEALTH);
+	writel(val | ESP32S31_TRNG_HEALTH_END, priv->base + ESP32S31_TRNG_HEALTH);
 	val = readl(priv->base + ESP32S31_TRNG_CONF);
-	writel(val & ~(ESP32S31_TRNG_SAMPLE_ENABLE |
+	writel(val & ~(ESP32S31_TRNG_RANDOM_OUTPUT | ESP32S31_TRNG_SAMPLE_ENABLE |
 		       ESP32S31_TRNG_NOISE_CRC_EN),
 	       priv->base + ESP32S31_TRNG_CONF);
 
@@ -85,8 +104,12 @@ static int esp32s31_rng_read(struct hwrng *rng, void *data, size_t max,
 	 * current CPU clock.
 	 */
 	while (done < max) {
-		u32 word = readl(priv->base + ESP32S31_TRNG_DATA);
+		u32 word;
 		unsigned int i;
+
+		if (readl(priv->base + ESP32S31_TRNG_HEALTH) & ESP32S31_TRNG_HEALTH_ERROR)
+			return -EIO;
+		word = readl(priv->base + ESP32S31_TRNG_DATA);
 
 		for (i = 0; i < sizeof(word) && done < max; i++) {
 			buf[done++] = word >> (i * 8);
@@ -121,6 +144,7 @@ static int esp32s31_rng_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	platform_set_drvdata(pdev, priv);
 	priv->rng.name = "esp32s31-trng";
 	priv->rng.read = esp32s31_rng_read;
 	priv->rng.quality = 900;

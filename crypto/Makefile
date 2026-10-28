@@ -181,6 +181,11 @@ obj-$(CONFIG_CRYPTO_USER_API_RNG) += algif_rng.o
 obj-$(CONFIG_CRYPTO_USER_API_AEAD) += algif_aead.o
 obj-$(CONFIG_CRYPTO_ZSTD) += zstd.o
 obj-$(CONFIG_CRYPTO_ECC) += ecc.o
+ifeq ($(CONFIG_SOC_ESP32S31),y)
+# RV32 arithmetic dominates the independent check of protected ECDSA results.
+# Optimize that implementation without removing the software verification.
+CFLAGS_ecc.o += -O3
+endif
 obj-$(CONFIG_CRYPTO_ESSIV) += essiv.o
 
 ecdh_generic-y += ecdh.o

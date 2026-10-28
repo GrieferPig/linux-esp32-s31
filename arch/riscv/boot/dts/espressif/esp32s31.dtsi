@@ -248,6 +248,7 @@
 			#size-cells = <1>;
 			ranges;
 			compatible = "espressif,esp32s31-radio";
+			espressif,crypto = <&crypto>;
 			status = "disabled";
 
 			wifi: wifi {
@@ -294,6 +295,14 @@
 				#address-cells = <1>;
 				#size-cells = <1>;
 
+				key_read_protect: key-read-protect@4 {
+					reg = <0x4 0x4>;
+				};
+
+				key_purposes: key-purposes@c {
+					reg = <0xc 0x4>;
+				};
+
 				factory_mac: mac-address@0 {
 					compatible = "mac-base";
 					/* BLK1 starts 0x24 bytes into this provider. */
@@ -312,15 +321,26 @@
 
 		crypto: crypto@20508000 {
 			compatible = "espressif,esp32s31-crypto";
+			interrupt-parent = <&intmtx>;
+			interrupts = <57 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "ecc";
 			/* AES, SHA, RSA/MPI and ECC are one HP crypto register island. */
-			reg = <0x20508000 0x4000>, <0x20587058 0x4>;
-			reg-names = "crypto", "clkrst";
-			dmas = <&axi_gdma 0 5>;
-			dma-names = "sha";
-			/* The closed Wi-Fi stack owns the same AES island (IDF source 55)
-			 * while associated.  Do not register an independent Linux Crypto
-			 * API owner until arbitration with the blob gate exists. */
-			status = "disabled";
+			reg = <0x20508000 0x7000>, <0x20587058 0x8>,
+			      <0x20586218 0x4>, <0x20506000 0x200>,
+			      <0x207151cc 0x34>, <0x20703000 0x400>;
+			reg-names = "crypto", "clkrst", "ecc-memory", "key-manager",
+				    "efuse-read-control", "huk";
+			dmas = <&axi_gdma ESP32S31_AXI_GDMA_ANY 5>,
+			       <&axi_gdma ESP32S31_AXI_GDMA_ANY 4>,
+			       <&axi_gdma ESP32S31_AXI_GDMA_ANY 4>;
+			dma-names = "sha", "aes-tx", "aes-rx";
+			clocks = <&clkc ESP32S31_CLK_PLL_F240>;
+			clock-names = "crypto";
+			rng = <&trng>;
+			nvmem-cells = <&key_purposes>, <&key_read_protect>;
+			nvmem-cell-names = "key-purposes", "key-read-protect";
+			/* Native and SDK consumers share per-engine ownership. */
+			status = "okay";
 		};
 
 		adc: adc@20815000 {

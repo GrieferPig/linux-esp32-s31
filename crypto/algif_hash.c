@@ -173,6 +173,10 @@ unlock_free:
 unlock_free_result:
 	hash_free_result(sk, ctx);
 	ctx->more = false;
+	/* The failed request discarded the stream. Reporting earlier progress
+	 * would let a caller retry the remainder against a fresh hash state.
+	 */
+	copied = 0;
 	goto unlock;
 }
 
@@ -424,7 +428,9 @@ static int hash_accept_parent_nokey(void *private, struct sock *sk)
 	ask->private = ctx;
 
 	ahash_request_set_tfm(&ctx->req, tfm);
-	ahash_request_set_callback(&ctx->req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+	/* Hash socket operations run in process context under lock_sock(). */
+	ahash_request_set_callback(&ctx->req, CRYPTO_TFM_REQ_MAY_SLEEP |
+				   CRYPTO_TFM_REQ_MAY_BACKLOG,
 				   crypto_req_done, &ctx->wait);
 
 	sk->sk_destruct = hash_sock_destruct;

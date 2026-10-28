@@ -1225,6 +1225,20 @@ do { \
 
 #endif /* __GNUC__ */
 
+/* RV32 multiplication produces both halves directly. Keeping the operands
+ * word-sized lets the compiler select mul/mulhu instead of four half-word
+ * products and a data-dependent carry correction in the generic expansion.
+ */
+#if defined(__riscv) && defined(__riscv_mul) && __riscv_xlen == 32 && \
+	W_TYPE_SIZE == 32 && !defined(umul_ppmm)
+#define umul_ppmm(w1, w0, u, v) \
+do { \
+	UDItype __ll_riscv_product = (UDItype)(UWtype)(u) * (UWtype)(v); \
+	(w0) = (UWtype)__ll_riscv_product; \
+	(w1) = (UWtype)(__ll_riscv_product >> 32); \
+} while (0)
+#endif
+
 /***************************************
 	***********  Generic Versions	********
 	***************************************/

@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/espressif,esp32s31-crypto.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 shared crypto accelerators
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  Native Crypto API provider and owner of the engine locks and clock/reset
+  registers shared with the ESP-IDF radio closure. AES and SHA share a DMA
+  domain; MPI and ECC are independent. ECDSA, HMAC and digital signing take
+  their hardware dependencies through the same provider.
+
+properties:
+  compatible:
+    const: espressif,esp32s31-crypto
+
+  reg:
+    items:
+      - description: AES, SHA, MPI, ECC, DS, HMAC and ECDSA registers
+      - description: Crypto and Key Manager clock/reset registers
+      - description: ECC SRAM power control
+      - description: Key Manager registers
+      - description: eFuse volatile ECDSA selector and read-reload controls
+      - description: Volatile Hardware Unique Key generator and recovery memory
+
+  reg-names:
+    items:
+      - const: crypto
+      - const: clkrst
+      - const: ecc-memory
+      - const: key-manager
+      - const: efuse-read-control
+      - const: huk
+
+  rng:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Conditioned TRNG supplier used by protected-key hardware
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: crypto
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    const: ecc
+
+  dmas:
+    maxItems: 3
+    minItems: 3
+
+  dma-names:
+    items:
+      - const: sha
+      - const: aes-tx
+      - const: aes-rx
+
+  nvmem-cells:
+    items:
+      - description: Five packed five-bit key purposes in eFuse BLK0 bits 96..120
+      - description: Read-protection flags in eFuse BLK0 bits 32..63
+
+  nvmem-cell-names:
+    items:
+      - const: key-purposes
+      - const: key-read-protect
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - interrupts
+  - interrupt-names
+  - rng
+  - nvmem-cells
+  - nvmem-cell-names
+
+additionalProperties: false
+...

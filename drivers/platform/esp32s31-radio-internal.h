@@ -274,6 +274,7 @@ void s31_radio_wifi_ap_station(const u8 *mac, bool joined);
 
 
 void s31_linux_pmu_reclaim_bridge(void);
+long s31_linux_crypto_operation(unsigned int operation, unsigned int domain);
 
 /* Native pressure wait on an already registered Linux radio stack. */
 bool s31_linux_native_rx_pressure_wait(void (*entry)(void *), void *arg);

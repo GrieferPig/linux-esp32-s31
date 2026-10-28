@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/esp32s31-radio.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/pm.h>
 #include <linux/platform_device.h>
 #include <linux/stringify.h>
@@ -41,11 +42,41 @@ static int s31_radio_parse_mode(bool *enable_wifi, bool *enable_bt)
 	return 0;
 }
 
+static int s31_radio_link_crypto(struct device *dev)
+{
+	struct device_node *node;
+	struct platform_device *supplier;
+	struct device_link *link;
+	int ret = 0;
+
+	node = of_parse_phandle(dev->of_node, "espressif,crypto", 0);
+	if (!node)
+		return -EINVAL;
+	supplier = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!supplier)
+		return -EPROBE_DEFER;
+	/* Keep the dependency across supplier unbind so crypto reprobe also
+	 * schedules the radio consumer again, after its native users drain.
+	 */
+	link = device_link_add(dev, &supplier->dev, DL_FLAG_AUTOPROBE_CONSUMER);
+	if (!link)
+		ret = -ENOMEM;
+	else if (!device_is_bound(&supplier->dev)) {
+		ret = -EPROBE_DEFER;
+	}
+	put_device(&supplier->dev);
+	return ret;
+}
+
 static int esp32s31_radio_probe(struct platform_device *pdev)
 {
 	bool enable_bt, enable_wifi;
 	int ret;
 
+	ret = s31_radio_link_crypto(&pdev->dev);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "crypto supplier unavailable\n");
 	ret = s31_radio_parse_mode(&enable_wifi, &enable_bt);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
@@ -207,10 +238,14 @@ static void esp32s31_radio_shutdown(struct platform_device *pdev)
 {
 
 	if (s31_radio_started) {
-		if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
-			s31_radio_wifi_frontend_suspend();
+		/* Reboot does not run the wiphy PM callback that drains producers
+		 * before suspend. Use the terminal unregister path, as remove does,
+		 * while command admission and the vendor tasks are still alive.
+		 */
 		if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
-			s31_radio_btdm_frontend_suspend();
+			s31_radio_btdm_frontend_exit();
+		if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
+			s31_radio_wifi_frontend_exit();
 		s31_radio_runtime_shutdown();
 		s31_radio_started = false;
 		s31_linux_pmu_radio_vote(false);

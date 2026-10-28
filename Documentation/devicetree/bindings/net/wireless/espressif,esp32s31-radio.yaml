@@ -18,6 +18,10 @@ properties:
   compatible:
     const: espressif,esp32s31-radio
 
+  espressif,crypto:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared native crypto engine provider and suspend dependency.
+
   '#address-cells':
     const: 1
   '#size-cells':

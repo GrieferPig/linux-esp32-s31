@@ -15,6 +15,11 @@ extern asmlinkage void *__memset(void *, int, size_t);
 #define __HAVE_ARCH_MEMCPY
 extern asmlinkage void *memcpy(void *, const void *, size_t);
 extern asmlinkage void *__memcpy(void *, const void *, size_t);
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL) && !defined(CONFIG_KASAN)
+#define __HAVE_ARCH_MEMCMP
+extern asmlinkage int memcmp(const void *, const void *, size_t);
+#endif
+
 #define __HAVE_ARCH_MEMMOVE
 extern asmlinkage void *memmove(void *, const void *, size_t);
 extern asmlinkage void *__memmove(void *, const void *, size_t);

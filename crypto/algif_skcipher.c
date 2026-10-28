@@ -141,9 +141,12 @@ static int _skcipher_recvmsg(struct socket *sock, struct msghdr *msg,
 	areq->tsgl_entries = af_alg_count_tsgl(sk, len, 0);
 	if (!areq->tsgl_entries)
 		areq->tsgl_entries = 1;
-	areq->tsgl = sock_kmalloc(sk, array_size(sizeof(*areq->tsgl),
-						 areq->tsgl_entries),
-				  GFP_KERNEL);
+	if (areq->tsgl_entries == 1)
+		areq->tsgl = &areq->first_tsgl;
+	else
+		areq->tsgl = sock_kmalloc(sk, array_size(sizeof(*areq->tsgl),
+						     areq->tsgl_entries),
+					  GFP_KERNEL);
 	if (!areq->tsgl) {
 		err = -ENOMEM;
 		goto free;

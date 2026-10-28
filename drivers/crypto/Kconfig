@@ -13,17 +13,31 @@ if CRYPTO_HW
 
 config CRYPTO_DEV_ESP32S31
 	tristate "Espressif ESP32-S31 crypto accelerators"
-	depends on SOC_ESP32S31 && OF
+	select CRC32
+	depends on SOC_ESP32S31 && OF && NVMEM
+	select CRYPTO_ENGINE
+	select RT_MUTEXES
+	select CRYPTO_HMAC
+	select CRYPTO_SHA1
+	select CRYPTO_SHA256
+	select CRYPTO_SHA512
 	select CRYPTO_SKCIPHER
 	select CRYPTO_HASH
 	select CRYPTO_AKCIPHER
 	select CRYPTO_KPP
 	select CRYPTO_RSA
 	select CRYPTO_ECDH
+	select CRYPTO_ECDSA
 	help
-	  Enable the AES, SHA, RSA/MPI and ECC hardware accelerators in the
-	  ESP32-S31.  RSA is exposed through the akcipher API and ECC point
-	  multiplication through the P-256 and P-384 ECDH KPP algorithms.
+	  Enable queued AES, SHA, RSA/MPI and ECC hardware acceleration in the
+	  ESP32-S31. SHA supports the standard HMAC template. RSA uses akcipher
+	  and ECC exposes P-256/P-384 ECDH through KPP. Runtime PM gates idle
+	  engines; system sleep drains accepted work before suspending them.
+	  /dev/s31-crypto provides bounded RSA and ECDH application operations;
+	  it also accepts opaque existing HMAC_UP eFuse slot handles. Key purpose
+	  metadata comes from NVMEM; Key Manager supports volatile deployment and chip-bound recovery for
+	  HMAC, DS and ECDSA. This driver never programs eFuses.
+	  Ordinary symmetric/hash applications use the standard AF_ALG interface.
 
 source "drivers/crypto/allwinner/Kconfig"
 

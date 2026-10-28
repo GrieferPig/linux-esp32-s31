@@ -163,6 +163,8 @@ static void s31_native_mutex_assert_current_quiescent(void)
 	struct s31_native_mutex *mutex;
 	unsigned long flags;
 
+	if (esp32s31_crypto_radio_operation(S31_CRYPTO_QUIESCENT, 0))
+		panic("esp32s31-radio: thread exit retains crypto engine ownership");
 	raw_spin_lock_irqsave(&s31_native_mutex_alloc_lock, flags);
 	list_for_each_entry(mutex, &s31_native_mutexes, allocations)
 		if (s31_native_mutex_owner(mutex) == current)

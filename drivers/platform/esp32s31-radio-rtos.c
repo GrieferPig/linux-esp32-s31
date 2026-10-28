@@ -15,6 +15,7 @@
 #include <linux/math64.h>
 #include <linux/mutex.h>
 #include <linux/soc/espressif/esp32s31-pmu.h>
+#include <linux/soc/espressif/esp32s31-crypto.h>
 
 #include <linux/rtmutex.h>
 #include <linux/module.h>
@@ -2237,6 +2238,39 @@ u32 s31_linux_dispatch_wait(void *opaque, u32 sequence, u64 deadline_ns,
   panic("esp32s31-radio: invalid managed dispatcher wait");
  if (s31_task_native_linux_call(task, s31_wait_on_kernel_stack, &args)) return args.sequence;
  panic("esp32s31-radio: dispatcher wait outside native execution context");
+}
+
+struct s31_crypto_call {
+	unsigned int operation, domain;
+	long result;
+};
+
+static void s31_crypto_on_linux_stack(void *opaque)
+{
+	struct s31_crypto_call *call = opaque;
+
+	call->result = esp32s31_crypto_radio_operation(call->operation, call->domain);
+}
+
+long s31_linux_crypto_operation(unsigned int operation, unsigned int domain)
+{
+	struct s31_linux_task *task = s31_linux_current_task();
+	struct s31_crypto_call call = {
+		.operation = operation, .domain = domain, .result = -EWOULDBLOCK,
+	};
+
+	if (!s31_task_create_kernel_context() || s31_task_create_sync_locked())
+		return -EWOULDBLOCK;
+	if (task) {
+		if (!s31_task_native_linux_call(task, s31_crypto_on_linux_stack, &call))
+			return -EWOULDBLOCK;
+	} else {
+		s31_crypto_on_linux_stack(&call);
+	}
+	if (call.result)
+		pr_err_ratelimited("esp32s31-radio: crypto op=%u domain=%u failed: %ld\n",
+				   operation, domain, call.result);
+	return call.result;
 }
 
 static void s31_pmu_reclaim_on_kernel_stack(void *opaque)

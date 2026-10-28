@@ -11,6 +11,9 @@
  */
 EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcpy);
+#if defined(CONFIG_SOC_ESP32S31) && defined(CONFIG_XIP_KERNEL) && !defined(CONFIG_KASAN)
+EXPORT_SYMBOL(memcmp);
+#endif
 EXPORT_SYMBOL(memmove);
 EXPORT_SYMBOL(__memset);
 EXPORT_SYMBOL(__memcpy);

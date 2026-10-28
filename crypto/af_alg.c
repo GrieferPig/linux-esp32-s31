@@ -600,31 +600,36 @@ static int af_alg_cmsg_send(struct msghdr *msg, struct af_alg_control *con)
  * af_alg_alloc_tsgl - allocate the TX SGL
  *
  * @sk: socket of connection to user space
+ * @capacity: entries needed, excluding the chain slot
  * Return: 0 upon success, < 0 upon error
  */
-static int af_alg_alloc_tsgl(struct sock *sk)
+static int af_alg_alloc_tsgl(struct sock *sk, unsigned int capacity)
 {
 	struct alg_sock *ask = alg_sk(sk);
 	struct af_alg_ctx *ctx = ask->private;
 	struct af_alg_tsgl *sgl;
 	struct scatterlist *sg = NULL;
+	unsigned int previous_capacity = 0;
 
 	sgl = list_entry(ctx->tsgl_list.prev, struct af_alg_tsgl, list);
-	if (!list_empty(&ctx->tsgl_list))
+	if (!list_empty(&ctx->tsgl_list)) {
 		sg = sgl->sg;
+		previous_capacity = sgl->capacity;
+	}
 
-	if (!sg || sgl->cur >= MAX_SGL_ENTS) {
+	if (!sg || sgl->cur >= sgl->capacity) {
 		sgl = sock_kmalloc(sk,
-				   struct_size(sgl, sg, (MAX_SGL_ENTS + 1)),
+				   struct_size(sgl, sg, capacity + 1),
 				   GFP_KERNEL);
 		if (!sgl)
 			return -ENOMEM;
 
-		sg_init_table(sgl->sg, MAX_SGL_ENTS + 1);
+		sg_init_table(sgl->sg, capacity + 1);
 		sgl->cur = 0;
+		sgl->capacity = capacity;
 
 		if (sg)
-			sg_chain(sg, MAX_SGL_ENTS + 1, sgl->sg);
+			sg_chain(sg, previous_capacity + 1, sgl->sg);
 
 		list_add_tail(&sgl->list, &ctx->tsgl_list);
 	}
@@ -753,7 +758,7 @@ void af_alg_pull_tsgl(struct sock *sk, size_t used, struct scatterlist *dst,
 		}
 
 		list_del(&sgl->list);
-		sock_kfree_s(sk, sgl, struct_size(sgl, sg, MAX_SGL_ENTS + 1));
+		sock_kfree_s(sk, sgl, struct_size(sgl, sg, sgl->capacity + 1));
 	}
 
 	if (!ctx->used)
@@ -793,7 +798,8 @@ static void af_alg_free_areq_sgls(struct af_alg_async_req *areq)
 			put_page(sg_page(sg));
 		}
 
-		sock_kfree_s(sk, tsgl, areq->tsgl_entries * sizeof(*tsgl));
+		if (tsgl != &areq->first_tsgl)
+			sock_kfree_s(sk, tsgl, areq->tsgl_entries * sizeof(*tsgl));
 	}
 }
 
@@ -1036,7 +1042,12 @@ int af_alg_sendmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		/* allocate a new page */
 		len = min_t(unsigned long, len, af_alg_sndbuf(sk));
 
-		err = af_alg_alloc_tsgl(sk);
+		/* Keep full tables for open-ended streams. A complete message
+		 * usually needs far fewer entries than a page-sized table.
+		 */
+		err = af_alg_alloc_tsgl(sk, msg->msg_flags & MSG_MORE ?
+			MAX_SGL_ENTS : clamp_t(size_t, DIV_ROUND_UP(len, PAGE_SIZE),
+					      ALG_MAX_PAGES, MAX_SGL_ENTS));
 		if (err)
 			goto unlock;
 
@@ -1054,7 +1065,7 @@ int af_alg_sendmsg(struct socket *sock, struct msghdr *msg, size_t size,
 			};
 
 			plen = extract_iter_to_sg(&msg->msg_iter, len, &sgtable,
-						  MAX_SGL_ENTS - sgl->cur, 0);
+						  sgl->capacity - sgl->cur, 0);
 			if (plen < 0) {
 				err = plen;
 				goto unlock;
@@ -1096,7 +1107,7 @@ int af_alg_sendmsg(struct socket *sock, struct msghdr *msg, size_t size,
 				copied += plen;
 				size -= plen;
 				sgl->cur++;
-			} while (len && sgl->cur < MAX_SGL_ENTS);
+			} while (len && sgl->cur < sgl->capacity);
 
 			ctx->merge = plen & (PAGE_SIZE - 1);
 		}
