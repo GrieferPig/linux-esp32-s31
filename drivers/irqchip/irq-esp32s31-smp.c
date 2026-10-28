@@ -56,11 +56,13 @@
 #define ESP32S31_SBI_CLIC_MIP		2
 #define ESP32S31_SBI_CLIC_MIE		3
 #define ESP32S31_SBI_CLIC_WFI		4
+#define ESP32S31_SBI_CLIC_WFI_GUARD_US	7
 
 static void __iomem *esp32s31_doorbells;
 /* Keep real WFI command-line gated so older OpenSBI images fail safe. */
 static bool esp32s31_idle_requested;
 static bool esp32s31_idle_proxy_ready;
+static unsigned int esp32s31_idle_guard_us;
 
 static int __init esp32s31_idle_setup(char *str)
 {
@@ -76,6 +78,7 @@ bool noinstr esp32s31_sbi_idle_enabled(void)
 
 int esp32s31_sbi_idle_activate(void)
 {
+	struct sbiret guard;
 	long probe;
 
 	if (!esp32s31_idle_requested)
@@ -87,12 +90,23 @@ int esp32s31_sbi_idle_activate(void)
 	probe = sbi_probe_extension(ESP32S31_SBI_EXT_CLIC);
 	if (probe <= 0)
 		return -ENODEV;
+	guard = sbi_ecall(ESP32S31_SBI_EXT_CLIC,
+			  ESP32S31_SBI_CLIC_WFI_GUARD_US, 0, 0, 0, 0, 0, 0);
+	if (guard.error || guard.value <= 0 || guard.value > USEC_PER_SEC)
+		return -ENODEV;
+	esp32s31_idle_guard_us = guard.value;
 
 	/* Runtime timers are initialized before the cpuidle device initcall. */
 	esp32s31_idle_proxy_ready = true;
 	cpu_idle_poll_ctrl(false);
-	pr_info("esp32s31-smp: concurrent per-hart WFI enabled (M-mode guard)\n");
+	pr_info("esp32s31-smp: concurrent per-hart WFI enabled (%u us M-mode guard)\n",
+		esp32s31_idle_guard_us);
 	return 0;
+}
+
+unsigned int esp32s31_sbi_idle_guard_us(void)
+{
+	return esp32s31_idle_guard_us;
 }
 
 void esp32s31_sbi_idle_deactivate(void)

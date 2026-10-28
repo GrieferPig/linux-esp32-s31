@@ -6,6 +6,7 @@
 
 bool esp32s31_sbi_idle_enabled(void);
 int esp32s31_sbi_idle_activate(void);
+unsigned int esp32s31_sbi_idle_guard_us(void);
 void esp32s31_sbi_idle_deactivate(void);
 void esp32s31_sbi_wfi(void);
 

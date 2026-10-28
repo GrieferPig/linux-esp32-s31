@@ -59,6 +59,8 @@
 #define ESP32S31_CLK_RTC_FAST		52
 #define ESP32S31_CLK_RTC_SLOW		53
 
-#define ESP32S31_CLK_NR			54
+#define ESP32S31_CLK_AXI_GDMA		54
+
+#define ESP32S31_CLK_NR			55
 
 #endif

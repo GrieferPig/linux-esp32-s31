@@ -16,18 +16,15 @@
 #include <linux/seqlock.h>
 #include <linux/spinlock.h>
 #include <linux/syscore_ops.h>
-#include <linux/timekeeping.h>
 #include <linux/clocksource/esp32s31-systimer.h>
 #include <asm/fixmap.h>
 #include <asm/irqflags.h>
 
 #define S31_SYSTIMER_PHYS		0x20399000U
 #define S31_HP_CLKRST_PHYS		0x20587000U
-#define S31_RTC_TIMER_PHYS		0x20800000U
 #define S31_HP_CLKRST_SYSTIMER_CTRL0	0x120
 #define S31_SYSTIMER_APB_CLK_EN		BIT(0)
 #define S31_SYSTIMER_RST_EN		BIT(1)
-#define S31_SYSTIMER_FORCE_NORST		BIT(2)
 #define S31_SYSTIMER_CLK_SRC_SEL	BIT(3)
 #define S31_SYSTIMER_FUNC_CLK_EN	BIT(4)
 
@@ -50,19 +47,7 @@
 #define S31_SYSTIMER_TARGET_EN(cpu)	BIT(24 - (cpu))
 #define S31_SYSTIMER_COUNTER1_SEL	BIT(31)
 
-#define S31_RTC_TIMER_UPDATE		0x10
-#define S31_RTC_TIMER_COUNTER0_LO	0x14
-#define S31_RTC_TIMER_COUNTER0_HI	0x18
-#define S31_RTC_TIMER_DATE		0x3fc
-#define S31_RTC_TIMER_SNAPSHOT		BIT(27)
-#define S31_RTC_TIMER_SYS_STALL		BIT(30)
-#define S31_RTC_TIMER_SYS_RST		BIT(31)
-#define S31_RTC_TIMER_CLK_EN		BIT(31)
-#define S31_RTC_TIMER_HI_MASK		GENMASK(15, 0)
-#define S31_RTC_SLOW_RATE		32768U
-
 static void __iomem *s31_systimer_base;
-static void __iomem *s31_rtc_timer_base;
 static u64 s31_systimer_last;
 /* Serialized writers publish two copies so a nested NMI never waits on its
  * interrupted snapshot owner or observes an RV32 half-written u64. */
@@ -90,46 +75,10 @@ static void notrace s31_systimer_publish_counter(u64 value)
 }
 static DEFINE_RAW_SPINLOCK(s31_systimer_lock);
 
-static void s31_rtc_timer_ensure_mmio(void)
-{
-	u32 val;
-
-	if (likely(s31_rtc_timer_base))
-		return;
-
-	set_fixmap_io(FIX_S31_RTC_TIMER, S31_RTC_TIMER_PHYS);
-	s31_rtc_timer_base = (void __iomem *)fix_to_virt(FIX_S31_RTC_TIMER);
-	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_DATE);
-	writel(val | S31_RTC_TIMER_CLK_EN,
-	       s31_rtc_timer_base + S31_RTC_TIMER_DATE);
-	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
-	val &= ~(S31_RTC_TIMER_SYS_STALL | S31_RTC_TIMER_SYS_RST);
-	writel(val, s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
-}
-
-static u64 notrace s31_rtc_timer_read_counter(void)
-{
-	u32 val, hi, lo;
-
-	s31_rtc_timer_ensure_mmio();
-	val = readl(s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
-	writel(val | S31_RTC_TIMER_SNAPSHOT,
-	       s31_rtc_timer_base + S31_RTC_TIMER_UPDATE);
-	lo = readl(s31_rtc_timer_base + S31_RTC_TIMER_COUNTER0_LO);
-	hi = readl(s31_rtc_timer_base + S31_RTC_TIMER_COUNTER0_HI) &
-	     S31_RTC_TIMER_HI_MASK;
-	return ((u64)hi << 32) | lo;
-}
-
-void read_persistent_clock64(struct timespec64 *ts)
-{
-	u64 cycles = s31_rtc_timer_read_counter();
-	u32 rem;
-
-	ts->tv_sec = div_u64_rem(cycles, S31_RTC_SLOW_RATE, &rem);
-	ts->tv_nsec = div_u64((u64)rem * NSEC_PER_SEC,
-			      S31_RTC_SLOW_RATE);
-}
+/* Sleep elapsed time comes from the LP controller's calibrated RTC class.
+ * Do not expose raw RTC ticks as an early persistent wall clock: RTC_SLOW
+ * may be RC-derived rather than 32.768 kHz, and has no wall-time epoch.
+ */
 
 static void s31_systimer_ensure_mmio(void)
 {

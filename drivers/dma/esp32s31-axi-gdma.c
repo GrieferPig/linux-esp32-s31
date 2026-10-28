@@ -7,7 +7,9 @@
  * one of memory-to-memory, memory-to-device or device-to-memory at a time.
  */
 
+#include <dt-bindings/dma/esp32s31-axi-gdma.h>
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/genalloc.h>
@@ -18,6 +20,8 @@
 #include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 
@@ -60,24 +64,20 @@
 #define ESP32S31_AXI_TX_LINK2		0x24
 #define ESP32S31_AXI_TX_EOF_DESC		0x2c
 #define ESP32S31_AXI_TX_DSCR		0x34
-#define ESP32S31_AXI_TX_DSCR_BF0		0x38
 #define ESP32S31_AXI_TX_PERI_SEL		0x44
 
 #define ESP32S31_AXI_RX_RST		BIT(0)
 #define ESP32S31_AXI_RX_MEM_TRANS_EN	BIT(2)
 #define ESP32S31_AXI_RX_BURST_SIZE	GENMASK(6, 4)
 #define ESP32S31_AXI_RX_DSCR_BURST_EN	BIT(9)
-#define ESP32S31_AXI_RX_CHECK_OWNER	BIT(12)
 #define ESP32S31_AXI_RX_LINK_STOP	BIT(1)
 #define ESP32S31_AXI_RX_LINK_START	BIT(2)
 #define ESP32S31_AXI_RX_LINK_RESTART	BIT(3)
 
 #define ESP32S31_AXI_TX_RST		BIT(0)
-#define ESP32S31_AXI_TX_AUTO_WRBACK	BIT(2)
 #define ESP32S31_AXI_TX_EOF_MODE		BIT(3)
 #define ESP32S31_AXI_TX_BURST_SIZE	GENMASK(7, 5)
 #define ESP32S31_AXI_TX_DSCR_BURST_EN	BIT(10)
-#define ESP32S31_AXI_TX_CHECK_OWNER	BIT(12)
 #define ESP32S31_AXI_TX_LINK_STOP	BIT(0)
 #define ESP32S31_AXI_TX_LINK_START	BIT(1)
 #define ESP32S31_AXI_TX_LINK_RESTART	BIT(2)
@@ -104,8 +104,6 @@
 #define ESP32S31_AXI_MISC_RST_WR	BIT(0)
 #define ESP32S31_AXI_MISC_RST_RD	BIT(1)
 #define ESP32S31_AXI_MISC_CLK_EN	BIT(4)
-#define ESP32S31_AXI_CLK_EN		BIT(0)
-#define ESP32S31_AXI_RESET		BIT(1)
 
 #define ESP32S31_DESC_SIZE		GENMASK(11, 0)
 #define ESP32S31_DESC_LENGTH		GENMASK(23, 12)
@@ -177,13 +175,17 @@ struct esp32s31_axi_chan {
 	unsigned int id;
 	int rx_irq;
 	int tx_irq;
+	bool allocated;
 };
 
 struct esp32s31_axi_gdma {
 	struct dma_device dma_dev;
 	struct device *dev;
 	void __iomem *base;
-	void __iomem *clkrst;
+	struct clk *clk;
+	struct reset_control *reset;
+	bool powered;
+	bool suspending;
 	void __iomem *desc_base;
 	void __iomem *psram_direct;
 	struct gen_pool *desc_pool;
@@ -306,6 +308,13 @@ static void esp32s31_axi_stop_pair(struct esp32s31_axi_chan *chan)
 	writel(ESP32S31_AXI_TX_LINK_STOP,
 	       esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_LINK1));
 	esp32s31_axi_reset_pair(chan);
+	/* Reset leaves PERI_SEL intact. An idle pair must not keep matching a
+	 * peripheral request that another allocated pair is about to service.
+	 */
+	writel(ESP32S31_AXI_GDMA_PERIPH_DISCONNECT,
+	       esp32s31_axi_rx_reg(chan, ESP32S31_AXI_RX_PERI_SEL));
+	writel(ESP32S31_AXI_GDMA_PERIPH_DISCONNECT,
+	       esp32s31_axi_tx_reg(chan, ESP32S31_AXI_TX_PERI_SEL));
 }
 
 static u32 esp32s31_axi_ack(struct esp32s31_axi_chan *chan, bool tx)
@@ -543,10 +552,21 @@ static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 	wmb();
 }
 
+static bool esp32s31_axi_polling(struct esp32s31_axi_desc *desc)
+{
+	struct dma_async_tx_descriptor *tx = &desc->vd.tx;
+
+	/* Only driver-owned descriptors without a callback can finish inline. */
+	return !desc->cyclic && !(tx->flags & DMA_PREP_INTERRUPT) &&
+	       async_tx_test_ack(tx) && !(tx->flags & DMA_CTRL_REUSE) &&
+	       !tx->callback && !tx->callback_result;
+}
+
 static bool esp32s31_axi_compatible(struct esp32s31_axi_desc *a,
 				    struct esp32s31_axi_desc *b)
 {
-	return !a->cyclic && !b->cyclic && a->direction == b->direction;
+	return !a->cyclic && !b->cyclic && a->direction == b->direction &&
+	       esp32s31_axi_polling(a) == esp32s31_axi_polling(b);
 }
 
 static void esp32s31_axi_start_desc(struct esp32s31_axi_chan *chan,
@@ -563,6 +583,10 @@ static void esp32s31_axi_start_desc(struct esp32s31_axi_chan *chan,
 		rx_mask |= ESP32S31_AXI_RX_DONE;
 	if (desc->direction == DMA_MEM_TO_DEV)
 		tx_mask |= ESP32S31_AXI_TX_EOF;
+	if (esp32s31_axi_polling(desc)) {
+		rx_mask = 0;
+		tx_mask = 0;
+	}
 
 	dma_wmb();
 	writel(rx_mask, esp32s31_axi_rx_reg(chan, ESP32S31_AXI_INT_ENA));
@@ -608,6 +632,8 @@ static void esp32s31_axi_start_pending(struct esp32s31_axi_chan *chan)
 	struct virt_dma_desc *vd;
 
 	lockdep_assert_held(&chan->vc.lock);
+	if (!chan->allocated || !chan->gdma->powered || chan->gdma->suspending)
+		return;
 	if (!list_empty(&chan->running))
 		tail = list_last_entry(&chan->running, struct esp32s31_axi_desc,
 				       running_node);
@@ -641,7 +667,12 @@ static void esp32s31_axi_complete_desc(struct esp32s31_axi_chan *chan,
 		chan->error_cookie = desc->vd.tx.cookie;
 	else
 		esp32s31_axi_recover_stash(chan, desc, -1);
-	vchan_cookie_complete(&desc->vd);
+	if (esp32s31_axi_polling(desc)) {
+		dma_cookie_complete(&desc->vd.tx);
+		esp32s31_axi_free_desc(&desc->vd);
+	} else {
+		vchan_cookie_complete(&desc->vd);
+	}
 }
 
 static void esp32s31_axi_cyclic_advance(struct esp32s31_axi_chan *chan,
@@ -728,6 +759,10 @@ static irqreturn_t esp32s31_axi_rx_irq(int irq, void *data)
 
 	/* Keep sampled status attached to the running list it came from. */
 	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (!chan->allocated || !chan->gdma->powered) {
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		return IRQ_NONE;
+	}
 	status = esp32s31_axi_ack(chan, false);
 	if (status & ESP32S31_AXI_RX_ERROR_MASK) {
 		dev_err_ratelimited(chan->gdma->dev,
@@ -755,6 +790,10 @@ static irqreturn_t esp32s31_axi_tx_irq(int irq, void *data)
 	u32 status;
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (!chan->allocated || !chan->gdma->powered) {
+		spin_unlock_irqrestore(&chan->vc.lock, flags);
+		return IRQ_NONE;
+	}
 	status = esp32s31_axi_ack(chan, true);
 	if (status & ESP32S31_AXI_TX_DSCR_ERR) {
 		dev_err_ratelimited(chan->gdma->dev,
@@ -1011,14 +1050,46 @@ static enum dma_status esp32s31_axi_tx_status(struct dma_chan *dchan,
 	struct virt_dma_desc *vd;
 	enum dma_status status;
 	unsigned long flags;
+	u32 rx, tx;
 
 	status = dma_cookie_status(dchan, cookie, state);
 	if (status == DMA_COMPLETE && cookie == READ_ONCE(chan->error_cookie))
 		return DMA_ERROR;
-	if (status == DMA_COMPLETE || !state)
+	if (status == DMA_COMPLETE)
 		return status;
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (chan->allocated && chan->gdma->powered &&
+	    !list_empty(&chan->running)) {
+		desc = list_first_entry(&chan->running, struct esp32s31_axi_desc,
+					running_node);
+		if (esp32s31_axi_polling(desc)) {
+			/* IRQs are masked for these descriptors. Keep both status
+			 * samples attached to this running list, just like the ISR.
+			 */
+			rx = esp32s31_axi_ack(chan, false);
+			tx = esp32s31_axi_ack(chan, true);
+			if (rx & ESP32S31_AXI_RX_ERROR_MASK)
+				esp32s31_axi_fail_running(chan, DMA_TRANS_WRITE_FAILED);
+			else if (tx & ESP32S31_AXI_TX_DSCR_ERR)
+				esp32s31_axi_fail_running(chan, DMA_TRANS_READ_FAILED);
+			else if (desc->direction == DMA_MEM_TO_DEV &&
+				 (tx & ESP32S31_AXI_TX_EOF))
+				esp32s31_axi_complete_eof(chan,
+					readl(esp32s31_axi_tx_reg(chan,
+						ESP32S31_AXI_TX_EOF_DESC)), true);
+			else if (desc->direction != DMA_MEM_TO_DEV &&
+				 (rx & ESP32S31_AXI_RX_SUC_EOF))
+				esp32s31_axi_complete_eof(chan,
+					readl(esp32s31_axi_rx_reg(chan,
+						ESP32S31_AXI_RX_SUC_EOF_DESC)), false);
+		}
+	}
+	status = dma_cookie_status(dchan, cookie, state);
+	if (status == DMA_COMPLETE && cookie == chan->error_cookie)
+		status = DMA_ERROR;
+	if (status != DMA_IN_PROGRESS || !state)
+		goto out;
 	list_for_each_entry(desc, &chan->running, running_node) {
 		if (desc->vd.tx.cookie == cookie) {
 			dma_set_residue(state, esp32s31_axi_active_residue(chan, desc));
@@ -1041,7 +1112,8 @@ static int esp32s31_axi_terminate_all(struct dma_chan *dchan)
 	LIST_HEAD(head);
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	esp32s31_axi_stop_pair(chan);
+	if (chan->gdma->powered)
+		esp32s31_axi_stop_pair(chan);
 	list_for_each_entry_safe(desc, tmp, &chan->running, running_node) {
 		list_del_init(&desc->running_node);
 		if (desc->cyclic)
@@ -1055,20 +1127,6 @@ static int esp32s31_axi_terminate_all(struct dma_chan *dchan)
 	return 0;
 }
 
-static int esp32s31_axi_alloc_chan_resources(struct dma_chan *dchan)
-{
-	return 0;
-}
-
-static void esp32s31_axi_free_chan_resources(struct dma_chan *dchan)
-{
-	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
-
-	esp32s31_axi_terminate_all(dchan);
-	vchan_free_chan_resources(&chan->vc);
-	chan->request_id = U32_MAX;
-}
-
 static void esp32s31_axi_synchronize(struct dma_chan *dchan)
 {
 	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
@@ -1078,15 +1136,79 @@ static void esp32s31_axi_synchronize(struct dma_chan *dchan)
 	vchan_synchronize(&chan->vc);
 }
 
+static int esp32s31_axi_alloc_chan_resources(struct dma_chan *dchan)
+{
+	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
+	struct esp32s31_axi_gdma *gdma = chan->gdma;
+	unsigned long flags;
+	int ret;
+
+	/* Allocation is sleepable; prep/issue and IRQ paths remain atomic.
+	 * A channel owns its runtime reference until all IRQs and callbacks
+	 * have been joined on release. Crypto borrows a pair per request.
+	 */
+	ret = pm_runtime_resume_and_get(gdma->dev);
+	if (ret < 0)
+		return ret;
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	if (gdma->suspending) {
+		ret = -EBUSY;
+	} else {
+		chan->allocated = true;
+		chan->error_cookie = -EBUSY;
+	}
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	if (ret < 0) {
+		pm_runtime_mark_last_busy(gdma->dev);
+		pm_runtime_put_autosuspend(gdma->dev);
+	}
+	return ret;
+}
+
+static void esp32s31_axi_free_chan_resources(struct dma_chan *dchan)
+{
+	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
+	unsigned long flags;
+
+	esp32s31_axi_terminate_all(dchan);
+	esp32s31_axi_synchronize(dchan);
+	vchan_free_chan_resources(&chan->vc);
+	spin_lock_irqsave(&chan->vc.lock, flags);
+	chan->request_id = U32_MAX;
+	chan->allocated = false;
+	spin_unlock_irqrestore(&chan->vc.lock, flags);
+	pm_runtime_mark_last_busy(chan->gdma->dev);
+	pm_runtime_put_autosuspend(chan->gdma->dev);
+}
+
+/* Only PM transitions take all three locks. Normal transfers retain their
+ * independent channel locks and never acquire a controller-wide gate.
+ */
+static void esp32s31_axi_lock_all(struct esp32s31_axi_gdma *gdma,
+				unsigned long *flags)
+{
+	unsigned int i;
+
+	spin_lock_irqsave(&gdma->chans[0].vc.lock, *flags);
+	for (i = 1; i < ESP32S31_AXI_GDMA_CHANNELS; i++)
+		spin_lock_nested(&gdma->chans[i].vc.lock, i);
+}
+
+static void esp32s31_axi_unlock_all(struct esp32s31_axi_gdma *gdma,
+				  unsigned long flags)
+{
+	unsigned int i;
+
+	for (i = ESP32S31_AXI_GDMA_CHANNELS - 1; i > 0; i--)
+		spin_unlock(&gdma->chans[i].vc.lock);
+	spin_unlock_irqrestore(&gdma->chans[0].vc.lock, flags);
+}
+
 static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)
 {
 	u32 val;
 	unsigned int i;
 
-	val = readl(gdma->clkrst);
-	writel(val | ESP32S31_AXI_CLK_EN, gdma->clkrst);
-	writel((val | ESP32S31_AXI_CLK_EN) | ESP32S31_AXI_RESET, gdma->clkrst);
-	writel((val | ESP32S31_AXI_CLK_EN) & ~ESP32S31_AXI_RESET, gdma->clkrst);
 	writel(0x2f000000, gdma->base + ESP32S31_AXI_INTR_MEM_START);
 	writel(0x2f07ffff, gdma->base + ESP32S31_AXI_INTR_MEM_END);
 	writel(0x40000000, gdma->base + ESP32S31_AXI_EXTR_MEM_START);
@@ -1103,21 +1225,133 @@ static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)
 	}
 }
 
+static int esp32s31_axi_runtime_resume(struct device *dev)
+{
+	struct esp32s31_axi_gdma *gdma = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
+
+	ret = clk_prepare_enable(gdma->clk);
+	if (ret)
+		return ret;
+	ret = reset_control_reset(gdma->reset);
+	if (ret) {
+		clk_disable_unprepare(gdma->clk);
+		return ret;
+	}
+	esp32s31_axi_lock_all(gdma, &flags);
+	esp32s31_axi_hw_init(gdma);
+	gdma->powered = true;
+	esp32s31_axi_unlock_all(gdma, flags);
+	return 0;
+}
+
+static int esp32s31_axi_runtime_suspend(struct device *dev)
+{
+	struct esp32s31_axi_gdma *gdma = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int i;
+
+	esp32s31_axi_lock_all(gdma, &flags);
+	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+		struct esp32s31_axi_chan *chan = &gdma->chans[i];
+
+		if (!list_empty(&chan->running)) {
+			esp32s31_axi_unlock_all(gdma, flags);
+			return -EBUSY;
+		}
+	}
+	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++)
+		esp32s31_axi_stop_pair(&gdma->chans[i]);
+	writel(readl(gdma->base + ESP32S31_AXI_MISC_CONF) &
+	       ~ESP32S31_AXI_MISC_CLK_EN, gdma->base + ESP32S31_AXI_MISC_CONF);
+	gdma->powered = false;
+	esp32s31_axi_unlock_all(gdma, flags);
+	clk_disable_unprepare(gdma->clk);
+	return 0;
+}
+
+static void esp32s31_axi_restart(struct esp32s31_axi_gdma *gdma)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	esp32s31_axi_lock_all(gdma, &flags);
+	gdma->suspending = false;
+	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++)
+		esp32s31_axi_start_pending(&gdma->chans[i]);
+	esp32s31_axi_unlock_all(gdma, flags);
+}
+
+static int esp32s31_axi_suspend(struct device *dev)
+{
+	struct esp32s31_axi_gdma *gdma = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int i;
+	int ret = 0;
+
+	esp32s31_axi_lock_all(gdma, &flags);
+	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+		struct esp32s31_axi_chan *chan = &gdma->chans[i];
+
+		if (!list_empty(&chan->running) ||
+		    !list_empty(&chan->vc.desc_submitted) ||
+		    !list_empty(&chan->vc.desc_issued)) {
+			ret = -EBUSY;
+			break;
+		}
+	}
+	if (!ret)
+		gdma->suspending = true;
+	esp32s31_axi_unlock_all(gdma, flags);
+	if (ret)
+		return ret;
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		esp32s31_axi_restart(gdma);
+	return ret;
+}
+
+static int esp32s31_axi_resume(struct device *dev)
+{
+	struct esp32s31_axi_gdma *gdma = dev_get_drvdata(dev);
+	int ret = pm_runtime_force_resume(dev);
+
+	if (!ret)
+		esp32s31_axi_restart(gdma);
+	return ret;
+}
+
+static const struct dev_pm_ops esp32s31_axi_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(esp32s31_axi_suspend, esp32s31_axi_resume)
+	RUNTIME_PM_OPS(esp32s31_axi_runtime_suspend,
+		       esp32s31_axi_runtime_resume, NULL)
+};
+
 static struct dma_chan *esp32s31_axi_of_xlate(struct of_phandle_args *spec,
 					      struct of_dma *ofdma)
 {
 	struct esp32s31_axi_gdma *gdma = ofdma->of_dma_data;
 	struct dma_chan *dchan;
 	struct esp32s31_axi_chan *chan;
+	unsigned int i;
 
-	if (spec->args_count != 2 || spec->args[0] >= ESP32S31_AXI_GDMA_CHANNELS ||
+	if (spec->args_count != 2 ||
+	    (spec->args[0] >= ESP32S31_AXI_GDMA_CHANNELS &&
+	     spec->args[0] != ESP32S31_AXI_GDMA_ANY) ||
 	    spec->args[1] > ESP32S31_AXI_GDMA_PERIPH_MAX)
 		return NULL;
-	chan = &gdma->chans[spec->args[0]];
-	dchan = dma_get_slave_channel(&chan->vc.chan);
-	if (dchan)
-		chan->request_id = spec->args[1];
-	return dchan;
+	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+		if (spec->args[0] != ESP32S31_AXI_GDMA_ANY && spec->args[0] != i)
+			continue;
+		chan = &gdma->chans[i];
+		dchan = dma_get_slave_channel(&chan->vc.chan);
+		if (dchan) {
+			chan->request_id = spec->args[1];
+			return dchan;
+		}
+	}
+	return NULL;
 }
 
 static int esp32s31_axi_probe(struct platform_device *pdev)
@@ -1136,10 +1370,13 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	gdma->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(gdma->base))
 		return PTR_ERR(gdma->base);
-	gdma->clkrst = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(gdma->clkrst))
-		return PTR_ERR(gdma->clkrst);
-	gdma->desc_base = devm_platform_get_and_ioremap_resource(pdev, 2, &desc_res);
+	gdma->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(gdma->clk))
+		return dev_err_probe(dev, PTR_ERR(gdma->clk), "missing DMA clock\n");
+	gdma->reset = devm_reset_control_get_exclusive(dev, NULL);
+	if (IS_ERR(gdma->reset))
+		return dev_err_probe(dev, PTR_ERR(gdma->reset), "missing DMA reset\n");
+	gdma->desc_base = devm_platform_get_and_ioremap_resource(pdev, 1, &desc_res);
 	if (IS_ERR(gdma->desc_base))
 		return PTR_ERR(gdma->desc_base);
 	gdma->psram_direct = devm_ioremap(dev, ESP32S31_PSRAM_DIRECT_BASE,
@@ -1200,7 +1437,14 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 		chan->vc.desc_free = esp32s31_axi_free_desc;
 		vchan_init(&chan->vc, dma_dev);
 	}
-	esp32s31_axi_hw_init(gdma);
+	platform_set_drvdata(pdev, gdma);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_set_autosuspend_delay(dev, 50);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		goto err_pm;
 
 	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
 		struct esp32s31_axi_chan *chan = &gdma->chans[i];
@@ -1234,16 +1478,22 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	ret = of_dma_controller_register(dev->of_node, esp32s31_axi_of_xlate, gdma);
 	if (ret)
 		goto err_unregister;
-	platform_set_drvdata(pdev, gdma);
 	dev_info(dev,
 		 "AXI GDMA ready: %u pairs, memcpy/memset/slave-sg/cyclic, burst %u, version %#x\n",
 		 ESP32S31_AXI_GDMA_CHANNELS, ESP32S31_AXI_GDMA_BURST_SIZE,
 		 readl(gdma->base + ESP32S31_AXI_DATE));
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 	return 0;
 
 err_unregister:
 	dma_async_device_unregister(dma_dev);
 err_vchans:
+	pm_runtime_put_noidle(dev);
+err_pm:
+	pm_runtime_disable(dev);
+	if (gdma->powered)
+		esp32s31_axi_runtime_suspend(dev);
 	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++)
 		tasklet_kill(&gdma->chans[i].vc.task);
 	return ret;
@@ -1258,8 +1508,11 @@ static void esp32s31_axi_remove(struct platform_device *pdev)
 	dma_async_device_unregister(&gdma->dma_dev);
 	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
 		esp32s31_axi_terminate_all(&gdma->chans[i].vc.chan);
-		tasklet_kill(&gdma->chans[i].vc.task);
+		esp32s31_axi_synchronize(&gdma->chans[i].vc.chan);
 	}
+	pm_runtime_disable(&pdev->dev);
+	if (gdma->powered)
+		esp32s31_axi_runtime_suspend(&pdev->dev);
 }
 
 static const struct of_device_id esp32s31_axi_of_match[] = {
@@ -1273,6 +1526,7 @@ static struct platform_driver esp32s31_axi_driver = {
 	.remove = esp32s31_axi_remove,
 	.driver = {
 		.name = "esp32s31-axi-gdma",
+		.pm = pm_ptr(&esp32s31_axi_pm_ops),
 		.of_match_table = esp32s31_axi_of_match,
 	},
 };

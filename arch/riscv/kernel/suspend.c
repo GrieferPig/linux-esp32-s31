@@ -185,12 +185,24 @@ static void sbi_system_suspend_finish(void)
 {
 	esp32s31_lp_system_suspend_finish();
 }
+
+static void sbi_system_suspend_wake(void)
+{
+	esp32s31_lp_system_suspend_wake();
+}
+
+static int sbi_system_suspend_validate(void)
+{
+	return esp32s31_lp_system_suspend_validate();
+}
 #endif
 
 static const struct platform_suspend_ops sbi_system_suspend_ops = {
 	.valid = suspend_valid_only_mem,
 	#ifdef CONFIG_SOC_ESP32S31
 	.prepare = sbi_system_suspend_prepare,
+	.prepare_late = sbi_system_suspend_validate,
+	.wake = sbi_system_suspend_wake,
 	.finish = sbi_system_suspend_finish,
 	#endif
 	.enter = sbi_system_suspend_enter,

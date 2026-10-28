@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
+#include <linux/soc/espressif/esp32s31-gpio.h>
 
 #include <linux/pinctrl/pinconf-generic.h>
 #include <linux/pinctrl/pinconf.h>
@@ -49,8 +50,10 @@
 #define GPIO_IN			0x064
 #define GPIO_IN1		0x068
 #define GPIO_STATUS		0x074
+#define GPIO_STATUS_W1TS	0x078
 #define GPIO_STATUS_W1TC	0x07c
 #define GPIO_STATUS1		0x080
+#define GPIO_STATUS1_W1TS	0x084
 #define GPIO_STATUS1_W1TC	0x088
 #define GPIO_INT0		0x0a4
 #define GPIO_INT0_1		0x0b4
@@ -77,12 +80,10 @@
 #define GPIO_FUNC_OUT_OEN_INV	BIT(11)
 
 /* IO_MUX has one 32-bit register per GPIO. */
-#define IOMUX_SLP_OE		BIT(0)
 #define IOMUX_SLP_SEL		BIT(1)
 #define IOMUX_SLP_PD		BIT(2)
 #define IOMUX_SLP_PU		BIT(3)
 #define IOMUX_SLP_IE		BIT(4)
-#define IOMUX_SLP_DRV		GENMASK(6, 5)
 #define IOMUX_FUN_PD		BIT(7)
 #define IOMUX_FUN_PU		BIT(8)
 #define IOMUX_FUN_IE		BIT(9)
@@ -137,6 +138,9 @@ struct esp32s31_pinctrl {
 	void __iomem *iomux_base;
 	void __iomem *cnnt_pad_base;
 	raw_spinlock_t lock;
+	raw_spinlock_t wake_lock;
+	u64 wake_mask;
+	bool removing;
 	struct mutex groups_lock;
 
 	struct pinctrl_dev *pctldev;
@@ -149,6 +153,12 @@ struct esp32s31_pinctrl {
 	u8 gmac_dedicated_users;
 	u8 sdio_dedicated_users;
 };
+
+/* Snapshot callers run in the sleeping platform-prepare phase. Unpublish
+ * before devres releases the GPIO domain or its register mappings.
+ */
+static DEFINE_MUTEX(esp32s31_gpio_owner_lock);
+static struct esp32s31_pinctrl *esp32s31_gpio_owner;
 
 static u64 esp32s31_bitmap_to_u64(const unsigned long *bitmap)
 {
@@ -1002,8 +1012,7 @@ static int esp32s31_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
 	struct esp32s31_pinctrl *pctl = gpiochip_get_data(gc);
 	unsigned int pin = irqd_to_hwirq(d);
-	u32 hw_type;
-
+	u32 hw_type, wake_bit = 0;
 	switch (type & IRQ_TYPE_SENSE_MASK) {
 	case IRQ_TYPE_EDGE_RISING:
 		hw_type = ESP32S31_GPIO_INTR_POSEDGE;
@@ -1030,9 +1039,13 @@ static int esp32s31_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	}
 
 	pctl->irq_types[pin] = hw_type;
+	if (irqd_is_wakeup_set(d) &&
+	    (hw_type == ESP32S31_GPIO_INTR_LOW_LEVEL ||
+	     hw_type == ESP32S31_GPIO_INTR_HIGH_LEVEL))
+		wake_bit = GPIO_PIN_WAKEUP_ENABLE;
 	esp32s31_update_bits(pctl, esp32s31_pin_reg(pctl, pin),
-			       GPIO_PIN_INT_TYPE,
-			       FIELD_PREP(GPIO_PIN_INT_TYPE, hw_type));
+			       GPIO_PIN_INT_TYPE | GPIO_PIN_WAKEUP_ENABLE,
+			       FIELD_PREP(GPIO_PIN_INT_TYPE, hw_type) | wake_bit);
 	esp32s31_gpio_irq_ack(d);
 	return 0;
 }
@@ -1043,14 +1056,165 @@ static int esp32s31_gpio_irq_set_wake(struct irq_data *d, unsigned int on)
 	struct esp32s31_pinctrl *pctl = gpiochip_get_data(gc);
 	unsigned int pin = irqd_to_hwirq(d);
 	u8 type = pctl->irq_types[pin];
+	unsigned long flags;
+	u64 bit = BIT_ULL(pin);
+	int ret = 0;
 
-	if (on && type != ESP32S31_GPIO_INTR_LOW_LEVEL &&
-	    type != ESP32S31_GPIO_INTR_HIGH_LEVEL)
+	if (on && (type < ESP32S31_GPIO_INTR_POSEDGE ||
+		   type > ESP32S31_GPIO_INTR_HIGH_LEVEL))
 		return -EINVAL;
+	raw_spin_lock_irqsave(&pctl->wake_lock, flags);
+	if (on && pctl->removing) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!!(pctl->wake_mask & bit) == !!on)
+		goto out;
+	/* A chained child cannot wake s2idle if genirq suspends its parent. */
+	if ((on && !pctl->wake_mask) || (!on && pctl->wake_mask == bit)) {
+		ret = irq_set_irq_wake(gc->irq.parents[0], on);
+		if (ret)
+			goto out;
+	}
 	esp32s31_update_bits(pctl, esp32s31_pin_reg(pctl, pin),
 			       GPIO_PIN_WAKEUP_ENABLE,
-			       on ? GPIO_PIN_WAKEUP_ENABLE : 0);
-	return 0;
+			       on && (type == ESP32S31_GPIO_INTR_LOW_LEVEL ||
+				      type == ESP32S31_GPIO_INTR_HIGH_LEVEL) ?
+				GPIO_PIN_WAKEUP_ENABLE : 0);
+	if (on) {
+		pctl->wake_mask |= bit;
+	} else {
+		pctl->wake_mask &= ~bit;
+	}
+out:
+	raw_spin_unlock_irqrestore(&pctl->wake_lock, flags);
+	return ret;
+}
+
+int esp32s31_gpio_get_lp_wake(struct esp32s31_gpio_wake *wake)
+{
+	struct esp32s31_pinctrl *pctl;
+	unsigned long flags;
+	u32 mask, pin, value, pullup, pulldown, type;
+	int ret = 0;
+
+	*wake = (struct esp32s31_gpio_wake){};
+	mutex_lock(&esp32s31_gpio_owner_lock);
+	pctl = esp32s31_gpio_owner;
+	if (!pctl) {
+		ret = -ENODEV;
+		goto unlock_owner;
+	}
+	raw_spin_lock_irqsave(&pctl->wake_lock, flags);
+	/* Only pads 0..7 have an always-on LP input. HP-only wake remains
+	 * available in s2idle, but must not be silently lost in MEM.
+	 */
+	if (pctl->wake_mask & ~0xffULL) {
+		ret = -EOPNOTSUPP;
+		goto unlock_wake;
+	}
+	mask = pctl->wake_mask;
+	raw_spin_lock(&pctl->lock);
+	for (pin = 0; pin < 8; pin++) {
+		if (!(mask & BIT(pin)))
+			continue;
+		type = FIELD_GET(GPIO_PIN_INT_TYPE,
+			readl_relaxed(esp32s31_pin_reg(pctl, pin)));
+		if (type < ESP32S31_GPIO_INTR_POSEDGE ||
+		    type > ESP32S31_GPIO_INTR_HIGH_LEVEL) {
+			ret = -EINVAL;
+			break;
+		}
+		value = readl_relaxed(esp32s31_iomux_reg(pctl, pin));
+		pullup = value & IOMUX_FUN_PU;
+		pulldown = value & IOMUX_FUN_PD;
+		if (value & IOMUX_SLP_SEL) {
+			if (!(value & IOMUX_SLP_IE)) {
+				ret = -EINVAL;
+				break;
+			}
+			pullup = value & IOMUX_SLP_PU;
+			pulldown = value & IOMUX_SLP_PD;
+		}
+		if (pullup && pulldown) {
+			ret = -EINVAL;
+			break;
+		}
+		wake->mask |= BIT(pin);
+		wake->types |= type << (3 * pin);
+		if (pullup)
+			wake->pullup |= BIT(pin);
+		if (pulldown)
+			wake->pulldown |= BIT(pin);
+	}
+	raw_spin_unlock(&pctl->lock);
+unlock_wake:
+	raw_spin_unlock_irqrestore(&pctl->wake_lock, flags);
+unlock_owner:
+	mutex_unlock(&esp32s31_gpio_owner_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_gpio_get_lp_wake);
+
+void esp32s31_gpio_replay_lp_wake(u32 mask)
+{
+	struct esp32s31_pinctrl *pctl;
+	unsigned long flags;
+
+	/* LP consumes its own edge latch while HP GPIO is disconnected from the
+	 * pad. Restore that captured event to the native IRQ path before device
+	 * IRQs resume. W1TS coalesces with an already pending GPIO event.
+	 */
+	mutex_lock(&esp32s31_gpio_owner_lock);
+	pctl = esp32s31_gpio_owner;
+	if (pctl) {
+		raw_spin_lock_irqsave(&pctl->wake_lock, flags);
+		mask &= pctl->wake_mask & 0xffU;
+		if (!pctl->removing && mask)
+			writel(mask, pctl->gpio_base + GPIO_STATUS_W1TS);
+		raw_spin_unlock_irqrestore(&pctl->wake_lock, flags);
+	}
+	mutex_unlock(&esp32s31_gpio_owner_lock);
+}
+EXPORT_SYMBOL_GPL(esp32s31_gpio_replay_lp_wake);
+
+static void esp32s31_gpio_unpublish(void *data)
+{
+	struct esp32s31_pinctrl *pctl = data;
+	unsigned long flags;
+	bool parent_wake;
+	unsigned int pin;
+
+	mutex_lock(&esp32s31_gpio_owner_lock);
+	if (esp32s31_gpio_owner == pctl)
+		esp32s31_gpio_owner = NULL;
+	raw_spin_lock_irqsave(&pctl->wake_lock, flags);
+	pctl->removing = true;
+	parent_wake = !!pctl->wake_mask;
+	for (pin = 0; pin < ESP32S31_GPIO_NR; pin++)
+		if (pctl->wake_mask & BIT_ULL(pin))
+			esp32s31_update_bits(pctl, esp32s31_pin_reg(pctl, pin),
+					       GPIO_PIN_WAKEUP_ENABLE, 0);
+	pctl->wake_mask = 0;
+	raw_spin_unlock_irqrestore(&pctl->wake_lock, flags);
+	if (parent_wake)
+		disable_irq_wake(pctl->gc.irq.parents[0]);
+	mutex_unlock(&esp32s31_gpio_owner_lock);
+}
+
+static int esp32s31_gpio_irq_retrigger(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct esp32s31_pinctrl *pctl = gpiochip_get_data(gc);
+	unsigned int pin = irqd_to_hwirq(d);
+
+	/* Resend through the same hardware pending latch as LP wake replay.
+	 * This coalesces with pending pad status instead of queueing a second
+	 * software IRQ replay while the parent can already be asserted.
+	 */
+	writel(BIT(pin % 32), pctl->gpio_base +
+		(pin < 32 ? GPIO_STATUS_W1TS : GPIO_STATUS1_W1TS));
+	return 1;
 }
 
 static const struct irq_chip esp32s31_gpio_irq_chip = {
@@ -1060,6 +1224,7 @@ static const struct irq_chip esp32s31_gpio_irq_chip = {
 	.irq_unmask = esp32s31_gpio_irq_unmask,
 	.irq_set_type = esp32s31_gpio_irq_set_type,
 	.irq_set_wake = esp32s31_gpio_irq_set_wake,
+	.irq_retrigger = esp32s31_gpio_irq_retrigger,
 	.flags = IRQCHIP_IMMUTABLE,
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
@@ -1112,6 +1277,7 @@ static int esp32s31_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->cnnt_pad_base))
 		return PTR_ERR(pctl->cnnt_pad_base);
 	raw_spin_lock_init(&pctl->lock);
+	raw_spin_lock_init(&pctl->wake_lock);
 	mutex_init(&pctl->groups_lock);
 	esp32s31_update_bits(pctl, pctl->gpio_base + GPIO_CLOCK_GATE,
 			       GPIO_CLOCK_GATE_EN, GPIO_CLOCK_GATE_EN);
@@ -1198,6 +1364,16 @@ static int esp32s31_pinctrl_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to add GPIO pin range\n");
 
 	platform_set_drvdata(pdev, pctl);
+	mutex_lock(&esp32s31_gpio_owner_lock);
+	if (esp32s31_gpio_owner) {
+		mutex_unlock(&esp32s31_gpio_owner_lock);
+		return -EBUSY;
+	}
+	esp32s31_gpio_owner = pctl;
+	mutex_unlock(&esp32s31_gpio_owner_lock);
+	ret = devm_add_action_or_reset(dev, esp32s31_gpio_unpublish, pctl);
+	if (ret)
+		return ret;
 	dev_info(dev, "registered 60 GPIOs with pinmux, matrix and IRQ support\n");
 	return 0;
 }

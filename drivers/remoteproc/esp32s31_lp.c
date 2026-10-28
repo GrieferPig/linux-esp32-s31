@@ -2,7 +2,6 @@
 /* ESP32-S31 LP-core remoteproc and hardware mailbox driver. */
 
 #include <linux/bitops.h>
-#include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/device.h>
@@ -26,27 +25,22 @@
 #include <linux/regmap.h>
 #include <linux/remoteproc.h>
 #include <linux/reboot.h>
+#include <linux/rtc.h>
 #include <linux/suspend.h>
 #include <linux/iopoll.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
 #include <linux/soc/espressif/esp32s31-lp.h>
+#include <linux/soc/espressif/esp32s31-gpio.h>
 
 #include "remoteproc_internal.h"
 
 #define S31_LP_SRAM_BASE                0x2e000000ULL
 #define S31_LP_SRAM_SIZE                0x00008000ULL
-#define S31_LP_RESET_VECTOR             (S31_LP_SRAM_BASE + 0x80)
 
 #define S31_LP_SYS_BOOT_ADDR_REG        0x18
-#define S31_LP_SYS_STORE0_REG           0x2c
 #define S31_LP_SYS_STORE1_REG           0x30
-#define S31_LP_SYS_STORE2_REG           0x34
-#define S31_LP_SYS_STORE3_REG           0x38
-#define S31_LP_SYS_STORE4_REG           0x3c
-#define S31_LP_SYS_STORE5_REG           0x40
-#define S31_DEEP_SLEEP_MAGIC            0x53314453U
 #define S31_LP_SYS_DEBUG_PC_REG         0x190
 #define S31_LP_SYS_EXCEPTION_PC_REG     0x194
 
@@ -54,6 +48,7 @@
 #define S31_LP_CLKRST_INTR_CTRL_REG     0x28
 #define S31_LP_CLKRST_MAILBOX_REG       0x38
 #define S31_LP_CLKRST_CPU_REG           0x44
+#define S31_LP_AON_HP0_RESET_CAUSE      0x20701030
 #define S31_LP_CPU_CLK_EN               BIT(30)
 #define S31_LP_CPU_RESET                BIT(31)
 #define S31_LP_INTR_CLK_EN              BIT(30)
@@ -99,6 +94,16 @@
 #define S31_LP_RX_DEPTH                 64
 #define S31_LP_TIMEOUT_MS               1000
 
+#define S31_RTC_TIMER_TARGET0_LOW_REG    0x00
+#define S31_RTC_TIMER_TARGET0_HIGH_REG   0x04
+#define S31_RTC_TIMER_INT_RAW_REG        0x28
+#define S31_RTC_TIMER_INT_ENA_REG        0x30
+#define S31_RTC_TIMER_INT_CLR_REG        0x34
+#define S31_RTC_TIMER_TARGET_EN          BIT(31)
+#define S31_RTC_TIMER_SOC_WAKE           BIT(31)
+#define S31_RTC_TIMER_MASK               GENMASK_ULL(47, 0)
+#define S31_RTC_ALARM_MAX_SECONDS        (366U * 24 * 60 * 60)
+
 #define S31_RTC_TIMER_UPDATE_REG        0x10
 #define S31_RTC_TIMER_BUF0_LOW_REG      0x14
 #define S31_RTC_TIMER_BUF0_HIGH_REG     0x18
@@ -118,11 +123,23 @@ struct esp32s31_lp {
 	void __iomem *lp_pms;
 	void __iomem *lp_sys;
 	void __iomem *lp_clkrst;
+	void __iomem *reset_cause;
 	void __iomem *rtc_timer;
 	struct regmap *pmu;
-	struct clk *cpu_clk;
-	struct notifier_block reboot_notifier;
 	int irq;
+	struct rtc_device *rtc;
+	int rtc_irq;
+	bool rtc_irq_wake;
+	spinlock_t rtc_lock;
+	u32 rtc_cal;
+	u64 rtc_base_ticks;
+	time64_t rtc_base_time;
+	time64_t rtc_alarm_time;
+	u64 rtc_alarm_ticks;
+	bool rtc_valid;
+	bool rtc_alarm_enabled;
+	bool rtc_alarm_pending;
+	bool rtc_alarm_handoff;
 
 	struct mbox_controller mbox;
 	struct mbox_chan chan;
@@ -154,27 +171,23 @@ struct esp32s31_lp {
 	atomic64_t timeout_count;
 
 	struct miscdevice miscdev;
-	struct s31_lp_sleep_control s2idle_control;
-	bool s2idle_armed;
 	struct s31_lp_sleep_control mem_control;
 	bool mem_armed;
-	struct s31_lp_sleep_control deep_control;
-	bool deep_armed;
-	struct s31_lp_sleep_control sleep_test_control;
-	int sleep_test_result;
-	struct s31_lp_sleep_control gpio_test_control;
-	int gpio_test_result;
 };
 
 static u64 esp32s31_lp_rtc_count(struct esp32s31_lp *lp)
 {
-	u32 high;
+	u32 high, low, check;
 
 	writel(S31_RTC_TIMER_MAIN_UPDATE,
 	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-	high = readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_HIGH_REG) & 0xffff;
-	return ((u64)high << 32) |
-		readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_LOW_REG);
+	/* LP can take another snapshot concurrently. Retry across a low wrap. */
+	do {
+		high = readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_HIGH_REG) & 0xffff;
+		low = readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_LOW_REG);
+		check = readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_HIGH_REG) & 0xffff;
+	} while (high != check);
+	return ((u64)high << 32) | low;
 }
 
 static int esp32s31_lp_calibrate_rtc_slow(struct esp32s31_lp *lp)
@@ -186,15 +199,14 @@ static int esp32s31_lp_calibrate_rtc_slow(struct esp32s31_lp *lp)
 	       S31_RTC_TIMER_CLK_EN,
 	       lp->rtc_timer + S31_RTC_TIMER_DATE_REG);
 	update = readl(lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-	writel(update | S31_RTC_TIMER_MAIN_RESET,
-	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
+	/* The RTC is shared with Linux timekeeping: never reset on LP restart. */
 	writel(update & ~(S31_RTC_TIMER_MAIN_RESET | S31_RTC_TIMER_MAIN_STALL),
 	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
 
 	first = esp32s31_lp_rtc_count(lp);
 	started_ns = ktime_get_raw_ns();
 	usleep_range(S31_RTC_CAL_SAMPLE_US, S31_RTC_CAL_SAMPLE_US + 1000);
-	delta = esp32s31_lp_rtc_count(lp) - first;
+	delta = (esp32s31_lp_rtc_count(lp) - first) & S31_RTC_TIMER_MASK;
 	elapsed_us = div_u64(ktime_get_raw_ns() - started_ns, NSEC_PER_USEC);
 	if (!delta || !elapsed_us)
 		return -EIO;
@@ -207,6 +219,7 @@ static int esp32s31_lp_calibrate_rtc_slow(struct esp32s31_lp *lp)
 				     "invalid RTC slow clock calibration: %llu Hz, cal=%llu\n",
 				     hz, cal);
 
+	lp->rtc_cal = cal;
 	writel((u32)cal, lp->lp_sys + S31_LP_SYS_STORE1_REG);
 	dev_info(lp->dev,
 		 "RTC slow clock calibrated at %llu Hz (Q13.19 period %llu)\n",
@@ -214,165 +227,9 @@ static int esp32s31_lp_calibrate_rtc_slow(struct esp32s31_lp *lp)
 	return 0;
 }
 
+#include "esp32s31_lp_rtc.inc"
+
 static struct esp32s31_lp *esp32s31_lp_sleep_owner;
-static unsigned int esp32s31_lp_s2idle_wake_ms;
-module_param_named(s2idle_wake_ms, esp32s31_lp_s2idle_wake_ms, uint, 0644);
-MODULE_PARM_DESC(s2idle_wake_ms,
-	"LP timer wakeup for s2idle in milliseconds (0 disables it)");
-static unsigned int esp32s31_lp_mem_wake_ms = 2000;
-module_param_named(mem_wake_ms, esp32s31_lp_mem_wake_ms, uint, 0644);
-MODULE_PARM_DESC(mem_wake_ms,
-	"LP timer wakeup for suspend-to-RAM in milliseconds (10..600000)");
-static int esp32s31_lp_mem_wake_gpio = -1;
-module_param_named(mem_wake_gpio, esp32s31_lp_mem_wake_gpio, int, 0644);
-MODULE_PARM_DESC(mem_wake_gpio,
-	"Optional LP GPIO wake pin for suspend-to-RAM (-1 disables, 0..7)");
-static bool esp32s31_lp_mem_gpio_active_high = true;
-module_param_named(mem_gpio_active_high, esp32s31_lp_mem_gpio_active_high,
-		   bool, 0644);
-MODULE_PARM_DESC(mem_gpio_active_high, "LP GPIO wake active level");
-static unsigned int esp32s31_lp_mem_gpio_pull;
-module_param_named(mem_gpio_pull, esp32s31_lp_mem_gpio_pull, uint, 0644);
-MODULE_PARM_DESC(mem_gpio_pull,
-	"LP GPIO wake pull: 0=none, 1=pull-up, 2=pull-down");
-
-static void esp32s31_lp_s2idle_check(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-	void __iomem *state_reg;
-	u32 state;
-	int ret;
-
-	if (!lp || !lp->s2idle_armed || !esp32s31_lp_s2idle_wake_ms)
-		return;
-
-	/*
-	 * INTMTX/CLIC cannot yet deliver the LP mailbox wake through the
-	 * noirq s2idle phase.  Poll only for the explicitly requested test
-	 * timer so device suspend/resume and the LP transaction remain
-	 * testable without claiming an HP low-power state.
-	 */
-	state_reg = lp->sram + S31_LP_SLEEP_CONTROL_OFFSET +
-		    offsetof(struct s31_lp_sleep_control, state);
-	/*
-	 * timekeeping is already suspended here, so ktime_get() cannot bound a
-	 * polling loop.  Use the atomic polling helper, whose timeout is based on
-	 * calibrated delays and remains live throughout the noirq phase.
-	 */
-	ret = readl_poll_timeout_atomic(state_reg, state,
-					state == S31_LP_SLEEP_WAKING, 10,
-					(esp32s31_lp_s2idle_wake_ms + 100) *
-					USEC_PER_MSEC);
-	if (!ret) {
-		/* Keep s2idle_enter() from sleeping after this check. */
-		pm_wakeup_hard_event(lp->dev);
-		return;
-	}
-
-	/* Fail safe: never strand a test suspend if the LP timer did not fire. */
-	pm_wakeup_hard_event(lp->dev);
-}
-
-static bool esp32s31_lp_s2idle_wake(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-	u32 state;
-
-	if (!lp || !lp->s2idle_armed)
-		return false;
-	state = readl(lp->sram + S31_LP_SLEEP_CONTROL_OFFSET +
-		      offsetof(struct s31_lp_sleep_control, state));
-	return state == S31_LP_SLEEP_WAKING;
-}
-
-static int esp32s31_lp_s2idle_begin(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-
-	if (!lp || !READ_ONCE(lp->ready))
-		return -ENODEV;
-	memset(&lp->s2idle_control, 0, sizeof(lp->s2idle_control));
-	lp->s2idle_control.flags = S31_LP_SLEEP_F_S2IDLE |
-					 S31_LP_SLEEP_F_DRY_RUN;
-	if (esp32s31_lp_s2idle_wake_ms) {
-		if (esp32s31_lp_s2idle_wake_ms < 10 ||
-		    esp32s31_lp_s2idle_wake_ms > 600000)
-			return -ERANGE;
-		lp->s2idle_control.wake_mask = S31_LP_WAKE_TIMER;
-		lp->s2idle_control.deadline_lo =
-			esp32s31_lp_s2idle_wake_ms * 1000U;
-	}
-	lp->s2idle_armed = false;
-	return 0;
-}
-
-static int esp32s31_lp_s2idle_prepare(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-	int ret;
-
-	if (!lp)
-		return -ENODEV;
-	ret = esp32s31_lp_sleep_prepare(&lp->s2idle_control);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_sleep_arm(&lp->s2idle_control);
-	if (ret) {
-		esp32s31_lp_sleep_abort(&lp->s2idle_control);
-		return ret;
-	}
-	lp->s2idle_armed = true;
-	return 0;
-}
-
-static void esp32s31_lp_s2idle_restore(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-	u64 sleep_ticks, wake_ticks;
-	int ret;
-
-	if (!lp || !lp->s2idle_armed)
-		return;
-	ret = esp32s31_lp_sleep_query(&lp->s2idle_control);
-	if (ret)
-		dev_warn(lp->dev, "failed to read LP wake status: %d\n", ret);
-	else {
-		sleep_ticks = (u64)lp->s2idle_control.sleep_ticks_lo |
-			      ((u64)lp->s2idle_control.sleep_ticks_hi << 32);
-		wake_ticks = (u64)lp->s2idle_control.wake_ticks_lo |
-			     ((u64)lp->s2idle_control.wake_ticks_hi << 32);
-		dev_info(lp->dev,
-			 "s2idle wake reason=%#x raw=%#x lp_cycles=%llu requested_ms=%u\n",
-			 lp->s2idle_control.wake_reason,
-			 lp->s2idle_control.wake_raw,
-			 wake_ticks - sleep_ticks,
-			 esp32s31_lp_s2idle_wake_ms);
-	}
-	ret = esp32s31_lp_sleep_reclaim(&lp->s2idle_control);
-	if (ret)
-		dev_warn(lp->dev, "failed to reclaim LP sleep state: %d\n", ret);
-	lp->s2idle_armed = false;
-}
-
-static void esp32s31_lp_s2idle_end(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-
-	if (!lp || !lp->s2idle_armed)
-		return;
-	esp32s31_lp_sleep_abort(&lp->s2idle_control);
-	esp32s31_lp_sleep_reclaim(&lp->s2idle_control);
-	lp->s2idle_armed = false;
-}
-
-static const struct platform_s2idle_ops esp32s31_lp_s2idle_ops = {
-	.begin = esp32s31_lp_s2idle_begin,
-	.prepare = esp32s31_lp_s2idle_prepare,
-	.check = esp32s31_lp_s2idle_check,
-	.wake = esp32s31_lp_s2idle_wake,
-	.restore = esp32s31_lp_s2idle_restore,
-	.end = esp32s31_lp_s2idle_end,
-};
 
 static int esp32s31_lp_start_tx(struct esp32s31_lp *lp, u32 message)
 {
@@ -477,7 +334,6 @@ static irqreturn_t esp32s31_lp_irq(int irq, void *data)
 			WRITE_ONCE(lp->ready, true);
 		if (message == S31_LP_MSG_WAKE) {
 			pm_wakeup_event(lp->dev, 0);
-			s2idle_wake();
 		}
 		if ((message & S31_LP_MESSAGE_MASK) == S31_LP_RSP_PONG)
 			lp->ping_rtt_us = ktime_us_delta(ktime_get(), lp->ping_started);
@@ -561,7 +417,8 @@ static int esp32s31_lp_start(struct rproc *rproc)
 	u32 pms;
 	int ret;
 
-	if (bootaddr < S31_LP_SRAM_BASE || bootaddr >= S31_LP_SRAM_BASE + S31_LP_SRAM_SIZE)
+	if (bootaddr < S31_LP_SRAM_BASE ||
+	    bootaddr >= S31_LP_SRAM_BASE + S31_LP_FIRMWARE_SIZE)
 		return -EINVAL;
 
 	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_SYSREG_CTRL,
@@ -570,9 +427,6 @@ static int esp32s31_lp_start(struct rproc *rproc)
 		return ret;
 	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_TIMER_CTRL,
 					  "RTC timer", NULL);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_calibrate_rtc_slow(lp);
 	if (ret)
 		return ret;
 	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_PERICLKRST_CTRL,
@@ -589,7 +443,6 @@ static int esp32s31_lp_start(struct rproc *rproc)
 		return ret;
 
 	writel((u32)bootaddr, lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG);
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE0_REG);
 
 	/* Mirror ESP-IDF lp_core_ll_reset_register() and bus-clock setup. */
 	value = readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG);
@@ -646,9 +499,8 @@ static int esp32s31_lp_start(struct rproc *rproc)
 		regmap_read(lp->pmu, S31_PMU_LP_CPU_PWR2_REG, &pmu_pwr2);
 		regmap_read(lp->pmu, S31_PMU_HP_LP_COMM_REG, &pmu_comm);
 		dev_err(lp->dev,
-			"state boot=%08x stage=%08x pc=%08x exc=%08x cpu=%08x intr=%08x mbclk=%08x dbg=%08x pmu=%08x/%08x/%08x/%08x\n",
+			"state boot=%08x pc=%08x exc=%08x cpu=%08x intr=%08x mbclk=%08x dbg=%08x pmu=%08x/%08x/%08x/%08x\n",
 			readl(lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG),
-			readl(lp->lp_sys + S31_LP_SYS_STORE0_REG),
 			readl(lp->lp_sys + S31_LP_SYS_DEBUG_PC_REG),
 			readl(lp->lp_sys + S31_LP_SYS_EXCEPTION_PC_REG),
 			readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG),
@@ -674,6 +526,7 @@ static int esp32s31_lp_stop(struct rproc *rproc)
 {
 	struct esp32s31_lp *lp = rproc->priv;
 
+	WRITE_ONCE(lp->ready, false);
 	regmap_write(lp->pmu, S31_PMU_LP_CPU_PWR1_REG,
 		     S31_PMU_LP_CPU_SLEEP_REQ);
 	return 0;
@@ -771,77 +624,67 @@ out_clear:
 	return ret;
 }
 
-bool esp32s31_lp_sleep_available(void)
-{
-	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
-
-	return lp && READ_ONCE(lp->ready);
-}
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_available);
-
-int esp32s31_lp_sleep_prepare(struct s31_lp_sleep_control *control)
+static int esp32s31_lp_sleep_prepare(struct s31_lp_sleep_control *control)
 {
 	return esp32s31_lp_sleep_rpc(S31_LP_CMD_SLEEP_PREPARE,
 		S31_LP_RSP_SLEEP_PREPARED, control, true);
 }
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_prepare);
 
-int esp32s31_lp_sleep_arm(struct s31_lp_sleep_control *control)
+static int esp32s31_lp_sleep_arm(struct s31_lp_sleep_control *control)
 {
 	return esp32s31_lp_sleep_rpc(S31_LP_CMD_SLEEP_ARM,
 		S31_LP_RSP_SLEEP_ARMED, control, true);
 }
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_arm);
 
-int esp32s31_lp_sleep_abort(struct s31_lp_sleep_control *control)
+static int esp32s31_lp_sleep_abort(struct s31_lp_sleep_control *control)
 {
 	return esp32s31_lp_sleep_rpc(S31_LP_CMD_SLEEP_ABORT,
 		S31_LP_RSP_SLEEP_ABORTED, control, false);
 }
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_abort);
 
-int esp32s31_lp_sleep_query(struct s31_lp_sleep_control *control)
+static int esp32s31_lp_sleep_query(struct s31_lp_sleep_control *control)
 {
 	return esp32s31_lp_sleep_rpc(S31_LP_CMD_SLEEP_QUERY,
 		S31_LP_RSP_SLEEP_STATUS, control, false);
 }
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_query);
 
-int esp32s31_lp_sleep_reclaim(struct s31_lp_sleep_control *control)
+static int esp32s31_lp_sleep_reclaim(struct s31_lp_sleep_control *control)
 {
 	return esp32s31_lp_sleep_rpc(S31_LP_CMD_SLEEP_RECLAIM,
 		S31_LP_RSP_SLEEP_RECLAIMED, control, false);
 }
-EXPORT_SYMBOL_GPL(esp32s31_lp_sleep_reclaim);
 
 int esp32s31_lp_system_suspend_prepare(void)
 {
 	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
+	struct esp32s31_gpio_wake gpio;
 	int ret;
 
 	if (!lp || !READ_ONCE(lp->ready))
 		return -ENODEV;
-	if (esp32s31_lp_mem_wake_ms < 10 ||
-	    esp32s31_lp_mem_wake_ms > 600000)
-		return -ERANGE;
-	if (esp32s31_lp_mem_wake_gpio < -1 ||
-	    esp32s31_lp_mem_wake_gpio > 7 || esp32s31_lp_mem_gpio_pull > 2)
-		return -ERANGE;
+	/* Normal device suspend has enabled native IRQ wake. Snapshot before
+	 * noirq/CPU-off phases while both GPIO mappings and LP RPC IRQs are live.
+	 */
+	ret = esp32s31_gpio_get_lp_wake(&gpio);
+	if (ret)
+		return ret;
 	memset(&lp->mem_control, 0, sizeof(lp->mem_control));
 	lp->mem_control.flags = S31_LP_SLEEP_F_MEM;
-	lp->mem_control.wake_mask = S31_LP_WAKE_TIMER;
-	lp->mem_control.deadline_lo = esp32s31_lp_mem_wake_ms * 1000U;
-	if (esp32s31_lp_mem_wake_gpio >= 0) {
-		u32 gpio = BIT(esp32s31_lp_mem_wake_gpio);
-
+	ret = esp32s31_lp_rtc_handoff(lp, &lp->mem_control);
+	if (ret)
+		return ret;
+	if (lp->mem_control.flags & S31_LP_SLEEP_F_RTC_ABSOLUTE)
+		lp->mem_control.wake_mask |= S31_LP_WAKE_TIMER;
+	if (gpio.mask) {
 		lp->mem_control.wake_mask |= S31_LP_WAKE_GPIO;
-		lp->mem_control.gpio_mask_lo = gpio;
-		if (esp32s31_lp_mem_gpio_active_high)
-			lp->mem_control.gpio_level_lo = gpio;
-		if (esp32s31_lp_mem_gpio_pull == 1)
-			lp->mem_control.flags |= S31_LP_SLEEP_F_GPIO_PULL_UP;
-		else if (esp32s31_lp_mem_gpio_pull == 2)
-			lp->mem_control.flags |= S31_LP_SLEEP_F_GPIO_PULL_DOWN;
+		lp->mem_control.gpio_mask_lo = gpio.mask;
+		lp->mem_control.gpio_types = gpio.types;
+		lp->mem_control.gpio_pullup_mask = gpio.pullup;
+		lp->mem_control.gpio_pulldown_mask = gpio.pulldown;
+	}
+	if (!lp->mem_control.wake_mask) {
+		ret = -ENXIO;
+		goto restore_alarm;
 	}
 	/* Conservative stage one: retain every domain until measured otherwise. */
 	lp->mem_control.retention_mask = ~0U;
@@ -851,40 +694,106 @@ int esp32s31_lp_system_suspend_prepare(void)
 
 	ret = esp32s31_lp_sleep_prepare(&lp->mem_control);
 	if (ret)
-		return ret;
-	if (!(lp->mem_control.capabilities & S31_LP_CAP_RETENTION_DESC))
-		return -EOPNOTSUPP;
+		goto restore_alarm;
+	if (!(lp->mem_control.capabilities & S31_LP_CAP_RETENTION_DESC) ||
+	    (gpio.mask && !(lp->mem_control.capabilities & S31_LP_CAP_GPIO_WAKE)) ||
+	    ((lp->mem_control.flags & S31_LP_SLEEP_F_RTC_ABSOLUTE) &&
+	     !(lp->mem_control.capabilities & S31_LP_CAP_RTC_ABSOLUTE))) {
+		ret = -EOPNOTSUPP;
+		goto abort_sleep;
+	}
 	ret = esp32s31_lp_sleep_arm(&lp->mem_control);
-	if (ret) {
-		esp32s31_lp_sleep_abort(&lp->mem_control);
-		return ret;
+	if (ret)
+		goto abort_sleep;
+	if (lp->mem_control.state != S31_LP_SLEEP_ARMED) {
+		pm_wakeup_event(lp->dev, 0);
+		ret = -EBUSY;
+		goto abort_sleep;
 	}
 	lp->mem_armed = true;
-	dev_info(lp->dev, "armed suspend-to-RAM timer for %u ms%s\n",
-		 esp32s31_lp_mem_wake_ms,
-		 esp32s31_lp_mem_wake_gpio >= 0 ? " with LP GPIO wake" : "");
 	return 0;
+
+abort_sleep:
+	esp32s31_lp_sleep_abort(&lp->mem_control);
+restore_alarm:
+	esp32s31_lp_rtc_restore(lp);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_prepare);
+
+int esp32s31_lp_system_suspend_validate(void)
+{
+	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
+	struct s31_lp_sleep_control control;
+	struct esp32s31_gpio_wake gpio;
+	int ret;
+
+	if (!lp || !lp->mem_armed)
+		return -ENODEV;
+	/* A driver which changes wake selection after ordinary device suspend
+	 * cannot silently invalidate an already-armed LP request. No mailbox RPC
+	 * is issued after device IRQs have been suspended.
+	 */
+	ret = esp32s31_gpio_get_lp_wake(&gpio);
+	if (ret)
+		return ret;
+	if (gpio.mask != lp->mem_control.gpio_mask_lo ||
+	    gpio.types != lp->mem_control.gpio_types ||
+	    gpio.pullup != lp->mem_control.gpio_pullup_mask ||
+	    gpio.pulldown != lp->mem_control.gpio_pulldown_mask) {
+		dev_err(lp->dev, "GPIO wake changed after LP preparation\n");
+		return -EAGAIN;
+	}
+	ret = esp32s31_lp_read_control(lp, &control);
+	if (ret)
+		return ret;
+	if (control.state != S31_LP_SLEEP_ARMED) {
+		pm_wakeup_event(lp->dev, 0);
+		return -EBUSY;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_validate);
+
+void esp32s31_lp_system_suspend_wake(void)
+{
+	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
+	struct s31_lp_sleep_control control;
+
+	if (!lp || !lp->mem_armed)
+		return;
+	/* No mailbox transaction before resume_device_irqs(). The LP response
+	 * is checksummed in retained SRAM and its GPIO edge must reach the
+	 * consumer even when the physical pulse ended before HP resumed.
+	 */
+	if (esp32s31_lp_read_control(lp, &control) ||
+	    control.sequence != lp->mem_control.sequence ||
+	    control.state != S31_LP_SLEEP_WAKING ||
+	    !(control.wake_reason & S31_LP_WAKE_GPIO))
+		return;
+	esp32s31_gpio_replay_lp_wake(control.wake_raw &
+				    lp->mem_control.gpio_mask_lo);
+}
+EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_wake);
 
 void esp32s31_lp_system_suspend_finish(void)
 {
 	struct esp32s31_lp *lp = READ_ONCE(esp32s31_lp_sleep_owner);
 	int ret;
 
-	if (!lp || !lp->mem_armed)
+	if (!lp)
 		return;
+	if (!lp->mem_armed)
+		goto restore_alarm;
 	ret = esp32s31_lp_sleep_query(&lp->mem_control);
 	if (ret)
 		dev_warn(lp->dev, "failed to query suspend wake: %d\n", ret);
-	else
-		dev_info(lp->dev, "resume state=%u reason=%#x raw=%#x\n",
-			 lp->mem_control.state, lp->mem_control.wake_reason,
-			 lp->mem_control.wake_raw);
 	ret = esp32s31_lp_sleep_reclaim(&lp->mem_control);
 	if (ret)
 		dev_warn(lp->dev, "failed to reclaim suspend state: %d\n", ret);
 	lp->mem_armed = false;
+restore_alarm:
+	esp32s31_lp_rtc_restore(lp);
 }
 EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_finish);
 
@@ -897,7 +806,9 @@ static void *esp32s31_lp_da_to_va(struct rproc *rproc, u64 da, size_t len,
 	if (da < S31_LP_SRAM_BASE)
 		return NULL;
 	offset = da - S31_LP_SRAM_BASE;
-	if (offset > S31_LP_SRAM_SIZE || len > S31_LP_SRAM_SIZE - offset)
+	/* HP retention and PM records are not firmware load/dump storage. */
+	if (offset >= S31_LP_FIRMWARE_SIZE ||
+	    len > S31_LP_FIRMWARE_SIZE - offset)
 		return NULL;
 
 	if (is_iomem)
@@ -1077,237 +988,50 @@ static ssize_t ping_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(ping);
 
-static ssize_t sleep_test_show(struct device *dev,
-			       struct device_attribute *attr, char *buffer)
+static_assert(sizeof(struct s31_lp_poweroff) == 32);
+static_assert(S31_LP_SLEEP_CONTROL_OFFSET + sizeof(struct s31_lp_sleep_control) <=
+	      S31_LP_POWEROFF_OFFSET);
+static_assert(S31_LP_POWEROFF_OFFSET + sizeof(struct s31_lp_poweroff) <=
+	      S31_LP_RTC_ANCHOR_OFFSET);
+static_assert(S31_LP_RTC_ANCHOR_OFFSET + sizeof(struct s31_lp_rtc_anchor) <=
+	      S31_LP_SRAM_SIZE);
+
+static int esp32s31_lp_poweroff_prepare(struct sys_off_data *data)
 {
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	struct s31_lp_sleep_control *control = &lp->sleep_test_control;
-	u64 start = (u64)control->sleep_ticks_lo |
-		    ((u64)control->sleep_ticks_hi << 32);
-	u64 wake = (u64)control->wake_ticks_lo |
-		   ((u64)control->wake_ticks_hi << 32);
+	struct esp32s31_lp *lp = data->cb_data;
+	struct s31_lp_poweroff request = {
+		.magic = S31_LP_POWEROFF_MAGIC,
+		.version = S31_LP_POWEROFF_VERSION,
+		.size = sizeof(request),
+	};
+	void __iomem *handoff = lp->sram + S31_LP_POWEROFF_OFFSET;
+	unsigned long flags;
 
-	return sysfs_emit(buffer,
-		"result=%d capabilities=%#x state=%u wake_reason=%#x raw=%#x start_ticks=%llu wake_ticks=%llu\n",
-		lp->sleep_test_result, control->capabilities, control->state,
-		control->wake_reason, control->wake_raw, start, wake);
-}
-
-static ssize_t sleep_test_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buffer, size_t count)
-{
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	struct s31_lp_sleep_control *control = &lp->sleep_test_control;
-	unsigned int duration_ms;
-	int ret;
-
-	ret = kstrtouint(buffer, 0, &duration_ms);
-	if (ret)
-		return ret;
-	if (duration_ms < 10 || duration_ms > 5000)
-		return -ERANGE;
-
-	memset(control, 0, sizeof(*control));
-	control->flags = S31_LP_SLEEP_F_S2IDLE | S31_LP_SLEEP_F_DRY_RUN;
-	control->wake_mask = S31_LP_WAKE_TIMER;
-	control->deadline_lo = duration_ms * 1000U;
-	ret = esp32s31_lp_sleep_prepare(control);
-	if (!ret && !(control->capabilities & S31_LP_CAP_TIMER_WAKE))
-		ret = -EOPNOTSUPP;
-	if (!ret)
-		ret = esp32s31_lp_sleep_arm(control);
-	if (!ret) {
-		msleep(duration_ms + 20);
-		ret = esp32s31_lp_sleep_query(control);
-	}
-	if (!ret && (!(control->wake_reason & S31_LP_WAKE_TIMER) ||
-		     control->state != S31_LP_SLEEP_WAKING))
-		ret = -ETIMEDOUT;
-	if (ret)
-		esp32s31_lp_sleep_abort(control);
-	else
-		esp32s31_lp_sleep_reclaim(control);
-	lp->sleep_test_result = ret;
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(sleep_test);
-
-static ssize_t gpio_test_show(struct device *dev,
-			      struct device_attribute *attr, char *buffer)
-{
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	struct s31_lp_sleep_control *control = &lp->gpio_test_control;
-	u64 start = (u64)control->sleep_ticks_lo |
-		    ((u64)control->sleep_ticks_hi << 32);
-	u64 wake = (u64)control->wake_ticks_lo |
-		   ((u64)control->wake_ticks_hi << 32);
-
-	return sysfs_emit(buffer,
-		"result=%d capabilities=%#x state=%u wake_reason=%#x raw=%#x start_ticks=%llu wake_ticks=%llu\n",
-		lp->gpio_test_result, control->capabilities, control->state,
-		control->wake_reason, control->wake_raw, start, wake);
-}
-
-static ssize_t gpio_test_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buffer, size_t count)
-{
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	struct s31_lp_sleep_control *control = &lp->gpio_test_control;
-	ktime_t timeout;
-	unsigned int pin, level, pull, timeout_ms;
-	u32 state;
-	int ret;
-
-	if (sscanf(buffer, "%u %u %u %u", &pin, &level, &pull,
-		   &timeout_ms) != 4)
-		return -EINVAL;
-	if (pin > 7 || level > 1 || pull > 2 ||
-	    timeout_ms < 10 || timeout_ms > 5000)
-		return -ERANGE;
-
-	memset(control, 0, sizeof(*control));
-	control->flags = S31_LP_SLEEP_F_S2IDLE | S31_LP_SLEEP_F_DRY_RUN;
-	if (pull == 1)
-		control->flags |= S31_LP_SLEEP_F_GPIO_PULL_UP;
-	else if (pull == 2)
-		control->flags |= S31_LP_SLEEP_F_GPIO_PULL_DOWN;
-	control->wake_mask = S31_LP_WAKE_GPIO;
-	control->gpio_mask_lo = BIT(pin);
-	if (level)
-		control->gpio_level_lo = BIT(pin);
-
-	ret = esp32s31_lp_sleep_prepare(control);
-	if (!ret && !(control->capabilities & S31_LP_CAP_GPIO_WAKE))
-		ret = -EOPNOTSUPP;
-	if (!ret)
-		ret = esp32s31_lp_sleep_arm(control);
-	if (!ret) {
-		timeout = ktime_add_ms(ktime_get(), timeout_ms);
-		do {
-			state = readl(lp->sram + S31_LP_SLEEP_CONTROL_OFFSET +
-				      offsetof(struct s31_lp_sleep_control, state));
-			if (state == S31_LP_SLEEP_WAKING)
-				break;
-			usleep_range(500, 1000);
-		} while (ktime_before(ktime_get(), timeout));
-		if (state != S31_LP_SLEEP_WAKING)
-			ret = -ETIMEDOUT;
-		else
-			ret = esp32s31_lp_sleep_query(control);
-	}
-	if (!ret && (!(control->wake_reason & S31_LP_WAKE_GPIO) ||
-		     !(control->wake_raw & BIT(pin))))
-		ret = -EPROTO;
-	if (ret)
-		esp32s31_lp_sleep_abort(control);
-	else
-		esp32s31_lp_sleep_reclaim(control);
-	lp->gpio_test_result = ret;
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(gpio_test);
-
-static ssize_t deep_sleep_show(struct device *dev,
-			       struct device_attribute *attr, char *buffer)
-{
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	u32 marker = readl(lp->lp_sys + S31_LP_SYS_STORE2_REG);
-	u32 reason = readl(lp->lp_sys + S31_LP_SYS_STORE3_REG);
-
-	return sysfs_emit(buffer, "armed=%u previous=%u wake_reason=%#x\n",
-			  lp->deep_armed, marker == S31_DEEP_SLEEP_MAGIC,
-			  marker == S31_DEEP_SLEEP_MAGIC ? reason : 0);
-}
-
-static int esp32s31_lp_reboot_notify(struct notifier_block *notifier,
-				     unsigned long action, void *data)
-{
-	struct esp32s31_lp *lp = container_of(notifier, struct esp32s31_lp,
-					      reboot_notifier);
-	int ret;
-
-	if (action != SYS_POWER_OFF || !READ_ONCE(lp->deep_armed))
-		return NOTIFY_DONE;
-
-	/*
-	 * SOC_CLK_UPDATE requires both HP harts to participate in the clock-tree
-	 * handshake.  Do the terminal CPLL-to-XTAL transition from the reboot
-	 * notifier, before migrate_to_reboot_cpu() stops the secondary hart.
-	 * OpenSBI then only has to verify the already-latched 40 MHz state before
-	 * the PMU powers the PLL domains down.
+	/* Runs after the clock provider's default-priority XTAL handoff. */
+	writel(0, handoff);
+	spin_lock_irqsave(&lp->rtc_lock, flags);
+	/* A previously delivered alarm is not a new wake request. Capture only
+	 * the currently enabled native RTC alarm, preserving its calibrated
+	 * absolute deadline across the rest of shutdown.
 	 */
-	ret = clk_set_rate(lp->cpu_clk, 40000000UL);
-	if (!ret) {
-		dev_info(lp->dev, "deep-sleep clock handoff to 40 MHz XTAL complete\n");
-		return NOTIFY_OK;
+	if (lp->rtc_alarm_enabled && device_may_wakeup(lp->dev)) {
+		request.flags = S31_LP_POWEROFF_RTC;
+		request.deadline_lo = lower_32_bits(lp->rtc_alarm_ticks);
+		request.deadline_hi = upper_32_bits(lp->rtc_alarm_ticks);
 	}
+	lp->rtc_alarm_handoff = true;
+	esp32s31_lp_rtc_disarm(lp);
+	spin_unlock_irqrestore(&lp->rtc_lock, flags);
 
-	/* Fail closed: revoke the always-on authorization so a failed handoff can
-	 * never enter deep sleep while the CPU still depends on CPLL. */
-	WRITE_ONCE(lp->deep_armed, false);
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE4_REG);
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE5_REG);
-	esp32s31_lp_sleep_abort(&lp->deep_control);
-	dev_err(lp->dev, "deep-sleep 40 MHz clock handoff failed: %d\n", ret);
-	return NOTIFY_BAD;
+	request.crc = crc32_le(~0U, (const u8 *)&request,
+			       offsetof(struct s31_lp_poweroff, crc)) ^ ~0U;
+	memcpy_toio(handoff + sizeof(request.magic),
+		    (const u8 *)&request + sizeof(request.magic),
+		    sizeof(request) - sizeof(request.magic));
+	wmb();
+	writel(request.magic, handoff);
+	return NOTIFY_DONE;
 }
-
-static void esp32s31_lp_unregister_reboot_notifier(void *data)
-{
-	struct esp32s31_lp *lp = data;
-
-	unregister_reboot_notifier(&lp->reboot_notifier);
-}
-
-static ssize_t deep_sleep_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buffer, size_t count)
-{
-	struct esp32s31_lp *lp = dev_get_drvdata(dev);
-	struct s31_lp_sleep_control *control = &lp->deep_control;
-	unsigned int duration_ms;
-	int ret;
-
-	ret = kstrtouint(buffer, 0, &duration_ms);
-	if (ret)
-		return ret;
-	if (duration_ms < 1000 || duration_ms > 600000)
-		return -ERANGE;
-	if (!READ_ONCE(lp->ready) || lp->mem_armed || lp->deep_armed)
-		return -EBUSY;
-
-	memset(control, 0, sizeof(*control));
-	control->flags = S31_LP_SLEEP_F_DEEP_REBOOT;
-	control->wake_mask = S31_LP_WAKE_TIMER;
-	control->deadline_lo = duration_ms * 1000U;
-	ret = esp32s31_lp_sleep_prepare(control);
-	if (!ret && !(control->capabilities & S31_LP_CAP_TIMER_WAKE))
-		ret = -EOPNOTSUPP;
-	if (!ret)
-		ret = esp32s31_lp_sleep_arm(control);
-	if (ret) {
-		esp32s31_lp_sleep_abort(control);
-		return ret;
-	}
-	lp->deep_armed = true;
-	/* The normal Linux poweroff path can reset/restart the LP remoteproc
-	 * before the final SBI shutdown call.  Latch authorization in an
-	 * always-on LP_SYS store register so OpenSBI does not depend on the
-	 * volatile shared-SRAM state at that late boundary. */
-	writel(S31_DEEP_SLEEP_MAGIC, lp->lp_sys + S31_LP_SYS_STORE4_REG);
-	writel(duration_ms, lp->lp_sys + S31_LP_SYS_STORE5_REG);
-	dev_info(lp->dev, "armed cold-resume deep sleep for %u ms\n",
-		 duration_ms);
-	/* Run the normal orderly shutdown path.  OpenSBI accepts SHUTDOWN only
-	 * after seeing this LP-owned descriptor and never returns on success. */
-	orderly_poweroff(true);
-	return count;
-}
-static DEVICE_ATTR_RW(deep_sleep);
 
 static struct attribute *esp32s31_lp_attrs[] = {
 	&dev_attr_ready.attr,
@@ -1315,9 +1039,6 @@ static struct attribute *esp32s31_lp_attrs[] = {
 	&dev_attr_mailbox_stats.attr,
 	&dev_attr_tx_message.attr,
 	&dev_attr_ping.attr,
-	&dev_attr_sleep_test.attr,
-	&dev_attr_gpio_test.attr,
-	&dev_attr_deep_sleep.attr,
 	NULL,
 };
 static const struct attribute_group esp32s31_lp_group = {
@@ -1342,8 +1063,6 @@ static void esp32s31_lp_clear_sleep_owner(void *data)
 {
 	struct esp32s31_lp *lp = data;
 
-	if (READ_ONCE(esp32s31_lp_sleep_owner) == lp)
-		s2idle_set_ops(NULL);
 	if (READ_ONCE(esp32s31_lp_sleep_owner) == lp)
 		WRITE_ONCE(esp32s31_lp_sleep_owner, NULL);
 }
@@ -1374,13 +1093,7 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	lp = rproc->priv;
 	lp->dev = dev;
 	lp->rproc = rproc;
-	lp->reboot_notifier.notifier_call = esp32s31_lp_reboot_notify;
 	platform_set_drvdata(pdev, lp);
-
-	lp->cpu_clk = devm_clk_get(dev, "cpu");
-	if (IS_ERR(lp->cpu_clk))
-		return dev_err_probe(dev, PTR_ERR(lp->cpu_clk),
-				     "failed to get CPU clock\n");
 
 	lp->sram = devm_platform_ioremap_resource_byname(pdev, "sram");
 	if (IS_ERR(lp->sram))
@@ -1396,12 +1109,8 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	lp->lp_sys = devm_platform_ioremap_resource_byname(pdev, "lp-sys");
 	if (IS_ERR(lp->lp_sys))
 		return PTR_ERR(lp->lp_sys);
-	/* A request latch authorizes only the immediately following shutdown.
-	 * Clear any stale value left by a reset before userspace can arm a new
-	 * deep-sleep transaction.  STORE2/3 are deliberately retained as the
-	 * previous-wake record. */
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE4_REG);
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE5_REG);
+	/* A reset must never authorize a later poweroff with a stale deadline. */
+	writel(0, lp->sram + S31_LP_POWEROFF_OFFSET);
 	lp->rtc_timer = devm_platform_ioremap_resource_byname(pdev, "rtc-timer");
 	if (IS_ERR(lp->rtc_timer))
 		return PTR_ERR(lp->rtc_timer);
@@ -1413,11 +1122,17 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 				    resource_size(resource));
 	if (!lp->lp_clkrst)
 		return -ENOMEM;
+	/* HP reset cause belongs to LP_AONCLKRST, not LP_PERICLKRST. */
+	lp->reset_cause = devm_ioremap(dev, S31_LP_AON_HP0_RESET_CAUSE, sizeof(u32));
+	if (!lp->reset_cause)
+		return -ENOMEM;
+
 
 	lp->pmu = syscon_regmap_lookup_by_phandle(dev->of_node, "espressif,pmu");
 	if (IS_ERR(lp->pmu))
 		return dev_err_probe(dev, PTR_ERR(lp->pmu), "failed to get PMU syscon\n");
 
+	spin_lock_init(&lp->rtc_lock);
 	spin_lock_init(&lp->tx_state_lock);
 	spin_lock_init(&lp->rx_lock);
 	mutex_init(&lp->user_tx_lock);
@@ -1466,6 +1181,13 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = esp32s31_lp_calibrate_rtc_slow(lp);
+	if (ret)
+		return ret;
+	ret = esp32s31_lp_rtc_register(pdev, lp);
+	if (ret)
+		return ret;
+
 	lp->mbox.dev = dev;
 	lp->mbox.ops = &esp32s31_lp_mbox_ops;
 	lp->mbox.chans = &lp->chan;
@@ -1502,19 +1224,59 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, esp32s31_lp_clear_sleep_owner, lp);
 	if (ret)
 		return ret;
-	ret = register_reboot_notifier(&lp->reboot_notifier);
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF_PREPARE,
+					SYS_OFF_PRIO_LOW,
+					esp32s31_lp_poweroff_prepare, lp);
 	if (ret)
 		return ret;
-	ret = devm_add_action_or_reset(dev,
-				       esp32s31_lp_unregister_reboot_notifier, lp);
-	if (ret)
-		return ret;
-	if (IS_ENABLED(CONFIG_SUSPEND))
-		s2idle_set_ops(&esp32s31_lp_s2idle_ops);
 
 	dev_info(dev, "LP-core remoteproc and mailbox registered\n");
 	return 0;
 }
+
+/* Suspend-to-idle keeps both HP harts and the RTC counter powered. Let
+ * genirq wake Linux from the actual target-0 interrupt; no LP dry-run,
+ * polling loop or platform wake predicate is needed. MEM still hands that
+ * target to LP/SBI through esp32s31_lp_system_suspend_prepare().
+ */
+static int esp32s31_lp_suspend_late(struct device *dev)
+{
+	struct esp32s31_lp *lp = dev_get_drvdata(dev);
+	unsigned long flags;
+	bool alarm;
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
+	    !device_may_wakeup(dev))
+		return 0;
+	spin_lock_irqsave(&lp->rtc_lock, flags);
+	alarm = lp->rtc_alarm_enabled;
+	spin_unlock_irqrestore(&lp->rtc_lock, flags);
+	if (!alarm)
+		return 0;
+	ret = enable_irq_wake(lp->rtc_irq);
+	if (!ret)
+		lp->rtc_irq_wake = true;
+	return ret;
+}
+
+static int esp32s31_lp_resume_early(struct device *dev)
+{
+	struct esp32s31_lp *lp = dev_get_drvdata(dev);
+	int ret;
+
+	if (!lp->rtc_irq_wake)
+		return 0;
+	ret = disable_irq_wake(lp->rtc_irq);
+	if (!ret)
+		lp->rtc_irq_wake = false;
+	return ret;
+}
+
+static const struct dev_pm_ops esp32s31_lp_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(esp32s31_lp_suspend_late,
+				esp32s31_lp_resume_early)
+};
 
 static const struct of_device_id esp32s31_lp_of_match[] = {
 	{ .compatible = "espressif,esp32s31-lp-core" },
@@ -1526,6 +1288,7 @@ static struct platform_driver esp32s31_lp_driver = {
 	.probe = esp32s31_lp_probe,
 	.driver = {
 		.name = "esp32s31-lp",
+		.pm = pm_sleep_ptr(&esp32s31_lp_pm_ops),
 		.of_match_table = esp32s31_lp_of_match,
 	},
 };

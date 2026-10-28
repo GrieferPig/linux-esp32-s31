@@ -6,6 +6,7 @@
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/clock/esp32s31-clock.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/dma/esp32s31-axi-gdma.h>
 #include <dt-bindings/pinctrl/esp32s31-pinmux.h>
 #include <dt-bindings/power/esp32s31-power.h>
 #include <dt-bindings/reset/esp32s31-reset.h>
@@ -147,9 +148,10 @@
 		axi_gdma: dma-controller@20348000 {
 			compatible = "espressif,esp32s31-axi-gdma";
 			/* 12 KiB descriptor pool in loader-reserved HP SRAM. */
-			reg = <0x20348000 0x1000>, <0x20587078 0x4>,
-			      <0x2f072380 0x3000>;
-			reg-names = "dma", "clkrst", "descriptors";
+			reg = <0x20348000 0x1000>, <0x2f072380 0x3000>;
+			reg-names = "dma", "descriptors";
+			clocks = <&clkc ESP32S31_CLK_AXI_GDMA>;
+			resets = <&clkc ESP32S31_RST_AXI_GDMA>;
 			interrupt-parent = <&intmtx>;
 			interrupts = <48 IRQ_TYPE_LEVEL_HIGH>,
 				     <49 IRQ_TYPE_LEVEL_HIGH>,
@@ -162,7 +164,7 @@
 			/* pair index, AXI peripheral trigger (LCD=0 .. SHA=5) */
 			#dma-cells = <2>;
 			dma-channels = <3>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		ahb_gdma: dma-controller@20343000 {
@@ -223,8 +225,9 @@
 			reg-names = "sram", "mailbox", "lp-sys", "lp-clkrst",
 				    "rtc-timer";
 			interrupt-parent = <&intmtx>;
-			interrupts = <139 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "mailbox";
+			interrupts = <139 IRQ_TYPE_LEVEL_HIGH>,
+				     <137 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "mailbox", "rtc-alarm";
 			firmware-name = "esp32s31/s31-lp-core.elf";
 			espressif,pmu = <&pmu>;
 			clocks = <&clkc ESP32S31_CLK_CPU>;
@@ -925,13 +928,13 @@
 
 				partition@400000 {
 					label = "linux";
-					reg = <0x400000 0x600000>;
+					reg = <0x400000 0x610000>;
 					read-only;
 				};
 
-				partition@a00000 {
+				partition@a10000 {
 					label = "rootfs";
-					reg = <0xa00000 0x600000>;
+					reg = <0xa10000 0x5f0000>;
 					linux,rootfs;
 					read-only;
 				};

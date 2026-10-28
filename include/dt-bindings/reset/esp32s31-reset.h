@@ -30,6 +30,8 @@
 #define ESP32S31_RST_I2S0		25
 #define ESP32S31_RST_I2S1		26
 
-#define ESP32S31_RST_NR			27
+#define ESP32S31_RST_AXI_GDMA		27
+
+#define ESP32S31_RST_NR			28
 
 #endif

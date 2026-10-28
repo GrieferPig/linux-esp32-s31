@@ -44,8 +44,6 @@ enum fixed_addresses {
 	FIX_S31_CLKRST,
 	/* Always-on SYSTIMER mapping used by the early clocksource. */
 	FIX_S31_SYSTIMER,
-	/* RTC slow-clock counter used to account time across HP suspend. */
-	FIX_S31_RTC_TIMER,
 #endif
 
 	__end_of_permanent_fixed_addresses,

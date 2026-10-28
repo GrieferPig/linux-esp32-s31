@@ -96,9 +96,7 @@
 #define HP_SDIO_EDGE_L			GENMASK(4, 1)
 #define HP_SDIO_EDGE_H			GENMASK(8, 5)
 #define HP_SDIO_EDGE_N			GENMASK(12, 9)
-#define HP_SDIO_SLF_CLK_EDGE_SEL	GENMASK(15, 13)
 #define HP_SDIO_DRV_CLK_EDGE_SEL	GENMASK(18, 16)
-#define HP_SDIO_SAM_CLK_EDGE_SEL	GENMASK(21, 19)
 #define HP_SDIO_SLF_CLK_EN		BIT(22)
 #define HP_SDIO_DRV_CLK_EN		BIT(23)
 #define HP_SDIO_SAM_CLK_EN		BIT(24)
@@ -314,6 +312,7 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 	[ESP32S31_RST_WDT1] = { HP_TIMERGRP1_CTRL0, HP_TIMERGRP_RST_EN,
 		HP_TIMERGRP_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_SYSTIMER] = { 0x120, BIT(1), BIT(2), ESP32S31_BANK_HP },
+	[ESP32S31_RST_AXI_GDMA] = { 0x78, BIT(1), BIT(2), ESP32S31_BANK_HP },
 	[ESP32S31_RST_AHB_GDMA] = { 0x7c, BIT(1), BIT(2), ESP32S31_BANK_HP },
 	[ESP32S31_RST_UHCI] = { 0x84, BIT(2), BIT(3), ESP32S31_BANK_HP },
 	[ESP32S31_RST_LEDC0] = { 0x148, BIT(1), BIT(2), ESP32S31_BANK_HP },
@@ -948,6 +947,8 @@ static unsigned long esp32s31_clk_recalc_rate(struct clk_hw *hw,
 		div = FIELD_GET(CNNT_EMAC_REF_CLK_DIV,
 				readl(priv->cnnt + CNNT_SYS_HP_EMAC_REF_CTRL));
 		return parent_rate / (div + 1);
+	case ESP32S31_CLK_KIND_GENERIC:
+		return parent_rate ? parent_rate : clk->fixed_rate;
 	default:
 		return clk->fixed_rate;
 	}
@@ -998,27 +999,36 @@ static const struct esp32s31_cpu_rate *esp32s31_cpu_find_rate(unsigned long rate
 	return NULL;
 }
 
-static long esp32s31_cpu_round_rate(struct clk_hw *hw, unsigned long rate,
-				    unsigned long *parent_rate)
+static int esp32s31_cpu_determine_rate(struct clk_hw *hw,
+				     struct clk_rate_request *req)
 {
-	const struct esp32s31_cpu_rate *best = &esp32s31_cpu_rates[0];
-	unsigned long best_delta = abs_diff(rate, best->rate);
+	const struct esp32s31_cpu_rate *best = NULL;
 	unsigned int i;
 
-	for (i = 1; i < ARRAY_SIZE(esp32s31_cpu_rates); i++) {
-		unsigned long delta = abs_diff(rate, esp32s31_cpu_rates[i].rate);
+	for (i = 0; i < ARRAY_SIZE(esp32s31_cpu_rates); i++) {
+		const struct esp32s31_cpu_rate *config = &esp32s31_cpu_rates[i];
 
-		if (delta < best_delta) {
-			best = &esp32s31_cpu_rates[i];
-			best_delta = delta;
-		}
+		if (config->rate < req->min_rate || config->rate > req->max_rate)
+			continue;
+		if (!best || abs_diff(config->rate, req->rate) <
+			     abs_diff(best->rate, req->rate))
+			best = config;
 	}
-
-	return best->rate;
+	if (!best)
+		return -EINVAL;
+	req->best_parent_hw = clk_hw_get_parent_by_index(hw, best->source);
+	if (!req->best_parent_hw)
+		return -EINVAL;
+	req->best_parent_rate = clk_hw_get_rate(req->best_parent_hw);
+	if (req->best_parent_rate / best->cpu_div != best->rate)
+		return -EINVAL;
+	req->rate = best->rate;
+	return 0;
 }
 
-static int esp32s31_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
-				 unsigned long parent_rate)
+static int esp32s31_cpu_set_rate_and_parent(struct clk_hw *hw,
+					  unsigned long rate,
+					  unsigned long parent_rate, u8 index)
 {
 	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
 	struct esp32s31_clk_priv *priv = clk->priv;
@@ -1028,7 +1038,8 @@ static int esp32s31_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 	int timeout;
 
 	config = esp32s31_cpu_find_rate(rate);
-	if (!config)
+	if (!config || config->source != index ||
+	    parent_rate / config->cpu_div != rate)
 		return -EINVAL;
 
 	/*
@@ -1054,10 +1065,44 @@ static int esp32s31_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 
 	if (!timeout)
 		return -ETIMEDOUT;
-	if (clk_hw_get_rate(hw) != rate)
+	/* CCF has not yet recalculated this node. Check the latched hardware
+	 * fields directly rather than querying its previous cached parent.
+	 */
+	if (FIELD_GET(HP_SOC_CLK_SEL_MASK,
+		      readl(priv->hp + HP_SOC_CLK_SEL)) != index ||
+	    readl(priv->hp + HP_CPU_FREQ_CTRL0) !=
+		FIELD_PREP(HP_CLK_DIV_NUM, config->cpu_div - 1) ||
+	    (readl(priv->hp + HP_MEM_FREQ_CTRL0) & BIT(0)) != config->mem_div - 1 ||
+	    readl(priv->hp + HP_SYS_FREQ_CTRL0) != config->sys_div - 1 ||
+	    readl(priv->hp + HP_APB_FREQ_CTRL0) != config->apb_div - 1)
 		return -EIO;
 
 	return 0;
+}
+
+static int esp32s31_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
+				 unsigned long parent_rate)
+{
+	return esp32s31_cpu_set_rate_and_parent(hw, rate, parent_rate,
+					      esp32s31_cpu_get_parent(hw));
+}
+
+static int esp32s31_cpu_set_parent(struct clk_hw *hw, u8 index)
+{
+	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
+	struct clk_hw *parent = clk_hw_get_parent_by_index(hw, index);
+	unsigned long parent_rate;
+	u32 reg = readl(clk->priv->hp + HP_CPU_FREQ_CTRL0);
+
+	if (!parent || FIELD_GET(HP_CLK_DIV_NUMERATOR, reg) ||
+	    FIELD_GET(HP_CLK_DIV_DENOMINATOR, reg))
+		return -EINVAL;
+	parent_rate = clk_hw_get_rate(parent);
+	/* A standalone parent change must also stay within a supported OPP.
+	 * Re-latch all bus dividers so XTAL->PLL cannot overclock MEM/APB.
+	 */
+	return esp32s31_cpu_set_rate_and_parent(hw,
+		parent_rate / (FIELD_GET(HP_CLK_DIV_NUM, reg) + 1), parent_rate, index);
 }
 
 static u8 esp32s31_pll_div_get_parent(struct clk_hw *hw)
@@ -1189,8 +1234,10 @@ static const struct clk_ops esp32s31_fixed_ops = {
 static const struct clk_ops esp32s31_cpu_ops = {
 	.get_parent = esp32s31_cpu_get_parent,
 	.recalc_rate = esp32s31_clk_recalc_rate,
-	.round_rate = esp32s31_cpu_round_rate,
+	.determine_rate = esp32s31_cpu_determine_rate,
 	.set_rate = esp32s31_cpu_set_rate,
+	.set_parent = esp32s31_cpu_set_parent,
+	.set_rate_and_parent = esp32s31_cpu_set_rate_and_parent,
 };
 
 static const struct clk_ops esp32s31_pll_div_ops = {
@@ -1248,7 +1295,9 @@ static int __esp32s31_register_clk(struct device *dev,
 				   enum esp32s31_clk_kind kind,
 				   unsigned long rate,
 				   const char * const *parent_names,
-				   unsigned int num_parents)
+				   unsigned int num_parents, u16 reg,
+				   u32 enable_mask, u32 reset_mask,
+				   u32 force_norst_mask)
 {
 	struct clk_init_data init = {};
 	struct esp32s31_clk *clk;
@@ -1295,9 +1344,16 @@ static int __esp32s31_register_clk(struct device *dev,
 	if (esp32s31_clk_is_critical(id))
 		init.flags |= CLK_IS_CRITICAL;
 	if (kind == ESP32S31_CLK_KIND_CPU || kind == ESP32S31_CLK_KIND_MEM ||
-	    kind == ESP32S31_CLK_KIND_SYS || kind == ESP32S31_CLK_KIND_APB)
+	    kind == ESP32S31_CLK_KIND_SYS || kind == ESP32S31_CLK_KIND_APB ||
+	    (kind == ESP32S31_CLK_KIND_GENERIC && num_parents))
 		init.flags |= CLK_GET_RATE_NOCACHE;
 
+	/* CCF may prepare a critical gate while registering it. Publish its
+	 * register and masks before that first callback, as for PLL dividers. */
+	clk->reg = reg;
+	clk->enable_mask = enable_mask;
+	clk->reset_mask = reset_mask;
+	clk->force_norst_mask = force_norst_mask;
 	clk->hw.init = &init;
 	clk->priv = priv;
 	clk->kind = kind;
@@ -1319,7 +1375,7 @@ static int esp32s31_register_clk(struct device *dev,
 				 unsigned long rate)
 {
 	return __esp32s31_register_clk(dev, priv, id, name, kind, rate,
-				       NULL, 0);
+				       NULL, 0, 0, 0, 0, 0);
 }
 
 static int esp32s31_register_parented_clk(struct device *dev,
@@ -1331,7 +1387,7 @@ static int esp32s31_register_parented_clk(struct device *dev,
 					  unsigned int num_parents)
 {
 	return __esp32s31_register_clk(dev, priv, id, name, kind, rate,
-				       parent_names, num_parents);
+				       parent_names, num_parents, 0, 0, 0, 0);
 }
 
 static int esp32s31_register_pll_div(struct device *dev,
@@ -1340,19 +1396,12 @@ static int esp32s31_register_pll_div(struct device *dev,
 				     const char * const *parent_names,
 				     unsigned int num_parents)
 {
-	struct esp32s31_clk *clk;
-	int ret;
-
-	ret = esp32s31_register_parented_clk(dev, priv, id, name,
-					 ESP32S31_CLK_KIND_PLL_DIV, 0,
-					 parent_names, num_parents);
-	if (ret)
-		return ret;
-
-	clk = to_esp32s31_clk(priv->onecell->hws[id]);
-	clk->reg = reg;
-
-	return 0;
+	/* CCF may recalculate the rate during registration. Publish the real
+	 * divider register before clk_hw_register(), not afterwards.
+	 */
+	return __esp32s31_register_clk(dev, priv, id, name,
+				      ESP32S31_CLK_KIND_PLL_DIV, 0,
+				      parent_names, num_parents, reg, 0, 0, 0);
 }
 
 static int esp32s31_register_gate(struct device *dev,
@@ -1362,21 +1411,21 @@ static int esp32s31_register_gate(struct device *dev,
 				  u32 enable_mask, u32 reset_mask,
 				  u32 force_norst_mask)
 {
-	struct esp32s31_clk *clk;
-	int ret;
+	return __esp32s31_register_clk(dev, priv, id, name,
+				      ESP32S31_CLK_KIND_GENERIC, rate,
+				      NULL, 0, reg, enable_mask, reset_mask,
+				      force_norst_mask);
+}
 
-	ret = esp32s31_register_clk(dev, priv, id, name,
-				    ESP32S31_CLK_KIND_GENERIC, rate);
-	if (ret)
-		return ret;
-
-	clk = to_esp32s31_clk(priv->onecell->hws[id]);
-	clk->reg = reg;
-	clk->enable_mask = enable_mask;
-	clk->reset_mask = reset_mask;
-	clk->force_norst_mask = force_norst_mask;
-
-	return 0;
+static int esp32s31_register_parented_gate(struct device *dev,
+					 struct esp32s31_clk_priv *priv,
+					 unsigned int id, const char *name,
+					 const char * const *parents, u16 reg,
+					 u32 enable, u32 reset, u32 force_norst)
+{
+	return __esp32s31_register_clk(dev, priv, id, name,
+				      ESP32S31_CLK_KIND_GENERIC, 0, parents, 1,
+				      reg, enable, reset, force_norst);
 }
 
 static const char * const esp32s31_xtal_parent[] = { "xtal" };
@@ -1662,6 +1711,11 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 				     BIT(0) | BIT(4), BIT(1), BIT(2));
 	if (ret)
 		return ret;
+	ret = esp32s31_register_parented_gate(dev, priv, ESP32S31_CLK_AXI_GDMA,
+					      "axi-gdma", esp32s31_sys_parent, 0x78,
+					      BIT(0), BIT(1), BIT(2));
+	if (ret)
+		return ret;
 	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_AHB_GDMA,
 				     "ahb-gdma", sys_rate, 0x7c,
 				     BIT(0), BIT(1), BIT(2));
@@ -1800,6 +1854,7 @@ static int esp32s31_clk_poweroff_prepare(struct sys_off_data *data)
 	cpu = clk_hw_get_clk(priv->onecell->hws[ESP32S31_CLK_CPU], NULL);
 	if (IS_ERR(cpu))
 		return NOTIFY_BAD;
+	/* device_shutdown() has already suspended CPUFreq governors. */
 	ret = clk_set_rate(cpu, ESP32S31_XTAL_RATE);
 	clk_put(cpu);
 	if (ret)

@@ -30,10 +30,14 @@ properties:
       - const: rtc-timer
 
   interrupts:
-    maxItems: 1
+    items:
+      - description: LP mailbox
+      - description: RTC timer target 0 alarm
 
   interrupt-names:
-    const: mailbox
+    items:
+      - const: mailbox
+      - const: rtc-alarm
 
   firmware-name:
     $ref: /schemas/types.yaml#/definitions/string
@@ -69,8 +73,8 @@ examples:
               <0x20800000 0x400>;
         reg-names = "sram", "mailbox", "lp-sys", "lp-clkrst",
                     "rtc-timer";
-        interrupts = <139 IRQ_TYPE_LEVEL_HIGH>;
-        interrupt-names = "mailbox";
+        interrupts = <139 IRQ_TYPE_LEVEL_HIGH>, <137 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "mailbox", "rtc-alarm";
         firmware-name = "esp32s31/s31-lp-core.elf";
         espressif,pmu = <&pmu>;
         clocks = <&clkc ESP32S31_CLK_CPU>;

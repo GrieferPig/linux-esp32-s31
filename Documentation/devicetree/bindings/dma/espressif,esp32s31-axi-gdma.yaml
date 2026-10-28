@@ -10,24 +10,32 @@ maintainers:
   - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
 
 description: |
-  AXI GDMA engine with three RX and three TX channels. The third register
+  AXI GDMA engine with three RX and three TX channels. The second register
   window is the 12 KiB descriptor pool in loader-reserved HP SRAM. The pair
-  index selects the AXI peripheral trigger (LCD=0 .. SHA=5).
+  index is the first DMA specifier cell (0..2, or 0xffffffff to borrow any
+  free pair). The second cell selects the peripheral trigger (LCD=0 .. SHA=5).
 
 properties:
   compatible:
     const: espressif,esp32s31-axi-gdma
 
   reg:
-    maxItems: 3
+    minItems: 2
+    maxItems: 2
 
   reg-names:
     items:
       - const: dma
-      - const: clkrst
       - const: descriptors
 
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
   interrupts:
+    minItems: 6
     maxItems: 6
 
   interrupt-names:
@@ -48,6 +56,12 @@ properties:
 required:
   - compatible
   - reg
+  - reg-names
+  - clocks
+  - resets
+  - interrupts
+  - interrupt-names
+  - '#dma-cells'
 
 additionalProperties: false
 
@@ -56,9 +70,10 @@ examples:
     #include <dt-bindings/interrupt-controller/irq.h>
     dma-controller@20348000 {
         compatible = "espressif,esp32s31-axi-gdma";
-        reg = <0x20348000 0x1000>, <0x20587078 0x4>,
-              <0x2f072380 0x3000>;
-        reg-names = "dma", "clkrst", "descriptors";
+        reg = <0x20348000 0x1000>, <0x2f072380 0x3000>;
+        reg-names = "dma", "descriptors";
+        clocks = <&clkc 54>;
+        resets = <&clkc 27>;
         interrupts = <48 IRQ_TYPE_LEVEL_HIGH>,
                      <49 IRQ_TYPE_LEVEL_HIGH>,
                      <50 IRQ_TYPE_LEVEL_HIGH>,

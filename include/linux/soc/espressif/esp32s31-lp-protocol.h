@@ -12,7 +12,7 @@ typedef uint32_t s31_lp_u32;
 #define S31_LP_PACKED __attribute__((packed))
 #endif
 
-#define S31_LP_ABI_VERSION		1U
+#define S31_LP_ABI_VERSION		2U
 #define S31_LP_MESSAGE_MASK		0xffff0000U
 #define S31_LP_SEQUENCE_MASK		0x0000ffffU
 
@@ -34,28 +34,71 @@ typedef uint32_t s31_lp_u32;
 #define S31_LP_RSP_SLEEP_RECLAIMED	0x80070000U
 #define S31_LP_RSP_ERROR		0xffff0000U
 
-/* Last KiB of the 32-KiB LP SRAM is outside the LP firmware link region. */
+/* The first 8 KiB belong to LP firmware (including its stack/shared data).
+ * OpenSBI uses [0x2e002000,0x2e007000) to retain HP context during MEM.
+ * Firmware loads must not enter that shadow or the final KiB of PM records.
+ */
+#define S31_LP_FIRMWARE_SIZE		0x00002000U
+
+/* Last KiB of the 32-KiB LP SRAM is reserved for PM handoffs. */
 #define S31_LP_SLEEP_CONTROL_ADDR	0x2e007c00U
 #define S31_LP_SLEEP_CONTROL_OFFSET	0x00007c00U
 #define S31_LP_SLEEP_CONTROL_MAGIC	0x5331504dU /* "S1PM" */
+
+/* Single-use Linux -> OpenSBI terminal poweroff handoff. Independent of the
+ * running LP firmware and of the MEM resume descriptor. Publish magic last;
+ * crc is IEEE CRC32 over the preceding bytes, including the final magic.
+ * Do not use LP_SYS STORE registers: those belong to the ROM boot ABI.
+ */
+#define S31_LP_POWEROFF_ADDR		0x2e007d00U
+#define S31_LP_POWEROFF_OFFSET		0x00007d00U
+#define S31_LP_POWEROFF_MAGIC		0x53314f46U /* "S1OF" */
+#define S31_LP_POWEROFF_VERSION		1U
+#define S31_LP_POWEROFF_RTC		(1U << 0)
+
+struct s31_lp_poweroff {
+	s31_lp_u32 magic;
+	s31_lp_u32 version;
+	s31_lp_u32 size;
+	s31_lp_u32 flags;
+	s31_lp_u32 deadline_lo;
+	s31_lp_u32 deadline_hi;
+	s31_lp_u32 reserved;
+	s31_lp_u32 crc;
+} S31_LP_PACKED;
+
+/* RTC epoch anchor, retained across HP software/deep-sleep resets. Its CRC
+ * covers the preceding bytes. Power-on and unknown reset causes invalidate it.
+ */
+#define S31_LP_RTC_ANCHOR_OFFSET		0x00007e00U
+#define S31_LP_RTC_ANCHOR_MAGIC		0x53315254U /* "S1RT" */
+#define S31_LP_RTC_ANCHOR_VERSION		1U
+
+struct s31_lp_rtc_anchor {
+	s31_lp_u32 magic;
+	s31_lp_u32 version;
+	s31_lp_u32 size;
+	s31_lp_u32 seconds_lo;
+	s31_lp_u32 seconds_hi;
+	s31_lp_u32 ticks_lo;
+	s31_lp_u32 ticks_hi;
+	s31_lp_u32 calibration;
+	s31_lp_u32 reserved;
+	s31_lp_u32 crc;
+} S31_LP_PACKED;
 
 #define S31_LP_CAP_HANDSHAKE		(1U << 0)
 #define S31_LP_CAP_TIMER_WAKE		(1U << 1)
 #define S31_LP_CAP_GPIO_WAKE		(1U << 2)
 #define S31_LP_CAP_WAKE_LOG		(1U << 3)
 #define S31_LP_CAP_RETENTION_DESC	(1U << 4)
+#define S31_LP_CAP_RTC_ABSOLUTE		(1U << 5)
 
 #define S31_LP_WAKE_TIMER		(1U << 0)
 #define S31_LP_WAKE_GPIO		(1U << 1)
-#define S31_LP_WAKE_LP_UART		(1U << 2)
 
-#define S31_LP_SLEEP_F_S2IDLE		(1U << 0)
-#define S31_LP_SLEEP_F_STANDBY		(1U << 1)
 #define S31_LP_SLEEP_F_MEM		(1U << 2)
-#define S31_LP_SLEEP_F_DEEP_REBOOT	(1U << 3)
-#define S31_LP_SLEEP_F_GPIO_PULL_UP	(1U << 4)
-#define S31_LP_SLEEP_F_GPIO_PULL_DOWN	(1U << 5)
-#define S31_LP_SLEEP_F_DRY_RUN		(1U << 31)
+#define S31_LP_SLEEP_F_RTC_ABSOLUTE	(1U << 6)
 
 enum s31_lp_sleep_state {
 	S31_LP_SLEEP_BOOT = 0,
@@ -91,13 +134,19 @@ struct s31_lp_sleep_control {
 	s31_lp_u32 sequence;
 	s31_lp_u32 flags;
 	s31_lp_u32 wake_mask;
-	/* Relative one-shot timer duration in microseconds. */
+	/* Absolute 48-bit RTC target when TIMER/RTC_ABSOLUTE are selected. */
 	s31_lp_u32 deadline_lo;
 	s31_lp_u32 deadline_hi;
 	s31_lp_u32 gpio_mask_lo;
-	s31_lp_u32 gpio_mask_hi;
-	s31_lp_u32 gpio_level_lo;
-	s31_lp_u32 gpio_level_hi;
+	/* S31 LP pads are 0..7; ABI 2 uses the former unused high words
+	 * for independent per-pad bias masks, without enlarging the record.
+	 */
+	s31_lp_u32 gpio_pullup_mask;
+	/* Three LP_GPIO INT_TYPE bits per pad: rising=1, falling=2,
+	 * both=3, low=4, high=5. Unselected pads have type zero.
+	 */
+	s31_lp_u32 gpio_types;
+	s31_lp_u32 gpio_pulldown_mask;
 	s31_lp_u32 retention_mask;
 	s31_lp_u32 domain_mask;
 	s31_lp_u32 clock_mask;
@@ -109,6 +158,7 @@ struct s31_lp_sleep_control {
 	s31_lp_u32 result;
 	s31_lp_u32 wake_reason;
 	s31_lp_u32 wake_raw;
+	/* Sleep and wake timestamps share the calibrated 48-bit RTC counter. */
 	s31_lp_u32 sleep_ticks_lo;
 	s31_lp_u32 sleep_ticks_hi;
 	s31_lp_u32 wake_ticks_lo;
