@@ -90,7 +90,7 @@ static long restore_fp_state(struct pt_regs *regs,
 			     union __riscv_fp_state __user *sc_fpregs)
 {
 	long err;
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	struct __riscv_f_ext_state state;
 	unsigned int i;
 
@@ -116,7 +116,7 @@ static long save_fp_state(struct pt_regs *regs,
 			  union __riscv_fp_state __user *sc_fpregs)
 {
 	long err;
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	struct __riscv_f_ext_state state;
 	unsigned int i;
 

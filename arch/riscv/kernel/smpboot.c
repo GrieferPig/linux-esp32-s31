@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/irq.h>
+#include <linux/irqchip/irq-esp32p4.h>
 #include <linux/of.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/mm.h>
@@ -196,7 +197,8 @@ int __cpu_up(unsigned int cpu, struct task_struct *tidle)
 			pr_crit("CPU%u: failed to come online\n", cpu);
 			ret = -EIO;
 		} else {
-			pr_info("S31 SMP: cpu%u online\n", cpu);
+			pr_info("%s SMP: cpu%u online\n",
+				IS_ENABLED(CONFIG_SOC_ESP32P4) ? "P4" : "S31", cpu);
 		}
 	} else {
 		pr_crit("CPU%u: failed to start\n", cpu);
@@ -231,6 +233,11 @@ asmlinkage __visible void smp_callin(void)
 	current->active_mm = mm;
 
 	store_cpu_topology(curr_cpuid);
+	/* Establish this hart's CLIC and doorbell before any CPUHP callback
+	 * can depend on an IPI. CLIC MMIO windows are hart-relative. */
+	if (IS_ENABLED(CONFIG_SOC_ESP32P4) &&
+	    esp32p4_irq_cpu_starting(curr_cpuid))
+		panic("P4 SMP: secondary interrupt initialization failed");
 	notify_cpu_starting(curr_cpuid);
 	riscv_ipi_enable();
 

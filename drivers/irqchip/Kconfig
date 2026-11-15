@@ -862,3 +862,13 @@ config SUNPLUS_SP7021_INTC
 	  the primary controller on C-Chip.
 
 endmenu
+
+config ESP32P4_IRQCHIP
+	bool "ESP32-P4 M-mode CLIC and interrupt matrix"
+	depends on SOC_ESP32P4 && RISCV_M_MODE && !MMU
+	select IRQ_DOMAIN
+	select GENERIC_IRQ_IPI_MUX if SMP
+	select GENERIC_IRQ_EFFECTIVE_AFF_MASK if SMP
+	help
+	  P4 revision 1.3 firmware-handoff IRQ controller, including one
+	  software doorbell per hart. Requires an explicit revision in DT.

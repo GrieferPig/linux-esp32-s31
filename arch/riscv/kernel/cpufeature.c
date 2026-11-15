@@ -146,7 +146,8 @@ static int riscv_ext_f_validate(const struct riscv_isa_ext_data *data,
 	 * is required.
 	 */
 	if (!__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d) &&
-	    !IS_ENABLED(CONFIG_SOC_ESP32S31)) {
+	    !IS_ENABLED(CONFIG_SOC_ESP32S31) &&
+	    !IS_ENABLED(CONFIG_SOC_ESP32P4)) {
 		pr_warn_once("This kernel does not support systems with F but not D\n");
 		return -EINVAL;
 	}
@@ -1077,10 +1078,11 @@ void __init riscv_fill_hwcap(void)
 		}
 	}
 
-	/* ESP32-S31 implements F without D and has an F-only context path. */
+	/* ESP32-S31/P4 implement F without D and have an F-only context path. */
 	if ((elf_hwcap & COMPAT_HWCAP_ISA_F) &&
 	    !(elf_hwcap & COMPAT_HWCAP_ISA_D) &&
-	    !IS_ENABLED(CONFIG_SOC_ESP32S31)) {
+	    !IS_ENABLED(CONFIG_SOC_ESP32S31) &&
+	    !IS_ENABLED(CONFIG_SOC_ESP32P4)) {
 		pr_info("This kernel does not support systems with F but not D\n");
 		elf_hwcap &= ~COMPAT_HWCAP_ISA_F;
 	}

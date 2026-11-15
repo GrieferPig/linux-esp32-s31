@@ -25,7 +25,7 @@ SYM_FUNC_START(__fstate_save)
 	li t1, SR_FS
 	csrs CSR_STATUS, t1
 	frcsr t0
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	/* S31 implements F but not D; keep Linux's 64-bit slots as the ABI. */
 	fsw f0,  TASK_THREAD_F0_F0(a0)
 	fsw f1,  TASK_THREAD_F1_F0(a0)
@@ -104,7 +104,7 @@ SYM_FUNC_START(__fstate_restore)
 	li t1, SR_FS
 	lw t0, TASK_THREAD_FCSR_F0(a0)
 	csrs CSR_STATUS, t1
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	flw f0,  TASK_THREAD_F0_F0(a0)
 	flw f1,  TASK_THREAD_F1_F0(a0)
 	flw f2,  TASK_THREAD_F2_F0(a0)

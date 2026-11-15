@@ -5,9 +5,59 @@
 
 #include <linux/acpi.h>
 #include <linux/of.h>
+#include <linux/interrupt.h>
+#include <linux/panic.h>
 #include <linux/prctl.h>
 #include <asm/acpi.h>
 #include <asm/cacheflush.h>
+
+#ifdef CONFIG_SOC_ESP32P4
+#ifdef CONFIG_SMP
+static void esp32p4_remote_fence_i(void *info)
+{
+	/* Never enter the shared cache engine from this IPI. */
+	asm volatile("fence.i" ::: "memory");
+}
+#endif
+
+/*
+ * Global range publication, distinct from local cache maintenance.
+ * The retained callback writes back the range and invalidates both L1I caches,
+ * but that does not replace each hart's own instruction-stream synchronization.
+ *
+ * Before secondary bringup, alternatives/runtime constants can call here with
+ * IRQs disabled. After bringup, the current no-hotplug P4 configuration requires
+ * task context with IRQs enabled, as does the standard synchronous SMP API.
+ */
+void esp32p4_flush_icache_range(unsigned long start, unsigned long end)
+{
+	BUILD_BUG_ON(IS_ENABLED(CONFIG_HOTPLUG_CPU));
+
+#ifdef CONFIG_SMP
+	if (num_online_cpus() < 2) {
+		local_flush_icache_range(start, end);
+		return;
+	}
+	if (unlikely(!in_task() || irqs_disabled()))
+		panic("P4 global icache range requires task context with IRQs enabled");
+
+	/* Pin the publisher without blocking reception of a peer's fence IPI. */
+	preempt_disable();
+	local_flush_icache_range(start, end);
+	/*
+	 * The helper has released the shared engine lock and restored IRQs.
+	 * Order completed writeback before the MMIO IPI, then wait for the peer
+	 * to fence its instruction stream. No cache-engine lock spans this wait.
+	 */
+	RISCV_FENCE(w, o);
+	smp_call_function(esp32p4_remote_fence_i, NULL, 1);
+	asm volatile("fence.i" ::: "memory");
+	preempt_enable();
+#else
+	local_flush_icache_range(start, end);
+#endif
+}
+#endif /* CONFIG_SOC_ESP32P4 */
 
 #ifdef CONFIG_SMP
 

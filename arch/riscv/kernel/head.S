@@ -170,6 +170,9 @@ secondary_start_sbi:
 
 	/* Set trap vector to spin forever to help debug */
 	la a3, .Lsecondary_park
+#ifdef CONFIG_SOC_ESP32P4
+	ori a3, a3, 3
+#endif
 	csrw CSR_TVEC, a3
 
 	/* a0 contains the hartid & a1 contains boot data.  a1 is already the
@@ -218,8 +221,8 @@ secondary_start_sbi:
 .Lsetup_trap_vector:
 	/* Set trap vector to exception handler */
 	la a0, handle_exception
-#ifdef CONFIG_SOC_ESP32S31
-	/* ESP32-S31 uses CLIC mode, encoded in the low stvec bits. */
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
+	/* Espressif uses CLIC mode, encoded in the low stvec bits. */
 	ori a0, a0, 3
 #endif
 	csrw CSR_TVEC, a0
@@ -238,13 +241,18 @@ secondary_start_sbi:
 SYM_CODE_END(_start)
 
 SYM_CODE_START(_start_kernel)
+#ifdef CONFIG_SOC_ESP32P4
+	csrci mstatus, 8
+	csrr t0, mhartid
+	bnez t0, esp32p4_secondary_start
+#endif
 #ifdef CONFIG_SOC_ESP32S31
 	/* Keep S-mode interrupts off while the CLIC path is still firmware-owned. */
 	li t0, 2
 	csrc sstatus, t0
 #endif
 	/* Mask all interrupts */
-#ifndef CONFIG_SOC_ESP32S31
+#if !defined(CONFIG_SOC_ESP32S31) && !defined(CONFIG_SOC_ESP32P4)
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
 #endif
@@ -263,7 +271,7 @@ SYM_CODE_START(_start_kernel)
 	 */
 
 	 /* Skip PMP configuration for bringup */
-#if !defined(CONFIG_SOC_ESP32S31)
+#if !defined(CONFIG_SOC_ESP32S31) && !defined(CONFIG_SOC_ESP32P4)
 	la a0, .Lpmp_done
 	csrw CSR_TVEC, a0
 
@@ -368,6 +376,9 @@ SYM_CODE_START(_start_kernel)
 #endif /* CONFIG_BUILTIN_DTB */
 	/* Set trap vector to spin forever to help debug */
 	la a3, .Lsecondary_park
+#ifdef CONFIG_SOC_ESP32P4
+	ori a3, a3, 3
+#endif
 	csrw CSR_TVEC, a3
 	call setup_vm
 #ifdef CONFIG_SOC_ESP32S31
@@ -395,9 +406,25 @@ SYM_CODE_START(_start_kernel)
 	tail start_kernel
 
 #ifdef CONFIG_RISCV_BOOT_SPINWAIT
+#ifdef CONFIG_SOC_ESP32P4
+	/* The retained loader releases CPU1 directly here, never through ROM.
+	 * Derive hart ID explicitly and consume published spinwait bootdata. */
+	.global esp32p4_secondary_start
+esp32p4_secondary_start:
+	csrci mstatus, 8
+	csrr a0, mhartid
+	load_global_pointer
+	li t0, SR_FS_VS
+	csrc CSR_STATUS, t0
+	fence rw, rw
+	fence.i
+#endif
 .Lsecondary_start:
 	/* Set trap vector to spin forever to help debug */
 	la a3, .Lsecondary_park
+#ifdef CONFIG_SOC_ESP32P4
+	ori a3, a3, 3
+#endif
 	csrw CSR_TVEC, a3
 
 	slli a3, a0, LGREG

@@ -53,7 +53,7 @@ struct pt_regs {
 	unsigned long cause;
 	/* a0 value before the syscall */
 	unsigned long orig_a0;
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	/* Raw CLIC xcause metadata, private to the trap return path. */
 	unsigned long cause_raw;
 #endif

@@ -8,18 +8,30 @@
 
 #include <linux/mm.h>
 #include <linux/soc/espressif/esp32s31-cache.h>
+#include <linux/soc/espressif/esp32p4.h>
+
+#ifdef CONFIG_SOC_ESP32P4
+void esp32p4_flush_icache_range(unsigned long start, unsigned long end);
+#endif
 
 static inline void local_flush_icache_all(void)
 {
 	asm volatile ("fence.i" ::: "memory");
 	/* S31's split external I/D caches are outside fence.i's reach. */
 	esp32s31_cache_sync_all_for_exec();
+#ifdef CONFIG_SOC_ESP32P4
+	esp32p4_cache_sync_all_for_exec();
+#endif
 }
 
 static inline void local_flush_icache_range(unsigned long start,
 					    unsigned long end)
 {
+#ifdef CONFIG_SOC_ESP32P4
+	esp32p4_cache_sync_for_exec(start, end);
+#else
 	local_flush_icache_all();
+#endif
 }
 
 #define PG_dcache_clean PG_arch_1
@@ -41,12 +53,22 @@ static inline void flush_dcache_page(struct page *page)
  * RISC-V doesn't have an instruction to flush parts of the instruction cache,
  * so instead we just flush the whole thing.
  */
+#ifdef CONFIG_SOC_ESP32P4
+/* noMMU access_remote_vm deliberately passes a NULL struct page. */
+#define flush_icache_user_page(vma, pg, addr, len) \
+do { \
+	if ((vma)->vm_flags & VM_EXEC) \
+		esp32p4_flush_icache_range((addr), (addr) + (len)); \
+} while (0)
+#else
 #define flush_icache_user_page(vma, pg, addr, len)		\
 do {								\
 	if (vma->vm_flags & VM_EXEC) {				\
 		esp32s31_cache_sync_for_exec(page_to_phys(pg), PAGE_SIZE); \
 	}							\
 } while (0)
+
+#endif
 
 #ifdef CONFIG_64BIT
 extern u64 new_vmalloc[NR_CPUS / sizeof(u64) + 1];
@@ -88,7 +110,11 @@ void flush_icache_mm(struct mm_struct *mm, bool local);
 #define flush_icache_range flush_icache_range
 static inline void flush_icache_range(unsigned long start, unsigned long end)
 {
+#ifdef CONFIG_SOC_ESP32P4
+	esp32p4_flush_icache_range(start, end);
+#else
 	flush_icache_all();
+#endif
 }
 
 extern unsigned int riscv_cbom_block_size;

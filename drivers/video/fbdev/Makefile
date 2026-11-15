@@ -124,5 +124,7 @@ obj-$(CONFIG_FB_OF)               += offb.o
 obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
 obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
 
+obj-$(CONFIG_FB_ESP32P4)         += esp32p4fb.o
+
 # the test framebuffer is last
 obj-$(CONFIG_FB_VIRTUAL)          += vfb.o

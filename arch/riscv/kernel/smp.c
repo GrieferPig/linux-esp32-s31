@@ -27,6 +27,7 @@
 #include <asm/tlbflush.h>
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
+#include <asm/esp32p4_debug.h>
 
 enum ipi_message_type {
 	IPI_RESCHEDULE,
@@ -347,7 +348,9 @@ static void riscv_backtrace_ipi(cpumask_t *mask)
 
 void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)
 {
+	esp32p4_backtrace_snapshot(false);
 	nmi_trigger_cpumask_backtrace(mask, exclude_cpu, riscv_backtrace_ipi);
+	esp32p4_backtrace_snapshot(true);
 }
 
 #ifdef CONFIG_KGDB

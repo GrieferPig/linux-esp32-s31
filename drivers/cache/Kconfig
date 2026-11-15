@@ -16,6 +16,14 @@ config ESP32S31_CACHE
 	  cached flash and PSRAM windows. This also supplies the non-coherent
 	  DMA cache operations required when devices access PSRAM directly.
 
+config ESP32P4_CACHE
+	bool "ESP32-P4 retained IDF cache callback"
+	depends on SOC_ESP32P4
+	default y
+	help
+	  Serialize executable synchronization and display writeback through
+	  the same retained SRAM cache engine. No ROM address assumptions.
+
 config AX45MP_L2_CACHE
 	bool "Andes Technology AX45MP L2 Cache controller"
 	depends on RISCV

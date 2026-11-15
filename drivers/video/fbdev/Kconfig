@@ -1781,6 +1781,16 @@ config FB_HYPERV
 	  This driver is deprecated, please use the Hyper-V DRM driver at
 	  drivers/gpu/drm/hyperv (CONFIG_DRM_HYPERV) instead.
 
+config FB_ESP32P4
+	bool "ESP32-P4 retained IDF DSI framebuffer"
+	depends on FB && OF && SOC_ESP32P4 && !MMU
+	select FB_SYSMEM_HELPERS
+	help
+	  Use the fixed RGB565 framebuffer and retained SRAM callbacks prepared
+	  by the ESP32-P4 v1.3 IDF loader. Provides fbdev and framebuffer console
+	  drawing with bounded, serialized writeback. Direct mmap is disabled.
+	  This is an independent reconstruction of the observed handoff ABI.
+
 config FB_SIMPLE
 	tristate "Simple framebuffer support"
 	depends on FB

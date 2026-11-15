@@ -31,3 +31,5 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-radio-wifi.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-radio-bluetooth.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-radio-combo.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-lp.dtbo
+
+dtb-$(CONFIG_SOC_ESP32P4) += esp32p4-hardware.dtb

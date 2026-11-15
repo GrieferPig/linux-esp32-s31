@@ -65,7 +65,11 @@ endif
 # ISA string setting
 riscv-march-$(CONFIG_ARCH_RV32I)	:= rv32ima
 riscv-march-$(CONFIG_ARCH_RV64I)	:= rv64ima
+ifeq ($(CONFIG_SOC_ESP32P4),y)
+riscv-march-$(CONFIG_FPU)		:= $(riscv-march-y)f
+else
 riscv-march-$(CONFIG_FPU)		:= $(riscv-march-y)fd
+endif
 riscv-march-$(CONFIG_RISCV_ISA_C)	:= $(riscv-march-y)c
 riscv-march-$(CONFIG_RISCV_ISA_V)	:= $(riscv-march-y)v
 

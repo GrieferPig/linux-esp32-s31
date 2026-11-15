@@ -254,6 +254,10 @@ static const struct esp32_uart_variant esp32s31_uhci_variant = {
 
 static const struct of_device_id esp32_uart_dt_ids[] = {
 	{
+		.compatible = "espressif,esp32p4-uart",
+		.data = &esp32s31_variant,
+	},
+	{
 		.compatible = "esp,esp32-uart",
 		.data = &esp32_variant,
 	}, {
@@ -262,10 +266,14 @@ static const struct of_device_id esp32_uart_dt_ids[] = {
 	}, {
 		.compatible = "espressif,esp32s31-uart",
 		.data = &esp32s31_variant,
-	}, {
+	},
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	{
 		.compatible = "espressif,esp32s31-uhci-uart",
 		.data = &esp32s31_uhci_variant,
-	}, { /* sentinel */ }
+	},
+#endif
+	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, esp32_uart_dt_ids);
 
@@ -688,8 +696,8 @@ static unsigned int esp32_uart_get_mctrl(struct uart_port *port)
 
 static void esp32_uart_stop_tx(struct uart_port *port)
 {
-	struct esp32_port *sport = container_of(port, struct esp32_port, port);
-	unsigned int i;
+	struct esp32_port *sport __maybe_unused = container_of(port, struct esp32_port, port);
+	unsigned int i __maybe_unused;
 	u32 int_ena;
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
@@ -843,7 +851,7 @@ static irqreturn_t esp32_uart_int(int irq, void *dev_id)
 
 static void esp32_uart_start_tx(struct uart_port *port)
 {
-	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	struct esp32_port *sport __maybe_unused = container_of(port, struct esp32_port, port);
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
 	if (port_variant(port)->uhci_dma) {
@@ -856,8 +864,8 @@ static void esp32_uart_start_tx(struct uart_port *port)
 
 static void esp32_uart_stop_rx(struct uart_port *port)
 {
-	struct esp32_port *sport = container_of(port, struct esp32_port, port);
-	unsigned int i;
+	struct esp32_port *sport __maybe_unused = container_of(port, struct esp32_port, port);
+	unsigned int i __maybe_unused;
 	u32 int_ena;
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
@@ -954,7 +962,7 @@ static int esp32_uart_startup(struct uart_port *port)
 static void esp32_uart_shutdown(struct uart_port *port)
 {
 	struct esp32_port *sport = container_of(port, struct esp32_port, port);
-	unsigned int i;
+	unsigned int i __maybe_unused;
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
 	if (port_variant(port)->uhci_dma) {
@@ -1159,7 +1167,7 @@ static void esp32_uart_console_putchar(struct uart_port *port, u8 c)
 static void esp32_uart_string_write(struct uart_port *port, const char *s,
 				    unsigned int count)
 {
-	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	struct esp32_port *sport __maybe_unused = container_of(port, struct esp32_port, port);
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
 	if (port_variant(port)->uhci_dma) {
@@ -1316,7 +1324,7 @@ static int __init esp32xx_uart_early_console_setup(struct earlycon_device *devic
 #ifdef CONFIG_CONSOLE_POLL
 	device->con->read = esp32_uart_earlycon_read;
 #endif
-	if (device->port.uartclk != BASE_BAUD * 16)
+	if (device->port.uartclk && device->port.uartclk != BASE_BAUD * 16)
 		esp32_uart_set_baud(&device->port, device->baud);
 
 	return 0;
@@ -1355,6 +1363,9 @@ static int __init esp32s31_uart_early_console_setup(struct earlycon_device *devi
 OF_EARLYCON_DECLARE(esp32s31uart, "espressif,esp32s31-uart",
 		    esp32s31_uart_early_console_setup);
 
+OF_EARLYCON_DECLARE(esp32p4uart, "espressif,esp32p4-uart",
+		    esp32s31_uart_early_console_setup);
+
 static struct uart_driver esp32_uart_reg = {
 	.owner		= THIS_MODULE,
 	.driver_name	= DRIVER_NAME,
@@ -1370,7 +1381,7 @@ static int esp32_uart_probe(struct platform_device *pdev)
 	struct uart_port *port;
 	struct esp32_port *sport;
 	struct resource *res;
-	unsigned int i;
+	unsigned int i __maybe_unused;
 	int ret;
 
 	sport = devm_kzalloc(&pdev->dev, sizeof(*sport), GFP_KERNEL);
@@ -1526,7 +1537,7 @@ err_dma:
 static void esp32_uart_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = platform_get_drvdata(pdev);
-	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	struct esp32_port *sport __maybe_unused = container_of(port, struct esp32_port, port);
 
 	uart_remove_one_port(&esp32_uart_reg, port);
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)

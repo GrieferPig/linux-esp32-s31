@@ -137,9 +137,9 @@
 	REG_L	a0, TASK_TI_A0(tp)
 .endm
 
-#ifdef CONFIG_SOC_ESP32S31
+#if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	/*
-	 * ESP32-S31 runs with stvec forced to CLIC mode, whose BASE field is
+	 * Espressif runs with its trap vector forced to CLIC mode, whose BASE field is
 	 * 64-byte aligned.  Keep the common Linux exception entry on that
 	 * boundary so synchronous traps do not land before handle_exception.
 	 */
@@ -416,6 +416,102 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	csrw CSR_CAUSE, a1
 #endif
 
+
+#ifdef CONFIG_SOC_ESP32P4
+	.option push
+	.option norelax
+	/* Keep the retained PC-relative addressing, not a new GP dependency. */
+	/* PT_CAUSE is mutable on signal/syscall paths; RAW retains the trap type.
+	 * Kernel returns preserve the interrupted CLIC context. User returns below
+	 * also discard per-hart exception state inherited across a task switch.
+	 */
+	REG_L a1, PT_CAUSE_RAW(sp)
+	csrr t1, CSR_CAUSE
+	blt t1, zero, .Lp4_live_irq
+	la t0, esp32p4_clic_rev1
+	lw t0, 0(t0)
+	beqz t0, .Lp4_ret_mil_v3
+	csrr t1, 0x346
+	j .Lp4_ret_mil_ready
+.Lp4_ret_mil_v3:
+	csrr t1, 0xfb1
+.Lp4_ret_mil_ready:
+	srli t1, t1, 24
+	bnez t1, .Lp4_ret_live_level
+	li t0, 0x00ff0000
+	and a1, a1, t0
+	j .Lp4_ret_merge
+.Lp4_live_irq:
+	blt a1, zero, .Lp4_ret_raw_irq
+	li a1, 0
+.Lp4_ret_raw_irq:
+	li t0, 0x00ff0000
+	and a1, a1, t0
+	li t0, 0x80000000
+	or a1, a1, t0
+	j .Lp4_ret_merge
+.Lp4_ret_live_level:
+	slli a1, t1, 16
+	li t0, 0x80000000
+	or a1, a1, t0
+.Lp4_ret_merge:
+	li t0, SR_MPP
+	and t0, a0, t0
+	slli t0, t0, 17
+	or a1, a1, t0
+	andi t0, a0, SR_MPIE
+	slli t0, t0, 20
+	or a1, a1, t0
+	REG_L t0, PT_CAUSE_RAW(sp)
+	li t1, 0xfff
+	and t0, t0, t1
+	or a1, a1, t0
+	/*
+	 * EXPT_VLD is per-hart, not per-task. An IRQ-preempted user task can be
+	 * scheduled from inside another task's ECALL, inheriting EXPT_VLD=1.
+	 * On P4 v1.3 an interrupt-class MRET preserves that bit, and the next
+	 * U-mode ECALL locks the core. Every user return must finish with an
+	 * exception-class MRET, including returns through an interrupt frame.
+	 *
+	 * An exception-class MRET does not unwind the active CLIC level. If MIL
+	 * is nonzero, first perform an IRQ-class MRET to an M-mode continuation
+	 * with MPIL=0 and interrupts disabled. Then restore the user status/PC
+	 * and clear INT for the final MRET. Keep a0/a1/a2 and the stack intact.
+	 */
+	li t0, SR_MPP
+	and t0, a0, t0
+	bnez t0, .Lp4_ret_write
+	la t1, esp32p4_clic_rev1
+	lw t1, 0(t1)
+	beqz t1, .Lp4_user_mil_v3
+	csrr t0, 0x346
+	j .Lp4_user_mil_ready
+.Lp4_user_mil_v3:
+	csrr t0, 0xfb1
+.Lp4_user_mil_ready:
+	srli t0, t0, 24
+	beqz t0, .Lp4_user_exception_return
+	li t0, SR_MPP
+	or t1, a0, t0
+	li t0, ~(SR_MIE | SR_MPIE)
+	and t1, t1, t0
+	csrw CSR_STATUS, t1
+	li t0, 0xb0000000 /* INT=1, MPP=M, MPIE=0, MPIL=0 */
+	csrw CSR_CAUSE, t0
+	la t0, .Lp4_user_level_unwound
+	csrw CSR_EPC, t0
+	mret
+.Lp4_user_level_unwound:
+	csrw CSR_STATUS, a0
+	csrw CSR_EPC, a2
+.Lp4_user_exception_return:
+	li t0, 0x7fffffff
+	and a1, a1, t0
+.Lp4_ret_write:
+	csrw CSR_CAUSE, a1
+	.option pop
+#endif
+
 	REG_L x1,  PT_RA(sp)
 	REG_L x3,  PT_GP(sp)
 	REG_L x4,  PT_TP(sp)
@@ -597,6 +693,41 @@ SYM_FUNC_START(__switch_to)
 	REG_L s11, TASK_THREAD_S11_RA(a4)
 	/* The offset of thread_info in task_struct is zero. */
 	move tp, a1
+#ifdef CONFIG_SOC_ESP32P4
+	.option push
+	.option norelax
+	/* Exact v4 policy: only a live MIL triggers the MRET bounce. */
+	la t4, esp32p4_clic_rev1
+	lw t4, 0(t4)
+	beqz t4, .Lp4_switch_v3
+	csrr t3, 0x346
+	j .Lp4_switch_mil
+.Lp4_switch_v3:
+	csrr t3, 0xfb1
+.Lp4_switch_mil:
+	srli t3, t3, 24
+	beqz t3, .Lp4_switch_done
+	csrr t0, mstatus
+	csrci mstatus, 8
+	csrr t1, mepc
+	csrr t2, mcause
+	li t3, 0xb0000000
+	csrw mcause, t3
+	li t3, SR_MPP
+	or t3, t0, t3
+	li t4, ~(SR_MIE | SR_MPIE)
+	and t3, t3, t4
+	csrw mstatus, t3
+	la t3, .Lp4_switch_return
+	csrw mepc, t3
+	mret
+.Lp4_switch_return:
+	csrw mcause, t2
+	csrw mepc, t1
+	csrw mstatus, t0
+.Lp4_switch_done:
+	.option pop
+#endif
 #ifdef CONFIG_ESP32S31_RADIO_SMODE
 	csrw CSR_SCRATCH, tp
 #endif

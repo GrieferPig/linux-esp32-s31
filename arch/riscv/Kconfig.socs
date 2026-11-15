@@ -103,6 +103,18 @@ config ARCH_ESPRESSIF
 	help
 	  This enables support for Espressif RISC-V SoCs.
 
+config SOC_ESP32P4
+	bool "Espressif ESP32-P4 machine-mode noMMU"
+	depends on ARCH_ESPRESSIF && !MMU && 32BIT
+	select RISCV_ESP_CLIC_TRAP_QUIRK
+	select ESP32P4_IRQCHIP
+	select ESP32P4_SYSTIMER
+	select ESP32P4_CACHE
+	select COMMON_CLK
+	help
+	  Reconstructed Linux port for the retained IDF SRAM handoff.
+	  This target has no SBI, XIP, hotplug or suspend support.
+
 config SOC_ESP32S31
 	bool "Espressif ESP32-S31 SoC"
 	depends on ARCH_ESPRESSIF

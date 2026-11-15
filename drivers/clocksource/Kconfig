@@ -799,4 +799,12 @@ config ESP32S31_SYSTIMER
 	  clocksource and clockevent, in preference to the CPU-clocked CLINT
 	  behind the SBI timer. Survives WFI and CPU-clock changes.
 
+config ESP32P4_SYSTIMER
+	bool "ESP32-P4 SYSTIMER clocksource and clockevents"
+	depends on SOC_ESP32P4 && ESP32P4_IRQCHIP
+	select TIMER_OF
+	help
+	  Use the shared 16 MHz SYSTIMER unit0 for timekeeping and
+	  independent one-shot comparators for the two HP CPUs.
+
 endmenu

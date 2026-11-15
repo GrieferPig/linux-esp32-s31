@@ -10,7 +10,21 @@
 
 typedef unsigned long cycles_t;
 
-#ifdef CONFIG_RISCV_M_MODE
+#ifdef CONFIG_SOC_ESP32P4
+/* P4 has no CLINT. Its cycle CSR runs at the DT's 360 MHz timebase. */
+static inline cycles_t get_cycles(void)
+{
+	return csr_read(0xb00);
+}
+#define get_cycles get_cycles
+static inline u32 get_cycles_hi(void)
+{
+	return csr_read(0xb80);
+}
+#define get_cycles_hi get_cycles_hi
+#define random_get_entropy() get_cycles()
+
+#elif defined(CONFIG_RISCV_M_MODE)
 
 #include <asm/clint.h>
 
