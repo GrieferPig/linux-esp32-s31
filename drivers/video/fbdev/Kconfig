@@ -1781,15 +1781,23 @@ config FB_HYPERV
 	  This driver is deprecated, please use the Hyper-V DRM driver at
 	  drivers/gpu/drm/hyperv (CONFIG_DRM_HYPERV) instead.
 
+config FB_ESP32P4_DSI
+	bool "ESP32-P4 MIPI DSI controller and panel bring-up"
+	depends on FB && OF && SOC_ESP32P4 && !MMU
+	help
+	  Program the ESP32-P4 MIPI DSI host, DPHY and DSI bridge, run the panel
+	  power/reset/initialisation sequence over the panel's I2C MCU and DCS, and
+	  feed the scanout from a VDMA link list. Used by the ESP32-P4 framebuffer
+	  driver, which supplies the RGB565 scanout buffer.
+
 config FB_ESP32P4
 	bool "ESP32-P4 retained IDF DSI framebuffer"
 	depends on FB && OF && SOC_ESP32P4 && !MMU
 	select FB_SYSMEM_HELPERS
 	help
-	  Use the fixed RGB565 framebuffer and retained SRAM callbacks prepared
-	  by the ESP32-P4 v1.3 IDF loader. Provides fbdev and framebuffer console
-	  drawing with bounded, serialized writeback. Direct mmap is disabled.
-	  This is an independent reconstruction of the observed handoff ABI.
+	  Use the fixed RGB565 framebuffer and drive the ESP32-P4 DSI scanout from
+	  the kernel. Provides fbdev and framebuffer console drawing with bounded,
+	  serialized cache writeback. Direct mmap is disabled.
 
 config FB_SIMPLE
 	tristate "Simple framebuffer support"

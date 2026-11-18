@@ -19,4 +19,5 @@ extern u32 esp32p4_clic_rev1;
 void esp32p4_cache_sync_for_exec(unsigned long start, unsigned long end);
 void esp32p4_cache_sync_all_for_exec(void);
 int esp32p4_display_cache_writeback(u32 start, u32 size);
+int esp32p4_camera_cache_invalidate(u32 start, u32 size);
 #endif

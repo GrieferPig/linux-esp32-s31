@@ -11,6 +11,7 @@
 /* The Magic number for signal context frame header. */
 #define RISCV_V_MAGIC	0x53465457
 #define RISCV_ESP32S31_EXT_MAGIC	0x53333145
+#define RISCV_ESP32P4_ZCMT_MAGIC	0x50345a43
 #define END_MAGIC	0x0
 
 /* The size of END signal context header. */
@@ -21,6 +22,12 @@
 struct __sc_riscv_v_state {
 	struct __riscv_v_ext_state v_state;
 } __attribute__((aligned(16)));
+
+/* Local ESP32-P4 Zcmt signal ABI; JVT.MODE must be zero. */
+struct __riscv_esp32p4_zcmt_state {
+	__u32 jvt;
+	__u32 reserved;
+};
 
 /* ESP32-S31 HWLoop and PIE state, matching the kernel/OpenSBI save area. */
 struct __riscv_esp32s31_ext_state {

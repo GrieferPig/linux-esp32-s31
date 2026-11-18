@@ -22,7 +22,7 @@
 #include <linux/reset.h>
 
 #include "virt-dma.h"
-#include "esp32s31-ahb-gdma.h"
+#include "espressif-gdma-ahb.h"
 
 #define AHB_CHANNELS			5
 #define AHB_DESC_MAX			4095U

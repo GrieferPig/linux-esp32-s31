@@ -71,6 +71,12 @@ else
 riscv-march-$(CONFIG_FPU)		:= $(riscv-march-y)fd
 endif
 riscv-march-$(CONFIG_RISCV_ISA_C)	:= $(riscv-march-y)c
+ifeq ($(CONFIG_SOC_ESP32P4),y)
+# P4 v1.3 implements Zcb, Zcmp and Zcmt, not the S31 bitmanip profile.
+# Match IDF SOC_CPU_ZCMP_PUSH_REVERSED / SOC_CPU_ZCMP_POPRET_ISSUE.
+KBUILD_CFLAGS += -mno-cm-push-reverse -mno-cm-popret
+riscv-march-y := $(riscv-march-y)_zcb_zcmp_zcmt_zicntr_zihpm
+endif
 riscv-march-$(CONFIG_RISCV_ISA_V)	:= $(riscv-march-y)v
 
 ifneq ($(CONFIG_RISCV_ISA_C),y)

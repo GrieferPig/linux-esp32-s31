@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-config ESP32S31_DT_OVERLAY
+config ESPRESSIF_DT_OVERLAY
 	bool "ESP32-S31 transactional Device Tree overlay manager"
 	depends on SOC_ESP32S31
 	select OF_OVERLAY

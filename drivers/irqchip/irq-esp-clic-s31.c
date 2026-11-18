@@ -33,7 +33,7 @@
 #include <linux/rcupdate.h>
 #include <linux/moduleparam.h>
 #include <linux/err.h>
-#include <linux/irqchip/irq-esp32s31-clic.h>
+#include <linux/irqchip/irq-esp-clic-s31.h>
 #include <linux/spinlock.h>
 #include <linux/io.h>
 #include <linux/irq.h>
@@ -47,7 +47,7 @@
 #include <linux/smp.h>
 #include <linux/syscore_ops.h>
 
-#include "irq-esp32s31-internal.h"
+#include "irq-esp-smp-s31.h"
 
 /* Supervisor bank per-source byte layout (mirror of M-bank in OpenSBI):
  *   +0 clicintip   pending bit

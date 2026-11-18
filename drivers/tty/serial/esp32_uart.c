@@ -21,7 +21,7 @@
 #include <linux/tty_flip.h>
 #include <asm/serial.h>
 #include <asm/irq_regs.h>
-#include "../../dma/esp32s31-ahb-gdma.h"
+#include "../../dma/espressif-gdma-ahb.h"
 
 #define DRIVER_NAME	"esp32-uart"
 #define DEV_NAME	"ttyS"

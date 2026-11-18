@@ -21,7 +21,7 @@ endmenu
 
 menu "Proximity and distance sensors"
 
-config ESP32S31_TOUCH
+config ESPRESSIF_TOUCH
 	tristate "Espressif ESP32-S31 capacitive touch sensor"
 	depends on SOC_ESP32S31 || COMPILE_TEST
 	help

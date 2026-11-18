@@ -2,6 +2,8 @@
 #ifndef _ASM_RISCV_ESP32S31_CACHE_H
 #define _ASM_RISCV_ESP32S31_CACHE_H
 
+#define ESP32S31_CACHE_PHYS_BASE	0x2c000000UL
+
 #ifdef __ASSEMBLY__
 /*
  * S31's Sv32 page-table walker does not snoop the shared write-back D-cache.

@@ -16,7 +16,7 @@
 #include <linux/sched/task.h>
 #include <linux/cpu.h>
 #include <linux/init.h>
-#include <linux/clocksource/esp32s31-systimer.h>
+#include <linux/clocksource/esp-systimer-s31.h>
 #include <linux/cpuhotplug.h>
 #include <linux/export.h>
 #include <linux/io.h>
@@ -38,7 +38,7 @@
 #include <asm/tlbflush.h>
 #include <asm/esp32s31_tlb_fence.h>
 
-#include "irq-esp32s31-internal.h"
+#include "irq-esp-smp-s31.h"
 
 #define ESP32S31_IPI_DOORBELL_BASE	0x20586010U
 #define ESP32S31_IPI_DOORBELL_SIZE	0x8U
@@ -173,7 +173,7 @@ static void esp32s31_ipi_send(unsigned int cpu)
 	writel(1, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
 }
 
-#include "irq-esp32s31-tlb-fence.inc"
+#include "irq-esp-tlb-fence-s31.inc"
 
 static void esp32s31_ipi_chained(struct irq_desc *desc)
 {

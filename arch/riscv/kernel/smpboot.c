@@ -22,7 +22,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/irq.h>
-#include <linux/irqchip/irq-esp32p4.h>
+#include <linux/irqchip/irq-esp-clic-p4.h>
 #include <linux/of.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/mm.h>

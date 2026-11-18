@@ -37,7 +37,7 @@
 #include <linux/spinlock.h>
 #include <linux/syscore_ops.h>
 
-#include "irq-esp32s31-internal.h"
+#include "irq-esp-smp-s31.h"
 
 /* Per-source 32-bit register, low 6 bits = target CLIC slot. */
 #define INTMTX_SRC_REG(src)	((src) * 4U)
@@ -150,9 +150,16 @@ static bool esp_intmtx_cpu0_owner(struct irq_data *data)
 
 static bool esp_intmtx_pm_migration(void)
 {
-	/* CPU hotplug retains the last tasks_frozen value after resume.
-	 * Only the actual suspend window permits quiesced CPU0 migration. */
+	/*
+	 * CPU hotplug retains the last tasks_frozen value after resume.
+	 * Only the actual suspend window permits quiesced CPU0 migration.
+	 * cpuhp_tasks_frozen only exists where CPU hotplug does.
+	 */
+#ifdef CONFIG_SMP
 	return READ_ONCE(cpuhp_tasks_frozen) && pm_suspend_in_progress();
+#else
+	return false;
+#endif
 }
 
 static int esp_intmtx_set_affinity(struct irq_data *d,

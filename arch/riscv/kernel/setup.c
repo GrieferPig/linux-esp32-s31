@@ -363,7 +363,7 @@ void __init setup_arch(char **cmdline_p)
 
 	if ((IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
 	     riscv_isa_extension_available(NULL, ZICBOM)) ||
-	    IS_ENABLED(CONFIG_ESP32S31_CACHE))
+	    IS_ENABLED(CONFIG_ESPRESSIF_CACHE))
 		riscv_noncoherent_supported();
 	riscv_set_dma_cache_alignment();
 

@@ -23,14 +23,14 @@
 
 #include "virt-dma.h"
 
-#define ESP32S31_AXI_GDMA_CHANNELS	3
-#define ESP32S31_AXI_GDMA_DESC_MAX	4095U
-#define ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX 4032U
-#define ESP32S31_AXI_GDMA_BURST_SIZE	128U
-#define ESP32S31_AXI_GDMA_CACHE_LINE	64U
-#define ESP32S31_AXI_GDMA_PATTERN_SIZE	512U
-#define ESP32S31_AXI_GDMA_PERIPH_MAX	5U
-#define ESP32S31_AXI_GDMA_PERIPH_DISCONNECT 0x3fU
+#define ESPRESSIF_GDMA_AXI_CHANNELS	3
+#define ESPRESSIF_GDMA_AXI_DESC_MAX	4095U
+#define ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX 4032U
+#define ESPRESSIF_GDMA_AXI_BURST_SIZE	128U
+#define ESPRESSIF_GDMA_AXI_CACHE_LINE	64U
+#define ESPRESSIF_GDMA_AXI_PATTERN_SIZE	512U
+#define ESPRESSIF_GDMA_AXI_PERIPH_MAX	5U
+#define ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT 0x3fU
 
 /* Cached and direct (uncached) views of the 16-MiB MSPI PSRAM window. */
 #define ESP32S31_PSRAM_CACHED_BASE	0x50000000U
@@ -187,7 +187,7 @@ struct esp32s31_axi_gdma {
 	void __iomem *desc_base;
 	void __iomem *psram_direct;
 	struct gen_pool *desc_pool;
-	struct esp32s31_axi_chan chans[ESP32S31_AXI_GDMA_CHANNELS];
+	struct esp32s31_axi_chan chans[ESPRESSIF_GDMA_AXI_CHANNELS];
 };
 
 static inline struct esp32s31_axi_chan *to_esp32s31_axi_chan(struct dma_chan *chan)
@@ -257,8 +257,8 @@ static void esp32s31_axi_reset_pair(struct esp32s31_axi_chan *chan)
 static void esp32s31_axi_config_pair(struct esp32s31_axi_chan *chan,
 				     enum dma_transfer_direction direction)
 {
-	u32 rx_periph = ESP32S31_AXI_GDMA_PERIPH_DISCONNECT;
-	u32 tx_periph = ESP32S31_AXI_GDMA_PERIPH_DISCONNECT;
+	u32 rx_periph = ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT;
+	u32 tx_periph = ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT;
 	u32 maxburst, width, burst_bytes;
 	u32 burst_sel;
 	u32 rx_conf;
@@ -271,9 +271,9 @@ static void esp32s31_axi_config_pair(struct esp32s31_axi_chan *chan,
 		width = chan->config.src_addr_width;
 	}
 	burst_bytes = maxburst && width ? maxburst * width :
-		ESP32S31_AXI_GDMA_BURST_SIZE;
+		ESPRESSIF_GDMA_AXI_BURST_SIZE;
 	burst_bytes = clamp_t(u32, rounddown_pow_of_two(burst_bytes), 8,
-			    ESP32S31_AXI_GDMA_BURST_SIZE);
+			    ESPRESSIF_GDMA_AXI_BURST_SIZE);
 	burst_sel = __ffs(burst_bytes) - 3;
 	rx_conf = FIELD_PREP(ESP32S31_AXI_RX_BURST_SIZE, burst_sel) |
 		  ESP32S31_AXI_RX_DSCR_BURST_EN;
@@ -341,11 +341,11 @@ static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
 		return -EINVAL;
 
 	if (rx && esp32s31_axi_is_psram(addr, len)) {
-		size_t head = addr & (ESP32S31_AXI_GDMA_CACHE_LINE - 1);
+		size_t head = addr & (ESPRESSIF_GDMA_AXI_CACHE_LINE - 1);
 
 		if (head) {
 			head = min_t(size_t, len,
-					     ESP32S31_AXI_GDMA_CACHE_LINE - head);
+					     ESPRESSIF_GDMA_AXI_CACHE_LINE - head);
 			if (n == capacity)
 				return -ENOSPC;
 			segs[n++] = (struct esp32s31_axi_seg) {
@@ -357,9 +357,9 @@ static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
 		}
 	}
 
-	while (len >= ESP32S31_AXI_GDMA_CACHE_LINE) {
-		size_t chunk = min_t(size_t, len & ~(ESP32S31_AXI_GDMA_CACHE_LINE - 1),
-				     ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX);
+	while (len >= ESPRESSIF_GDMA_AXI_CACHE_LINE) {
+		size_t chunk = min_t(size_t, len & ~(ESPRESSIF_GDMA_AXI_CACHE_LINE - 1),
+				     ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX);
 
 		if (!chunk)
 			break;
@@ -373,10 +373,10 @@ static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
 	}
 
 	while (len) {
-		size_t chunk = min_t(size_t, len, ESP32S31_AXI_GDMA_DESC_MAX);
+		size_t chunk = min_t(size_t, len, ESPRESSIF_GDMA_AXI_DESC_MAX);
 		bool stash = rx && esp32s31_axi_is_psram(addr, chunk) &&
-			     (chunk < ESP32S31_AXI_GDMA_CACHE_LINE ||
-			      (addr & (ESP32S31_AXI_GDMA_CACHE_LINE - 1)));
+			     (chunk < ESPRESSIF_GDMA_AXI_CACHE_LINE ||
+			      (addr & (ESPRESSIF_GDMA_AXI_CACHE_LINE - 1)));
 
 		if (n == capacity)
 			return -ENOSPC;
@@ -422,7 +422,7 @@ esp32s31_axi_alloc_desc(struct esp32s31_axi_chan *chan,
 
 	/* Padding permits cache-line aligned stash/pattern buffers in one allocation. */
 	pool_len = node_count * sizeof(struct esp32s31_axi_hw_desc) +
-		   stash_count * ESP32S31_AXI_GDMA_CACHE_LINE + pattern_len + 127;
+		   stash_count * ESPRESSIF_GDMA_AXI_CACHE_LINE + pattern_len + 127;
 	pool = gen_pool_alloc(chan->gdma->desc_pool, pool_len);
 	if (!pool)
 		goto err;
@@ -446,14 +446,14 @@ esp32s31_axi_alloc_desc(struct esp32s31_axi_chan *chan,
 	}
 
 	cursor = ALIGN(pool + node_count * sizeof(struct esp32s31_axi_hw_desc),
-		       ESP32S31_AXI_GDMA_CACHE_LINE);
+		       ESPRESSIF_GDMA_AXI_CACHE_LINE);
 	for (i = 0; i < stash_count; i++) {
 		desc->stash[i].hw = (void __iomem *)cursor;
 		desc->stash[i].dma = gen_pool_virt_to_phys(chan->gdma->desc_pool, cursor);
-		cursor += ESP32S31_AXI_GDMA_CACHE_LINE;
+		cursor += ESPRESSIF_GDMA_AXI_CACHE_LINE;
 	}
 	if (pattern_len) {
-		cursor = ALIGN(cursor, ESP32S31_AXI_GDMA_BURST_SIZE);
+		cursor = ALIGN(cursor, ESPRESSIF_GDMA_AXI_BURST_SIZE);
 		pattern_dma = gen_pool_virt_to_phys(chan->gdma->desc_pool, cursor);
 	}
 
@@ -514,16 +514,16 @@ static void __iomem *esp32s31_axi_pattern(struct esp32s31_axi_desc *desc)
 
 	cursor = (unsigned long)desc->pool_base +
 		 (desc->tx_count + desc->rx_count) * sizeof(struct esp32s31_axi_hw_desc);
-	cursor = ALIGN(cursor, ESP32S31_AXI_GDMA_CACHE_LINE);
-	cursor += stash_count * ESP32S31_AXI_GDMA_CACHE_LINE;
-	return (void __iomem *)ALIGN(cursor, ESP32S31_AXI_GDMA_BURST_SIZE);
+	cursor = ALIGN(cursor, ESPRESSIF_GDMA_AXI_CACHE_LINE);
+	cursor += stash_count * ESPRESSIF_GDMA_AXI_CACHE_LINE;
+	return (void __iomem *)ALIGN(cursor, ESPRESSIF_GDMA_AXI_BURST_SIZE);
 }
 
 static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 				       struct esp32s31_axi_desc *desc,
 				       int period)
 {
-	u8 data[ESP32S31_AXI_GDMA_CACHE_LINE];
+	u8 data[ESPRESSIF_GDMA_AXI_CACHE_LINE];
 	unsigned int i, count = desc->stash_count;
 
 	for (i = 0; i < count; i++) {
@@ -782,7 +782,7 @@ esp32s31_axi_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	if (!len || !IS_ALIGNED(src, 4) || !IS_ALIGNED(dst, 4) ||
 	    !IS_ALIGNED(len, 4) || upper_32_bits(src) || upper_32_bits(dst))
 		return NULL;
-	cap = DIV_ROUND_UP(len, ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX) + 3;
+	cap = DIV_ROUND_UP(len, ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX) + 3;
 	tx = kcalloc(cap, sizeof(*tx), GFP_NOWAIT);
 	rx = kcalloc(cap, sizeof(*rx), GFP_NOWAIT);
 	if (!tx || !rx)
@@ -820,14 +820,14 @@ esp32s31_axi_prep_memset(struct dma_chan *dchan, dma_addr_t dst, int value,
 	if (!len || !IS_ALIGNED(dst, 4) || !IS_ALIGNED(len, 4) ||
 	    upper_32_bits(dst))
 		return NULL;
-	tx_cap = DIV_ROUND_UP(len, ESP32S31_AXI_GDMA_PATTERN_SIZE);
-	rx_cap = DIV_ROUND_UP(len, ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX) + 3;
+	tx_cap = DIV_ROUND_UP(len, ESPRESSIF_GDMA_AXI_PATTERN_SIZE);
+	rx_cap = DIV_ROUND_UP(len, ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX) + 3;
 	tx = kcalloc(tx_cap, sizeof(*tx), GFP_NOWAIT);
 	rx = kcalloc(rx_cap, sizeof(*rx), GFP_NOWAIT);
 	if (!tx || !rx)
 		goto out;
 	for (i = 0; i < tx_cap; i++) {
-		size_t chunk = min_t(size_t, remaining, ESP32S31_AXI_GDMA_PATTERN_SIZE);
+		size_t chunk = min_t(size_t, remaining, ESPRESSIF_GDMA_AXI_PATTERN_SIZE);
 
 		tx[tx_count++] = (struct esp32s31_axi_seg) { .len = chunk };
 		remaining -= chunk;
@@ -837,11 +837,11 @@ esp32s31_axi_prep_memset(struct dma_chan *dchan, dma_addr_t dst, int value,
 		goto out;
 	rx[rx_count - 1].eof = true;
 	desc = esp32s31_axi_alloc_desc(chan, tx, tx_count, rx, rx_count,
-					ESP32S31_AXI_GDMA_PATTERN_SIZE);
+					ESPRESSIF_GDMA_AXI_PATTERN_SIZE);
 	if (!desc)
 		goto out;
 	memset_io(esp32s31_axi_pattern(desc), value,
-		  ESP32S31_AXI_GDMA_PATTERN_SIZE);
+		  ESPRESSIF_GDMA_AXI_PATTERN_SIZE);
 	desc->direction = DMA_MEM_TO_MEM;
 	desc->len = len;
 	desc->residue = len;
@@ -859,7 +859,7 @@ static int esp32s31_axi_slave_config(struct dma_chan *dchan,
 {
 	struct esp32s31_axi_chan *chan = to_esp32s31_axi_chan(dchan);
 
-	if (chan->request_id > ESP32S31_AXI_GDMA_PERIPH_MAX)
+	if (chan->request_id > ESPRESSIF_GDMA_AXI_PERIPH_MAX)
 		return -EINVAL;
 	memcpy(&chan->config, config, sizeof(*config));
 	return 0;
@@ -880,12 +880,12 @@ esp32s31_axi_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	bool rx;
 
 	if (!sg_len || (direction != DMA_MEM_TO_DEV && direction != DMA_DEV_TO_MEM) ||
-	    chan->request_id > ESP32S31_AXI_GDMA_PERIPH_MAX)
+	    chan->request_id > ESPRESSIF_GDMA_AXI_PERIPH_MAX)
 		return NULL;
 	rx = direction == DMA_DEV_TO_MEM;
 	for_each_sg(sgl, sg, sg_len, i) {
 		cap += DIV_ROUND_UP(sg_dma_len(sg),
-				    ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX) + 2;
+				    ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX) + 2;
 		len += sg_dma_len(sg);
 	}
 	segs = kcalloc(cap, sizeof(*segs), GFP_NOWAIT);
@@ -925,11 +925,11 @@ esp32s31_axi_prep_cyclic(struct dma_chan *dchan, dma_addr_t buf_addr,
 
 	if (!buf_len || !period_len || buf_len % period_len ||
 	    (direction != DMA_MEM_TO_DEV && direction != DMA_DEV_TO_MEM) ||
-	    chan->request_id > ESP32S31_AXI_GDMA_PERIPH_MAX)
+	    chan->request_id > ESPRESSIF_GDMA_AXI_PERIPH_MAX)
 		return NULL;
 	periods = buf_len / period_len;
 	cap = periods * (DIV_ROUND_UP(period_len,
-				    ESP32S31_AXI_GDMA_DESC_ALIGNED_MAX) + 3);
+				    ESPRESSIF_GDMA_AXI_DESC_ALIGNED_MAX) + 3);
 	segs = kcalloc(cap, sizeof(*segs), GFP_NOWAIT);
 	if (!segs)
 		return NULL;
@@ -1097,7 +1097,7 @@ static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)
 	writel(val & ~ESP32S31_AXI_MISC_RST_RD, gdma->base + ESP32S31_AXI_MISC_CONF);
 	writel(val | ESP32S31_AXI_MISC_RST_WR, gdma->base + ESP32S31_AXI_MISC_CONF);
 	writel(val & ~ESP32S31_AXI_MISC_RST_WR, gdma->base + ESP32S31_AXI_MISC_CONF);
-	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++) {
 		esp32s31_axi_reset_pair(&gdma->chans[i]);
 		esp32s31_axi_config_pair(&gdma->chans[i], DMA_MEM_TO_MEM);
 	}
@@ -1110,8 +1110,8 @@ static struct dma_chan *esp32s31_axi_of_xlate(struct of_phandle_args *spec,
 	struct dma_chan *dchan;
 	struct esp32s31_axi_chan *chan;
 
-	if (spec->args_count != 2 || spec->args[0] >= ESP32S31_AXI_GDMA_CHANNELS ||
-	    spec->args[1] > ESP32S31_AXI_GDMA_PERIPH_MAX)
+	if (spec->args_count != 2 || spec->args[0] >= ESPRESSIF_GDMA_AXI_CHANNELS ||
+	    spec->args[1] > ESPRESSIF_GDMA_AXI_PERIPH_MAX)
 		return NULL;
 	chan = &gdma->chans[spec->args[0]];
 	dchan = dma_get_slave_channel(&chan->vc.chan);
@@ -1175,7 +1175,7 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 				   BIT(DMA_SLAVE_BUSWIDTH_8_BYTES);
 	dma_dev->dst_addr_widths = dma_dev->src_addr_widths;
 	dma_dev->min_burst = 1;
-	dma_dev->max_burst = ESP32S31_AXI_GDMA_BURST_SIZE;
+	dma_dev->max_burst = ESPRESSIF_GDMA_AXI_BURST_SIZE;
 	dma_dev->residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
 	dma_dev->device_alloc_chan_resources = esp32s31_axi_alloc_chan_resources;
 	dma_dev->device_free_chan_resources = esp32s31_axi_free_chan_resources;
@@ -1189,7 +1189,7 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	dma_dev->device_terminate_all = esp32s31_axi_terminate_all;
 	dma_dev->device_synchronize = esp32s31_axi_synchronize;
 
-	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++) {
 		struct esp32s31_axi_chan *chan = &gdma->chans[i];
 
 		chan->gdma = gdma;
@@ -1202,7 +1202,7 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	}
 	esp32s31_axi_hw_init(gdma);
 
-	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++) {
 		struct esp32s31_axi_chan *chan = &gdma->chans[i];
 		char irq_name[8];
 
@@ -1237,14 +1237,14 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, gdma);
 	dev_info(dev,
 		 "AXI GDMA ready: %u pairs, memcpy/memset/slave-sg/cyclic, burst %u, version %#x\n",
-		 ESP32S31_AXI_GDMA_CHANNELS, ESP32S31_AXI_GDMA_BURST_SIZE,
+		 ESPRESSIF_GDMA_AXI_CHANNELS, ESPRESSIF_GDMA_AXI_BURST_SIZE,
 		 readl(gdma->base + ESP32S31_AXI_DATE));
 	return 0;
 
 err_unregister:
 	dma_async_device_unregister(dma_dev);
 err_vchans:
-	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++)
+	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++)
 		tasklet_kill(&gdma->chans[i].vc.task);
 	return ret;
 }
@@ -1256,7 +1256,7 @@ static void esp32s31_axi_remove(struct platform_device *pdev)
 
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&gdma->dma_dev);
-	for (i = 0; i < ESP32S31_AXI_GDMA_CHANNELS; i++) {
+	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++) {
 		esp32s31_axi_terminate_all(&gdma->chans[i].vc.chan);
 		tasklet_kill(&gdma->chans[i].vc.task);
 	}

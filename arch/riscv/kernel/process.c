@@ -208,6 +208,9 @@ void start_thread(struct pt_regs *regs, unsigned long pc,
 	}
 	regs->epc = pc;
 	regs->sp = sp;
+#ifdef CONFIG_SOC_ESP32P4
+	regs->jvt = 0;
+#endif
 
 #ifdef CONFIG_64BIT
 	regs->status &= ~SR_UXL;

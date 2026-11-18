@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared ABI between esp32s31-ahb-gdma and its UART client. */
 
-#ifndef ESP32S31_AHB_GDMA_H
-#define ESP32S31_AHB_GDMA_H
+#ifndef ESPRESSIF_GDMA_AHB_H
+#define ESPRESSIF_GDMA_AHB_H
 
 #include <linux/dmaengine.h>
 
@@ -23,4 +23,4 @@ struct esp32s31_ahb_rx_result {
 int esp32s31_ahb_terminate_direction(struct dma_chan *dchan,
 				     enum dma_transfer_direction direction);
 
-#endif /* ESP32S31_AHB_GDMA_H */
+#endif /* ESPRESSIF_GDMA_AHB_H */

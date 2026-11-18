@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Reconstructed P4 IDF framebuffer handoff, not recovered original source.
- * Fixed v1.3 loader ABI: retained SRAM callbacks, RGB565 PSRAM scanout.
- * Display DMA only reads this memory. No uncached-alias assumptions.
+ * Reconstructed ESP32-P4 framebuffer, not recovered original source.
+ * The display pipeline belongs to Linux: this driver owns the RGB565 PSRAM
+ * framebuffer and delegates DSI host, panel and VDMA programming to
+ * esp32p4-dsi.c. The loader only publishes the shared cache service, which
+ * writeback of the pixels the VDMA reads still goes through.
  */
 #include <linux/fb.h>
 #include <linux/interrupt.h>
@@ -16,6 +18,8 @@
 #include <linux/soc/espressif/esp32p4.h>
 #include <linux/uaccess.h>
 
+#include "esp32p4-dsi.h"
+
 #define P4_FB_BASE 0x49000000U
 #define P4_FB_SIZE 0x001c2000U
 #define P4_FB_WIDTH 720U
@@ -27,8 +31,9 @@
 struct p4_fb {
 	struct fb_info *info;
 	raw_spinlock_t service_lock;
-	int (*service)(u32 operation, u32 reserved);
+	struct esp32p4_dsi *dsi;
 	int irq;
+	bool mem_claimed;
 	bool running;
 	bool failed;
 	bool removed;
@@ -42,7 +47,7 @@ static void p4_fb_stop(struct p4_fb *fb)
 
 	raw_spin_lock_irqsave(&fb->service_lock, flags);
 	if (fb->running) {
-		fb->service(2, 0);
+		esp32p4_dsi_stop(fb->dsi);
 		fb->running = false;
 	}
 	raw_spin_unlock_irqrestore(&fb->service_lock, flags);
@@ -56,9 +61,9 @@ static irqreturn_t p4_fb_irq(int irq, void *data)
 
 	raw_spin_lock_irqsave(&fb->service_lock, flags);
 	if (fb->running) {
-		ret = fb->service(1, 0);
+		ret = esp32p4_dsi_irq(fb->dsi);
 		if (ret < 0) {
-			fb->service(2, 0);
+			esp32p4_dsi_stop(fb->dsi);
 			fb->running = false;
 			WRITE_ONCE(fb->failed, true);
 		}
@@ -221,7 +226,11 @@ static int p4_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 
 static void p4_fb_destroy(struct fb_info *info)
 {
-	release_mem_region(P4_FB_BASE, P4_FB_SIZE);
+	struct p4_fb *fb = info->par;
+
+	esp32p4_dsi_destroy(fb->dsi);
+	if (fb->mem_claimed)
+		release_mem_region(P4_FB_BASE, P4_FB_SIZE);
 	framebuffer_release(info);
 }
 
@@ -243,39 +252,60 @@ static int p4_fb_probe(struct platform_device *pdev)
 	struct fb_info *info;
 	struct p4_fb *fb;
 	const char *format;
-	u32 reg[2], interrupts[2], width, height, stride, service, cache;
+	u32 reg[2], interrupts[2], width, height, stride, cache;
 	unsigned long flags;
+	bool mem_claimed;
 	int ret;
 
-	if (of_n_addr_cells(node) != 1 || of_n_size_cells(node) != 1 ||
-	    of_property_count_u32_elems(node, "reg") != 2 ||
-	    of_property_count_u32_elems(node, "interrupts") != 2 ||
-	    of_property_read_u32_array(node, "interrupts", interrupts, 2) ||
-	    of_property_read_u32_array(node, "reg", reg, 2) ||
-	    of_property_read_u32(node, "width", &width) ||
+	if (of_n_addr_cells(node) != 1 || of_n_size_cells(node) != 1) {
+		dev_err(&pdev->dev, "node needs one address and size cell\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32_array(node, "reg", reg, 2) ||
+	    of_property_read_u32_array(node, "interrupts", interrupts, 2)) {
+		dev_err(&pdev->dev, "node needs reg and interrupts\n");
+		return -EINVAL;
+	}
+	if (of_property_read_u32(node, "width", &width) ||
 	    of_property_read_u32(node, "height", &height) ||
 	    of_property_read_u32(node, "stride", &stride) ||
 	    of_property_read_string(node, "format", &format) ||
-	    of_property_read_u32(node, "espressif,display-service-entry", &service) ||
-	    of_property_read_u32(node, "espressif,cache-writeback-entry", &cache))
+	    of_property_read_u32(node, "espressif,cache-writeback-entry", &cache)) {
+		dev_err(&pdev->dev, "node is missing geometry or cache entry\n");
 		return -EINVAL;
+	}
 	if (reg[0] != P4_FB_BASE || reg[1] != P4_FB_SIZE ||
 	    width != P4_FB_WIDTH || height != P4_FB_HEIGHT ||
-	    stride != P4_FB_STRIDE || strcmp(format, "r5g6b5") ||
-	    interrupts[0] != 24 || interrupts[1] != IRQ_TYPE_LEVEL_HIGH ||
-	    !esp32p4_retained_entry_valid(service) ||
-	    !esp32p4_retained_entry_valid(cache))
+	    stride != P4_FB_STRIDE || strcmp(format, "r5g6b5")) {
+		dev_err(&pdev->dev, "unexpected geometry: %ux%u stride %u %s reg %x+%x\n",
+			width, height, stride, format, reg[0], reg[1]);
 		return -EINVAL;
-	if (!request_mem_region(P4_FB_BASE, P4_FB_SIZE, "esp32p4-fb"))
-		return -EBUSY;
+	}
+	if (interrupts[0] != 24 || interrupts[1] != IRQ_TYPE_LEVEL_HIGH) {
+		dev_err(&pdev->dev, "unexpected interrupt spec %u %u\n",
+			interrupts[0], interrupts[1]);
+		return -EINVAL;
+	}
+	if (!esp32p4_retained_entry_valid(cache)) {
+		dev_err(&pdev->dev, "cache writeback entry 0x%08x is not retained SRAM\n",
+			cache);
+		return -EINVAL;
+	}
+	/*
+	 * The framebuffer is described by /reserved-memory, so the OF layer has
+	 * already inserted the range into iomem_resource and request_mem_region()
+	 * reports it busy. That is success for us: the memory is ours by DT.
+	 */
+	mem_claimed = request_mem_region(P4_FB_BASE, P4_FB_SIZE, "esp32p4-fb") != NULL;
 	info = framebuffer_alloc(sizeof(*fb), &pdev->dev);
 	if (!info) {
-		release_mem_region(P4_FB_BASE, P4_FB_SIZE);
+		if (mem_claimed)
+			release_mem_region(P4_FB_BASE, P4_FB_SIZE);
 		return -ENOMEM;
 	}
 	fb = info->par;
 	fb->info = info;
-	fb->service = (void *)(unsigned long)service;
+	fb->mem_claimed = mem_claimed;
 	raw_spin_lock_init(&fb->service_lock);
 	info->fbops = &p4_fb_ops;
 	info->flags = FBINFO_VIRTFB;
@@ -298,36 +328,59 @@ static int p4_fb_probe(struct platform_device *pdev)
 	info->var.width = info->var.height = -1;
 	info->var.activate = FB_ACTIVATE_NOW;
 	info->var.vmode = FB_VMODE_NONINTERLACED;
-	fb->irq = platform_get_irq(pdev, 0);
-	if (fb->irq < 0) {
-		ret = fb->irq;
+	{
+		struct esp32p4_dsi_config cfg = {
+			.fb_phys = P4_FB_BASE,
+			.width = P4_FB_WIDTH,
+			.height = P4_FB_HEIGHT,
+		};
+
+		fb->dsi = esp32p4_dsi_create(&pdev->dev, &cfg);
+		if (IS_ERR(fb->dsi)) {
+			ret = PTR_ERR(fb->dsi);
+			fb->dsi = NULL;
+			if (ret != -EPROBE_DEFER)
+				dev_err(&pdev->dev, "DSI setup failed: %d\n", ret);
+			goto release;
+		}
+	}
+	ret = esp32p4_dsi_probe(fb->dsi);
+	if (ret) {
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "DSI bring-up failed: %d\n", ret);
+		goto release;
+	}
+	fb->irq = esp32p4_dsi_irq_number(fb->dsi);
+	if ((int)fb->irq < 0) {
+		ret = (int)fb->irq;
 		goto release;
 	}
 	ret = p4_fb_flush(info, 0, P4_FB_SIZE);
 	if (ret)
 		goto release;
-	ret = request_irq(fb->irq, p4_fb_irq, 0, "esp32p4-fb", fb);
+	/* The DW-GDMA channel IRQ is shared between all channels. */
+	ret = request_irq(fb->irq, p4_fb_irq, IRQF_SHARED, "esp32p4-fb", fb);
 	if (ret)
 		goto release;
-	/* Firmware leaves the engine stopped. Install its IRQ before starting. */
+	/* Nothing runs before Linux starts the stream. */
 	raw_spin_lock_irqsave(&fb->service_lock, flags);
-	ret = fb->service(0, 0);
+	ret = esp32p4_dsi_start(fb->dsi);
 	if (!ret)
 		fb->running = true;
-	else
-		fb->service(2, 0);
 	raw_spin_unlock_irqrestore(&fb->service_lock, flags);
 	if (ret) {
 		ret = -EIO;
 		goto free_irq;
 	}
+	/* The stream is running; release the panel reset and set the backlight. */
+	esp32p4_dsi_late_init(fb->dsi);
 	ret = register_framebuffer(info);
 	if (ret) {
 		p4_fb_stop(fb);
 		goto free_irq;
 	}
 	platform_set_drvdata(pdev, info);
-	dev_info(&pdev->dev, "fb%d: %ux%u RGB565 retained DSI handoff\n",
+	dev_info(&pdev->dev, "fb%d: %ux%u RGB565 kernel DSI scanout\n",
 		 info->node, P4_FB_WIDTH, P4_FB_HEIGHT);
 	return 0;
 free_irq:
@@ -398,6 +451,6 @@ static int __init p4_fb_init(void)
 }
 device_initcall(p4_fb_init);
 
-MODULE_DESCRIPTION("ESP32-P4 retained IDF DSI framebuffer (reconstruction)");
+MODULE_DESCRIPTION("ESP32-P4 kernel DSI framebuffer (reconstruction)");
 MODULE_LICENSE("GPL");
 

@@ -28,6 +28,37 @@ unsigned long signal_minsigstksz __ro_after_init;
 extern u32 __user_rt_sigreturn[2];
 static size_t riscv_v_sc_size __ro_after_init;
 
+#ifdef CONFIG_SOC_ESP32P4
+#define ESP32P4_ZCMT_SC_SIZE (sizeof(struct __riscv_ctx_hdr) + \
+			     sizeof(struct __riscv_esp32p4_zcmt_state))
+
+static long save_esp32p4_zcmt_state(struct pt_regs *regs, void __user **sc_ext)
+{
+	struct __riscv_ctx_hdr __user *hdr = *sc_ext;
+	struct __riscv_esp32p4_zcmt_state __user *state = (void __user *)(hdr + 1);
+	long err;
+
+	err = __put_user(regs->jvt, &state->jvt);
+	err |= __put_user(0, &state->reserved);
+	err |= __put_user(RISCV_ESP32P4_ZCMT_MAGIC, &hdr->magic);
+	err |= __put_user(ESP32P4_ZCMT_SC_SIZE, &hdr->size);
+	*sc_ext += ESP32P4_ZCMT_SC_SIZE;
+	return err;
+}
+
+static long restore_esp32p4_zcmt_state(struct pt_regs *regs, void __user *sc_ext)
+{
+	struct __riscv_esp32p4_zcmt_state state;
+
+	if (__copy_from_user(&state, sc_ext, sizeof(state)))
+		return -EFAULT;
+	if (state.reserved || (state.jvt & 63))
+		return -EINVAL;
+	regs->jvt = state.jvt;
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_SOC_ESP32S31
 #define ESP32S31_EXT_SC_SIZE round_up(sizeof(struct __riscv_ctx_hdr) + \
 				      sizeof(struct __riscv_esp32s31_ext_state), 16)
@@ -265,6 +296,13 @@ static long restore_sigcontext(struct pt_regs *regs,
 
 			err = __restore_v_state(regs, sc_ext_ptr);
 			break;
+#ifdef CONFIG_SOC_ESP32P4
+		case RISCV_ESP32P4_ZCMT_MAGIC:
+			if (size != ESP32P4_ZCMT_SC_SIZE)
+				return -EINVAL;
+			err = restore_esp32p4_zcmt_state(regs, sc_ext_ptr);
+			break;
+#endif
 #ifdef CONFIG_SOC_ESP32S31
 		case RISCV_ESP32S31_EXT_MAGIC:
 			if (size != ESP32S31_EXT_SC_SIZE)
@@ -287,6 +325,9 @@ static size_t get_rt_frame_size(bool cal_all)
 	size_t total_context_size = 0;
 
 	frame_size = sizeof(*frame);
+#ifdef CONFIG_SOC_ESP32P4
+	total_context_size += ESP32P4_ZCMT_SC_SIZE;
+#endif
 
 	if (has_vector() || has_xtheadvector()) {
 		if (cal_all || riscv_v_vstate_query(task_pt_regs(current)))
@@ -364,6 +405,9 @@ static long setup_sigcontext(struct rt_sigframe __user *frame,
 	if (has_fpu())
 		err |= save_fp_state(regs, &sc->sc_fpregs);
 	/* Save the vector state. */
+#ifdef CONFIG_SOC_ESP32P4
+	err |= save_esp32p4_zcmt_state(regs, (void __user **)&sc_ext_ptr);
+#endif
 	if ((has_vector() || has_xtheadvector()) && riscv_v_vstate_query(regs))
 		err |= save_v_state(regs, (void __user **)&sc_ext_ptr);
 #ifdef CONFIG_SOC_ESP32S31
@@ -442,12 +486,15 @@ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
 	/*
 	 * For the nommu case we don't have a VDSO.  Instead we push two
 	 * instructions to call the rt_sigreturn syscall onto the user stack.
+	 * Extension records grow past uc_mcontext and can overlap the fixed
+	 * sigreturn_code member. Put the trampoline at the end of the complete
+	 * allocated frame, after all extension records and their terminator.
 	 */
-	if (copy_to_user(&frame->sigreturn_code, __user_rt_sigreturn,
+	addr = (unsigned long)frame + frame_size - sizeof(frame->sigreturn_code);
+	if (copy_to_user((void __user *)addr, __user_rt_sigreturn,
 			 sizeof(frame->sigreturn_code)))
 		return -EFAULT;
 
-	addr = (unsigned long)&frame->sigreturn_code;
 	/* Make sure the two instructions are pushed to icache. */
 	flush_icache_range(addr, addr + sizeof(frame->sigreturn_code));
 

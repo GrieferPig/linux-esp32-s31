@@ -1,0 +1,1 @@
+obj-$(CONFIG_VIDEO_ESPRESSIF_CSI) += csi.o

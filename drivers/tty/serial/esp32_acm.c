@@ -43,6 +43,8 @@ static const struct of_device_id esp32s3_acm_dt_ids[] = {
 		.compatible = "esp,esp32s3-acm",
 	}, {
 		.compatible = "espressif,esp32s31-usb-serial-jtag",
+	}, {
+		.compatible = "espressif,esp32p4-usb-serial-jtag",
 	}, { /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, esp32s3_acm_dt_ids);
@@ -380,6 +382,8 @@ static int __init esp32s3_acm_early_console_setup(struct earlycon_device *device
 
 OF_EARLYCON_DECLARE(esp32s3acm, "esp,esp32s3-acm",
 		    esp32s3_acm_early_console_setup);
+OF_EARLYCON_DECLARE(esp32p4acm, "espressif,esp32p4-usb-serial-jtag",
+		   esp32s3_acm_early_console_setup);
 
 static struct uart_driver esp32s3_acm_reg = {
 	.owner		= THIS_MODULE,

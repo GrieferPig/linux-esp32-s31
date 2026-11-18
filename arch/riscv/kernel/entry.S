@@ -234,6 +234,15 @@ SYM_CODE_START(handle_exception)
 	REG_S x5,  PT_T0(sp)
 	save_from_x6_to_x31
 
+#ifdef CONFIG_SOC_ESP32P4
+	/* No kernel jump-table relaxation is performed by this linker. Keep
+	 * user JVT out of kernel execution, including nested traps and IRQs.
+	 * The saved frame follows its task across scheduling and migration.
+	 */
+	csrrw t0, 0x017, zero
+	REG_S t0, PT_JVT(sp)
+#endif
+
 	/*
 	 * Disable user-mode memory access as it should only be set in the
 	 * actual user copy routines.
@@ -510,6 +519,8 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 .Lp4_ret_write:
 	csrw CSR_CAUSE, a1
 	.option pop
+	REG_L t0, PT_JVT(sp)
+	csrw 0x017, t0
 #endif
 
 	REG_L x1,  PT_RA(sp)

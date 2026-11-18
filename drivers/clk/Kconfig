@@ -33,7 +33,7 @@ menuconfig COMMON_CLK
 
 if COMMON_CLK
 
-config ESP32S31_CLOCK
+config ESPRESSIF_CLK
 	bool "Clock driver for Espressif ESP32-S31"
 	depends on SOC_ESP32S31 || COMPILE_TEST
 	depends on OF && HAS_IOMEM

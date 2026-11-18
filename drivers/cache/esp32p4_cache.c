@@ -9,6 +9,7 @@
 #include <linux/libfdt.h>
 #include <linux/printk.h>
 #include <linux/spinlock.h>
+#include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/soc/espressif/esp32p4.h>
 #include <asm/soc.h>
@@ -16,7 +17,9 @@
 typedef int (*p4_cache_fn)(u32 start, u32 size);
 static p4_cache_fn exec_sync;
 static p4_cache_fn display_writeback;
+static p4_cache_fn camera_invalidate;
 static DEFINE_RAW_SPINLOCK(p4_cache_engine_lock);
+static u32 p4_exec_ram_end __ro_after_init = ESP32P4_RAM_END;
 /* The retained target is v1.3; IRQ init verifies chosen revision before enable. */
 u32 esp32p4_clic_rev1 = 1;
 
@@ -32,13 +35,30 @@ static u32 __init p4_fdt_u32(const void *fdt, int node, const char *name)
 static void __init p4_cache_early_init(const void *fdt)
 {
 	int chosen = fdt_path_offset(fdt, "/chosen");
+	int mem = fdt_path_offset(fdt, "/memory@48000000");
+	int reg_len;
+	const fdt32_t *reg = fdt_getprop(fdt, mem, "reg", &reg_len);
+	u32 capacity;
 	int fb, child;
 	int matches = 0;
 	int status_len;
 	const char *status;
 	u32 entry = p4_fdt_u32(fdt, chosen, "espressif,cache-sync-entry");
+	u32 cam_inv = p4_fdt_u32(fdt, chosen,
+				  "espressif,camera-invalidate-entry");
 	u32 wb = 0;
 	u32 rev = p4_fdt_u32(fdt, chosen, "espressif,chip-revision");
+
+	/* The retained callback receives physical addresses under NOMMU.
+	 * Trust one bounded DT RAM bank, not a fixed legacy 16 MiB ceiling. */
+	if (!reg || reg_len != 2 * sizeof(*reg) ||
+	    fdt_address_cells(fdt, 0) != 1 || fdt_size_cells(fdt, 0) != 1 ||
+	    fdt32_to_cpu(reg[0]) != ESP32P4_RAM_START)
+		panic("P4 invalid executable PSRAM bank");
+	capacity = fdt32_to_cpu(reg[1]);
+	if (capacity != SZ_16M && capacity != SZ_32M && capacity != SZ_64M)
+		panic("P4 unsupported executable PSRAM capacity: %x", capacity);
+	p4_exec_ram_end = ESP32P4_RAM_START + capacity;
 
 	fb = -1;
 	fdt_for_each_subnode(child, fdt, chosen) {
@@ -57,6 +77,8 @@ static void __init p4_cache_early_init(const void *fdt)
 		exec_sync = (p4_cache_fn)(unsigned long)entry;
 	if (esp32p4_retained_entry_valid(wb))
 		display_writeback = (p4_cache_fn)(unsigned long)wb;
+	if (esp32p4_retained_entry_valid(cam_inv))
+		camera_invalidate = (p4_cache_fn)(unsigned long)cam_inv;
 	/* Default .data value is already v1 before the first possible trap.
 	 * Only this retained revision103 handoff is reconstructed. Never switch
 	 * to an unverified CSR bank before a later IRQ probe rejects the DT. */
@@ -86,6 +108,25 @@ int esp32p4_display_cache_writeback(u32 start, u32 size)
 }
 EXPORT_SYMBOL_GPL(esp32p4_display_cache_writeback);
 
+int esp32p4_camera_cache_invalidate(u32 start, u32 size)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!size)
+		return 0;
+	if (!camera_invalidate)
+		return -ENODEV;
+	if (start < ESP32P4_RAM_START || start >= ESP32P4_RAM_END ||
+	    size > ESP32P4_RAM_END - start)
+		return -EINVAL;
+	raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
+	ret = camera_invalidate(start, size);
+	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
+	return ret ? -EIO : 0;
+}
+EXPORT_SYMBOL_GPL(esp32p4_camera_cache_invalidate);
+
 void esp32p4_cache_sync_for_exec(unsigned long start, unsigned long end)
 {
 	unsigned long flags;
@@ -93,7 +134,7 @@ void esp32p4_cache_sync_for_exec(unsigned long start, unsigned long end)
 
 	if (end <= start)
 		return;
-	if (start < ESP32P4_RAM_START || end > ESP32P4_RAM_END)
+	if (start < ESP32P4_RAM_START || end > p4_exec_ram_end)
 		panic("P4 executable cache range invalid: %lx..%lx", start, end);
 	if (!exec_sync)
 		panic("P4 retained executable cache callback missing");
@@ -108,5 +149,5 @@ EXPORT_SYMBOL_GPL(esp32p4_cache_sync_for_exec);
 
 void esp32p4_cache_sync_all_for_exec(void)
 {
-	esp32p4_cache_sync_for_exec(ESP32P4_RAM_START, ESP32P4_RAM_END);
+	esp32p4_cache_sync_for_exec(ESP32P4_RAM_START, p4_exec_ram_end);
 }

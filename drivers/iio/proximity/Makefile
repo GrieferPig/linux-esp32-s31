@@ -5,8 +5,8 @@
 
 # When adding new entries keep the list in alphabetical order
 obj-$(CONFIG_AS3935)		+= as3935.o
-obj-$(CONFIG_ESP32S31_TOUCH)	+= esp32s31-touch.o
-obj-$(CONFIG_ESP32S31_COMPARATOR) += esp32s31-comparator.o
+obj-$(CONFIG_ESPRESSIF_TOUCH)	+= espressif-touch.o
+obj-$(CONFIG_ESP32S31_COMPARATOR) += espressif-comparator.o
 obj-$(CONFIG_CROS_EC_MKBP_PROXIMITY) += cros_ec_mkbp_proximity.o
 obj-$(CONFIG_D3323AA)		+= d3323aa.o
 obj-$(CONFIG_HX9023S)		+= hx9023s.o

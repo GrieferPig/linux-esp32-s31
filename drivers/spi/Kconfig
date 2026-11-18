@@ -411,7 +411,7 @@ config SPI_EP93XX
 	  This enables using the Cirrus EP93xx SPI controller in master
 	  mode.
 
-config SPI_ESP32S31
+config SPI_ESPRESSIF
 	tristate "Espressif ESP32-S31 GPSPI controller"
 	depends on ARCH_ESPRESSIF || COMPILE_TEST
 	depends on OF

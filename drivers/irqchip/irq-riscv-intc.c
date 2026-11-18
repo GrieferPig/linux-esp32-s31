@@ -12,7 +12,7 @@
 #include <linux/cpu.h>
 #include <linux/irq.h>
 #include <linux/irqchip.h>
-#include <linux/irqchip/irq-esp32s31-clic.h>
+#include <linux/irqchip/irq-esp-clic-s31.h>
 #include <linux/irqdomain.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>

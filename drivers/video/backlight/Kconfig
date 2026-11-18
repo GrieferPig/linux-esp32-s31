@@ -494,6 +494,13 @@ config BACKLIGHT_LED
 	  If you have a LCD backlight adjustable by LED class driver, say Y
 	  to enable this driver.
 
+config BACKLIGHT_ESPRESSIF_TOUCH_DISPLAY2
+	tristate "Retained Raspberry Pi Touch Display 2 backlight on ESP32-P4"
+	depends on I2C && SOC_ESP32P4
+	help
+	  Control brightness through the loader-initialized panel MCU on I2C.
+	  Does not reset or initialize the panel. Transfers complete using IRQs.
+
 endif # BACKLIGHT_CLASS_DEVICE
 
 endmenu

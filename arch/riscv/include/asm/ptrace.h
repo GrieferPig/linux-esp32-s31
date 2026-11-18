@@ -57,6 +57,10 @@ struct pt_regs {
 	/* Raw CLIC xcause metadata, private to the trap return path. */
 	unsigned long cause_raw;
 #endif
+#ifdef CONFIG_SOC_ESP32P4
+	/* Zcmt jump table, saved independently for every nested trap. */
+	unsigned long jvt;
+#endif
 };
 
 #define PTRACE_SYSEMU			0x1f

@@ -34,7 +34,7 @@ SECTIONS {
 		/* CPU1 RX wakeups cross the SoC doorbell and virtual-IPI mux on
 		 * every coalesced kick. Keep their small steady-state wrappers
 		 * beside the existing CSD/IRQ-flow code; cold setup stays XIP. */
-		*drivers/irqchip/irq-esp32s31-smp.o(.text.esp32s31_ipi_chained
+		*drivers/irqchip/irq-esp-smp-s31.o(.text.esp32s31_ipi_chained
 			.text.esp32s31_ipi_send .text.esp32s31_tlb_flush_poll)
 		*kernel/irq/ipi-mux.o(.text.ipi_mux_process .text.ipi_mux_pending
 			.text.ipi_mux_send_mask)
@@ -83,7 +83,7 @@ SECTIONS {
 			.text.irqtime_account_irq .text.irqtime_account_delta
 			.text.update_rt_rq_load_avg .text.__update_load_avg_se
 			.text.decay_load .text.dequeue_rt_stack)
-		*drivers/clocksource/timer-esp32s31-systimer.o(
+		*drivers/clocksource/timer-espressif-systimer-s31.o(
 			.text.s31_systimer_read_counter_locked)
 		*arch/riscv/kernel/s31-blob-fp-adapter.o(
 			.text.esp32s31_radio_task_current_data)

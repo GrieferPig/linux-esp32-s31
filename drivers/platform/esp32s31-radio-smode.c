@@ -36,7 +36,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/esp32s31-radio.h>
-#include <linux/irqchip/irq-esp32s31-clic.h>
+#include <linux/irqchip/irq-esp-clic-s31.h>
 #include <net/checksum.h>
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci.h>

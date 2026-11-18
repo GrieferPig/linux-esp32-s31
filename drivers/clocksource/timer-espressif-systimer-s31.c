@@ -17,7 +17,7 @@
 #include <linux/spinlock.h>
 #include <linux/syscore_ops.h>
 #include <linux/timekeeping.h>
-#include <linux/clocksource/esp32s31-systimer.h>
+#include <linux/clocksource/esp-systimer-s31.h>
 #include <asm/fixmap.h>
 #include <asm/irqflags.h>
 

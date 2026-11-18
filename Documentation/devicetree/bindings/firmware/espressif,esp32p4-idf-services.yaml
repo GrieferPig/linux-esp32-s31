@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/firmware/espressif,esp32p4-idf-services.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-P4 retained cold-init firmware services
+
+maintainers:
+  - Espressif ESP32-P4 Linux port
+
+description: |
+  On the ESP32-P4 the cold-init firmware keeps running from retained SRAM
+  after the kernel has taken over.  The firmware owns a few engines that the
+  kernel cannot initialize a second time, and exposes them as callbacks in a
+  fixed SRAM window.
+
+  This node only says which services the resident firmware provides.  The
+  callback addresses are firmware-internal and therefore described here
+  instead of being hardcoded in the kernel; consumers reference the service
+  child by its ABI id.
+
+properties:
+  compatible:
+    const: espressif,esp32p4-idf-services
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 0
+
+  abi-version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Retained firmware call ABI version.
+
+patternProperties:
+  "^service@[0-2]$":
+    type: object
+    additionalProperties: false
+    description: |
+      One firmware callback.  The unit address is the ABI service id defined
+      by the retained firmware handoff contract.
+
+    properties:
+      reg:
+        maxItems: 1
+        description:
+          ABI service id: 0 executable cache sync, 1 display writeback,
+          2 camera invalidate.
+
+      espressif,entry:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: |
+          Physical address of the callback inside the retained SRAM window.
+
+    required:
+      - reg
+      - espressif,entry
+
+required:
+  - compatible
+  - "#address-cells"
+  - "#size-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    firmware-services {
+        compatible = "espressif,esp32p4-idf-services";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        service@0 {
+            reg = <0>;
+            espressif,entry = <0x4ff00000>;
+        };
+    };
+...

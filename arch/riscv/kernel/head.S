@@ -243,6 +243,11 @@ SYM_CODE_END(_start)
 SYM_CODE_START(_start_kernel)
 #ifdef CONFIG_SOC_ESP32P4
 	csrci mstatus, 8
+	/* Standard user counters: cycle/time/instret and implemented HPM8/9/13. */
+	li t0, 0x2307
+	csrw 0x306, t0
+	csrci 0x320, 5
+	csrw 0x017, zero
 	csrr t0, mhartid
 	bnez t0, esp32p4_secondary_start
 #endif
@@ -412,6 +417,10 @@ SYM_CODE_START(_start_kernel)
 	.global esp32p4_secondary_start
 esp32p4_secondary_start:
 	csrci mstatus, 8
+	li t0, 0x2307
+	csrw 0x306, t0
+	csrci 0x320, 5
+	csrw 0x017, zero
 	csrr a0, mhartid
 	load_global_pointer
 	li t0, SR_FS_VS

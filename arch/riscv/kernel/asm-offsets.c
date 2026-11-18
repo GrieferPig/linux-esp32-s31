@@ -135,6 +135,9 @@ void asm_offsets(void)
 #if defined(CONFIG_SOC_ESP32S31) || defined(CONFIG_SOC_ESP32P4)
 	OFFSET(PT_CAUSE_RAW, pt_regs, cause_raw);
 #endif
+#ifdef CONFIG_SOC_ESP32P4
+	OFFSET(PT_JVT, pt_regs, jvt);
+#endif
 
 	OFFSET(SUSPEND_CONTEXT_REGS, suspend_context, regs);
 

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
-#ifndef _DT_BINDINGS_PINCTRL_ESP32S31_H
-#define _DT_BINDINGS_PINCTRL_ESP32S31_H
+#ifndef _DT_BINDINGS_PINCTRL_ESPRESSIF_H
+#define _DT_BINDINGS_PINCTRL_ESPRESSIF_H
 
 /*
  * ESP32-S31 pinmux entries.  A pinctrl group's pinmux property may contain

@@ -3,7 +3,7 @@
 # Makefile for linux/drivers/platform
 #
 
-obj-$(CONFIG_ESP32S31_DT_OVERLAY) += esp32s31-overlay.o
+obj-$(CONFIG_ESPRESSIF_DT_OVERLAY) += espressif-overlay.o
 obj-$(CONFIG_SOC_ESP32S31) += esp32s31-radio-loader-core.o
 obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio.o
 esp32s31-radio-y := esp32s31-radio-module.o \

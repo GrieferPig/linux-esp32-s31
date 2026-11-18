@@ -1,0 +1,9 @@
+config VIDEO_ESPRESSIF_CSI
+	bool "ESP32-P4 retained CSI/ISP with OV5647"
+	depends on SOC_ESP32P4 && I2C && VIDEO_DEV && !MMU
+	select VIDEOBUF2_CORE
+	select VIDEOBUF2_V4L2
+	select VIDEOBUF2_MEMOPS
+	help
+	  IRQ-driven RGB565 capture using the rev103 IDF hardware handoff and
+	  an OV5647 connected to the Waveshare 15-pin CSI connector.
