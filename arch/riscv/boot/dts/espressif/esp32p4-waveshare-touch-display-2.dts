@@ -157,6 +157,10 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	#gpio-cells = <2>;
 	gpio-ranges = <&p4_pinctrl 0 0 57>;
 	gpio-reserved-ranges = <0 51>, <52 1>, <55 2>;
+
+	pins_adc1_header: adc1-header-pins {
+		function = "adc1-header";
+	};
 };
 
 /* This board configuration has no OV5647 sensor fitted. */
@@ -202,7 +206,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	/* TRM ch.10 eFuse Controller - RD_MAC_SYS0 through RD_MAC_SYS1. */
 	efuse@5012d044 {
 		compatible = "espressif,esp32p4-efuse";
-		reg = <0x5012d044 0x8>;
+		reg = <0x5012d044 0x30>;
 		read-only;
 
 		nvmem-layout {
@@ -214,6 +218,22 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 				compatible = "mac-base";
 				#nvmem-cell-cells = <1>;
 				reg = <0 6>;
+			};
+
+			/* TRM ch.10 eFuse Controller — BLOCK1/2 read shadows. */
+			adc_otp_version: version@9 {
+				reg = <0x09 1>;
+				bits = <0 5>;
+			};
+
+			adc1_offset: adc1-offset@28 {
+				reg = <0x28 2>;
+				bits = <0 10>;
+			};
+
+			adc2_offset: adc2-offset@2d {
+				reg = <0x2d 2>;
+				bits = <0 10>;
 			};
 		};
 	};
@@ -306,6 +326,18 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	};
 
 	/* TRM ch.6 GDMA Controller - three coupled AHB RX/TX channel pairs. */
+	/* TRM ch.6 GDMA Controller — AXI RX/TX interrupts and linked lists. */
+	axi_dma: dma-controller@5008a000 {
+		compatible = "espressif,esp32p4-axi-gdma";
+		reg = <0x5008a000 0x2000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <62 4>, <63 4>, <64 4>, <65 4>, <66 4>, <67 4>;
+		interrupt-names = "rx0", "rx1", "rx2", "tx0", "tx1", "tx2";
+		clocks = <&periphclk ESP32P4_CLK_AXI_GDMA>;
+		resets = <&periphclk ESP32P4_RST_AXI_GDMA>;
+		#dma-cells = <2>;
+	};
+
 	ahb_dma: dma-controller@50085000 {
 		compatible = "espressif,esp32p4-ahb-gdma";
 		reg = <0x50085000 0x1000>;
@@ -314,6 +346,33 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		clocks = <&periphclk ESP32P4_CLK_AHB_GDMA>;
 		resets = <&periphclk ESP32P4_RST_AHB_GDMA>;
 		#dma-cells = <2>;
+	};
+
+	/* TRM ch.20 RTC Timer - 48-bit RC_SLOW_CLK counter and capture buffers. */
+	rtc_counter: counter@50112000 {
+		compatible = "espressif,esp32p4-rtc-timer";
+		reg = <0x50112000 0x400>;
+	};
+
+	/* TRM ch.18 TIMG - T0CONFIG through T1LOAD, before watchdog registers. */
+	gptimer0: counter@500c2000 {
+		compatible = "espressif,esp32p4-gptimer";
+		reg = <0x500c2000 0x48>, <0x500c2070 0x10>;
+		reg-names = "counters", "interrupts";
+		clocks = <&periphclk ESP32P4_CLK_GPTIMER0>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <46 4>, <47 4>;
+		interrupt-names = "timer0", "timer1";
+	};
+
+	gptimer1: counter@500c3000 {
+		compatible = "espressif,esp32p4-gptimer";
+		reg = <0x500c3000 0x48>, <0x500c3070 0x10>;
+		reg-names = "counters", "interrupts";
+		clocks = <&periphclk ESP32P4_CLK_GPTIMER1>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <49 4>, <50 4>;
+		interrupt-names = "timer0", "timer1";
 	};
 
 	/* TRM ch.18 Timer Group - TIMG_WDTCONFIG0 through TIMG_WDTWPROTECT. */
@@ -368,12 +427,49 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		#pwm-cells = <3>;
 	};
 
+	/* TRM ch.12 Reset and Clock — LPPERI_CLK_EN, RESET_EN and ADC_CTRL. */
+	lpperi: syscon@50120000 {
+		compatible = "espressif,esp32p4-lpperi", "syscon";
+		reg = <0x50120000 0x100>;
+	};
+
+	/* TRM ch.16 Low-Power Management — PMU_RF_PWC. */
+	analog_power: regulator@5011515c {
+		compatible = "espressif,esp32p4-ana-i2c";
+		reg = <0x5011515c 0x4>;
+		regulator-name = "p4-sar-analog";
+	};
+
+	/* TRM ch.49 Analog I2C Controller — I2C0_CTRL, ANA_CONF2. */
+	analog_i2c: analog-i2c@50124000 {
+		compatible = "espressif,esp32p4-analog-i2c";
+		reg = <0x50124000 0x3c>;
+		espressif,lpperi = <&lpperi>;
+		analog-supply = <&analog_power>;
+	};
+
+	/* TRM ch.67 ADC Controller — four available ADC1 header inputs. */
+	adc@50127000 {
+		compatible = "espressif,esp32p4-lp-adc";
+		reg = <0x50127000 0x100>;
+		espressif,lpperi = <&lpperi>;
+		espressif,adc-inputs = <4 5 6 7>;
+		espressif,analog-i2c = <&analog_i2c>;
+		nvmem-cells = <&adc_otp_version>, <&adc1_offset>, <&adc2_offset>;
+		nvmem-cell-names = "otp-version", "adc1-offset", "adc2-offset";
+		analog-supply = <&analog_power>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_adc1_header>;
+	};
+
 	/* TRM ch.66 Temperature Sensor - TSENS_OUT and LP_TSENS_INTR. */
 	temperature-sensor@5012f000 {
 		compatible = "espressif,esp32p4-tsens";
-		reg = <0x5012f000 0x2c>, <0x50120000 0xc>,
-		      <0x50124000 0x3c>, <0x5011515c 0x4>;
-		reg-names = "tsens", "clkrst", "analog-i2c", "analog-power";
+		reg = <0x5012f000 0x2c>;
+		reg-names = "tsens";
+		espressif,analog-i2c = <&analog_i2c>;
+		espressif,lpperi = <&lpperi>;
+		analog-supply = <&analog_power>;
 		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
 		interrupts = <15 4>;
 	};

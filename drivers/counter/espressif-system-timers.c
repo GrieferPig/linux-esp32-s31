@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Read-only Counter framework access to ESP32-S31 SYSTIMER and RTC_TIMER.
- * Linux scheduling continues to use the architectural RISC-V timer.
+ * Read-only access to Espressif SYSTIMER and RTC timer snapshots.
+ * The kernel clocksource remains owned by the platform timer driver.
  */
 
 #include <linux/clk.h>
@@ -9,18 +9,30 @@
 #include <linux/iopoll.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
 enum esp32s31_timer_kind {
 	ESP32S31_SYSTIMER,
 	ESP32S31_RTC_TIMER,
+	ESP32P4_RTC_TIMER,
 };
+
+/* TRM ch.20 RTC Timer: UPDATE, MAIN_BUF0 and DATE.CLK_EN. */
+#define RTC_TIMER_UPDATE	0x010
+#define RTC_TIMER_BUF_LO	0x014
+#define RTC_TIMER_BUF_HI	0x018
+#define RTC_TIMER_DATE		0x3fc
+#define RTC_TIMER_CLK_EN	BIT(31)
+#define P4_RTC_TIMER_LATCH	BIT(28)
+#define S31_RTC_TIMER_LATCH	BIT(27)
 
 struct esp32s31_system_timer {
 	void __iomem *base;
 	enum esp32s31_timer_kind kind;
 	struct clk *clk;
+	struct mutex lock;
 	struct counter_count counts[2];
 };
 
@@ -32,26 +44,36 @@ static int esp32s31_timer_count_read(struct counter_device *counter,
 				     struct counter_count *count, u64 *value)
 {
 	struct esp32s31_system_timer *timer = counter_priv(counter);
-	u32 hi, lo, status;
-	int ret;
+	u32 hi, lo, status, latch;
+	int ret = 0;
 
+	mutex_lock(&timer->lock);
 	if (timer->kind == ESP32S31_SYSTIMER) {
 		/* Snapshot unit n, then read its 52-bit synchronized value. */
 		writel(BIT(30), timer->base + 0x04 + count->id * 4);
 		ret = readl_poll_timeout(timer->base + 0x04 + count->id * 4,
 					 status, status & BIT(29), 0, 1000);
 		if (ret)
-			return ret;
+			goto unlock;
 		hi = readl(timer->base + 0x40 + count->id * 8) & GENMASK(19, 0);
 		lo = readl(timer->base + 0x44 + count->id * 8);
 	} else {
-		/* RTC_TIMER update snapshots both 48-bit counters. */
-		writel(BIT(27), timer->base + 0x10);
-		lo = readl(timer->base + 0x14 + count->id * 8);
-		hi = readl(timer->base + 0x18 + count->id * 8) & GENMASK(15, 0);
+		if (timer->kind == ESP32P4_RTC_TIMER) {
+			/* Preserve the hardware-triggered event latching enables. */
+			latch = readl(timer->base + RTC_TIMER_UPDATE) |
+				P4_RTC_TIMER_LATCH;
+		} else {
+			latch = S31_RTC_TIMER_LATCH;
+		}
+		writel(latch, timer->base + RTC_TIMER_UPDATE);
+		lo = readl(timer->base + RTC_TIMER_BUF_LO + count->id * 8);
+		hi = readl(timer->base + RTC_TIMER_BUF_HI + count->id * 8) &
+		     GENMASK(15, 0);
 	}
 	*value = ((u64)hi << 32) | lo;
-	return 0;
+unlock:
+	mutex_unlock(&timer->lock);
+	return ret;
 }
 
 static int esp32s31_timer_function_read(struct counter_device *counter,
@@ -71,12 +93,13 @@ static int esp32s31_system_timer_probe(struct platform_device *pdev)
 {
 	struct counter_device *counter;
 	struct esp32s31_system_timer *timer;
-	unsigned int i;
+	unsigned int i, num_counts;
 
 	counter = devm_counter_alloc(&pdev->dev, sizeof(*timer));
 	if (!counter)
 		return -ENOMEM;
 	timer = counter_priv(counter);
+	mutex_init(&timer->lock);
 	timer->kind = (uintptr_t)of_device_get_match_data(&pdev->dev);
 	timer->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(timer->base))
@@ -88,10 +111,12 @@ static int esp32s31_system_timer_probe(struct platform_device *pdev)
 		writel(readl(timer->base) | BIT(31) | BIT(30) | BIT(29),
 		       timer->base);
 	else
-		writel(readl(timer->base + 0x3fc) | BIT(31),
-		       timer->base + 0x3fc);
+		writel(readl(timer->base + RTC_TIMER_DATE) | RTC_TIMER_CLK_EN,
+		       timer->base + RTC_TIMER_DATE);
 
-	for (i = 0; i < ARRAY_SIZE(timer->counts); i++) {
+	/* On P4 BUF1 is the previous snapshot of the same 48-bit counter. */
+	num_counts = timer->kind == ESP32P4_RTC_TIMER ? 1 : ARRAY_SIZE(timer->counts);
+	for (i = 0; i < num_counts; i++) {
 		timer->counts[i].id = i;
 		timer->counts[i].name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
 						      "counter%u", i);
@@ -105,7 +130,7 @@ static int esp32s31_system_timer_probe(struct platform_device *pdev)
 	counter->parent = &pdev->dev;
 	counter->ops = &esp32s31_timer_ops;
 	counter->counts = timer->counts;
-	counter->num_counts = ARRAY_SIZE(timer->counts);
+	counter->num_counts = num_counts;
 	return devm_counter_add(&pdev->dev, counter);
 }
 
@@ -114,6 +139,8 @@ static const struct of_device_id esp32s31_system_timer_of_match[] = {
 	  .data = (void *)ESP32S31_SYSTIMER },
 	{ .compatible = "espressif,esp32s31-rtc-timer",
 	  .data = (void *)ESP32S31_RTC_TIMER },
+	{ .compatible = "espressif,esp32p4-rtc-timer",
+	  .data = (void *)ESP32P4_RTC_TIMER },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_system_timer_of_match);
@@ -126,6 +153,6 @@ static struct platform_driver esp32s31_system_timer_driver = {
 	},
 };
 module_platform_driver(esp32s31_system_timer_driver);
-MODULE_DESCRIPTION("ESP32-S31 SYSTIMER and RTC timer counter driver");
+MODULE_DESCRIPTION("Espressif SYSTIMER and RTC timer counter driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("COUNTER");

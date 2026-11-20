@@ -160,7 +160,18 @@ static const struct p4_route twai0_routes[] = { { 80, 80 } };
 static const struct p4_route twai1_routes[] = { { 83, 83 } };
 static const struct p4_route twai2_routes[] = { { 86, 86 } };
 
+/* TRM ch.11 GPIO Matrix and IO MUX — GPIO20..23 analog inputs. */
+static const unsigned int adc1_header_pins[] = { 20, 21, 22, 23 };
+static const struct p4_route adc1_header_routes[] = {
+	{ P4_SIGNAL_NONE, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, P4_SIGNAL_NONE },
+};
+
 static const struct p4_group p4_groups[] = {
+	{ "adc1-header", adc1_header_pins, adc1_header_routes,
+	  ARRAY_SIZE(adc1_header_pins) },
 	{ "i2c1", i2c1_pins, i2c1_routes, ARRAY_SIZE(i2c1_pins) },
 	{ "gpspi2", gpspi2_pins, gpspi2_routes, ARRAY_SIZE(gpspi2_pins) },
 	{ "sdmmc0", sdmmc0_pins, sdmmc0_routes, ARRAY_SIZE(sdmmc0_pins), true },

@@ -127,14 +127,14 @@ config AXI_DMAC
 	  platforms.
 
 config ESPRESSIF_GDMA_AXI
-	tristate "Espressif ESP32-S31 AXI GDMA support"
-	depends on SOC_ESP32S31
+	tristate "Espressif ESP32-S31 and ESP32-P4 AXI GDMA support"
+	depends on SOC_ESP32S31 || SOC_ESP32P4
 	depends on OF
 	select DMA_ENGINE
 	select DMA_VIRTUAL_CHANNELS
 	select GENERIC_ALLOCATOR
 	help
-	  Enable the AXI general-purpose DMA controller found in the ESP32-S31.
+	  Enable the AXI general-purpose DMA controller found in the ESP32-S31 and ESP32-P4.
 
 config ESPRESSIF_GDMA_AHB
 	tristate "Espressif ESP32-S31 and ESP32-P4 AHB GDMA support"

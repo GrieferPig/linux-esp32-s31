@@ -1,0 +1,26 @@
+What:		/sys/bus/counter/devices/counterX/countY/alarm_value
+KernelVersion:	6.18
+Contact:	Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+Description:
+		Compare value for an ESP32-P4 timer-group alarm, in counter
+		ticks. Write a value from 0 through 2^54 - 1 with the alarm
+		disarmed. A write to an armed alarm returns -EBUSY.
+
+What:		/sys/bus/counter/devices/counterX/countY/alarm_enable
+KernelVersion:	6.18
+Contact:	Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+Description:
+		Write 1 to arm the compare event, or 0 to disarm it.
+		A match produces COUNTER_EVENT_THRESHOLD on channel Y.
+		In one-shot mode the alarm then disarms while the timer can
+		continue counting. Stopping the counter disarms its alarm.
+
+What:		/sys/bus/counter/devices/counterX/countY/autoreload
+KernelVersion:	6.18
+Contact:	Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+Description:
+		Write 1 for periodic alarms or 0 for one-shot alarms. In
+		periodic mode a compare match reloads the value last written
+		to countY/count. The interrupt handler rearms the alarm.
+		If the requested period is shorter than the time needed to
+		service the interrupt, compare events can be missed.

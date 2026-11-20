@@ -11,6 +11,15 @@ config MFD_CORE
 	select IRQ_DOMAIN
 	default n
 
+config MFD_ESP32P4_ANALOG
+	tristate "Espressif ESP32-P4 analog sensor register bus"
+	depends on SOC_ESP32P4 && OF && REGULATOR
+	select MFD_SYSCON
+	select REGMAP
+	help
+	  Expose the P4 internal analog SAR ADC and temperature sensor
+	  registers through a serialized register map.
+
 config MFD_CS5535
 	tristate "AMD CS5535 and CS5536 southbridge core functions"
 	select MFD_CORE

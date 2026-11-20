@@ -1827,8 +1827,8 @@ config REGULATOR_ESP32S31_GP_LDO
 	  whether voltage changes are permitted.
 
 config REGULATOR_ESP32S31_ANA_I2C
-	bool "ESP32-S31 shared analog I2C power"
-	depends on SOC_ESP32S31 || COMPILE_TEST
+	bool "ESP32-S31 and ESP32-P4 shared analog I2C power"
+	depends on SOC_ESP32S31 || SOC_ESP32P4 || COMPILE_TEST
 	depends on REGULATOR
 	help
 	  Centralize the PMU power/reset sequence for the analog register-I2C

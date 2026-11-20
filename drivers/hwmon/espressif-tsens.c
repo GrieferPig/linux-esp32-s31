@@ -6,11 +6,14 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/soc/espressif/esp32p4-analog.h>
 
 #define ESP32S31_MODEM_SYSCON_CLK	0x20109c04
 #define ESP32S31_MODEM_LPCON_CLK	0x2010f018
@@ -74,7 +77,9 @@ struct esp32p4_tsens_power {
 	void __iomem *base;
 	void __iomem *clkrst;
 	void __iomem *pmu;
+	struct regmap *lpperi;
 	u32 old_clock;
+	u32 clock_mask;
 	u32 old_power;
 };
 
@@ -303,7 +308,7 @@ static int esp32s31_tsens_setup(struct platform_device *pdev, void __iomem *base
 	ret = esp32s31_tsens_set_range(&pdev->dev, 15);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
-				     "analog range setup timed out\n");
+				     "analog range setup failed\n");
 
 	return 0;
 }
@@ -316,7 +321,15 @@ static void esp32p4_tsens_power_release(void *data)
 	mask = TSENS_POWER | TSENS_SAMPLE | TSENS_INT_ENABLE;
 	writel(readl(power->base + TSENS_CTRL) & ~mask, power->base + TSENS_CTRL);
 
-	mask = P4_LPPERI_CK_EN_LP_TSENS | P4_LPPERI_CK_EN_LP_I2CMST;
+	mask = power->clock_mask;
+	if (power->lpperi) {
+		int ret;
+
+		ret = regmap_update_bits(power->lpperi, 0, mask, power->old_clock);
+		if (ret)
+			pr_err("esp32p4-tsens: failed to restore clock gates: %d\n", ret);
+		return;
+	}
 	writel((readl(power->clkrst) & ~mask) | (power->old_clock & mask),
 	       power->clkrst);
 	mask = P4_PMU_XPD_PERIF_I2C | P4_PMU_PERIF_I2C_RSTB;
@@ -364,45 +377,89 @@ static int esp32p4_tsens_setup(struct platform_device *pdev, void __iomem *base,
 {
 	struct device *dev = &pdev->dev;
 	struct esp32p4_tsens_power *power;
-	void __iomem *ana;
+	struct regmap *analog = NULL;
+	void __iomem *ana = NULL;
 	u32 mask, reset;
 	int ret;
 
-	ana = devm_platform_ioremap_resource_byname(pdev, "analog-i2c");
-	if (IS_ERR(ana))
-		return PTR_ERR(ana);
+	if (of_property_present(dev->of_node, "espressif,analog-i2c")) {
+		analog = esp32p4_analog_get(dev);
+		if (IS_ERR(analog))
+			return PTR_ERR(analog);
+	} else {
+		ana = devm_platform_ioremap_resource_byname(pdev, "analog-i2c");
+		if (IS_ERR(ana))
+			return PTR_ERR(ana);
+	}
 
 	power = devm_kzalloc(dev, sizeof(*power), GFP_KERNEL);
 	if (!power)
 		return -ENOMEM;
-	power->pmu = devm_platform_ioremap_resource_byname(pdev, "analog-power");
-	if (IS_ERR(power->pmu))
-		return PTR_ERR(power->pmu);
 	power->base = base;
-	power->clkrst = clkrst;
-	power->old_clock = readl(clkrst);
-	power->old_power = readl(power->pmu);
-	writel(power->old_clock | P4_LPPERI_CK_EN_LP_TSENS |
-	       P4_LPPERI_CK_EN_LP_I2CMST, clkrst);
-	ret = devm_add_action_or_reset(dev, esp32p4_tsens_power_release, power);
-	if (ret)
-		return ret;
+	power->clock_mask = P4_LPPERI_CK_EN_LP_TSENS;
+	if (!analog)
+		power->clock_mask |= P4_LPPERI_CK_EN_LP_I2CMST;
+	if (!clkrst) {
+		power->lpperi = syscon_regmap_lookup_by_phandle(dev->of_node,
+							      "espressif,lpperi");
+		if (IS_ERR(power->lpperi))
+			return PTR_ERR(power->lpperi);
 
-	reset = readl(clkrst + P4_LPPERI_RESET_EN);
-	writel(reset | P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
-	writel(reset & ~P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
+		ret = devm_regulator_get_enable(dev, "analog");
+		if (ret)
+			return dev_err_probe(dev, ret, "analog supply unavailable\n");
+		ret = regmap_read(power->lpperi, 0, &power->old_clock);
+		if (ret)
+			return ret;
+		mask = power->clock_mask;
+		ret = regmap_update_bits(power->lpperi, 0, mask, mask);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, esp32p4_tsens_power_release, power);
+		if (ret)
+			return ret;
+		ret = regmap_update_bits(power->lpperi, P4_LPPERI_RESET_EN,
+					 P4_LPPERI_RST_EN_LP_TSENS,
+					 P4_LPPERI_RST_EN_LP_TSENS);
+		if (ret)
+			return ret;
+		ret = regmap_update_bits(power->lpperi, P4_LPPERI_RESET_EN,
+					 P4_LPPERI_RST_EN_LP_TSENS, 0);
+		if (ret)
+			return ret;
+	} else {
+		power->pmu = devm_platform_ioremap_resource_byname(pdev, "analog-power");
+		if (IS_ERR(power->pmu))
+			return PTR_ERR(power->pmu);
+		power->clkrst = clkrst;
+		power->old_clock = readl(clkrst);
+		power->old_power = readl(power->pmu);
+		writel(power->old_clock | P4_LPPERI_CK_EN_LP_TSENS |
+		       P4_LPPERI_CK_EN_LP_I2CMST, clkrst);
+		ret = devm_add_action_or_reset(dev, esp32p4_tsens_power_release, power);
+		if (ret)
+			return ret;
 
-	/* P4 regi2c_ctrl_ll_i2c_sar_periph_enable() powers SAR while reset. */
-	mask = P4_PMU_XPD_PERIF_I2C | P4_PMU_PERIF_I2C_RSTB;
-	if ((power->old_power & mask) != mask) {
-		writel(power->old_power & ~P4_PMU_PERIF_I2C_RSTB, power->pmu);
-		udelay(1);
-		writel((power->old_power & ~P4_PMU_PERIF_I2C_RSTB) |
-		       P4_PMU_XPD_PERIF_I2C, power->pmu);
-		writel(power->old_power | mask, power->pmu);
+		reset = readl(clkrst + P4_LPPERI_RESET_EN);
+		writel(reset | P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
+		writel(reset & ~P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
+
+		/* P4 regi2c_ctrl_ll_i2c_sar_periph_enable() powers SAR while reset. */
+		mask = P4_PMU_XPD_PERIF_I2C | P4_PMU_PERIF_I2C_RSTB;
+		if ((power->old_power & mask) != mask) {
+			writel(power->old_power & ~P4_PMU_PERIF_I2C_RSTB, power->pmu);
+			udelay(1);
+			writel((power->old_power & ~P4_PMU_PERIF_I2C_RSTB) |
+			       P4_PMU_XPD_PERIF_I2C, power->pmu);
+			writel(power->old_power | mask, power->pmu);
+		}
 	}
 
-	ret = esp32p4_tsens_set_range(ana);
+	/* temperature_sensor_ll_set_range(): offset 0 uses DAC code 15. */
+	if (analog)
+		ret = regmap_update_bits(analog, REGI2C_TSENS_DAC, GENMASK(3, 0), 15);
+	else
+		ret = esp32p4_tsens_set_range(ana);
 	if (ret)
 		return dev_err_probe(dev, ret, "analog range setup timed out\n");
 	return 0;
@@ -438,9 +495,13 @@ static int espressif_tsens_probe(struct platform_device *pdev)
 	tsens->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(tsens->base))
 		return PTR_ERR(tsens->base);
-	clkrst = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(clkrst))
-		return PTR_ERR(clkrst);
+	clkrst = NULL;
+	if (!of_device_is_compatible(pdev->dev.of_node, "espressif,esp32p4-tsens") ||
+	    !of_property_present(pdev->dev.of_node, "espressif,lpperi")) {
+		clkrst = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(clkrst))
+			return PTR_ERR(clkrst);
+	}
 
 	ret = layout->setup(pdev, tsens->base, clkrst);
 	if (ret)

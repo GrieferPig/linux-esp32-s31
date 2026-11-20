@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Espressif ESP32-S31 AXI GDMA dmaengine driver
+ * Espressif ESP32-S31 and ESP32-P4 AXI GDMA dmaengine driver
  *
- * Hardware reference: ESP-IDF esp32s31 AXI GDMA HAL/LL.  The block contains
- * three coupled TX/RX pairs.  A Linux channel represents one pair and can run
+ * The block contains three coupled TX/RX pairs.  A Linux channel represents one pair and can run
  * one of memory-to-memory, memory-to-device or device-to-memory at a time.
  */
 
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/genalloc.h>
@@ -18,7 +18,9 @@
 #include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
+#include <linux/reset.h>
 #include <linux/scatterlist.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include "virt-dma.h"
@@ -29,13 +31,9 @@
 #define ESPRESSIF_GDMA_AXI_BURST_SIZE	128U
 #define ESPRESSIF_GDMA_AXI_CACHE_LINE	64U
 #define ESPRESSIF_GDMA_AXI_PATTERN_SIZE	512U
+#define ESP32P4_AXI_DESC_POOL_SIZE	SZ_8K
 #define ESPRESSIF_GDMA_AXI_PERIPH_MAX	5U
 #define ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT 0x3fU
-
-/* Cached and direct (uncached) views of the 16-MiB MSPI PSRAM window. */
-#define ESP32S31_PSRAM_CACHED_BASE	0x50000000U
-#define ESP32S31_PSRAM_DIRECT_BASE	0xc0000000U
-#define ESP32S31_PSRAM_SIZE		0x01000000U
 
 #define ESP32S31_AXI_RX_BASE(ch)		((ch) * 0x68)
 #define ESP32S31_AXI_TX_BASE(ch)		(0x138 + (ch) * 0x68)
@@ -179,12 +177,49 @@ struct esp32s31_axi_chan {
 	int tx_irq;
 };
 
+struct esp_axi_soc {
+	u32 sram_start;
+	u32 sram_end;
+	u32 ext_start;
+	u32 ext_end;
+	u32 psram_base;
+	u32 psram_direct_base;
+	u32 psram_size;
+	bool coherent_pool;
+};
+
+static const struct esp_axi_soc esp32s31_axi_soc = {
+	.sram_start = 0x2f000000,
+	.sram_end = 0x2f07ffff,
+	.ext_start = 0x40000000,
+	.ext_end = 0x53ffffff,
+	.psram_base = 0x50000000,
+	.psram_direct_base = 0xc0000000,
+	.psram_size = SZ_16M,
+};
+
+/*
+ * TRM ch.6 GDMA Controller — AXI_DMA_ACCESS_{INTR,EXTR}_MEM_*_ADDR.
+ * TRM ch.9 System and Memory — HP L2MEM and external memory aliases.
+ * Match the P4 AXI aperture in axi_dma_ll_set_default_memory_range().
+ */
+static const struct esp_axi_soc esp32p4_axi_soc = {
+	.sram_start = 0x4fc00000,
+	.sram_end = 0x4ffc0000,
+	.ext_start = 0x40000000,
+	.ext_end = 0x4c000000,
+	.psram_base = 0x48000000,
+	.psram_direct_base = 0x88000000,
+	.psram_size = SZ_64M,
+	.coherent_pool = true,
+};
+
 struct esp32s31_axi_gdma {
 	struct dma_device dma_dev;
 	struct device *dev;
+	const struct esp_axi_soc *soc;
 	void __iomem *base;
 	void __iomem *clkrst;
-	void __iomem *desc_base;
 	void __iomem *psram_direct;
 	struct gen_pool *desc_pool;
 	struct esp32s31_axi_chan chans[ESPRESSIF_GDMA_AXI_CHANNELS];
@@ -212,11 +247,11 @@ static inline void __iomem *esp32s31_axi_tx_reg(struct esp32s31_axi_chan *chan,
 	return chan->gdma->base + ESP32S31_AXI_TX_BASE(chan->id) + reg;
 }
 
-static bool esp32s31_axi_is_psram(dma_addr_t addr, size_t len)
+static bool esp32s31_axi_is_psram(const struct esp_axi_soc *soc,
+				 dma_addr_t addr, size_t len)
 {
-	return addr >= ESP32S31_PSRAM_CACHED_BASE &&
-	       len <= ESP32S31_PSRAM_SIZE &&
-	       addr - ESP32S31_PSRAM_CACHED_BASE <= ESP32S31_PSRAM_SIZE - len;
+	return addr >= soc->psram_base && len <= soc->psram_size &&
+	       addr - soc->psram_base <= soc->psram_size - len;
 }
 
 static void esp32s31_axi_free_desc(struct virt_dma_desc *vd)
@@ -330,7 +365,8 @@ static u32 esp32s31_axi_ack(struct esp32s31_axi_chan *chan, bool tx)
 	return status;
 }
 
-static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
+static int esp32s31_axi_build_linear(struct esp32s31_axi_chan *chan,
+				      struct esp32s31_axi_seg *segs,
 				      unsigned int capacity, dma_addr_t addr,
 				      size_t len, unsigned int period,
 				      bool rx, unsigned int *used)
@@ -340,7 +376,7 @@ static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
 	if (upper_32_bits(addr) || !len)
 		return -EINVAL;
 
-	if (rx && esp32s31_axi_is_psram(addr, len)) {
+	if (rx && esp32s31_axi_is_psram(chan->gdma->soc, addr, len)) {
 		size_t head = addr & (ESPRESSIF_GDMA_AXI_CACHE_LINE - 1);
 
 		if (head) {
@@ -374,7 +410,7 @@ static int esp32s31_axi_build_linear(struct esp32s31_axi_seg *segs,
 
 	while (len) {
 		size_t chunk = min_t(size_t, len, ESPRESSIF_GDMA_AXI_DESC_MAX);
-		bool stash = rx && esp32s31_axi_is_psram(addr, chunk) &&
+		bool stash = rx && esp32s31_axi_is_psram(chan->gdma->soc, addr, chunk) &&
 			     (chunk < ESPRESSIF_GDMA_AXI_CACHE_LINE ||
 			      (addr & (ESPRESSIF_GDMA_AXI_CACHE_LINE - 1)));
 
@@ -404,7 +440,7 @@ esp32s31_axi_alloc_desc(struct esp32s31_axi_chan *chan,
 	unsigned long pool;
 	unsigned long cursor;
 	size_t pool_len;
-	dma_addr_t pattern_dma = 0;
+	dma_addr_t pool_dma, pattern_dma = 0;
 
 	for (i = 0; i < rx_count; i++)
 		stash_count += rx_seg[i].stash;
@@ -426,6 +462,7 @@ esp32s31_axi_alloc_desc(struct esp32s31_axi_chan *chan,
 	pool = gen_pool_alloc(chan->gdma->desc_pool, pool_len);
 	if (!pool)
 		goto err;
+	pool_dma = gen_pool_virt_to_phys(chan->gdma->desc_pool, pool);
 	desc->pool_base = (void __iomem *)pool;
 	desc->pool_len = pool_len;
 	desc->tx_count = tx_count;
@@ -435,26 +472,24 @@ esp32s31_axi_alloc_desc(struct esp32s31_axi_chan *chan,
 
 	for (i = 0; i < tx_count; i++) {
 		desc->tx[i].hw = desc->pool_base + i * sizeof(struct esp32s31_axi_hw_desc);
-		desc->tx[i].dma = gen_pool_virt_to_phys(chan->gdma->desc_pool,
-							(unsigned long)desc->tx[i].hw);
+		desc->tx[i].dma = pool_dma + ((unsigned long)desc->tx[i].hw - pool);
 	}
 	for (i = 0; i < rx_count; i++) {
 		desc->rx[i].hw = desc->pool_base + (tx_count + i) *
 						 sizeof(struct esp32s31_axi_hw_desc);
-		desc->rx[i].dma = gen_pool_virt_to_phys(chan->gdma->desc_pool,
-							(unsigned long)desc->rx[i].hw);
+		desc->rx[i].dma = pool_dma + ((unsigned long)desc->rx[i].hw - pool);
 	}
 
 	cursor = ALIGN(pool + node_count * sizeof(struct esp32s31_axi_hw_desc),
 		       ESPRESSIF_GDMA_AXI_CACHE_LINE);
 	for (i = 0; i < stash_count; i++) {
 		desc->stash[i].hw = (void __iomem *)cursor;
-		desc->stash[i].dma = gen_pool_virt_to_phys(chan->gdma->desc_pool, cursor);
+		desc->stash[i].dma = pool_dma + (cursor - pool);
 		cursor += ESPRESSIF_GDMA_AXI_CACHE_LINE;
 	}
 	if (pattern_len) {
 		cursor = ALIGN(cursor, ESPRESSIF_GDMA_AXI_BURST_SIZE);
-		pattern_dma = gen_pool_virt_to_phys(chan->gdma->desc_pool, cursor);
+		pattern_dma = pool_dma + (cursor - pool);
 	}
 
 	for (i = 0; i < tx_count; i++) {
@@ -532,10 +567,10 @@ static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 
 		if (period >= 0 && stash->period != period)
 			continue;
-		if (!esp32s31_axi_is_psram(stash->recovery, stash->len))
+		if (!esp32s31_axi_is_psram(chan->gdma->soc, stash->recovery, stash->len))
 			continue;
 		dst = chan->gdma->psram_direct +
-		      (stash->recovery - ESP32S31_PSRAM_CACHED_BASE);
+		      (stash->recovery - chan->gdma->soc->psram_base);
 		memcpy_fromio(data, stash->hw, stash->len);
 		memcpy_toio(dst, data, stash->len);
 	}
@@ -787,8 +822,8 @@ esp32s31_axi_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	rx = kcalloc(cap, sizeof(*rx), GFP_NOWAIT);
 	if (!tx || !rx)
 		goto out;
-	if (esp32s31_axi_build_linear(tx, cap, src, len, 0, false, &tx_count) ||
-	    esp32s31_axi_build_linear(rx, cap, dst, len, 0, true, &rx_count))
+	if (esp32s31_axi_build_linear(chan, tx, cap, src, len, 0, false, &tx_count) ||
+	    esp32s31_axi_build_linear(chan, rx, cap, dst, len, 0, true, &rx_count))
 		goto out;
 	tx[tx_count - 1].eof = true;
 	rx[rx_count - 1].eof = true;
@@ -833,7 +868,7 @@ esp32s31_axi_prep_memset(struct dma_chan *dchan, dma_addr_t dst, int value,
 		remaining -= chunk;
 	}
 	tx[tx_count - 1].eof = true;
-	if (esp32s31_axi_build_linear(rx, rx_cap, dst, len, 0, true, &rx_count))
+	if (esp32s31_axi_build_linear(chan, rx, rx_cap, dst, len, 0, true, &rx_count))
 		goto out;
 	rx[rx_count - 1].eof = true;
 	desc = esp32s31_axi_alloc_desc(chan, tx, tx_count, rx, rx_count,
@@ -892,7 +927,7 @@ esp32s31_axi_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 	if (!segs)
 		return NULL;
 	for_each_sg(sgl, sg, sg_len, i) {
-		if (esp32s31_axi_build_linear(segs, cap, sg_dma_address(sg),
+		if (esp32s31_axi_build_linear(chan, segs, cap, sg_dma_address(sg),
 					      sg_dma_len(sg), 0, rx, &count))
 			goto out;
 	}
@@ -935,7 +970,7 @@ esp32s31_axi_prep_cyclic(struct dma_chan *dchan, dma_addr_t buf_addr,
 		return NULL;
 	rx = direction == DMA_DEV_TO_MEM;
 	for (i = 0; i < periods; i++) {
-		if (esp32s31_axi_build_linear(segs, cap, buf_addr + i * period_len,
+		if (esp32s31_axi_build_linear(chan, segs, cap, buf_addr + i * period_len,
 					      period_len, i, rx, &count))
 			goto out;
 		segs[count - 1].eof = true;
@@ -1083,14 +1118,16 @@ static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)
 	u32 val;
 	unsigned int i;
 
-	val = readl(gdma->clkrst);
-	writel(val | ESP32S31_AXI_CLK_EN, gdma->clkrst);
-	writel((val | ESP32S31_AXI_CLK_EN) | ESP32S31_AXI_RESET, gdma->clkrst);
-	writel((val | ESP32S31_AXI_CLK_EN) & ~ESP32S31_AXI_RESET, gdma->clkrst);
-	writel(0x2f000000, gdma->base + ESP32S31_AXI_INTR_MEM_START);
-	writel(0x2f07ffff, gdma->base + ESP32S31_AXI_INTR_MEM_END);
-	writel(0x40000000, gdma->base + ESP32S31_AXI_EXTR_MEM_START);
-	writel(0x53ffffff, gdma->base + ESP32S31_AXI_EXTR_MEM_END);
+	if (gdma->clkrst) {
+		val = readl(gdma->clkrst) | ESP32S31_AXI_CLK_EN;
+		writel(val, gdma->clkrst);
+		writel(val | ESP32S31_AXI_RESET, gdma->clkrst);
+		writel(val & ~ESP32S31_AXI_RESET, gdma->clkrst);
+	}
+	writel(gdma->soc->sram_start, gdma->base + ESP32S31_AXI_INTR_MEM_START);
+	writel(gdma->soc->sram_end, gdma->base + ESP32S31_AXI_INTR_MEM_END);
+	writel(gdma->soc->ext_start, gdma->base + ESP32S31_AXI_EXTR_MEM_START);
+	writel(gdma->soc->ext_end, gdma->base + ESP32S31_AXI_EXTR_MEM_END);
 	val = readl(gdma->base + ESP32S31_AXI_MISC_CONF) |
 	      ESP32S31_AXI_MISC_CLK_EN;
 	writel(val | ESP32S31_AXI_MISC_RST_RD, gdma->base + ESP32S31_AXI_MISC_CONF);
@@ -1125,7 +1162,9 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct esp32s31_axi_gdma *gdma;
 	struct dma_device *dma_dev;
-	struct resource *desc_res;
+	unsigned long desc_base;
+	dma_addr_t desc_dma;
+	size_t desc_size;
 	unsigned int i;
 	int ret;
 
@@ -1133,29 +1172,63 @@ static int esp32s31_axi_probe(struct platform_device *pdev)
 	if (!gdma)
 		return -ENOMEM;
 	gdma->dev = dev;
+	gdma->soc = of_device_get_match_data(dev);
 	gdma->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(gdma->base))
 		return PTR_ERR(gdma->base);
-	gdma->clkrst = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(gdma->clkrst))
-		return PTR_ERR(gdma->clkrst);
-	gdma->desc_base = devm_platform_get_and_ioremap_resource(pdev, 2, &desc_res);
-	if (IS_ERR(gdma->desc_base))
-		return PTR_ERR(gdma->desc_base);
-	gdma->psram_direct = devm_ioremap(dev, ESP32S31_PSRAM_DIRECT_BASE,
-					 ESP32S31_PSRAM_SIZE);
-	if (!gdma->psram_direct)
-		return -ENOMEM;
-	gdma->desc_pool = devm_gen_pool_create(dev, 3, -1, NULL);
-	if (IS_ERR(gdma->desc_pool))
-		return PTR_ERR(gdma->desc_pool);
-	ret = gen_pool_add_virt(gdma->desc_pool, (unsigned long)gdma->desc_base,
-				 desc_res->start, resource_size(desc_res), -1);
-	if (ret)
-		return ret;
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
+
+	if (gdma->soc->coherent_pool) {
+		struct reset_control *rst;
+		struct clk *clk;
+
+		clk = devm_clk_get_enabled(dev, NULL);
+		if (IS_ERR(clk))
+			return dev_err_probe(dev, PTR_ERR(clk), "failed to enable clock\n");
+		rst = devm_reset_control_get_exclusive(dev, NULL);
+		if (IS_ERR(rst))
+			return dev_err_probe(dev, PTR_ERR(rst), "failed to get reset\n");
+		ret = reset_control_reset(rst);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to reset controller\n");
+
+		/*
+		 * Suballocate chains from coherent HP SRAM. DMAengine clients may
+		 * release a chain in atomic context, where dma_free_coherent()
+		 * cannot be called.
+		 */
+		desc_size = ESP32P4_AXI_DESC_POOL_SIZE;
+		desc_base = (unsigned long)dmam_alloc_coherent(dev, desc_size,
+							      &desc_dma,
+							      GFP_KERNEL);
+		if (!desc_base)
+			return dev_err_probe(dev, -ENOMEM, "no coherent descriptor memory\n");
+	} else {
+		struct resource *desc_res;
+		void __iomem *iomem;
+
+		gdma->clkrst = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(gdma->clkrst))
+			return PTR_ERR(gdma->clkrst);
+		iomem = devm_platform_get_and_ioremap_resource(pdev, 2, &desc_res);
+		if (IS_ERR(iomem))
+			return PTR_ERR(iomem);
+		desc_base = (unsigned long)iomem;
+		desc_dma = desc_res->start;
+		desc_size = resource_size(desc_res);
+	}
+	gdma->desc_pool = devm_gen_pool_create(dev, 3, -1, NULL);
+	if (IS_ERR(gdma->desc_pool))
+		return PTR_ERR(gdma->desc_pool);
+	ret = gen_pool_add_virt(gdma->desc_pool, desc_base, desc_dma, desc_size, -1);
+	if (ret)
+		return ret;
+	gdma->psram_direct = devm_ioremap(dev, gdma->soc->psram_direct_base,
+					 gdma->soc->psram_size);
+	if (!gdma->psram_direct)
+		return -ENOMEM;
 
 	dma_dev = &gdma->dma_dev;
 	dma_dev->dev = dev;
@@ -1263,7 +1336,8 @@ static void esp32s31_axi_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id esp32s31_axi_of_match[] = {
-	{ .compatible = "espressif,esp32s31-axi-gdma" },
+	{ .compatible = "espressif,esp32s31-axi-gdma", .data = &esp32s31_axi_soc },
+	{ .compatible = "espressif,esp32p4-axi-gdma", .data = &esp32p4_axi_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_axi_of_match);

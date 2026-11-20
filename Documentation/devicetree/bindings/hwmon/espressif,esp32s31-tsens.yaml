@@ -16,23 +16,23 @@ properties:
       - espressif,esp32p4-tsens
 
   reg:
-    minItems: 2
-    items:
-      - description: Temperature sensor register block
-      - description: LP temperature sensor clock and reset registers
-      - description: LP analog I2C master registers
-      - description: Power-management register for the analog I2C master
+    minItems: 1
+    maxItems: 4
 
   reg-names:
-    minItems: 2
-    items:
-      - const: tsens
-      - const: clkrst
-      - const: analog-i2c
-      - const: analog-power
+    minItems: 1
+    maxItems: 4
+
+  espressif,lpperi:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: ESP32-P4 LP peripheral clock and reset registers.
 
   interrupts:
     maxItems: 1
+
+  espressif,analog-i2c:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared ESP32-P4 internal analog sensor register bus.
 
   analog-supply:
     description: Shared analog register-I2C power switch.
@@ -50,18 +50,51 @@ allOf:
     then:
       properties:
         reg:
+          minItems: 2
           maxItems: 2
         reg-names:
-          maxItems: 2
+          items:
+            - const: tsens
+            - const: clkrst
       required:
         - analog-supply
     else:
-      properties:
-        reg:
-          minItems: 4
-        reg-names:
-          minItems: 4
-        analog-supply: false
+      if:
+        required:
+          - espressif,lpperi
+      then:
+        if:
+          required:
+            - espressif,analog-i2c
+        then:
+          properties:
+            reg:
+              maxItems: 1
+            reg-names:
+              items:
+                - const: tsens
+        else:
+          properties:
+            reg:
+              minItems: 2
+              maxItems: 2
+            reg-names:
+              items:
+                - const: tsens
+                - const: analog-i2c
+        required:
+          - analog-supply
+      else:
+        properties:
+          reg:
+            minItems: 4
+          reg-names:
+            items:
+              - const: tsens
+              - const: clkrst
+              - const: analog-i2c
+              - const: analog-power
+          analog-supply: false
 
 additionalProperties: false
 

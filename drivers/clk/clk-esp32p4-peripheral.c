@@ -42,6 +42,8 @@
  */
 #define AHB_PDMA_SYS_EN		BIT(3)
 #define HP_AHB_PDMA_RESET	BIT(1)
+#define AXI_PDMA_SYS_EN		BIT(4)
+#define HP_AXI_PDMA_RESET	BIT(2)
 #define SDMMC_SYS_EN		BIT(14)
 #define USB_OTG20_SYS_EN	BIT(16)
 #define SDIO_HS_MODE		BIT(22)
@@ -139,6 +141,12 @@
 #define I2S_TX_YN1		BIT(18)
 #define I2S_MCLK_TX		BIT(19)
 #define I2S_DIV_MAX		511
+
+/* TRM ch.12 Reset and Clock - TIMERGRP<n>_T<m>_SRC_SEL and CLK_EN. */
+#define GPTIMER0_SRC		(GENMASK(23, 22) | GENMASK(26, 25))
+#define GPTIMER0_ENABLE		(BIT(24) | BIT(27))
+#define GPTIMER1_SRC		(GENMASK(21, 20) | GENMASK(24, 23))
+#define GPTIMER1_ENABLE		(BIT(22) | BIT(25))
 
 /* TRM ch.19 Watchdog Timers - TIMERGRP<n>_WDT_SRC_SEL and WDT_CLK_EN. */
 #define TIMG0_APB_EN		BIT(21)
@@ -246,6 +254,10 @@ static int p4_clk_enable(struct clk_hw *hw)
 		p4_update(cc, SDIO_CLK_SOURCE, EMAC_PTP_CLK_SRC | EMAC_PTP_CLK_EN,
 			  EMAC_PTP_CLK_EN);
 		break;
+	case ESP32P4_CLK_AXI_GDMA:
+		/* TRM ch.12 Reset and Clock — AXI_PDMA_SYS_CLK_EN. */
+		p4_update(cc, SOC_CLK1, AXI_PDMA_SYS_EN, AXI_PDMA_SYS_EN);
+		break;
 	case ESP32P4_CLK_AHB_GDMA:
 		/* TRM ch.12 Reset and Clock - AHB_PDMA_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, AHB_PDMA_SYS_EN, AHB_PDMA_SYS_EN);
@@ -275,6 +287,16 @@ static int p4_clk_enable(struct clk_hw *hw)
 	case ESP32P4_CLK_ECC:
 		p4_update(cc, CRYPTO_CLK25, ECC_CLK_ENABLE, ECC_CLK_ENABLE);
 		p4_update(cc, HP_RST2, ECC_RESET, 0);
+		break;
+	case ESP32P4_CLK_GPTIMER0:
+		p4_update(cc, SOC_CLK2, TIMG0_APB_EN, TIMG0_APB_EN);
+		p4_update(cc, TIMER_CLK20, GPTIMER0_SRC | GPTIMER0_ENABLE,
+			  GPTIMER0_ENABLE);
+		break;
+	case ESP32P4_CLK_GPTIMER1:
+		p4_update(cc, SOC_CLK2, TIMG1_APB_EN, TIMG1_APB_EN);
+		p4_update(cc, TIMER_CLK21, GPTIMER1_SRC | GPTIMER1_ENABLE,
+			  GPTIMER1_ENABLE);
 		break;
 	case ESP32P4_CLK_TWAI0 ... ESP32P4_CLK_TWAI2: {
 		unsigned int n = clk->id - ESP32P4_CLK_TWAI0;
@@ -360,6 +382,9 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_EMAC_PTP:
 		p4_update(cc, SDIO_CLK_SOURCE, EMAC_PTP_CLK_EN, 0);
 		break;
+	case ESP32P4_CLK_AXI_GDMA:
+		p4_update(cc, SOC_CLK1, AXI_PDMA_SYS_EN, 0);
+		break;
 	case ESP32P4_CLK_AHB_GDMA:
 		p4_update(cc, SOC_CLK1, AHB_PDMA_SYS_EN, 0);
 		break;
@@ -383,6 +408,13 @@ static void p4_clk_disable(struct clk_hw *hw)
 		break;
 	case ESP32P4_CLK_ECC:
 		p4_update(cc, CRYPTO_CLK25, ECC_CLK_ENABLE, 0);
+		break;
+	case ESP32P4_CLK_GPTIMER0:
+		/* Leave the shared APB clock available to the watchdog. */
+		p4_update(cc, TIMER_CLK20, GPTIMER0_ENABLE, 0);
+		break;
+	case ESP32P4_CLK_GPTIMER1:
+		p4_update(cc, TIMER_CLK21, GPTIMER1_ENABLE, 0);
 		break;
 	case ESP32P4_CLK_TWAI0 ... ESP32P4_CLK_TWAI2: {
 		unsigned int n = clk->id - ESP32P4_CLK_TWAI0;
@@ -582,6 +614,10 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST2;
 		bit = GPSPI2_RST;
 		break;
+	case ESP32P4_RST_AXI_GDMA:
+		reg = HP_RST0;
+		bit = HP_AXI_PDMA_RESET;
+		break;
 	case ESP32P4_RST_AHB_GDMA:
 		reg = HP_RST0;
 		bit = HP_AHB_PDMA_RESET;
@@ -649,6 +685,8 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-aes-sha",
 		"p4-twai0", "p4-twai1", "p4-twai2",
 		"p4-rsa", "p4-ecc",
+		"p4-gptimer0", "p4-gptimer1",
+		"p4-axi-gdma",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -694,6 +732,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 			.num_parents = (i == ESP32P4_CLK_USBHS ||
 					i == ESP32P4_CLK_EMAC ||
 					i == ESP32P4_CLK_AHB_GDMA ||
+					i == ESP32P4_CLK_AXI_GDMA ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};
 		struct p4_clk *clk;
