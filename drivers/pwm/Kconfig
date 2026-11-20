@@ -250,20 +250,20 @@ config PWM_EP93XX
 	  will be called pwm-ep93xx.
 
 config PWM_ESP32S31_LEDC
-	tristate "Espressif ESP32-S31 LEDC PWM support"
-	depends on SOC_ESP32S31 || COMPILE_TEST
+	tristate "Espressif ESP32-S31 and ESP32-P4 LEDC PWM support"
+	depends on SOC_ESP32S31 || SOC_ESP32P4 || COMPILE_TEST
 	depends on COMMON_CLK
 	help
-	  PWM framework support for both eight-channel LEDC groups in S31.
+	  PWM framework support for the eight-channel LEDC groups in S31 and P4.
 	  Each pair of channels shares one hardware timer and therefore must
 	  use the same period while both channels are requested.
 
 config PWM_ESP32S31_MCPWM
-	tristate "Espressif ESP32-S31 MCPWM support"
-	depends on SOC_ESP32S31 || COMPILE_TEST
+	tristate "Espressif ESP32-S31 and ESP32-P4 MCPWM support"
+	depends on SOC_ESP32S31 || SOC_ESP32P4 || COMPILE_TEST
 	depends on COMMON_CLK
 	help
-	  Basic PWM output support for all four S31 MCPWM groups.  Each group
+	  Basic PWM output support for the S31 and P4 MCPWM groups. Each group
 	  provides six outputs arranged as three two-output timer pairs.
 
 config PWM_ESP32S31_SDM

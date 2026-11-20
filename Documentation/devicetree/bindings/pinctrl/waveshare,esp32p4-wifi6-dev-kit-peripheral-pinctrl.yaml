@@ -37,11 +37,12 @@ properties:
   gpio-reserved-ranges: true
 
 patternProperties:
-  '^(i2c1|gpspi2|sdmmc0|sdmmc1|emac-rmii|emac-mdio|i2s0|pcnt0)-pins$':
+  '^(i2c1|gpspi2|sdmmc0|sdmmc1|emac-rmii|emac-mdio|i2s0|pcnt0|ledc0|mcpwm0|mcpwm1|rmt-loopback)-pins$':
     type: object
     properties:
       function:
-        enum: [i2c1, gpspi2, sdmmc0, sdmmc1, emac-rmii, emac-mdio, i2s0, pcnt0]
+        enum: [i2c1, gpspi2, sdmmc0, sdmmc1, emac-rmii, emac-mdio, i2s0, pcnt0, ledc0,
+               mcpwm0, mcpwm1, rmt-loopback]
     required:
       - function
     additionalProperties: false

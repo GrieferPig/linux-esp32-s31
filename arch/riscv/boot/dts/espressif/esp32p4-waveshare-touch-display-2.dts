@@ -283,6 +283,53 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		timeout-sec = <30>;
 	};
 
+	/* TRM ch.62 RMT - pulse send and capture using the on-chip RAM. */
+	rmt@500a2000 {
+		compatible = "espressif,esp32p4-rmt";
+		reg = <0x500a2000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <43 4>;
+		clocks = <&periphclk ESP32P4_CLK_RMT>;
+		resets = <&periphclk ESP32P4_RST_RMT>;
+		status = "disabled";
+	};
+
+	/* TRM ch.61 Motor Control PWM - three timer/operator pairs per group. */
+	pwm@500c0000 {
+		compatible = "espressif,esp32p4-mcpwm";
+		reg = <0x500c0000 0x1000>;
+		clocks = <&periphclk ESP32P4_CLK_MCPWM0>;
+		resets = <&periphclk ESP32P4_RST_MCPWM0>;
+		#pwm-cells = <3>;
+	};
+
+	pwm@500c1000 {
+		compatible = "espressif,esp32p4-mcpwm";
+		reg = <0x500c1000 0x1000>;
+		clocks = <&periphclk ESP32P4_CLK_MCPWM1>;
+		resets = <&periphclk ESP32P4_RST_MCPWM1>;
+		#pwm-cells = <3>;
+	};
+
+	/* TRM ch.60 LED PWM Controller - one low-speed group, eight outputs. */
+	pwm@500d3000 {
+		compatible = "espressif,esp32p4-ledc";
+		reg = <0x500d3000 0x1000>;
+		clocks = <&periphclk ESP32P4_CLK_LEDC>;
+		resets = <&periphclk ESP32P4_RST_LEDC>;
+		#pwm-cells = <3>;
+	};
+
+	/* TRM ch.66 Temperature Sensor - TSENS_OUT and LP_TSENS_INTR. */
+	temperature-sensor@5012f000 {
+		compatible = "espressif,esp32p4-tsens";
+		reg = <0x5012f000 0x2c>, <0x50120000 0xc>,
+		      <0x50124000 0x3c>, <0x5011515c 0x4>;
+		reg-names = "tsens", "clkrst", "analog-i2c", "analog-power";
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <15 4>;
+	};
+
 	/* TRM ch.53 PCNT - four units, GPIO2 feeds unit 0 channel 0. */
 	pcnt: counter@500c9000 {
 		compatible = "espressif,esp32p4-pcnt";

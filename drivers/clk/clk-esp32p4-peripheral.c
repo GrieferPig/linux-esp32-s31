@@ -29,6 +29,7 @@
 #define GPSPI_CLK116		0x80
 #define TIMER_CLK20		0x94
 #define TIMER_CLK21		0x98
+#define LEDC_CLK22		0x9c
 #define IOMUX_CLK26		0xac
 #define HP_RST0			0xc0
 #define HP_RST1			0xc4
@@ -74,6 +75,29 @@
 #define EMAC_PTP_CLK_EN		BIT(19)
 #define EMAC_PHY_INTF		GENMASK(4, 2)
 #define EMAC_PHY_RMII		4
+
+/* TRM ch.61 Motor Control PWM - MCPWMn clock source, gate and reset. */
+#define MCPWM0_APB_EN		BIT(27)
+#define MCPWM1_APB_EN		BIT(28)
+#define MCPWM0_SRC		GENMASK(1, 0)
+#define MCPWM0_CLK_EN		BIT(2)
+#define MCPWM1_SRC		GENMASK(12, 11)
+#define MCPWM1_CLK_EN		BIT(13)
+#define MCPWM0_RESET		BIT(24)
+#define MCPWM1_RESET		BIT(25)
+
+/* TRM ch.62 RMT and ch.12 Reset and Clock - RMT_SYS_CLK_EN, RMT_CLK_SRC_SEL. */
+#define RMT_SYS_EN		BIT(0)
+#define RMT_CLK_SRC		GENMASK(4, 3)
+#define RMT_FUNC_EN		BIT(5)
+#define RMT_DIV_FIELDS		GENMASK(29, 6)
+#define RMT_RESET		BIT(23)
+
+/* TRM ch.60 LED PWM Controller - LEDC clock source, gate and reset. */
+#define LEDC_APB_EN		BIT(0)
+#define LEDC_SRC		GENMASK(1, 0)
+#define LEDC_CLK_EN		BIT(2)
+#define LEDC_RESET		BIT(29)
 
 /* TRM ch.12 Reset and Clock - I2S0 RX/TX_CLK_SRC_SEL, DIV_X/Y/Z/N. */
 #define I2S0_APB_EN		BIT(14)
@@ -205,6 +229,23 @@ static int p4_clk_enable(struct clk_hw *hw)
 		/* TRM ch.12 Reset and Clock - AHB_PDMA_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, AHB_PDMA_SYS_EN, AHB_PDMA_SYS_EN);
 		break;
+	case ESP32P4_CLK_MCPWM0:
+		p4_update(cc, SOC_CLK2, MCPWM0_APB_EN, MCPWM0_APB_EN);
+		p4_update(cc, TIMER_CLK20, MCPWM0_SRC | MCPWM0_CLK_EN, MCPWM0_CLK_EN);
+		break;
+	case ESP32P4_CLK_MCPWM1:
+		p4_update(cc, SOC_CLK2, MCPWM1_APB_EN, MCPWM1_APB_EN);
+		p4_update(cc, TIMER_CLK20, MCPWM1_SRC | MCPWM1_CLK_EN, MCPWM1_CLK_EN);
+		break;
+	case ESP32P4_CLK_RMT:
+		p4_update(cc, SOC_CLK2, RMT_SYS_EN, RMT_SYS_EN);
+		p4_update(cc, LEDC_CLK22, RMT_CLK_SRC | RMT_DIV_FIELDS | RMT_FUNC_EN,
+			  RMT_FUNC_EN);
+		break;
+	case ESP32P4_CLK_LEDC:
+		p4_update(cc, SOC_CLK3, LEDC_APB_EN, LEDC_APB_EN);
+		p4_update(cc, LEDC_CLK22, LEDC_SRC | LEDC_CLK_EN, LEDC_CLK_EN);
+		break;
 	case ESP32P4_CLK_PCNT:
 		p4_update(cc, SOC_CLK2, PCNT_APB_EN, PCNT_APB_EN);
 		break;
@@ -279,6 +320,22 @@ static void p4_clk_disable(struct clk_hw *hw)
 		break;
 	case ESP32P4_CLK_AHB_GDMA:
 		p4_update(cc, SOC_CLK1, AHB_PDMA_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_MCPWM0:
+		p4_update(cc, TIMER_CLK20, MCPWM0_CLK_EN, 0);
+		p4_update(cc, SOC_CLK2, MCPWM0_APB_EN, 0);
+		break;
+	case ESP32P4_CLK_MCPWM1:
+		p4_update(cc, TIMER_CLK20, MCPWM1_CLK_EN, 0);
+		p4_update(cc, SOC_CLK2, MCPWM1_APB_EN, 0);
+		break;
+	case ESP32P4_CLK_RMT:
+		p4_update(cc, LEDC_CLK22, RMT_FUNC_EN, 0);
+		p4_update(cc, SOC_CLK2, RMT_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_LEDC:
+		p4_update(cc, LEDC_CLK22, LEDC_CLK_EN, 0);
+		p4_update(cc, SOC_CLK3, LEDC_APB_EN, 0);
 		break;
 	case ESP32P4_CLK_PCNT:
 		p4_update(cc, SOC_CLK2, PCNT_APB_EN, 0);
@@ -471,6 +528,22 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST0;
 		bit = HP_AHB_PDMA_RESET;
 		break;
+	case ESP32P4_RST_MCPWM0:
+		reg = HP_RST1;
+		bit = MCPWM0_RESET;
+		break;
+	case ESP32P4_RST_MCPWM1:
+		reg = HP_RST1;
+		bit = MCPWM1_RESET;
+		break;
+	case ESP32P4_RST_RMT:
+		reg = HP_RST1;
+		bit = RMT_RESET;
+		break;
+	case ESP32P4_RST_LEDC:
+		reg = HP_RST1;
+		bit = LEDC_RESET;
+		break;
 	case ESP32P4_RST_PCNT:
 		reg = HP_RST1;
 		bit = PCNT_APB_RESET;
@@ -507,6 +580,10 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-mwdt0",
 		"p4-mwdt1",
 		"p4-pcnt",
+		"p4-ledc",
+		"p4-mcpwm0",
+		"p4-mcpwm1",
+		"p4-rmt",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;

@@ -13,7 +13,7 @@ description: |
   The I2C1, GPSPI2, IOMUX, SDMMC, high-speed USB and Ethernet clocks on ESP32-P4 hw_ver1
   and the I2C1 and GPSPI2 reset controls. Clock and reset identifiers are in
   dt-bindings/clock/esp32p4-peripheral-clock.h. I2C1 and GPSPI2 use XTAL.
-  I2S0 takes XTAL through its fractional MCLK divider.
+  I2S0 takes XTAL through its fractional MCLK divider. LEDC uses XTAL.
   SDMMC uses PLL_F160M and requires the additional low-power reset register.
 
 properties:

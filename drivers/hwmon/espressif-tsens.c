@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* ESP32-S31 on-chip temperature sensor, register flow from ESP-IDF. */
+/* Espressif on-chip temperature sensor. */
 
 #include <linux/bitfield.h>
 #include <linux/hwmon.h>
@@ -48,9 +48,38 @@
 #define LP_TSENS_CLK_EN			BIT(30)
 #define LP_TSENS_RST			BIT(31)
 
-struct esp32s31_tsens {
+/* P4 TRM ch.12 Reset and Clock: LPPERI_CLK_EN and LPPERI_RESET_EN. */
+#define P4_LPPERI_RESET_EN		0x08
+#define P4_LPPERI_CK_EN_LP_TSENS	BIT(17)
+#define P4_LPPERI_RST_EN_LP_TSENS	BIT(18)
+#define P4_LPPERI_CK_EN_LP_I2CMST	BIT(27)
+
+/* P4 TRM ch.16 Low-Power Management: PMU_RF_PWC. */
+#define P4_PMU_PERIF_I2C_RSTB		BIT(26)
+#define P4_PMU_XPD_PERIF_I2C		BIT(27)
+
+/* P4 TRM ch.49 Analog I2C: ANA_I2C_MST_I2C0_CTRL and ANA_CONF2. */
+#define P4_ANA_I2C_CONF_MASK		GENMASK(23, 0)
+#define P4_ANA_I2C_SAR_MST_SEL		BIT(7)
+#define P4_ANA_I2C_CLK160M		0x34
+#define P4_ANA_I2C_CLK_SEL_160M		BIT(0)
+
+struct esp_tsens_layout {
+	const char *name;
+	int (*setup)(struct platform_device *pdev, void __iomem *base,
+		     void __iomem *clkrst);
+};
+
+struct esp32p4_tsens_power {
 	void __iomem *base;
 	void __iomem *clkrst;
+	void __iomem *pmu;
+	u32 old_clock;
+	u32 old_power;
+};
+
+struct espressif_tsens {
+	void __iomem *base;
 	struct device *hwmon;
 	struct mutex lock;
 	long low_mc;
@@ -58,25 +87,25 @@ struct esp32s31_tsens {
 	int irq;
 };
 
-static long esp32s31_tsens_raw_to_mc(u8 raw)
+static long espressif_tsens_raw_to_mc(u8 raw)
 {
 	/* IDF range with offset 0: C = 0.4386 * raw - 20.52. */
 	return ((long)raw * 4386 - 205200) / 10;
 }
 
-static u8 esp32s31_tsens_mc_to_raw(long value)
+static u8 espressif_tsens_mc_to_raw(long value)
 {
 	long raw = DIV_ROUND_CLOSEST(value * 10 + 205200, 4386);
 
 	return clamp_val(raw, 0, U8_MAX);
 }
 
-static void esp32s31_tsens_program_thresholds(struct esp32s31_tsens *tsens)
+static void espressif_tsens_program_thresholds(struct espressif_tsens *tsens)
 {
 	u32 ctrl = FIELD_PREP(TSENS_WAKE_LOW,
-			      esp32s31_tsens_mc_to_raw(tsens->low_mc)) |
+			      espressif_tsens_mc_to_raw(tsens->low_mc)) |
 		   FIELD_PREP(TSENS_WAKE_HIGH,
-			      esp32s31_tsens_mc_to_raw(tsens->high_mc)) |
+			      espressif_tsens_mc_to_raw(tsens->high_mc)) |
 		   TSENS_WAKE_ENABLE;
 
 	/* Absolute comparison mode; relative/delta mode is not a hwmon ABI. */
@@ -84,9 +113,9 @@ static void esp32s31_tsens_program_thresholds(struct esp32s31_tsens *tsens)
 	writel(ctrl, tsens->base + TSENS_WAKEUP_CTRL);
 }
 
-static irqreturn_t esp32s31_tsens_irq(int irq, void *data)
+static irqreturn_t espressif_tsens_irq(int irq, void *data)
 {
-	struct esp32s31_tsens *tsens = data;
+	struct espressif_tsens *tsens = data;
 	u32 status = readl(tsens->base + TSENS_INT_ST);
 	u32 wake;
 
@@ -157,7 +186,7 @@ static int esp32s31_tsens_set_range(struct device *dev, u8 range)
 				  !(ctrl & REGI2C_BUSY), 1, 10000);
 }
 
-static umode_t esp32s31_tsens_is_visible(const void *data,
+static umode_t espressif_tsens_is_visible(const void *data,
 					 enum hwmon_sensor_types type,
 					 u32 attr, int channel)
 {
@@ -176,11 +205,11 @@ static umode_t esp32s31_tsens_is_visible(const void *data,
 	}
 }
 
-static int esp32s31_tsens_read(struct device *dev,
+static int espressif_tsens_read(struct device *dev,
 			       enum hwmon_sensor_types type,
 			       u32 attr, int channel, long *value)
 {
-	struct esp32s31_tsens *tsens = dev_get_drvdata(dev);
+	struct espressif_tsens *tsens = dev_get_drvdata(dev);
 	u32 ctrl, raw;
 
 	if (type != hwmon_temp)
@@ -189,7 +218,7 @@ static int esp32s31_tsens_read(struct device *dev,
 	raw = ctrl & 0xff;
 	switch (attr) {
 	case hwmon_temp_input:
-		*value = esp32s31_tsens_raw_to_mc(raw);
+		*value = espressif_tsens_raw_to_mc(raw);
 		return 0;
 	case hwmon_temp_min:
 		*value = READ_ONCE(tsens->low_mc);
@@ -198,28 +227,28 @@ static int esp32s31_tsens_read(struct device *dev,
 		*value = READ_ONCE(tsens->high_mc);
 		return 0;
 	case hwmon_temp_min_alarm:
-		*value = raw < esp32s31_tsens_mc_to_raw(READ_ONCE(tsens->low_mc));
+		*value = raw < espressif_tsens_mc_to_raw(READ_ONCE(tsens->low_mc));
 		return 0;
 	case hwmon_temp_max_alarm:
-		*value = raw > esp32s31_tsens_mc_to_raw(READ_ONCE(tsens->high_mc));
+		*value = raw > espressif_tsens_mc_to_raw(READ_ONCE(tsens->high_mc));
 		return 0;
 	default:
 		return -EOPNOTSUPP;
 	}
 }
 
-static int esp32s31_tsens_write(struct device *dev,
+static int espressif_tsens_write(struct device *dev,
 				enum hwmon_sensor_types type,
 				u32 attr, int channel, long value)
 {
-	struct esp32s31_tsens *tsens = dev_get_drvdata(dev);
+	struct espressif_tsens *tsens = dev_get_drvdata(dev);
 	int ret = 0;
 
 	if (type != hwmon_temp ||
 	    (attr != hwmon_temp_min && attr != hwmon_temp_max))
 		return -EOPNOTSUPP;
-	if (value < esp32s31_tsens_raw_to_mc(0) ||
-	    value > esp32s31_tsens_raw_to_mc(U8_MAX))
+	if (value < espressif_tsens_raw_to_mc(0) ||
+	    value > espressif_tsens_raw_to_mc(U8_MAX))
 		return -ERANGE;
 
 	mutex_lock(&tsens->lock);
@@ -232,7 +261,7 @@ static int esp32s31_tsens_write(struct device *dev,
 		tsens->low_mc = value;
 	else
 		tsens->high_mc = value;
-	esp32s31_tsens_program_thresholds(tsens);
+	espressif_tsens_program_thresholds(tsens);
 	writel(TSENS_WAKE_INT, tsens->base + TSENS_INT_CLR);
 	writel(TSENS_WAKE_INT, tsens->base + TSENS_INT_ENA_W1TS);
 out:
@@ -240,29 +269,165 @@ out:
 	return ret;
 }
 
-static const struct hwmon_ops esp32s31_tsens_ops = {
-	.is_visible = esp32s31_tsens_is_visible,
-	.read = esp32s31_tsens_read,
-	.write = esp32s31_tsens_write,
+static const struct hwmon_ops espressif_tsens_ops = {
+	.is_visible = espressif_tsens_is_visible,
+	.read = espressif_tsens_read,
+	.write = espressif_tsens_write,
 };
 
-static const struct hwmon_channel_info * const esp32s31_tsens_info[] = {
+static const struct hwmon_channel_info * const espressif_tsens_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX |
 			   HWMON_T_MIN_ALARM | HWMON_T_MAX_ALARM),
 	NULL
 };
 
-static const struct hwmon_chip_info esp32s31_tsens_chip_info = {
-	.ops = &esp32s31_tsens_ops,
-	.info = esp32s31_tsens_info,
+static const struct hwmon_chip_info espressif_tsens_chip_info = {
+	.ops = &espressif_tsens_ops,
+	.info = espressif_tsens_info,
 };
 
-static int esp32s31_tsens_probe(struct platform_device *pdev)
+static int esp32s31_tsens_setup(struct platform_device *pdev, void __iomem *base,
+			      void __iomem *clkrst)
 {
-	struct esp32s31_tsens *tsens;
+	int ret;
+
+	ret = devm_regulator_get_enable(&pdev->dev, "analog");
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "analog I2C power unavailable\n");
+
+	writel(readl(clkrst) | LP_TSENS_CLK_EN | LP_TSENS_RST, clkrst);
+	writel(readl(clkrst) & ~LP_TSENS_RST, clkrst);
+	writel(TSENS_REG_CLK, base + TSENS_CLK_CONF);
+	/* IDF's middle range: DAC 15, -10..80 C, nominal 1 C error. */
+	ret = esp32s31_tsens_set_range(&pdev->dev, 15);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "analog range setup timed out\n");
+
+	return 0;
+}
+
+static void esp32p4_tsens_power_release(void *data)
+{
+	const struct esp32p4_tsens_power *power = data;
+	u32 mask;
+
+	mask = TSENS_POWER | TSENS_SAMPLE | TSENS_INT_ENABLE;
+	writel(readl(power->base + TSENS_CTRL) & ~mask, power->base + TSENS_CTRL);
+
+	mask = P4_LPPERI_CK_EN_LP_TSENS | P4_LPPERI_CK_EN_LP_I2CMST;
+	writel((readl(power->clkrst) & ~mask) | (power->old_clock & mask),
+	       power->clkrst);
+	mask = P4_PMU_XPD_PERIF_I2C | P4_PMU_PERIF_I2C_RSTB;
+	writel((readl(power->pmu) & ~mask) | (power->old_power & mask),
+	       power->pmu);
+}
+
+static int esp32p4_tsens_set_range(void __iomem *ana)
+{
+	u32 conf1, conf2, clock, ctrl, cmd;
+	int ret;
+
+	ret = readl_poll_timeout(ana, ctrl, !(ctrl & REGI2C_BUSY), 1, 10000);
+	if (ret)
+		return ret;
+
+	/*
+	 * IDF regi2c_enable_block() selects master 0 for SARADC.
+	 * Preserve the firmware routes and clock source when the transfer ends.
+	 */
+	conf1 = readl(ana + REGI2C_CONF1) & P4_ANA_I2C_CONF_MASK;
+	conf2 = readl(ana + REGI2C_CONF2) & P4_ANA_I2C_CONF_MASK;
+	clock = readl(ana + P4_ANA_I2C_CLK160M);
+	writel(clock | P4_ANA_I2C_CLK_SEL_160M, ana + P4_ANA_I2C_CLK160M);
+	writel(0, ana + REGI2C_CONF1);
+	writel(P4_ANA_I2C_SAR_MST_SEL, ana + REGI2C_CONF2);
+
+	cmd = REGI2C_PERIF_ID | (REGI2C_TSENS_DAC << 8);
+	writel(cmd, ana);
+	ret = readl_poll_timeout(ana, ctrl, !(ctrl & REGI2C_BUSY), 1, 10000);
+	if (!ret) {
+		/* temperature_sensor_ll_set_range(): offset 0 uses DAC code 15. */
+		ctrl = (ctrl & GENMASK(23, 20)) | FIELD_PREP(GENMASK(19, 16), 15);
+		writel(cmd | REGI2C_WRITE | ctrl, ana);
+		ret = readl_poll_timeout(ana, ctrl, !(ctrl & REGI2C_BUSY), 1, 10000);
+	}
+	writel(conf1, ana + REGI2C_CONF1);
+	writel(conf2, ana + REGI2C_CONF2);
+	writel(clock, ana + P4_ANA_I2C_CLK160M);
+	return ret;
+}
+
+static int esp32p4_tsens_setup(struct platform_device *pdev, void __iomem *base,
+			     void __iomem *clkrst)
+{
+	struct device *dev = &pdev->dev;
+	struct esp32p4_tsens_power *power;
+	void __iomem *ana;
+	u32 mask, reset;
+	int ret;
+
+	ana = devm_platform_ioremap_resource_byname(pdev, "analog-i2c");
+	if (IS_ERR(ana))
+		return PTR_ERR(ana);
+
+	power = devm_kzalloc(dev, sizeof(*power), GFP_KERNEL);
+	if (!power)
+		return -ENOMEM;
+	power->pmu = devm_platform_ioremap_resource_byname(pdev, "analog-power");
+	if (IS_ERR(power->pmu))
+		return PTR_ERR(power->pmu);
+	power->base = base;
+	power->clkrst = clkrst;
+	power->old_clock = readl(clkrst);
+	power->old_power = readl(power->pmu);
+	writel(power->old_clock | P4_LPPERI_CK_EN_LP_TSENS |
+	       P4_LPPERI_CK_EN_LP_I2CMST, clkrst);
+	ret = devm_add_action_or_reset(dev, esp32p4_tsens_power_release, power);
+	if (ret)
+		return ret;
+
+	reset = readl(clkrst + P4_LPPERI_RESET_EN);
+	writel(reset | P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
+	writel(reset & ~P4_LPPERI_RST_EN_LP_TSENS, clkrst + P4_LPPERI_RESET_EN);
+
+	/* P4 regi2c_ctrl_ll_i2c_sar_periph_enable() powers SAR while reset. */
+	mask = P4_PMU_XPD_PERIF_I2C | P4_PMU_PERIF_I2C_RSTB;
+	if ((power->old_power & mask) != mask) {
+		writel(power->old_power & ~P4_PMU_PERIF_I2C_RSTB, power->pmu);
+		udelay(1);
+		writel((power->old_power & ~P4_PMU_PERIF_I2C_RSTB) |
+		       P4_PMU_XPD_PERIF_I2C, power->pmu);
+		writel(power->old_power | mask, power->pmu);
+	}
+
+	ret = esp32p4_tsens_set_range(ana);
+	if (ret)
+		return dev_err_probe(dev, ret, "analog range setup timed out\n");
+	return 0;
+}
+
+static const struct esp_tsens_layout esp32s31_tsens_layout = {
+	.name = "esp32s31_tsens",
+	.setup = esp32s31_tsens_setup,
+};
+
+static const struct esp_tsens_layout esp32p4_tsens_layout = {
+	.name = "esp32p4_tsens",
+	.setup = esp32p4_tsens_setup,
+};
+
+static int espressif_tsens_probe(struct platform_device *pdev)
+{
+	const struct esp_tsens_layout *layout = device_get_match_data(&pdev->dev);
+	struct espressif_tsens *tsens;
 	void __iomem *clkrst;
 	struct device *hwmon;
 	int ret;
+
+	if (!layout)
+		return -ENODEV;
 
 	tsens = devm_kzalloc(&pdev->dev, sizeof(*tsens), GFP_KERNEL);
 	if (!tsens)
@@ -276,33 +441,23 @@ static int esp32s31_tsens_probe(struct platform_device *pdev)
 	clkrst = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(clkrst))
 		return PTR_ERR(clkrst);
-	tsens->clkrst = clkrst;
 
-	ret = devm_regulator_get_enable(&pdev->dev, "analog");
+	ret = layout->setup(pdev, tsens->base, clkrst);
 	if (ret)
-		return dev_err_probe(&pdev->dev, ret,
-				     "analog I2C power unavailable\n");
-
-	writel(readl(clkrst) | LP_TSENS_CLK_EN | LP_TSENS_RST, clkrst);
-	writel(readl(clkrst) & ~LP_TSENS_RST, clkrst);
-	writel(TSENS_REG_CLK, tsens->base + TSENS_CLK_CONF);
-	/* IDF's middle range: DAC 15, -10..80 C, nominal 1 C error. */
-	ret = esp32s31_tsens_set_range(&pdev->dev, 15);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret,
-				     "analog range setup timed out\n");
-	/* IDF only sets power_up; power_up_force is not used by its driver. */
+		return ret;
+	/* P4 TRM ch.66 Temperature Sensor: TSENS_POWER_UP, TSENS_SAMPLE_EN. */
 	writel(FIELD_PREP(TSENS_CLK_DIV, 6) | TSENS_SAMPLE | TSENS_INT_ENABLE |
 	       TSENS_POWER,
 	       tsens->base + TSENS_CTRL);
 	writel(20, tsens->base + TSENS_SAMPLE_RATE);
-	esp32s31_tsens_program_thresholds(tsens);
+	espressif_tsens_program_thresholds(tsens);
 	writel(TSENS_WAKE_INT, tsens->base + TSENS_INT_CLR);
+	/* TRM ch.66: TSENS_XPD_WAIT defaults to two clocks, then settle. */
 	udelay(300);
 	platform_set_drvdata(pdev, tsens);
 	hwmon = devm_hwmon_device_register_with_info(&pdev->dev,
-						     "esp32s31_tsens", tsens,
-						     &esp32s31_tsens_chip_info,
+						     layout->name, tsens,
+						     &espressif_tsens_chip_info,
 						     NULL);
 	if (IS_ERR(hwmon))
 		return PTR_ERR(hwmon);
@@ -310,7 +465,7 @@ static int esp32s31_tsens_probe(struct platform_device *pdev)
 	tsens->irq = platform_get_irq(pdev, 0);
 	if (tsens->irq < 0)
 		return tsens->irq;
-	ret = devm_request_irq(&pdev->dev, tsens->irq, esp32s31_tsens_irq,
+	ret = devm_request_irq(&pdev->dev, tsens->irq, espressif_tsens_irq,
 			       0, dev_name(&pdev->dev), tsens);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
@@ -319,27 +474,29 @@ static int esp32s31_tsens_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void esp32s31_tsens_remove(struct platform_device *pdev)
+static void espressif_tsens_remove(struct platform_device *pdev)
 {
-	struct esp32s31_tsens *tsens = platform_get_drvdata(pdev);
+	struct espressif_tsens *tsens = platform_get_drvdata(pdev);
 
 	writel(TSENS_WAKE_INT, tsens->base + TSENS_INT_ENA_W1TC);
 	writel(TSENS_WAKE_INT, tsens->base + TSENS_INT_CLR);
 }
 
-static const struct of_device_id esp32s31_tsens_of_match[] = {
-	{ .compatible = "espressif,esp32s31-tsens" }, { }
+static const struct of_device_id espressif_tsens_of_match[] = {
+	{ .compatible = "espressif,esp32s31-tsens", .data = &esp32s31_tsens_layout },
+	{ .compatible = "espressif,esp32p4-tsens", .data = &esp32p4_tsens_layout },
+	{ }
 };
-MODULE_DEVICE_TABLE(of, esp32s31_tsens_of_match);
+MODULE_DEVICE_TABLE(of, espressif_tsens_of_match);
 
-static struct platform_driver esp32s31_tsens_driver = {
-	.probe = esp32s31_tsens_probe,
-	.remove = esp32s31_tsens_remove,
+static struct platform_driver espressif_tsens_driver = {
+	.probe = espressif_tsens_probe,
+	.remove = espressif_tsens_remove,
 	.driver = {
 		.name = "esp32s31-tsens",
-		.of_match_table = esp32s31_tsens_of_match,
+		.of_match_table = espressif_tsens_of_match,
 	},
 };
-module_platform_driver(esp32s31_tsens_driver);
-MODULE_DESCRIPTION("ESP32-S31 temperature sensor");
+module_platform_driver(espressif_tsens_driver);
+MODULE_DESCRIPTION("Espressif ESP32-S31 and ESP32-P4 temperature sensor");
 MODULE_LICENSE("GPL");

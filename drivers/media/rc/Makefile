@@ -27,6 +27,7 @@ obj-$(CONFIG_IR_XMP_DECODER) += ir-xmp-decoder.o
 # sorted by Kconfig name (e. g. LC_ALL=C sort Makefile)
 obj-$(CONFIG_IR_ENE) += ene_ir.o
 obj-$(CONFIG_IR_FINTEK) += fintek-cir.o
+obj-$(CONFIG_IR_ESP32P4_RMT) += ir-esp32p4-rmt.o
 obj-$(CONFIG_IR_GPIO_CIR) += gpio-ir-recv.o
 obj-$(CONFIG_IR_GPIO_TX) += gpio-ir-tx.o
 obj-$(CONFIG_IR_HIX5HD2) += ir-hix5hd2.o

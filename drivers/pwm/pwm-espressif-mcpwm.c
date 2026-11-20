@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 MCPWM basic waveform driver.
+ * Espressif MCPWM basic waveform driver.
  *
- * Each of the four instances has three timer/operator pairs and two
- * generators per operator.  The PWM framework exposes all 24 basic outputs
+ * Each instance has three timer/operator pairs and two generators per
+ * operator. The PWM framework exposes six outputs per instance
  * and its capture ABI exposes the three capture inputs.  Device-tree policy
  * can additionally arm GPIO faults and timer synchronization.
  */
@@ -23,12 +23,13 @@
 #define MCPWM_TIMER_CFG0(t)		((t) * 0x10)
 #define MCPWM_TIMER_CFG1(t)		(0x04 + (t) * 0x10)
 #define MCPWM_OPERATOR_TIMERSEL		0x34
-#define MCPWM_OPERATOR_BASE(op)		(0x38 + (op) * 0x3c)
-#define MCPWM_STAMP(op, cmp)		(MCPWM_OPERATOR_BASE(op) + 0x04 + \
+#define MCPWM_OPERATOR_BASE(pc, op)	(0x38 + (op) * (pc)->layout->operator_stride)
+#define MCPWM_STAMP(pc, op, cmp)		(MCPWM_OPERATOR_BASE(pc, op) + 0x04 + \
 					 (cmp) * 0x04)
-#define MCPWM_GEN_CFG(op)		(MCPWM_OPERATOR_BASE(op) + 0x0c)
-#define MCPWM_GENERATOR(op, gen)	(MCPWM_OPERATOR_BASE(op) + 0x14 + \
+#define MCPWM_GEN_CFG(pc, op)		(MCPWM_OPERATOR_BASE(pc, op) + 0x0c)
+#define MCPWM_GENERATOR(pc, op, gen)	(MCPWM_OPERATOR_BASE(pc, op) + 0x14 + \
 					 (gen) * 0x04)
+#define MCPWM_GEN_FORCE(pc, op)		(MCPWM_OPERATOR_BASE(pc, op) + 0x10)
 #define MCPWM_TIMER_SYNC(t)		(0x08 + (t) * 0x10)
 #define MCPWM_TIMER_SYNCI_CFG		0x30
 #define MCPWM_FAULT_DETECT		0xe0
@@ -54,26 +55,49 @@
 #define MCPWM_CAP_BOTH_EDGES		GENMASK(2, 1)
 #define MCPWM_CAP_INT(ch)		BIT(27 + (ch))
 
+#define MCPWM_CONT_FORCE_UPMETHOD	GENMASK(5, 0)
+#define MCPWM_CONT_FORCE_A_SHIFT	6
+#define MCPWM_CONT_FORCE_MASK		GENMASK(1, 0)
+
 #define MCPWM_ACTION_LOW		1
 #define MCPWM_ACTION_HIGH		2
 
-struct esp32s31_mcpwm {
+struct mcpwm_layout {
+	unsigned int register_bias;
+	unsigned int operator_stride;
+	bool independent_outputs;
+};
+
+static const struct mcpwm_layout esp32s31_mcpwm_layout = {
+	.operator_stride = 0x3c,
+};
+
+static const struct mcpwm_layout esp32p4_mcpwm_layout = {
+	/* TRM ch.61 MCPWM: CLK_CFG precedes TIMER0_CFG0; GENx stride is 0x38. */
+	.register_bias = 4,
+	.operator_stride = 0x38,
+	.independent_outputs = true,
+};
+
+struct espressif_mcpwm {
 	void __iomem *base;
+	const struct mcpwm_layout *layout;
 	struct clk *clk;
 	struct mutex lock;
 	u64 timer_period[3];
 	unsigned int timer_users[3];
+	unsigned long enabled_channels;
 };
 
-static inline struct esp32s31_mcpwm *to_esp32s31_mcpwm(struct pwm_chip *chip)
+static inline struct espressif_mcpwm *to_espressif_mcpwm(struct pwm_chip *chip)
 {
 	return pwmchip_get_drvdata(chip);
 }
 
-static int esp32s31_mcpwm_request(struct pwm_chip *chip,
+static int espressif_mcpwm_request(struct pwm_chip *chip,
 				  struct pwm_device *pwm)
 {
-	struct esp32s31_mcpwm *pc = to_esp32s31_mcpwm(chip);
+	struct espressif_mcpwm *pc = to_espressif_mcpwm(chip);
 
 	mutex_lock(&pc->lock);
 	pc->timer_users[pwm->hwpwm / 2]++;
@@ -81,10 +105,10 @@ static int esp32s31_mcpwm_request(struct pwm_chip *chip,
 	return 0;
 }
 
-static void esp32s31_mcpwm_free(struct pwm_chip *chip,
+static void espressif_mcpwm_free(struct pwm_chip *chip,
 				struct pwm_device *pwm)
 {
-	struct esp32s31_mcpwm *pc = to_esp32s31_mcpwm(chip);
+	struct espressif_mcpwm *pc = to_espressif_mcpwm(chip);
 	unsigned int timer = pwm->hwpwm / 2;
 
 	mutex_lock(&pc->lock);
@@ -93,22 +117,28 @@ static void esp32s31_mcpwm_free(struct pwm_chip *chip,
 	mutex_unlock(&pc->lock);
 }
 
-static int esp32s31_mcpwm_apply(struct pwm_chip *chip,
+static int espressif_mcpwm_apply(struct pwm_chip *chip,
 				struct pwm_device *pwm,
 				const struct pwm_state *state)
 {
-	struct esp32s31_mcpwm *pc = to_esp32s31_mcpwm(chip);
+	struct espressif_mcpwm *pc = to_espressif_mcpwm(chip);
 	unsigned int ch = pwm->hwpwm, op = ch / 2, gen = ch & 1;
+	unsigned long rate = clk_get_rate(pc->clk);
 	u64 raw_ticks;
 	u32 prescale, peak, compare, val, action;
+	bool run_timer = state->enabled;
 	int ret = 0;
 
 	if (!state->period || state->duty_cycle > state->period ||
 	    state->polarity != PWM_POLARITY_NORMAL)
 		return -EINVAL;
 
-	raw_ticks = DIV64_U64_ROUND_CLOSEST((u64)clk_get_rate(pc->clk) *
-					    state->period, NSEC_PER_SEC);
+	if (!rate || state->period > DIV_ROUND_UP_ULL(65536ULL * 256 *
+						       NSEC_PER_SEC, rate))
+		return -ERANGE;
+
+	raw_ticks = DIV64_U64_ROUND_CLOSEST((u64)rate * state->period,
+					    NSEC_PER_SEC);
 	prescale = DIV_ROUND_UP_ULL(raw_ticks, 65536);
 	if (!prescale || prescale > 256)
 		return -ERANGE;
@@ -133,7 +163,7 @@ static int esp32s31_mcpwm_apply(struct pwm_chip *chip,
 	val |= op << (op * 2);
 	writel(val, pc->base + MCPWM_OPERATOR_TIMERSEL);
 	writel(FIELD_PREP(MCPWM_STAMP_VALUE, min(compare, peak - 1)),
-	       pc->base + MCPWM_STAMP(op, gen));
+	       pc->base + MCPWM_STAMP(pc, op, gen));
 
 	/*
 	 * In up-count mode: set high at TEZ, set low at comparator A/B.
@@ -146,24 +176,40 @@ static int esp32s31_mcpwm_apply(struct pwm_chip *chip,
 	else
 		action = MCPWM_ACTION_HIGH |
 			 (MCPWM_ACTION_LOW << (4 + gen * 2));
-	writel(action, pc->base + MCPWM_GENERATOR(op, gen));
-	writel(0, pc->base + MCPWM_GEN_CFG(op)); /* update immediately */
+	writel(action, pc->base + MCPWM_GENERATOR(pc, op, gen));
+	writel(0, pc->base + MCPWM_GEN_CFG(pc, op)); /* update immediately */
+	if (pc->layout->independent_outputs) {
+		unsigned int shift = MCPWM_CONT_FORCE_A_SHIFT + gen * 2;
+		void __iomem *force = pc->base + MCPWM_GEN_FORCE(pc, op);
+		u32 level = 0;
+
+		/* TRM ch.61: GENx_FORCE.CNTUFORCE_MODE acts on each output. */
+		if (!state->enabled || !compare)
+			level = MCPWM_ACTION_LOW;
+		else if (compare >= peak)
+			level = MCPWM_ACTION_HIGH;
+		val = readl(force) & ~(MCPWM_CONT_FORCE_UPMETHOD |
+				     (MCPWM_CONT_FORCE_MASK << shift));
+		writel(val | (level << shift), force);
+		__assign_bit(ch, &pc->enabled_channels, state->enabled);
+		run_timer = (pc->enabled_channels >> (op * 2)) & GENMASK(1, 0);
+	}
 	writel(FIELD_PREP(MCPWM_TIMER_START,
-			 state->enabled ? MCPWM_TIMER_START_FREE : 0) |
+			 run_timer ? MCPWM_TIMER_START_FREE : 0) |
 	       FIELD_PREP(MCPWM_TIMER_MODE,
-			 state->enabled ? MCPWM_TIMER_MODE_UP : 0),
+			 run_timer ? MCPWM_TIMER_MODE_UP : 0),
 	       pc->base + MCPWM_TIMER_CFG1(op));
 out:
 	mutex_unlock(&pc->lock);
 	return ret;
 }
 
-static int esp32s31_mcpwm_capture(struct pwm_chip *chip,
+static int espressif_mcpwm_capture(struct pwm_chip *chip,
 				  struct pwm_device *pwm,
 				  struct pwm_capture *result,
 				  unsigned long timeout_ms)
 {
-	struct esp32s31_mcpwm *pc = to_esp32s31_mcpwm(chip);
+	struct espressif_mcpwm *pc = to_espressif_mcpwm(chip);
 	unsigned int cap = pwm->hwpwm % 3;
 	ktime_t deadline = ktime_add_ms(ktime_get(), timeout_ms);
 	u32 first_rise = 0, fall = 0, second_rise = 0, status;
@@ -226,8 +272,8 @@ out:
 	return ret;
 }
 
-static int esp32s31_mcpwm_init_fault_sync(struct platform_device *pdev,
-					   struct esp32s31_mcpwm *pc)
+static int espressif_mcpwm_init_fault_sync(struct platform_device *pdev,
+					   struct espressif_mcpwm *pc)
 {
 	u32 fault_mask = 0, active_high = 0;
 	u32 sync_sources[3] = { 0 }, sync_phases[3] = { 0 };
@@ -272,16 +318,16 @@ static int esp32s31_mcpwm_init_fault_sync(struct platform_device *pdev,
 	return 0;
 }
 
-static const struct pwm_ops esp32s31_mcpwm_ops = {
-	.request = esp32s31_mcpwm_request,
-	.free = esp32s31_mcpwm_free,
-	.capture = esp32s31_mcpwm_capture,
-	.apply = esp32s31_mcpwm_apply,
+static const struct pwm_ops espressif_mcpwm_ops = {
+	.request = espressif_mcpwm_request,
+	.free = espressif_mcpwm_free,
+	.capture = espressif_mcpwm_capture,
+	.apply = espressif_mcpwm_apply,
 };
 
-static int esp32s31_mcpwm_probe(struct platform_device *pdev)
+static int espressif_mcpwm_probe(struct platform_device *pdev)
 {
-	struct esp32s31_mcpwm *pc;
+	struct espressif_mcpwm *pc;
 	struct pwm_chip *chip;
 	struct reset_control *rst;
 	int ret;
@@ -289,11 +335,15 @@ static int esp32s31_mcpwm_probe(struct platform_device *pdev)
 	chip = devm_pwmchip_alloc(&pdev->dev, 6, sizeof(*pc));
 	if (IS_ERR(chip))
 		return PTR_ERR(chip);
-	pc = to_esp32s31_mcpwm(chip);
+	pc = to_espressif_mcpwm(chip);
+	pc->layout = device_get_match_data(&pdev->dev);
+	if (!pc->layout)
+		return -ENODEV;
 	mutex_init(&pc->lock);
 	pc->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(pc->base))
 		return PTR_ERR(pc->base);
+	pc->base += pc->layout->register_bias;
 	pc->clk = devm_clk_get_enabled(&pdev->dev, NULL);
 	if (IS_ERR(pc->clk))
 		return dev_err_probe(&pdev->dev, PTR_ERR(pc->clk),
@@ -305,12 +355,12 @@ static int esp32s31_mcpwm_probe(struct platform_device *pdev)
 	ret = reset_control_reset(rst);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "reset failed\n");
-	ret = esp32s31_mcpwm_init_fault_sync(pdev, pc);
+	ret = espressif_mcpwm_init_fault_sync(pdev, pc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "invalid fault/sync configuration\n");
 
-	chip->ops = &esp32s31_mcpwm_ops;
+	chip->ops = &espressif_mcpwm_ops;
 	ret = pwmchip_add(chip);
 	if (ret)
 		return ret;
@@ -318,26 +368,27 @@ static int esp32s31_mcpwm_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void esp32s31_mcpwm_remove(struct platform_device *pdev)
+static void espressif_mcpwm_remove(struct platform_device *pdev)
 {
 	pwmchip_remove(platform_get_drvdata(pdev));
 }
 
-static const struct of_device_id esp32s31_mcpwm_of_match[] = {
-	{ .compatible = "espressif,esp32s31-mcpwm" },
+static const struct of_device_id espressif_mcpwm_of_match[] = {
+	{ .compatible = "espressif,esp32s31-mcpwm", .data = &esp32s31_mcpwm_layout },
+	{ .compatible = "espressif,esp32p4-mcpwm", .data = &esp32p4_mcpwm_layout },
 	{ }
 };
-MODULE_DEVICE_TABLE(of, esp32s31_mcpwm_of_match);
+MODULE_DEVICE_TABLE(of, espressif_mcpwm_of_match);
 
-static struct platform_driver esp32s31_mcpwm_driver = {
-	.probe = esp32s31_mcpwm_probe,
-	.remove = esp32s31_mcpwm_remove,
+static struct platform_driver espressif_mcpwm_driver = {
+	.probe = espressif_mcpwm_probe,
+	.remove = espressif_mcpwm_remove,
 	.driver = {
 		.name = "esp32s31-mcpwm",
-		.of_match_table = esp32s31_mcpwm_of_match,
+		.of_match_table = espressif_mcpwm_of_match,
 	},
 };
-module_platform_driver(esp32s31_mcpwm_driver);
+module_platform_driver(espressif_mcpwm_driver);
 
-MODULE_DESCRIPTION("ESP32-S31 MCPWM driver");
+MODULE_DESCRIPTION("Espressif ESP32-S31 and ESP32-P4 MCPWM driver");
 MODULE_LICENSE("GPL");

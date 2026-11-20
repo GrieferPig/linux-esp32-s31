@@ -43,6 +43,22 @@
 			function = "pcnt0";
 		};
 
+		pins_ledc0: ledc0-pins {
+			function = "ledc0";
+		};
+
+		pins_mcpwm0: mcpwm0-pins {
+			function = "mcpwm0";
+		};
+
+		pins_mcpwm1: mcpwm1-pins {
+			function = "mcpwm1";
+		};
+
+		pins_rmt_loopback: rmt-loopback-pins {
+			function = "rmt-loopback";
+		};
+
 		pins_gpspi2: gpspi2-pins {
 			function = "gpspi2";
 		};

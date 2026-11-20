@@ -139,6 +139,21 @@ static const struct p4_route pcnt0_routes[] = {
 	{ 141, P4_SIGNAL_NONE },
 };
 
+/* TRM ch.11 GPIO Matrix - LEDC output 0 on the GPIO3 header pad. */
+static const unsigned int ledc0_pins[] = { 3 };
+static const struct p4_route ledc0_routes[] = {
+	{ P4_SIGNAL_NONE, 126 },
+};
+
+/* TRM ch.11 GPIO Matrix - alternative MCPWM outputs on the GPIO3 header. */
+static const unsigned int mcpwm_pins[] = { 3 };
+static const struct p4_route mcpwm0_routes[] = { { P4_SIGNAL_NONE, 89 } };
+static const struct p4_route mcpwm1_routes[] = { { P4_SIGNAL_NONE, 95 } };
+
+/* TRM ch.11 GPIO Matrix - RMT shared line on GPIO3. */
+static const unsigned int rmt_pins[] = { 3 };
+static const struct p4_route rmt_routes[] = { { 246, 246 } };
+
 static const struct p4_group p4_groups[] = {
 	{ "i2c1", i2c1_pins, i2c1_routes, ARRAY_SIZE(i2c1_pins) },
 	{ "gpspi2", gpspi2_pins, gpspi2_routes, ARRAY_SIZE(gpspi2_pins) },
@@ -150,6 +165,10 @@ static const struct p4_group p4_groups[] = {
 	  ARRAY_SIZE(emac_mdio_pins) },
 	{ "i2s0", i2s0_pins, i2s0_routes, ARRAY_SIZE(i2s0_pins) },
 	{ "pcnt0", pcnt0_pins, pcnt0_routes, ARRAY_SIZE(pcnt0_pins) },
+	{ "ledc0", ledc0_pins, ledc0_routes, ARRAY_SIZE(ledc0_pins) },
+	{ "mcpwm0", mcpwm_pins, mcpwm0_routes, ARRAY_SIZE(mcpwm_pins) },
+	{ "mcpwm1", mcpwm_pins, mcpwm1_routes, ARRAY_SIZE(mcpwm_pins) },
+	{ "rmt-loopback", rmt_pins, rmt_routes, ARRAY_SIZE(rmt_pins) },
 };
 
 #define P4_PIN(n) PINCTRL_PIN(n, "GPIO" #n)

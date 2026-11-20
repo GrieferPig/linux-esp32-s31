@@ -26,10 +26,11 @@ menuconfig HWMON
 if HWMON
 
 config SENSORS_ESP32S31_TSENS
-	tristate "Espressif ESP32-S31 temperature sensor"
-	depends on SOC_ESP32S31 || COMPILE_TEST
+	tristate "Espressif ESP32-S31 and ESP32-P4 temperature sensor"
+	depends on SOC_ESP32S31 || SOC_ESP32P4 || COMPILE_TEST
 	help
-	  Support the on-chip ESP32-S31 temperature sensor through hwmon.
+	  Support the on-chip ESP32-S31 and ESP32-P4 temperature sensors
+	  through hwmon.
 
 config HWMON_VID
 	tristate
