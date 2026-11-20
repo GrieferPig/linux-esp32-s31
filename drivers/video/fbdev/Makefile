@@ -129,3 +129,4 @@ obj-$(CONFIG_FB_ESP32P4_DSI)     += esp32p4-dsi.o
 
 # the test framebuffer is last
 obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
+obj-$(CONFIG_FB_ESP32S31_I80) += esp32s31-i80.o

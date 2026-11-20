@@ -1246,7 +1246,7 @@ static int __esp32s31_register_clk(struct device *dev,
 				   struct esp32s31_clk_priv *priv,
 				   unsigned int id, const char *name,
 				   enum esp32s31_clk_kind kind,
-				   unsigned long rate,
+				   unsigned long rate, u16 reg,
 				   const char * const *parent_names,
 				   unsigned int num_parents)
 {
@@ -1302,6 +1302,7 @@ static int __esp32s31_register_clk(struct device *dev,
 	clk->priv = priv;
 	clk->kind = kind;
 	clk->fixed_rate = rate;
+	clk->reg = reg;
 
 	ret = devm_clk_hw_register(dev, &clk->hw);
 	if (ret)
@@ -1318,7 +1319,7 @@ static int esp32s31_register_clk(struct device *dev,
 				 enum esp32s31_clk_kind kind,
 				 unsigned long rate)
 {
-	return __esp32s31_register_clk(dev, priv, id, name, kind, rate,
+	return __esp32s31_register_clk(dev, priv, id, name, kind, rate, 0,
 				       NULL, 0);
 }
 
@@ -1330,7 +1331,7 @@ static int esp32s31_register_parented_clk(struct device *dev,
 					  const char * const *parent_names,
 					  unsigned int num_parents)
 {
-	return __esp32s31_register_clk(dev, priv, id, name, kind, rate,
+	return __esp32s31_register_clk(dev, priv, id, name, kind, rate, 0,
 				       parent_names, num_parents);
 }
 
@@ -1340,19 +1341,13 @@ static int esp32s31_register_pll_div(struct device *dev,
 				     const char * const *parent_names,
 				     unsigned int num_parents)
 {
-	struct esp32s31_clk *clk;
-	int ret;
-
-	ret = esp32s31_register_parented_clk(dev, priv, id, name,
-					 ESP32S31_CLK_KIND_PLL_DIV, 0,
-					 parent_names, num_parents);
-	if (ret)
-		return ret;
-
-	clk = to_esp32s31_clk(priv->onecell->hws[id]);
-	clk->reg = reg;
-
-	return 0;
+	/*
+	 * The clock core caches the rate during registration. The REF register
+	 * offset must be available to recalc_rate at that point.
+	 */
+	return __esp32s31_register_clk(dev, priv, id, name,
+				      ESP32S31_CLK_KIND_PLL_DIV, 0, reg,
+				      parent_names, num_parents);
 }
 
 static int esp32s31_register_gate(struct device *dev,

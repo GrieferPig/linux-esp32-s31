@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/esp32s31-clock.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "i80-ili9341";
+	espressif,gpio-claims = <3 36 38 39 40 42 43 44 45 46 47 48 49>;
+	espressif,resource-claims = "lcdcam", "axi-gdma-pair0";
+};
+
+&{/soc} {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	lcd@20396000 {
+		compatible = "espressif,esp32s31-i80-ili9341";
+		reg = <0x20396000 0x1000>, <0x2058714c 0x0c>;
+		reg-names = "lcdcam", "clkrst";
+		interrupt-parent = <&intmtx>;
+		interrupts = <13 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkc ESP32S31_CLK_PLL_F160>, <&clkc ESP32S31_CLK_PLL_F120>;
+		clock-names = "lcd", "core";
+		clock-frequency = <13333334>;
+		dmas = <&axi_gdma 0 0>;
+		dma-names = "tx";
+		pinctrl-names = "default", "touch-detect", "touch-x",
+				"touch-x-reverse", "touch-y", "touch-y-reverse";
+		pinctrl-0 = <&lcd_i80_pins>;
+		pinctrl-1 = <&touch_wr_idle &touch_detect>;
+		pinctrl-2 = <&touch_wr_idle &touch_x>;
+		pinctrl-3 = <&touch_wr_idle &touch_x_reverse>;
+		pinctrl-4 = <&touch_wr_idle &touch_y>;
+		pinctrl-5 = <&touch_wr_idle &touch_y_reverse>;
+		io-channels = <&adc 0>, <&adc 1>;
+		io-channel-names = "gpio42", "gpio43";
+		reset-gpios = <&gpio 3 GPIO_ACTIVE_LOW>;
+		rd-gpios = <&gpio 36 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&gpio {
+	lcd_i80_pins: lcd-i80-pins {
+		data-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(43, 154, 0)>,
+				 <ESP32S31_MATRIX_OUT(42, 155, 0)>,
+				 <ESP32S31_MATRIX_OUT(44, 156, 0)>,
+				 <ESP32S31_MATRIX_OUT(45, 157, 0)>,
+				 <ESP32S31_MATRIX_OUT(46, 158, 0)>,
+				 <ESP32S31_MATRIX_OUT(47, 159, 0)>,
+				 <ESP32S31_MATRIX_OUT(48, 160, 0)>,
+				 <ESP32S31_MATRIX_OUT(49, 161, 0)>;
+			bias-disable;
+			drive-strength = <20>;
+		};
+
+		control-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(38, 144, 0)>,
+				 <ESP32S31_MATRIX_OUT(39, 145, 0)>,
+				 <ESP32S31_MATRIX_OUT(40, 149, 0)>;
+			bias-disable;
+			drive-strength = <20>;
+		};
+	};
+
+	/* Panel electrode pairs measured on the shield: 39–43 and 38–42. */
+	touch_wr_idle: touch-wr-idle-pins {
+		hold-pins {
+			pinmux = <ESP32S31_IOMUX(40, 1)>;
+			output-high;
+		};
+	};
+
+	touch_detect: touch-detect-pins {
+		drive-pins {
+			pinmux = <ESP32S31_IOMUX(39, 1)>, <ESP32S31_IOMUX(43, 1)>;
+			output-low;
+		};
+		bias-pins {
+			pinmux = <ESP32S31_IOMUX(38, 1)>;
+			bias-pull-up;
+		};
+		sense-pins {
+			pinmux = <ESP32S31_IOMUX(42, 1)>;
+			bias-disable;
+		};
+	};
+
+	touch_x: touch-x-pins {
+		high-pins {
+			pinmux = <ESP32S31_IOMUX(43, 1)>;
+			output-high;
+		};
+		low-pins {
+			pinmux = <ESP32S31_IOMUX(39, 1)>;
+			output-low;
+		};
+		sense-pins {
+			pinmux = <ESP32S31_IOMUX(38, 1)>, <ESP32S31_IOMUX(42, 1)>;
+			bias-disable;
+		};
+	};
+
+	touch_x_reverse: touch-x-reverse-pins {
+		high-pins {
+			pinmux = <ESP32S31_IOMUX(39, 1)>;
+			output-high;
+		};
+		low-pins {
+			pinmux = <ESP32S31_IOMUX(43, 1)>;
+			output-low;
+		};
+		sense-pins {
+			pinmux = <ESP32S31_IOMUX(38, 1)>, <ESP32S31_IOMUX(42, 1)>;
+			bias-disable;
+		};
+	};
+
+	touch_y: touch-y-pins {
+		high-pins {
+			pinmux = <ESP32S31_IOMUX(38, 1)>;
+			output-high;
+		};
+		low-pins {
+			pinmux = <ESP32S31_IOMUX(42, 1)>;
+			output-low;
+		};
+		sense-pins {
+			pinmux = <ESP32S31_IOMUX(39, 1)>, <ESP32S31_IOMUX(43, 1)>;
+			bias-disable;
+		};
+	};
+
+	touch_y_reverse: touch-y-reverse-pins {
+		high-pins {
+			pinmux = <ESP32S31_IOMUX(42, 1)>;
+			output-high;
+		};
+		low-pins {
+			pinmux = <ESP32S31_IOMUX(38, 1)>;
+			output-low;
+		};
+		sense-pins {
+			pinmux = <ESP32S31_IOMUX(39, 1)>, <ESP32S31_IOMUX(43, 1)>;
+			bias-disable;
+		};
+	};
+};
+
+&axi_gdma {
+	status = "okay";
+};
+
+&adc {
+	status = "okay";
+};
