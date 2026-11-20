@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Independent reconstruction against the audited retained IDF callback ABI.
- * Does not implement DMA invalidation: only executable sync and display WB.
+ * ESP32-P4 cache maintenance for DMA, executable data, and display.
  */
 #include <linux/cacheflush.h>
 #include <linux/errno.h>
@@ -66,17 +65,17 @@ static int p4_cache_dma_sync(u32 start, u32 size, u32 map, u32 op)
 					 P4_CACHE_SYNC_DONE, 0, 1000);
 }
 
-static void p4_cache_dma_op(phys_addr_t paddr, size_t size, u32 op)
+static int p4_cache_range_op(phys_addr_t paddr, size_t size, u32 op)
 {
 	unsigned long flags;
 	u32 start, end, len;
 	int ret = 0;
 
 	if (!size)
-		return;
+		return 0;
 	if (paddr < ESP32P4_RAM_START || paddr >= p4_exec_ram_end ||
 	    size > p4_exec_ram_end - paddr)
-		panic("P4 DMA cache range outside PSRAM: %pa, %zu bytes", &paddr, size);
+		return -EINVAL;
 
 	start = ALIGN_DOWN(paddr, P4_DMA_CACHE_ALIGN);
 	end = ALIGN(paddr + size, P4_DMA_CACHE_ALIGN);
@@ -91,6 +90,13 @@ static void p4_cache_dma_op(phys_addr_t paddr, size_t size, u32 op)
 		start += len;
 	}
 	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
+	return ret;
+}
+
+static void p4_cache_dma_op(phys_addr_t paddr, size_t size, u32 op)
+{
+	int ret = p4_cache_range_op(paddr, size, op);
+
 	if (ret)
 		panic("P4 DMA cache sync failed: %pa, %zu bytes, op %#x", &paddr,
 		      size, op);
@@ -155,30 +161,32 @@ static void __init p4_cache_early_init(const void *fdt)
 		panic("P4 unsupported executable PSRAM capacity: %x", capacity);
 	p4_exec_ram_end = ESP32P4_RAM_START + capacity;
 
-	fb = -1;
-	fdt_for_each_subnode(child, fdt, chosen) {
-		if (fdt_node_check_compatible(fdt, child,
-				"espressif,esp32p4-idf-framebuffer"))
-			continue;
-		status = fdt_getprop(fdt, child, "status", &status_len);
-		if (status && (status_len < 5 || strcmp(status, "okay")))
-			continue;
-		fb = child;
-		matches++;
+	if (!IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
+		fb = -1;
+		fdt_for_each_subnode(child, fdt, chosen) {
+			if (fdt_node_check_compatible(fdt, child,
+					"espressif,esp32p4-idf-framebuffer"))
+				continue;
+			status = fdt_getprop(fdt, child, "status", &status_len);
+			if (status && (status_len < 5 || strcmp(status, "okay")))
+				continue;
+			fb = child;
+			matches++;
+		}
+		if (matches == 1)
+			wb = p4_fdt_u32(fdt, fb, "espressif,cache-writeback-entry");
+		if (esp32p4_retained_entry_valid(entry))
+			exec_sync = (p4_cache_fn)(unsigned long)entry;
+		if (esp32p4_retained_entry_valid(wb))
+			display_writeback = (p4_cache_fn)(unsigned long)wb;
+		if (esp32p4_retained_entry_valid(cam_inv))
+			camera_invalidate = (p4_cache_fn)(unsigned long)cam_inv;
 	}
-	if (matches == 1)
-		wb = p4_fdt_u32(fdt, fb, "espressif,cache-writeback-entry");
-	if (esp32p4_retained_entry_valid(entry))
-		exec_sync = (p4_cache_fn)(unsigned long)entry;
-	if (esp32p4_retained_entry_valid(wb))
-		display_writeback = (p4_cache_fn)(unsigned long)wb;
-	if (esp32p4_retained_entry_valid(cam_inv))
-		camera_invalidate = (p4_cache_fn)(unsigned long)cam_inv;
 	/* Default .data value is already v1 before the first possible trap.
 	 * Only this retained revision103 handoff is reconstructed. Never switch
 	 * to an unverified CSR bank before a later IRQ probe rejects the DT. */
 	if (rev != 103)
-		panic("P4 requires revision103 retained IDF handoff");
+		panic("P4 cache setup requires chip revision 1.3");
 	esp32p4_clic_rev1 = 1;
 	dma_cache_alignment = P4_DMA_CACHE_ALIGN;
 	riscv_noncoherent_register_cache_ops(&p4_dma_cache_ops);
@@ -193,12 +201,14 @@ int esp32p4_display_cache_writeback(u32 start, u32 size)
 
 	if (!size)
 		return 0;
-	if (!display_writeback)
-		return -ENODEV;
 	if (start < ESP32P4_FB_START || start >= ESP32P4_FB_END ||
 	    size > ESP32P4_FB_END - start || size > ESP32P4_CACHE_CHUNK ||
 	    ((start | size) & 63))
 		return -EINVAL;
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP))
+		return p4_cache_range_op(start, size, P4_CACHE_SYNC_WB);
+	if (!display_writeback)
+		return -ENODEV;
 	raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
 	ret = display_writeback(start, size);
 	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
@@ -213,11 +223,13 @@ int esp32p4_camera_cache_invalidate(u32 start, u32 size)
 
 	if (!size)
 		return 0;
-	if (!camera_invalidate)
-		return -ENODEV;
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP))
+		return p4_cache_range_op(start, size, P4_CACHE_SYNC_INV);
 	if (start < ESP32P4_RAM_START || start >= ESP32P4_RAM_END ||
 	    size > ESP32P4_RAM_END - start)
 		return -EINVAL;
+	if (!camera_invalidate)
+		return -ENODEV;
 	raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
 	ret = camera_invalidate(start, size);
 	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
@@ -234,11 +246,15 @@ void esp32p4_cache_sync_for_exec(unsigned long start, unsigned long end)
 		return;
 	if (start < ESP32P4_RAM_START || end > p4_exec_ram_end)
 		panic("P4 executable cache range invalid: %lx..%lx", start, end);
-	if (!exec_sync)
-		panic("P4 retained executable cache callback missing");
-	raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
-	ret = exec_sync(start, end - start);
-	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
+		ret = p4_cache_range_op(start, end - start, P4_CACHE_SYNC_WB);
+	} else {
+		if (!exec_sync)
+			panic("P4 retained executable cache callback missing");
+		raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
+		ret = exec_sync(start, end - start);
+		raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
+	}
 	if (ret)
 		panic("P4 executable cache sync failed: %lx..%lx", start, end);
 	asm volatile("fence.i" ::: "memory");

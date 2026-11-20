@@ -269,9 +269,8 @@ static int p4_fb_probe(struct platform_device *pdev)
 	if (of_property_read_u32(node, "width", &width) ||
 	    of_property_read_u32(node, "height", &height) ||
 	    of_property_read_u32(node, "stride", &stride) ||
-	    of_property_read_string(node, "format", &format) ||
-	    of_property_read_u32(node, "espressif,cache-writeback-entry", &cache)) {
-		dev_err(&pdev->dev, "node is missing geometry or cache entry\n");
+	    of_property_read_string(node, "format", &format)) {
+		dev_err(&pdev->dev, "node is missing framebuffer geometry\n");
 		return -EINVAL;
 	}
 	if (reg[0] != P4_FB_BASE || reg[1] != P4_FB_SIZE ||
@@ -286,9 +285,10 @@ static int p4_fb_probe(struct platform_device *pdev)
 			interrupts[0], interrupts[1]);
 		return -EINVAL;
 	}
-	if (!esp32p4_retained_entry_valid(cache)) {
-		dev_err(&pdev->dev, "cache writeback entry 0x%08x is not retained SRAM\n",
-			cache);
+	if (!IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP) &&
+	    (of_property_read_u32(node, "espressif,cache-writeback-entry", &cache) ||
+	     !esp32p4_retained_entry_valid(cache))) {
+		dev_err(&pdev->dev, "invalid retained cache writeback entry\n");
 		return -EINVAL;
 	}
 	/*

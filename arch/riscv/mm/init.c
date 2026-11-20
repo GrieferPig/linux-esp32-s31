@@ -232,7 +232,9 @@ static void __init setup_bootmem(void)
 	phys_addr_t max_mapped_addr;
 	phys_addr_t phys_ram_end, vmlinux_start;
 
-	if (IS_ENABLED(CONFIG_XIP_KERNEL))
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP))
+		vmlinux_start = __pa_symbol(&__init_begin);
+	else if (IS_ENABLED(CONFIG_XIP_KERNEL))
 		vmlinux_start = __pa_symbol(&_sdata);
 	else
 		vmlinux_start = __pa_symbol(&_start);

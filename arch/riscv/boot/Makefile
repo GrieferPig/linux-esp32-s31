@@ -20,14 +20,14 @@ OBJCOPYFLAGS_xipImage :=-O binary -R .note -R .note.gnu.build-id -R .comment -S
 
 targets := Image Image.* loader loader.o loader.lds loader.bin xipImage
 
-ifeq ($(CONFIG_XIP_KERNEL),y)
+ifneq ($(filter y,$(CONFIG_XIP_KERNEL) $(CONFIG_ESP32P4_NOMMU_XIP)),)
 
 quiet_cmd_mkxip = $(quiet_cmd_objcopy)
 cmd_mkxip = $(cmd_objcopy)
 
 $(obj)/xipImage: vmlinux FORCE
 	$(call if_changed,mkxip)
-	@$(kecho) '  Physical Address of xipImage: $(CONFIG_XIP_PHYS_ADDR)'
+	@$(kecho) '  Physical Address of xipImage: $(CONFIG_XIP_PHYS_ADDR)$(CONFIG_ESP32P4_XIP_PHYS_ADDR)'
 
 endif
 

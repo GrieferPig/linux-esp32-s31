@@ -88,6 +88,9 @@ obj-$(CONFIG_SOC_ESP32P4)		+= esp32p4_debug.o
 obj-$(CONFIG_SMP)		+= cpu_ops.o
 
 obj-$(CONFIG_RISCV_BOOT_SPINWAIT) += cpu_ops_spinwait.o
+ifeq ($(CONFIG_SMP),y)
+obj-$(CONFIG_ESP32P4_NOMMU_XIP) += esp32p4_smp.o
+endif
 obj-$(CONFIG_MODULES)		+= module.o
 obj-$(CONFIG_MODULE_SECTIONS)	+= module-sections.o
 

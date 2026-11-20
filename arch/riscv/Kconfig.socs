@@ -115,8 +115,20 @@ config SOC_ESP32P4
 	select DMA_GLOBAL_POOL
 	select COMMON_CLK
 	help
-	  Reconstructed Linux port for the retained IDF SRAM handoff.
-	  This target has no SBI, XIP, hotplug or suspend support.
+	  ESP32-P4 Linux runs in machine mode without an MMU or SBI.
+	  It can execute from PSRAM or use the ESP32P4 NOMMU XIP layout.
+
+config ESP32P4_NOMMU_XIP
+	bool "Execute ESP32-P4 Linux from mapped NOR flash"
+	depends on SOC_ESP32P4 && RISCV_M_MODE && PHYS_RAM_BASE_FIXED && !COMPILE_TEST
+	help
+	  Link immutable kernel sections at their physical flash addresses.
+	  At entry, copy initialized writable sections to PSRAM and clear BSS.
+
+config ESP32P4_XIP_PHYS_ADDR
+	hex
+	depends on ESP32P4_NOMMU_XIP
+	default 0x40200000
 
 config SOC_ESP32S31
 	bool "Espressif ESP32-S31 SoC"

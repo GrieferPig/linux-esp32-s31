@@ -12,7 +12,12 @@
 #else
 
 #include <asm/pgtable.h>
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+#define LOAD_OFFSET CONFIG_ESP32P4_XIP_PHYS_ADDR
+#define RO_AFTER_INIT_DATA
+#else
 #define LOAD_OFFSET KERNEL_LINK_ADDR
+#endif
 
 #include <asm/vmlinux.lds.h>
 #include <asm/page.h>
@@ -49,7 +54,9 @@ SECTIONS
 	}
 
 	. = ALIGN(SECTION_ALIGN);
+#ifndef CONFIG_ESP32P4_NOMMU_XIP
 	__init_begin = .;
+#endif
 	__init_text_begin = .;
 	.init.text : AT(ADDR(.init.text) - LOAD_OFFSET) ALIGN(SECTION_ALIGN) { \
 		_sinittext = .;						\
@@ -82,6 +89,17 @@ SECTIONS
 	. = ALIGN(PECOFF_SECTION_ALIGNMENT);
 	__pecoff_text_end = .;
 #endif
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	/* P4 TRM ch.9 System and Memory - separate flash and PSRAM windows. */
+	RO_DATA(SECTION_ALIGN)
+	.srodata : { *(.srodata*) }
+	__esp32p4_data_load = ALIGN(., THREAD_ALIGN);
+	. = CONFIG_PHYS_RAM_BASE;
+	__init_begin = .;
+#undef LOAD_OFFSET
+#define LOAD_OFFSET (CONFIG_ESP32P4_XIP_PHYS_ADDR + __init_begin - __esp32p4_data_load)
+#endif
+
 	/* Start of init data section */
 	__init_data_begin = .;
 	INIT_DATA_SECTION(16)
@@ -124,10 +142,12 @@ SECTIONS
 
 	/* Start of data section */
 	_sdata = .;
+#ifndef CONFIG_ESP32P4_NOMMU_XIP
 	RO_DATA(SECTION_ALIGN)
 	.srodata : {
 		*(.srodata*)
 	}
+#endif
 
 	. = ALIGN(SECTION_ALIGN);
 	_data = .;
@@ -157,7 +177,20 @@ SECTIONS
 #endif
 
 	/* End of data section */
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	.data.ro_after_init : AT(ADDR(.data.ro_after_init) - LOAD_OFFSET) {
+		__start_ro_after_init = .;
+		*(.data..ro_after_init)
+		. = ALIGN(4);
+		__end_ro_after_init = .;
+	}
+#endif
 	_edata = .;
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	__esp32p4_xip_size = ABSOLUTE(__esp32p4_data_load - _start + _edata - __init_begin);
+	ASSERT((__esp32p4_data_load & 3) == 0 && (_edata & 3) == 0,
+	       "P4 initialized data must be word-aligned")
+#endif
 
 	BSS_SECTION(PAGE_SIZE, PAGE_SIZE, 0)
 

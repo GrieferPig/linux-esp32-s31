@@ -53,7 +53,11 @@ SYM_CODE_START(_start)
 #endif
 #endif
 	/* Effective size of kernel image */
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	.dword __esp32p4_xip_size
+#else
 	.dword _end - _start
+#endif
 	.dword __HEAD_FLAGS
 	.word RISCV_HEADER_VERSION
 	.word 0
@@ -308,6 +312,21 @@ SYM_CODE_START(_start_kernel)
 	 */
 	li t0, SR_FS_VS
 	csrc CSR_STATUS, t0
+
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	/* Only hart 0 reaches here. Initialize RAM before using writable globals. */
+	la a2, __esp32p4_data_load
+	la a3, __init_begin
+	la a4, _edata
+.Lp4_copy_data:
+	beq a3, a4, .Lp4_data_ready
+	lw t0, 0(a2)
+	sw t0, 0(a3)
+	addi a2, a2, 4
+	addi a3, a3, 4
+	j .Lp4_copy_data
+.Lp4_data_ready:
+#endif
 
 #ifdef CONFIG_RISCV_BOOT_SPINWAIT
 	li t0, CONFIG_NR_CPUS

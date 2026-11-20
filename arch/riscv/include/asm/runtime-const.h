@@ -2,7 +2,7 @@
 #ifndef _ASM_RISCV_RUNTIME_CONST_H
 #define _ASM_RISCV_RUNTIME_CONST_H
 
-#ifdef CONFIG_XIP_KERNEL
+#if defined(CONFIG_XIP_KERNEL) || defined(CONFIG_ESP32P4_NOMMU_XIP)
 /* XIP: kernel text is in read-only flash — can't patch instructions.
  * Fall back to the generic (variable-load) implementation. */
 #include <asm-generic/runtime-const.h>
@@ -271,5 +271,5 @@ static inline void runtime_const_fixup(void (*fn)(void *, unsigned long),
 	}
 }
 
-#endif /* !CONFIG_XIP_KERNEL */
+#endif /* XIP */
 #endif /* _ASM_RISCV_RUNTIME_CONST_H */

@@ -22,6 +22,24 @@
 		watchdog1 = &mwdt1;
 	};
 
+	chosen {
+		/delete-property/ espressif,cache-sync-entry;
+		/delete-property/ espressif,cpu1-boot-mailbox;
+		/delete-property/ espressif,camera-invalidate-entry;
+		/delete-property/ espressif,camera-service-entry;
+		bootargs = "clk_ignore_unused root=/dev/mtdblock0 ro";
+	};
+
+	/* TRM ch.9, External Memory Address Mapping: SPL maps the SPI NOR window.
+	 * Keep the bootloader, kernel and DTB outside this read-only MTD device.
+	 */
+	rootfs@40c00000 {
+		compatible = "mtd-rom";
+		linux,mtd-name = "rootfs";
+		reg = <0x40c00000 0x00400000>;
+		bank-width = <1>;
+	};
+
 	/* The panel MCU exposes LCD reset on GPIO0 and CTP reset on GPIO1. */
 	touch_supply: regulator-touch {
 		compatible = "regulator-fixed";
@@ -107,6 +125,9 @@
 };
 
 &{/chosen/framebuffer@49000000} {
+	/delete-property/ espressif,dsi-lli;
+	/delete-property/ espressif,cache-writeback-entry;
+	memory-region = <&dsi_lli>;
 	reset-gpios = <&panel_mcu 0 GPIO_ACTIVE_LOW>;
 	backlight = <&panel_backlight>;
 };
@@ -122,17 +143,13 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	AVDD28-supply = <&touch_supply>;
 };
 
-/*
- * After the handoff SPL and U-Boot's temporary BSS are dead. U-Boot
- * retains the cache routines and display LLI below 0x4ff2b000 and the AP
- * mailbox at 0x4ff3c000. TRM ch.9 System and Memory - SRAM CPU/DMA aliases.
- */
+/* TRM ch.9 System and Memory - CPU and DMA aliases of HP L2MEM. */
 &{/reserved-memory} {
-	/*
-	 * TRM rev1.3 ch.7 System and Memory — GMAC uses the AHB L2MEM
-	 * alias. The CPU accesses this reclaimed U-Boot text through
-	 * the direct alias. U-Boot checks its retained objects against it.
-	 */
+	dsi_lli: dsi-descriptor@4ff00000 {
+		reg = <0x4ff00000 0x1000>;
+		no-map;
+	};
+
 	emac_dma: dma-pool@8ff04000 {
 		compatible = "shared-dma-pool";
 		reg = <0x8ff04000 0x10000>;
@@ -197,9 +214,23 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	};
 };
 
-/* This board configuration has no OV5647 sensor fitted. */
+/*
+ * TRM v1.3 ch.7.3.3.1: these ranges are in the PSRAM window.
+ * Native DSI uses the portrait framebuffer directly.
+ */
+/delete-node/ &{/reserved-memory/landscape-framebuffer@49200000};
+
+&{/chosen/framebuffer@49000000} {
+	/delete-property/ espressif,dsi-lli;
+	/delete-property/ espressif,cache-writeback-entry;
+	memory-region = <&dsi_lli>;
+	/delete-property/ espressif,logical-framebuffer;
+};
+
 &{/soc/i2c@500c5000/camera@36} {
-	status = "disabled";
+	memory-region = <&camera_buffers>;
+	espressif,mipi-supplier = <&p4_fb>;
+	status = "okay";
 };
 
 &periphclk {

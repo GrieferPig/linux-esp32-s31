@@ -40,7 +40,7 @@ static void cpu_update_secondary_bootdata(unsigned int cpuid,
 	WRITE_ONCE(__cpu_spinwait_task_pointer[hartid], tidle);
 }
 
-#ifdef CONFIG_SOC_ESP32P4
+#if defined(CONFIG_SOC_ESP32P4) && !defined(CONFIG_ESP32P4_NOMMU_XIP)
 /*
  * Matches the retained IDF loader, not a generic spin-table protocol.
  * CPU1 is parked with interrupts off in internal SRAM; it only accepts the
@@ -103,9 +103,13 @@ static int __ref p4_prepare_secondary(unsigned int cpu,
 }
 #endif
 
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+extern int esp32p4_boot_secondary(unsigned int hart);
+#endif
+
 static int spinwait_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 {
-#ifdef CONFIG_SOC_ESP32P4
+#if defined(CONFIG_SOC_ESP32P4) && !defined(CONFIG_ESP32P4_NOMMU_XIP)
 	struct p4_secondary_mailbox __iomem *mailbox;
 	int ret = p4_prepare_secondary(cpuid, &mailbox);
 
@@ -121,13 +125,15 @@ static int spinwait_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 	 * can continue the boot process.
 	 */
 	cpu_update_secondary_bootdata(cpuid, tidle);
-#ifdef CONFIG_SOC_ESP32P4
+#if defined(CONFIG_SOC_ESP32P4) && !defined(CONFIG_ESP32P4_NOMMU_XIP)
 	/* Both HP harts share L1D. Publish both bootdata words before release.
 	 * Do not change entry: the firmware explicitly rejects non-Image PCs. */
 	wmb();
 	writel(1, &mailbox->release);
 	readl(&mailbox->release);
 	iounmap(mailbox);
+#elif defined(CONFIG_ESP32P4_NOMMU_XIP)
+	return esp32p4_boot_secondary(cpuid_to_hartid_map(cpuid));
 #endif
 
 	return 0;

@@ -114,7 +114,19 @@ static int __init add_kernel_resources(void)
 	bss_res.end = __pa_symbol(__bss_stop) - 1;
 	bss_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
+#ifdef CONFIG_ESP32P4_NOMMU_XIP
+	/* NOR and PSRAM are disjoint physical resources. */
+	code_res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+	rodata_res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+	ret = add_resource(&iomem_resource, &code_res);
+	if (ret >= 0)
+		ret = add_resource(&iomem_resource, &rodata_res);
+	if (ret < 0)
+		return ret;
+	kimage_res.start = __pa_symbol(__init_begin);
+#else
 	kimage_res.start = code_res.start;
+#endif
 	kimage_res.end = bss_res.end;
 	kimage_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
@@ -122,6 +134,7 @@ static int __init add_kernel_resources(void)
 	if (ret < 0)
 		return ret;
 
+#ifndef CONFIG_ESP32P4_NOMMU_XIP
 	ret = add_resource(&kimage_res, &code_res);
 	if (ret < 0)
 		return ret;
@@ -130,6 +143,7 @@ static int __init add_kernel_resources(void)
 	if (ret < 0)
 		return ret;
 
+#endif
 	ret = add_resource(&kimage_res, &data_res);
 	if (ret < 0)
 		return ret;

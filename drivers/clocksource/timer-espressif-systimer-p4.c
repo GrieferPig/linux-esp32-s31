@@ -189,10 +189,19 @@ static int p4_timer_starting_cpu(unsigned int cpu)
 {
 	unsigned int hart = cpuid_to_hartid_map(cpu);
 	struct p4_timer_event *event;
+	int ret;
 
 	if (hart > 1)
 		return -EINVAL;
 	event = &p4_events[hart];
+	/*
+	 * TRM ch.12: HP_SYS_CLKRST_SOC_CLK_CTRL0.CORE1_CLIC_CLK_EN.
+	 * Program the route after the target hart has initialized its CLIC.
+	 * At power-on the peer window can fault while that hart is in reset.
+	 */
+	ret = irq_force_affinity(event->irq, cpumask_of(cpu));
+	if (ret)
+		return ret;
 	event->ce.cpumask = cpumask_of(cpu);
 	clockevents_config_and_register(&event->ce, P4_TIMER_RATE, 100, ULONG_MAX);
 	enable_irq(event->irq);
@@ -246,9 +255,6 @@ static int __init p4_timer_init(struct device_node *node)
 		event->irq = irq_of_parse_and_map(node, hart);
 		if (!event->irq)
 			return -EINVAL;
-		ret = irq_force_affinity(event->irq, cpumask_of(cpu));
-		if (ret)
-			return ret;
 		ret = request_irq(event->irq, p4_timer_interrupt,
 				  IRQF_TIMER | IRQF_NOBALANCING | IRQF_NO_AUTOEN,
 				  event->ce.name, event);

@@ -5,7 +5,11 @@
  */
 #pragma once
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -60,6 +60,7 @@
 #include <linux/iopoll.h>
 #include <linux/irqdomain.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
@@ -259,7 +260,7 @@ struct esp32p4_dsi {
 	bool fatal;
 	bool ldo_on;
 	bool hw_ready;
-	bool lli_donated;
+	bool lli_in_sram;
 	u32 block_size;
 };
 
@@ -1244,7 +1245,7 @@ static void dsi_dma_channel_config(struct esp32p4_dsi *dsi)
 /* The descriptor is written through the SRAM non-cache alias. */
 static struct esp32p4_dsi_lli *dsi_lli_view(struct esp32p4_dsi *dsi)
 {
-	if (!dsi->lli_donated)
+	if (!dsi->lli_in_sram)
 		return dsi->lli;
 
 	return (struct esp32p4_dsi_lli *)((uintptr_t)dsi->lli +
@@ -1314,9 +1315,9 @@ static int dsi_dma_init(struct esp32p4_dsi *dsi)
 	dev_info(dsi->dev, "gdma id=0x%08x compver=0x%08x cfg0=0x%08x lli_ctrl_hi=0x%08x lli_ctrl_lo=0x%08x lli_llp=0x%08x\n",
 		 dsi->gdma->id0.val, dsi->gdma->compver0.val,
 		 dsi->gdma->cfg0.val,
-		 ((struct esp32p4_dsi_lli *)dsi->lli)->ctrl_hi.val,
-		 ((struct esp32p4_dsi_lli *)dsi->lli)->ctrl_lo.val,
-		 ((struct esp32p4_dsi_lli *)dsi->lli)->llp_lo.val);
+		 dsi_lli_view(dsi)->ctrl_hi.val,
+		 dsi_lli_view(dsi)->ctrl_lo.val,
+		 dsi_lli_view(dsi)->llp_lo.val);
 
 	dev_info(dsi->dev, "VDMA channel %d, %llu bytes, %u x 64-bit\n",
 		 DSI_GDMA_CHANNEL, frame_bytes, block_size);
@@ -1349,7 +1350,7 @@ static void dsi_lli_rearm(struct esp32p4_dsi *dsi)
 	lli->ctrl_hi.shadowreg_or_lli_last = 1;
 	lli->ctrl_hi.shadowreg_or_lli_valid = 1;
 	dma_wmb();
-	if (!dsi->lli_donated)
+	if (!dsi->lli_in_sram)
 		esp32p4_display_cache_writeback((u32)dsi->lli_dma,
 						(u32)sizeof(*lli));
 
@@ -1655,11 +1656,30 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 	if (ret)
 		goto err_mcu;
 	/*
-	 * The GDMA fetches the link-list item from internal SRAM, which the kernel
-	 * (running from PSRAM) cannot allocate. The loader reserves 64 bytes there
-	 * and publishes the address next to the other retained entries.
+	 * TRM ch.9 System and Memory, DMA Address Space: VDMA sees HP L2MEM
+	 * at its direct address. CPU writes the descriptor at the uncached alias.
 	 */
-	{
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
+		struct device_node *lli_node;
+		struct resource sram;
+
+		lli_node = of_parse_phandle(dev->of_node, "memory-region", 0);
+		if (!lli_node) {
+			ret = -EINVAL;
+			goto err_mcu;
+		}
+		ret = of_address_to_resource(lli_node, 0, &sram);
+		of_node_put(lli_node);
+		if (ret || sram.start < 0x4ff00000 || sram.end >= 0x4ff40000 ||
+		    !IS_ALIGNED(sram.start, 64) ||
+		    resource_size(&sram) < sizeof(*dsi->lli)) {
+			ret = -EINVAL;
+			goto err_mcu;
+		}
+		dsi->lli = (void *)(uintptr_t)sram.start;
+		dsi->lli_dma = sram.start;
+		dsi->lli_in_sram = true;
+	} else {
 		struct device_node *fb_node;
 		u32 lli_addr = 0;
 
@@ -1671,9 +1691,8 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 		}
 		if (lli_addr) {
 			dsi->lli = (void *)(uintptr_t)lli_addr;
-			dsi->lli_dma = (dma_addr_t)lli_addr;
-			dsi->lli_donated = true;
-			memset(dsi->lli, 0, sizeof(*dsi->lli));
+			dsi->lli_dma = lli_addr;
+			dsi->lli_in_sram = true;
 		} else {
 			dsi->lli = dma_alloc_coherent(dev, sizeof(*dsi->lli),
 						      &dsi->lli_dma, GFP_KERNEL);
@@ -1695,7 +1714,7 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 	return dsi;
 
 err_lli:
-	if (!dsi->lli_donated)
+	if (!dsi->lli_in_sram)
 		dma_free_coherent(dev, sizeof(*dsi->lli), dsi->lli,
 				  dsi->lli_dma);
 	dsi->lli = NULL;
@@ -1800,7 +1819,7 @@ void esp32p4_dsi_destroy(struct esp32p4_dsi *dsi)
 	}
 	dsi_ldo_disable(dsi);
 
-	if (dsi->lli && !dsi->lli_donated)
+	if (dsi->lli && !dsi->lli_in_sram)
 		dma_free_coherent(dsi->dev, sizeof(*dsi->lli), dsi->lli,
 				  dsi->lli_dma);
 	if (dsi->mcu)

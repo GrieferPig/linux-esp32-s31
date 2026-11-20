@@ -18,7 +18,7 @@
 		espressif,chip-revision = <0x67>;
 		stdout-path = "usbserial0:115200n8";
 
-		framebuffer@49000000 {
+		p4_fb: framebuffer@49000000 {
 			interrupts = <0x18 0x04>;
 			interrupt-parent = <0x01>;
 			espressif,ppa-service-entry = <0x00>;
@@ -64,7 +64,7 @@
 			reg = <0x49200000 0xe1000>;
 		};
 
-		camera-buffers@49300000 {
+		camera_buffers: camera-buffers@49300000 {
 			no-map;
 			reg = <0x49300000 0x300000>;
 		};
