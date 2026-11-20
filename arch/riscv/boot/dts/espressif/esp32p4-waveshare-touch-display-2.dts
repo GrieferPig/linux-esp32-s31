@@ -153,10 +153,16 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 };
 
 &p4_pinctrl {
+	reg = <0x500e0000 0x700>, <0x500e1000 0x100>,
+	      <0x5012a000 0x200>, <0x5012b000 0x100>;
 	gpio-controller;
 	#gpio-cells = <2>;
 	gpio-ranges = <&p4_pinctrl 0 0 57>;
 	gpio-reserved-ranges = <0 51>, <52 1>, <55 2>;
+
+	pins_lp_i2c: lp-i2c-pins {
+		function = "lp-i2c";
+	};
 
 	pins_adc1_header: adc1-header-pins {
 		function = "adc1-header";
@@ -169,6 +175,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 };
 
 &periphclk {
+	espressif,lpperi = <&lpperi>;
 	reg = <0x500e6000 0x100>, <0x5011104c 0x4>,
 	      <0x50111040 0x4>, <0x500e514c 0x4>;
 	clocks = <&xtal>, <&pll_f160m>, <&rmii_ref>;
@@ -438,6 +445,23 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		compatible = "espressif,esp32p4-ana-i2c";
 		reg = <0x5011515c 0x4>;
 		regulator-name = "p4-sar-analog";
+	};
+
+	/* TRM ch.48 I2C Controller — LP I2C master, IRQ11, 16-byte FIFO. */
+	lp_i2c: i2c@50122000 {
+		compatible = "espressif,esp32p4-lp-i2c";
+		reg = <0x50122000 0x100>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <11 4>;
+		clocks = <&periphclk ESP32P4_CLK_LP_I2C>;
+		resets = <&periphclk ESP32P4_RST_LP_I2C>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_lp_i2c>;
+		clock-frequency = <100000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* I2C1 owns the display pads by default. */
+		status = "disabled";
 	};
 
 	/* TRM ch.49 Analog I2C Controller — I2C0_CTRL, ANA_CONF2. */

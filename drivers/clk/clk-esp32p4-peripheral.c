@@ -5,7 +5,9 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/math64.h>
+#include <linux/mfd/syscon.h>
 #include <linux/rational.h>
+#include <linux/regmap.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -159,11 +161,26 @@
 #define PCNT_APB_EN		BIT(30)
 #define PCNT_APB_RESET		BIT(30)
 
+/* TRM ch.12 Reset and Clock — I2C0/I2C1 APB gates and PERI_CLK_CTRL10. */
+#define I2C0_APB_EN		BIT(12)
+#define I2C0_CLK_SRC		BIT(0)
+#define I2C0_FUNC_EN		BIT(1)
+#define I2C0_PREDIV		GENMASK(25, 2)
+#define I2C0_RST		BIT(22)
 #define I2C1_APB_EN		BIT(13)
 #define I2C1_XTAL_MASK		BIT(26)
 #define I2C1_FUNC_EN		BIT(27)
 #define I2C1_PREDIV		GENMASK(23, 0)
 #define I2C1_RST		BIT(21)
+
+/* TRM ch.12 Reset and Clock — LPPERI_LP_I2C_CLK_SEL and CK_EN_LP_I2C. */
+#define LP_PERI_CLOCK_EN	0x00
+#define LP_PERI_CLOCK_SEL	0x04
+#define LP_PERI_RESET_EN	0x08
+#define LP_I2C_XTAL_D2_SEL	BIT(28)
+#define LP_I2C_CLK_SEL_MASK	GENMASK(29, 28)
+#define LP_I2C_CLOCK_EN		BIT(28)
+#define LP_I2C_RESET_EN		BIT(27)
 
 #define GPSPI2_SYS_EN		BIT(0)
 #define GPSPI2_APB_EN		BIT(19)
@@ -182,6 +199,7 @@ struct p4_cc {
 	void __iomem *lp_reset;
 	void __iomem *emac_ref;
 	void __iomem *emac_ctrl;
+	struct regmap *lpperi;
 	spinlock_t lock;
 	struct reset_controller_dev reset;
 };
@@ -214,9 +232,23 @@ static int p4_clk_enable(struct clk_hw *hw)
 	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
 	struct p4_cc *cc = clk->cc;
 	unsigned long flags;
+	int ret;
 
+	if (clk->id == ESP32P4_CLK_LP_I2C) {
+		ret = regmap_update_bits(cc->lpperi, LP_PERI_CLOCK_SEL,
+					 LP_I2C_CLK_SEL_MASK, LP_I2C_XTAL_D2_SEL);
+		if (ret)
+			return ret;
+		return regmap_set_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_I2C_CLOCK_EN);
+	}
 	spin_lock_irqsave(&cc->lock, flags);
 	switch (clk->id) {
+	case ESP32P4_CLK_I2C0:
+		p4_update(cc, SOC_CLK2, I2C0_APB_EN, I2C0_APB_EN);
+		p4_update(cc, I2C_CLK10, I2C0_FUNC_EN, 0);
+		p4_update(cc, I2C_CLK10, I2C0_CLK_SRC | I2C0_PREDIV |
+			  I2C0_FUNC_EN, I2C0_FUNC_EN);
+		break;
 	case ESP32P4_CLK_I2C1:
 		p4_update(cc, SOC_CLK2, I2C1_APB_EN, I2C1_APB_EN);
 		p4_update(cc, I2C_CLK10, I2C1_FUNC_EN, 0);
@@ -364,9 +396,20 @@ static void p4_clk_disable(struct clk_hw *hw)
 	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
 	struct p4_cc *cc = clk->cc;
 	unsigned long flags;
+	int ret;
 
+	if (clk->id == ESP32P4_CLK_LP_I2C) {
+		ret = regmap_clear_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_I2C_CLOCK_EN);
+		if (ret)
+			pr_err("ESP32-P4: failed to disable LP I2C clock: %d\n", ret);
+		return;
+	}
 	spin_lock_irqsave(&cc->lock, flags);
 	switch (clk->id) {
+	case ESP32P4_CLK_I2C0:
+		p4_update(cc, I2C_CLK10, I2C0_FUNC_EN, 0);
+		p4_update(cc, SOC_CLK2, I2C0_APB_EN, 0);
+		break;
 	case ESP32P4_CLK_I2C1:
 		p4_update(cc, I2C_CLK10, I2C1_FUNC_EN, 0);
 		p4_update(cc, SOC_CLK2, I2C1_APB_EN, 0);
@@ -464,7 +507,9 @@ static unsigned long p4_clk_rate(struct clk_hw *hw, unsigned long parent_rate)
 
 	if (clk->id == ESP32P4_CLK_SDMMC)
 		return parent_rate / SDIO_CLOCK_DIV;
-	return clk->id == ESP32P4_CLK_GPSPI2 ? parent_rate / 2 : parent_rate;
+	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_LP_I2C)
+		return parent_rate / 2;
+	return parent_rate;
 }
 
 static const struct clk_ops p4_clk_ops = {
@@ -604,8 +649,20 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 	struct p4_cc *cc = container_of(rcdev, struct p4_cc, reset);
 	unsigned long flags;
 	u32 reg, bit;
+	int ret;
 
 	switch (id) {
+	case ESP32P4_RST_LP_I2C:
+		if (!cc->lpperi)
+			return -ENOENT;
+		ret = regmap_set_bits(cc->lpperi, LP_PERI_RESET_EN, LP_I2C_RESET_EN);
+		if (ret)
+			return ret;
+		return regmap_clear_bits(cc->lpperi, LP_PERI_RESET_EN, LP_I2C_RESET_EN);
+	case ESP32P4_RST_I2C0:
+		reg = HP_RST1;
+		bit = I2C0_RST;
+		break;
 	case ESP32P4_RST_I2C1:
 		reg = HP_RST1;
 		bit = I2C1_RST;
@@ -687,6 +744,8 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-rsa", "p4-ecc",
 		"p4-gptimer0", "p4-gptimer1",
 		"p4-axi-gdma",
+		"p4-i2c0",
+		"p4-lp-i2c",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -712,6 +771,10 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		if (IS_ERR(cc->emac_ctrl))
 			return PTR_ERR(cc->emac_ctrl);
 	}
+	cc->lpperi = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
+							     "espressif,lpperi");
+	if (IS_ERR(cc->lpperi))
+		return PTR_ERR(cc->lpperi);
 	spin_lock_init(&cc->lock);
 
 	data = devm_kzalloc(dev, struct_size(data, hws, ESP32P4_CLK_NR),
@@ -738,7 +801,8 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		struct p4_clk *clk;
 
 		if (((i == ESP32P4_CLK_SDMMC || i == ESP32P4_CLK_EMAC) &&
-		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->emac_ref)) {
+		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->emac_ref) ||
+		    (i == ESP32P4_CLK_LP_I2C && !cc->lpperi)) {
 			data->hws[i] = ERR_PTR(-ENOENT);
 			continue;
 		}

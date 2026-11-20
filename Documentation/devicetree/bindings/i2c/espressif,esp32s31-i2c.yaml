@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Espressif ESP32-S31 and ESP32-P4 I2C controllers
 
 description: |
-  ESP32-S31 and native ESP32-P4 rev1 HP I2C1 use Linux clock, reset and
+  ESP32-S31 and native ESP32-P4 HP and LP I2C use Linux clock, reset and
   pinctrl resources. The retained P4 compatible describes HP I2C1 initialized
   by the revision-103 IDF
   display loader at 100 kHz on GPIO7 (SDA) and GPIO8 (SCL). Its clock and
@@ -35,7 +35,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: espressif,esp32p4-rev1-i2c
+          enum:
+            - espressif,esp32p4-rev1-i2c
+            - espressif,esp32p4-lp-i2c
     then:
       required:
         - resets
@@ -48,6 +50,7 @@ properties:
       - espressif,esp32s31-i2c
       - espressif,esp32p4-idf-i2c
       - espressif,esp32p4-rev1-i2c
+      - espressif,esp32p4-lp-i2c
 
   reg:
     maxItems: 1

@@ -10,7 +10,7 @@ maintainers:
   - GrieferPig <noreply@example.com>
 
 description: |
-  Board pin groups for I2C1, GPSPI2, SDMMC, Ethernet, I2S0 and PCNT on the ESP32-P4
+  Board pin groups for HP and LP I2C, GPSPI2, SDMMC, Ethernet, I2S0 and PCNT on the ESP32-P4
   hw_ver1 GPIO matrix and IO MUX. Board-owned GPIO ranges may be exported.
 
 properties:
@@ -18,9 +18,15 @@ properties:
     const: waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl
 
   reg:
-    items:
-      - description: GPIO matrix
-      - description: IO_MUX pads
+    oneOf:
+      - items:
+          - description: HP GPIO matrix
+          - description: HP IO MUX pads
+      - items:
+          - description: HP GPIO matrix
+          - description: HP IO MUX pads
+          - description: LP GPIO matrix
+          - description: LP IO MUX pads
 
   clocks:
     maxItems: 1
@@ -37,13 +43,13 @@ properties:
   gpio-reserved-ranges: true
 
 patternProperties:
-  '^(i2c1|gpspi2|sdmmc0|sdmmc1|emac-rmii|emac-mdio|i2s0|pcnt0|ledc0|mcpwm0|mcpwm1|rmt-loopback|twai[0-2]-loopback|adc1-header)-pins$':
+  '^(i2c[01]|gpspi2|sdmmc0|sdmmc1|emac-rmii|emac-mdio|i2s0|pcnt0|ledc0|mcpwm0|mcpwm1|rmt-loopback|twai[0-2]-loopback|adc1-header|lp-i2c)-pins$':
     type: object
     properties:
       function:
-        enum: [i2c1, gpspi2, sdmmc0, sdmmc1, emac-rmii, emac-mdio, i2s0, pcnt0, ledc0,
+        enum: [i2c0, i2c1, gpspi2, sdmmc0, sdmmc1, emac-rmii, emac-mdio, i2s0, pcnt0, ledc0,
                mcpwm0, mcpwm1, rmt-loopback, twai0-loopback, twai1-loopback,
-               twai2-loopback, adc1-header]
+               twai2-loopback, adc1-header, lp-i2c]
     required:
       - function
     additionalProperties: false

@@ -36,6 +36,7 @@ if COMMON_CLK
 config ESP32P4_PERIPHERAL_CLK
 	bool "ESP32-P4 rev1 peripheral clock/reset subset"
 	depends on SOC_ESP32P4 && OF
+	select MFD_SYSCON
 	select RESET_CONTROLLER
 	select RATIONAL
 	help

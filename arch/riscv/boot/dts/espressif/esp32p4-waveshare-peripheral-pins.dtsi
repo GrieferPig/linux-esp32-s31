@@ -10,10 +10,31 @@
 		#reset-cells = <1>;
 	};
 
+	/* TRM ch.48 I2C Controller — HP I2C0 master and IRQ44. */
+	i2c0: i2c@500c4000 {
+		compatible = "espressif,esp32p4-rev1-i2c";
+		reg = <0x500c4000 0x100>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <44 4>;
+		clocks = <&periphclk ESP32P4_CLK_I2C0>;
+		resets = <&periphclk ESP32P4_RST_I2C0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_i2c0>;
+		clock-frequency = <100000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* I2C1 owns the display pads by default. */
+		status = "disabled";
+	};
+
 	p4_pinctrl: pinctrl@500e0000 {
 		compatible = "waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl";
 		reg = <0x500e0000 0x700>, <0x500e1000 0x100>;
 		clocks = <&periphclk ESP32P4_CLK_IOMUX>;
+
+		pins_i2c0: i2c0-pins {
+			function = "i2c0";
+		};
 
 		pins_i2c1: i2c1-pins {
 			function = "i2c1";

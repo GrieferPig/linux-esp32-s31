@@ -49,6 +49,24 @@
 #define IO_MUX_FUNC_MASK	GENMASK(14, 12)
 #define IO_MUX_FUNC_MATRIX	BIT(12)
 
+/* TRM ch.11 GPIO Matrix and IO MUX — LP IOMUX PADn and LP GPIO matrix. */
+#define LP_PAD(n)		(8 + 4 * (n))
+#define LP_PAD_PULLDOWN		BIT(2)
+#define LP_PAD_PULLUP		BIT(3)
+#define LP_PAD_MUX		BIT(4)
+#define LP_PAD_FUNC		GENMASK(6, 5)
+#define LP_PAD_MATRIX		BIT(5)
+#define LP_PAD_SLEEP		BIT(7)
+#define LP_PAD_INPUT		BIT(10)
+#define LP_GPIO_ENABLE_CLR	0x1c
+#define LP_GPIO_PIN(n)		(0x34 + 4 * (n))
+#define LP_GPIO_OPEN_DRAIN	BIT(4)
+#define LP_GPIO_IN_SEL(n)	(0x74 + 4 * (n))
+#define LP_GPIO_IN_MATRIX	BIT(1)
+#define LP_GPIO_IN_PIN		GENMASK(7, 2)
+#define LP_GPIO_OUT_SEL(n)	(0xf4 + 4 * (n))
+#define LP_GPIO_OUT_FUNC	GENMASK(8, 3)
+
 #define P4_SIGNAL_NONE		(-1)
 
 struct p4_route {
@@ -65,9 +83,16 @@ struct p4_group {
 	unsigned int npins;
 	bool iomux;
 	u8 iomux_func;
+	bool lp_i2c;
 };
 
-static const unsigned int i2c1_pins[] = { 7, 8 };	/* SDA, SCL */
+static const unsigned int display_i2c_pins[] = { 7, 8 };	/* SDA, SCL */
+/* TRM ch.11 GPIO Matrix — I2C0_SDA/SCL signals 69/68. */
+static const struct p4_route i2c0_routes[] = {
+	{ 69, 69, true, true },
+	{ 68, 68, true, true },
+};
+
 static const struct p4_route i2c1_routes[] = {
 	{ 71, 71, true, true },
 	{ 70, 70, true, true },
@@ -172,7 +197,10 @@ static const struct p4_route adc1_header_routes[] = {
 static const struct p4_group p4_groups[] = {
 	{ "adc1-header", adc1_header_pins, adc1_header_routes,
 	  ARRAY_SIZE(adc1_header_pins) },
-	{ "i2c1", i2c1_pins, i2c1_routes, ARRAY_SIZE(i2c1_pins) },
+	{ "i2c1", display_i2c_pins, i2c1_routes, ARRAY_SIZE(display_i2c_pins) },
+	{ "i2c0", display_i2c_pins, i2c0_routes, ARRAY_SIZE(display_i2c_pins) },
+	{ .name = "lp-i2c", .pins = display_i2c_pins,
+	  .npins = ARRAY_SIZE(display_i2c_pins), .lp_i2c = true },
 	{ "gpspi2", gpspi2_pins, gpspi2_routes, ARRAY_SIZE(gpspi2_pins) },
 	{ "sdmmc0", sdmmc0_pins, sdmmc0_routes, ARRAY_SIZE(sdmmc0_pins), true },
 	{ "sdmmc1", sdmmc1_pins, sdmmc1_routes, ARRAY_SIZE(sdmmc1_pins) },
@@ -211,6 +239,8 @@ struct p4_pinctrl {
 	struct gpio_chip gpiochip;
 	void __iomem *gpio;
 	void __iomem *iomux;
+	void __iomem *lp_gpio;
+	void __iomem *lp_iomux;
 };
 
 static int p4_group_count(struct pinctrl_dev *pctldev)
@@ -264,6 +294,36 @@ static int p4_dt_node_to_map(struct pinctrl_dev *pctldev, struct device_node *np
 	return -EINVAL;
 }
 
+static int p4_lp_i2c_set_mux(struct p4_pinctrl *pc)
+{
+	unsigned int i;
+
+	if (!pc->lp_gpio || !pc->lp_iomux)
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(display_i2c_pins); i++) {
+		unsigned int pin = display_i2c_pins[i];
+		unsigned int signal = i ? 0 : 1;
+		void __iomem *pad = pc->lp_iomux + LP_PAD(pin);
+		u32 val;
+
+		/* Park both GPIO output drivers before asking LP I2C for OE. */
+		writel(BIT(pin), pc->gpio + GPIO_ENABLE_CLR);
+		writel(BIT(pin), pc->lp_gpio + LP_GPIO_ENABLE_CLR);
+		writel(readl(pc->lp_gpio + LP_GPIO_PIN(pin)) | LP_GPIO_OPEN_DRAIN,
+		       pc->lp_gpio + LP_GPIO_PIN(pin));
+		writel(LP_GPIO_IN_MATRIX | FIELD_PREP(LP_GPIO_IN_PIN, pin),
+		       pc->lp_gpio + LP_GPIO_IN_SEL(signal));
+		writel(FIELD_PREP(LP_GPIO_OUT_FUNC, signal),
+		       pc->lp_gpio + LP_GPIO_OUT_SEL(pin));
+
+		val = readl(pad);
+		val &= ~(LP_PAD_PULLDOWN | LP_PAD_FUNC | LP_PAD_SLEEP);
+		writel(val | LP_PAD_MUX | LP_PAD_MATRIX | LP_PAD_PULLUP | LP_PAD_INPUT,
+		       pad);
+	}
+	return 0;
+}
+
 static int p4_set_mux(struct pinctrl_dev *pctldev, unsigned int function,
 		      unsigned int group)
 {
@@ -277,6 +337,8 @@ static int p4_set_mux(struct pinctrl_dev *pctldev, unsigned int function,
 
 	val = readl(pc->gpio + GPIO_CLOCK_GATE);
 	writel(val | GPIO_CLK_EN, pc->gpio + GPIO_CLOCK_GATE);
+	if (pg->lp_i2c)
+		return p4_lp_i2c_set_mux(pc);
 
 	for (i = 0; i < pg->npins; i++) {
 		const struct p4_route *route = &pg->routes[i];
@@ -288,6 +350,11 @@ static int p4_set_mux(struct pinctrl_dev *pctldev, unsigned int function,
 		writel(BIT(pin % 32), pc->gpio +
 		       (pin >= 32 ? GPIO_ENABLE1_CLR : GPIO_ENABLE_CLR));
 		writel(GPIO_OUT_SW_EN | GPIO_OUT_SW, pc->gpio + GPIO_OUT_SEL(pin));
+		if (pc->lp_iomux && (pin == 7 || pin == 8)) {
+			void __iomem *lp_pad = pc->lp_iomux + LP_PAD(pin);
+
+			writel(readl(lp_pad) & ~LP_PAD_MUX, lp_pad);
+		}
 		val = readl(pad) & ~GPIO_OD;
 		writel(val | (route->open_drain ? GPIO_OD : 0), pad);
 
@@ -428,6 +495,14 @@ static int p4_pinctrl_probe(struct platform_device *pdev)
 	pc->iomux = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pc->iomux))
 		return PTR_ERR(pc->iomux);
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 2)) {
+		pc->lp_gpio = devm_platform_ioremap_resource(pdev, 2);
+		if (IS_ERR(pc->lp_gpio))
+			return PTR_ERR(pc->lp_gpio);
+		pc->lp_iomux = devm_platform_ioremap_resource(pdev, 3);
+		if (IS_ERR(pc->lp_iomux))
+			return PTR_ERR(pc->lp_iomux);
+	}
 	clk = devm_clk_get_enabled(dev, NULL);
 	if (IS_ERR(clk))
 		return dev_err_probe(dev, PTR_ERR(clk), "IOMUX clock unavailable\n");

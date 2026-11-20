@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Shared FIFO I2C engine for ESP32-S31 and ESP32-P4 HP controllers.
+ * Shared FIFO I2C engine for ESP32-S31 HP and ESP32-P4 HP/LP.
  *
  * The register layout and command encoding follow ESP-IDF's esp32s31
- * i2c_ll implementation.  Linux owns only HP I2C0/I2C1; LP I2C ownership is
- * deliberately left for the future LP-core/remoteproc design.
+ * i2c_ll implementation. Linux owns the controller selected in the DT.
  */
 
 #include <linux/bitfield.h>
@@ -81,6 +80,10 @@
 #define S31_I2C_INT_XFER			(S31_I2C_INT_TRANS_COMPLETE | \
 					 S31_I2C_INT_ERRORS)
 #define S31_I2C_INT_ALL			GENMASK(18, 0)
+/* TRM ch.48 I2C Controller — LP FIFO depth and master interrupt fields. */
+#define P4_LP_I2C_INT_ALL		GENMASK(15, 0)
+#define P4_LP_I2C_FIFO_LEN		16
+#define P4_LP_I2C_RX_FULL_NACK		BIT(3)
 #define S31_I2C_INT_SLAVE		(S31_I2C_INT_RXFIFO_WM | \
 					 S31_I2C_INT_TXFIFO_WM | \
 					 S31_I2C_INT_RXFIFO_OVF | \
@@ -130,6 +133,7 @@ struct esp_i2c_variant {
 	int (*prepare)(struct device *dev, struct esp_i2c *i2c,
 		       const struct resource *res);
 	bool hardware_bus_clear;
+	bool lp_master;
 };
 
 struct esp_i2c {
@@ -143,6 +147,8 @@ struct esp_i2c {
 	u32 frequency;
 	const struct esp_i2c_variant *variant;
 	unsigned long source_rate;
+	unsigned int fifo_len;
+	u32 int_mask;
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
 	struct i2c_client *slave;
 	bool slave_active;
@@ -180,15 +186,16 @@ static int s31_i2c_add_command(u32 *commands, unsigned int *count,
 	return 0;
 }
 
-static int s31_i2c_put_byte(u8 *fifo, unsigned int *count, u8 value)
+static int s31_i2c_put_byte(struct esp_i2c *i2c, u8 *fifo,
+			    unsigned int *count, u8 value)
 {
-	if (*count >= S31_I2C_FIFO_LEN)
+	if (*count >= i2c->fifo_len)
 		return -EOPNOTSUPP;
 	fifo[(*count)++] = value;
 	return 0;
 }
 
-static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
+static int s31_i2c_build_commands(struct esp_i2c *i2c, struct i2c_msg *msgs, int num,
 				   u32 *commands, unsigned int *command_count,
 				   u8 *tx_fifo, unsigned int *tx_count,
 				   unsigned int *rx_count)
@@ -228,10 +235,10 @@ static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
 				return ret;
 			write_start = *tx_count;
 			header = 0xf0 | ((msg->addr >> 7) & 0x06);
-			ret = s31_i2c_put_byte(tx_fifo, tx_count, header);
+			ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count, header);
 			if (ret)
 				return ret;
-			ret = s31_i2c_put_byte(tx_fifo, tx_count, msg->addr);
+			ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count, msg->addr);
 			if (ret)
 				return ret;
 			ret = s31_i2c_add_command(commands, command_count,
@@ -251,17 +258,17 @@ static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
 		if (ten) {
 			header = 0xf0 | ((msg->addr >> 7) & 0x06) |
 				 (read ? 1 : 0);
-			ret = s31_i2c_put_byte(tx_fifo, tx_count, header);
+			ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count, header);
 			if (ret)
 				return ret;
 			if (!read) {
-				ret = s31_i2c_put_byte(tx_fifo, tx_count,
+				ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count,
 						       msg->addr);
 				if (ret)
 					return ret;
 			}
 		} else {
-			ret = s31_i2c_put_byte(tx_fifo, tx_count,
+			ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count,
 					       (msg->addr << 1) | read);
 			if (ret)
 				return ret;
@@ -269,7 +276,7 @@ static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
 
 		if (!read)
 			for (j = 0; j < msg->len; j++) {
-				ret = s31_i2c_put_byte(tx_fifo, tx_count,
+				ret = s31_i2c_put_byte(i2c, tx_fifo, tx_count,
 						       msg->buf[j]);
 				if (ret)
 					return ret;
@@ -298,7 +305,7 @@ static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
 					return ret;
 			}
 			*rx_count += msg->len;
-			if (*rx_count > S31_I2C_FIFO_LEN)
+			if (*rx_count > i2c->fifo_len)
 				return -EOPNOTSUPP;
 		}
 	}
@@ -334,7 +341,7 @@ static int s31_i2c_recover_bus(struct i2c_adapter *adapter)
 	int ret;
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	s31_i2c_reset_fsm(i2c);
 	/* Retained firmware leaves ownership of pin recovery outside Linux. */
 	if (!i2c->variant->hardware_bus_clear) {
@@ -455,7 +462,7 @@ static int s31_i2c_batch(struct esp_i2c *i2c, const u32 *commands,
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
 	synchronize_irq(i2c->irq);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	reinit_completion(&i2c->complete);
 	i2c->result = -ETIMEDOUT;
 	s31_i2c_reset_fifos(i2c);
@@ -526,7 +533,7 @@ static int s31_i2c_long_xfer(struct esp_i2c *i2c,
 			/* Leave an RX FIFO slot free until the ACK/NACK handshake
 			 * and END/STOP finish; only then may the CPU drain it. */
 			len = min_t(unsigned int, msg->len - offset,
-				    S31_I2C_FIFO_LEN - (read ? 1 : 0));
+				    i2c->fifo_len - (read ? 1 : 0));
 			final = offset + len == msg->len;
 			n = 0;
 			if (read && len) {
@@ -571,7 +578,7 @@ static int s31_i2c_xfer(struct i2c_adapter *adapter,
 		return -EBUSY;
 #endif
 
-	ret = s31_i2c_build_commands(msgs, num, commands, &command_count,
+	ret = s31_i2c_build_commands(i2c, msgs, num, commands, &command_count,
 				      tx_fifo, &tx_count, &rx_count);
 	if (ret && ret != -EOPNOTSUPP)
 		return ret;
@@ -602,7 +609,7 @@ static int s31_i2c_xfer(struct i2c_adapter *adapter,
 	i2c->result = -ETIMEDOUT;
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
 	synchronize_irq(i2c->irq);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	s31_i2c_reset_fifos(i2c);
 
 	for (i = 0; i < S31_I2C_COMMANDS; i++)
@@ -661,7 +668,10 @@ static u32 s31_i2c_functionality(struct i2c_adapter *adapter)
 			    I2C_FUNC_SMBUS_EMUL;
 
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
-	functionality |= I2C_FUNC_SLAVE;
+	struct esp_i2c *i2c = i2c_get_adapdata(adapter);
+
+	if (!i2c->variant->lp_master)
+		functionality |= I2C_FUNC_SLAVE;
 #endif
 	return functionality;
 }
@@ -672,6 +682,8 @@ static int s31_i2c_reg_slave(struct i2c_client *slave)
 	struct esp_i2c *i2c = i2c_get_adapdata(slave->adapter);
 	u32 address, ctr, fifo;
 
+	if (i2c->variant->lp_master)
+		return -EOPNOTSUPP;
 	if (i2c->slave)
 		return -EBUSY;
 	if (slave->flags & I2C_CLIENT_PEC)
@@ -687,7 +699,7 @@ static int s31_i2c_reg_slave(struct i2c_client *slave)
 		   S31_I2C_SLAVE_ADDR_10BIT;
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	s31_i2c_reset_fifos(i2c);
 	fifo = s31_i2c_read(i2c, S31_I2C_FIFO_CONF);
 	fifo &= ~(S31_I2C_FIFO_RX_WM | S31_I2C_FIFO_TX_WM);
@@ -717,7 +729,7 @@ static int s31_i2c_unreg_slave(struct i2c_client *slave)
 	if (i2c->slave != slave)
 		return -EINVAL;
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	i2c->slave = NULL;
 	i2c->slave_active = false;
 	ctr = s31_i2c_read(i2c, S31_I2C_CTR);
@@ -762,8 +774,17 @@ static int s31_i2c_init_hardware(struct esp_i2c *i2c)
 	timeout_exp = min_t(u32, fls(max_t(u32, source_rate / 10, 1) - 1),
 			    31);
 
-	ctr = S31_I2C_CTR_MASTER | S31_I2C_CTR_CLK_EN |
-	      S31_I2C_CTR_ARB_EN;
+	ctr = S31_I2C_CTR_CLK_EN | S31_I2C_CTR_ARB_EN;
+	/*
+	 * TRM ch.48, LP_I2C_CTR.RX_FULL_ACK_LEVEL overrides the read-command
+	 * ACK at full FIFO. A short batch can finish exactly at 16 bytes;
+	 * it must send NACK there so the target releases SDA for STOP.
+	 * Multi-batch reads leave space until the final NACK.
+	 */
+	if (i2c->variant->lp_master)
+		ctr |= P4_LP_I2C_RX_FULL_NACK;
+	else
+		ctr |= S31_I2C_CTR_MASTER;
 	s31_i2c_write(i2c, S31_I2C_CTR, ctr);
 	s31_i2c_write(i2c, S31_I2C_SCL_LOW, half_cycle - 1);
 	s31_i2c_write(i2c, S31_I2C_SCL_HIGH,
@@ -784,7 +805,7 @@ static int s31_i2c_init_hardware(struct esp_i2c *i2c)
 		      S31_I2C_FILTER_SCL_EN | S31_I2C_FILTER_SDA_EN);
 	s31_i2c_reset_fifos(i2c);
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 	s31_i2c_write(i2c, S31_I2C_CTR, ctr | S31_I2C_CTR_CONF_UPDATE);
 
 	return 0;
@@ -801,7 +822,7 @@ static void s31_i2c_quiesce(void *data)
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
 	synchronize_irq(i2c->irq);
-	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
+	s31_i2c_write(i2c, S31_I2C_INT_CLR, i2c->int_mask);
 }
 
 static int esp_i2c_prepare_clocked(struct device *dev, struct esp_i2c *i2c,
@@ -850,13 +871,26 @@ static int esp_i2c_p4_prepare(struct device *dev, struct esp_i2c *i2c,
 			      const struct resource *res)
 {
 	/*
-	 * TRM ch.48 I2C Controller - HP I2C1 APB and XTAL clocks must
-	 * be active before setting I2C_CTR_REG.I2C_MS_MODE.
+	 * TRM ch.48 I2C Controller — HP I2C0 and I2C1 share the master
+	 * register layout. Enable the selected APB and XTAL clocks before
+	 * setting I2C_CTR_REG.I2C_MS_MODE.
 	 */
-	if (!esp_i2c_is_p4_i2c1(res) ||
+	if ((res->start != 0x500c4000 && res->start != 0x500c5000) ||
+	    resource_size(res) < 0xfc ||
 	    !IS_ENABLED(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) ||
 	    !of_find_property(dev->of_node, "pinctrl-0", NULL))
-		return dev_err_probe(dev, -EINVAL, "invalid native P4 I2C1 resources\n");
+		return dev_err_probe(dev, -EINVAL, "invalid native P4 HP I2C resources\n");
+
+	return esp_i2c_prepare_clocked(dev, i2c, true);
+}
+
+static int esp_i2c_p4_lp_prepare(struct device *dev, struct esp_i2c *i2c,
+				 const struct resource *res)
+{
+	if (res->start != 0x50122000 || resource_size(res) < 0xfc ||
+	    !IS_ENABLED(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) ||
+	    !of_property_present(dev->of_node, "pinctrl-0"))
+		return dev_err_probe(dev, -EINVAL, "invalid P4 LP I2C resources\n");
 
 	return esp_i2c_prepare_clocked(dev, i2c, true);
 }
@@ -888,6 +922,13 @@ static const struct esp_i2c_variant esp_i2c_p4 = {
 	.hardware_bus_clear = true,
 };
 
+static const struct esp_i2c_variant esp_i2c_p4_lp = {
+	.adapter_name = "ESP32-P4 LP I2C",
+	.prepare = esp_i2c_p4_lp_prepare,
+	.hardware_bus_clear = true,
+	.lp_master = true,
+};
+
 static const struct esp_i2c_variant esp_i2c_p4_retained = {
 	.adapter_name = "ESP32-P4 retained I2C",
 	.prepare = esp_i2c_p4_retained_prepare,
@@ -910,6 +951,10 @@ static int s31_i2c_probe(struct platform_device *pdev)
 	i2c->variant = device_get_match_data(dev);
 	if (!i2c->variant)
 		i2c->variant = &esp_i2c_s31;
+	i2c->fifo_len = i2c->variant->lp_master ? P4_LP_I2C_FIFO_LEN :
+						S31_I2C_FIFO_LEN;
+	i2c->int_mask = i2c->variant->lp_master ? P4_LP_I2C_INT_ALL :
+						S31_I2C_INT_ALL;
 	ret = i2c->variant->prepare(dev, i2c, res);
 	if (ret)
 		return ret;
@@ -955,6 +1000,7 @@ static const struct of_device_id s31_i2c_of_match[] = {
 	{ .compatible = "espressif,esp32s31-i2c", .data = &esp_i2c_s31 },
 	{ .compatible = "espressif,esp32p4-idf-i2c", .data = &esp_i2c_p4_retained },
 	{ .compatible = "espressif,esp32p4-rev1-i2c", .data = &esp_i2c_p4 },
+	{ .compatible = "espressif,esp32p4-lp-i2c", .data = &esp_i2c_p4_lp },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s31_i2c_of_match);
