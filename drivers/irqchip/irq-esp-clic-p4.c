@@ -31,6 +31,7 @@
 #define P4_SLOTS               48
 #define P4_FIRST_SLOT          16
 #define P4_IPI_SLOT            47
+#define P4_IRQ_SLOT_COUNT      (P4_IPI_SLOT - P4_FIRST_SLOT)
 #define P4_IPI_SOURCE(hart)     (79 + (hart))
 #define P4_IPI_OFFSET(hart)     (0x10 + (hart) * 4)
 #define P4_MATRIX_STRIDE        0x800
@@ -51,7 +52,8 @@ static struct irq_domain *p4_domain;
 static struct p4_irq_route p4_routes[P4_SOURCES];
 /* Zero means unmapped; values are source + 1. */
 static unsigned int p4_slot_source[2][P4_SLOTS];
-static unsigned long p4_slots;
+/* TRM v1.3 ch.12 — each core has an independent matrix output bank. */
+static unsigned long p4_slots[2];
 static DEFINE_RAW_SPINLOCK(p4_irq_lock);
 
 /* Caller is pinned, by IRQ descriptor lock, irq-off entry, or p4_irq_lock. */
@@ -121,30 +123,59 @@ static int p4_irq_set_type(struct irq_data *d, unsigned int type)
 	return 0;
 }
 
+static int p4_free_slot(unsigned int hart)
+{
+	unsigned int bit = find_first_zero_bit(&p4_slots[hart], P4_IRQ_SLOT_COUNT);
+
+	return bit < P4_IRQ_SLOT_COUNT ? P4_FIRST_SLOT + bit : -ENOSPC;
+}
+
 #ifdef CONFIG_SMP
 static int p4_irq_set_affinity(struct irq_data *d, const struct cpumask *mask,
 			       bool force)
 {
 	struct p4_irq_route *r = irq_data_get_irq_chip_data(d);
+	const struct cpumask *allowed = force ? cpu_possible_mask : cpu_online_mask;
 	unsigned int cpu, hart;
 	unsigned long flags;
-
-	cpu = force ? cpumask_first_and(mask, cpu_possible_mask) :
-		      cpumask_any_and(mask, cpu_online_mask);
-	if (cpu >= nr_cpu_ids)
-		return -EINVAL;
-	hart = cpuid_to_hartid_map(cpu);
-	if (hart > 1)
-		return -EINVAL;
+	void __iomem *old_reg;
+	bool pending = false;
+	int slot;
 
 	raw_spin_lock_irqsave(&p4_irq_lock, flags);
-	writeb(0, p4_slot_reg(r->hart, r->slot) + 1);
-	p4_route(r->hart, d->hwirq, 0);
-	WRITE_ONCE(p4_slot_source[r->hart][r->slot], 0);
-	r->hart = hart;
-	WRITE_ONCE(p4_slot_source[hart][r->slot], d->hwirq + 1);
-	p4_configure_slot(r);
-	p4_route(hart, d->hwirq, r->slot);
+	for_each_cpu_and(cpu, mask, allowed) {
+		hart = cpuid_to_hartid_map(cpu);
+		if (hart > 1)
+			continue;
+		if (hart == r->hart)
+			goto out;
+		slot = p4_free_slot(hart);
+		if (slot < 0)
+			continue;
+
+		old_reg = p4_slot_reg(r->hart, r->slot);
+		writeb(0, old_reg + 1);
+		p4_route(r->hart, d->hwirq, 0);
+		if (r->type == IRQ_TYPE_EDGE_RISING)
+			pending = readb(old_reg) & BIT(0);
+		WRITE_ONCE(p4_slot_source[r->hart][r->slot], 0);
+		__clear_bit(r->slot - P4_FIRST_SLOT, &p4_slots[r->hart]);
+
+		__set_bit(slot - P4_FIRST_SLOT, &p4_slots[hart]);
+		r->hart = hart;
+		r->slot = slot;
+		WRITE_ONCE(p4_slot_source[hart][slot], d->hwirq + 1);
+		p4_configure_slot(r);
+		/* TRM v1.3 ch.1 clicintip is writable for an edge-triggered slot. */
+		if (pending)
+			writeb(1, p4_slot_reg(hart, slot));
+		p4_route(hart, d->hwirq, slot);
+		goto out;
+	}
+
+	raw_spin_unlock_irqrestore(&p4_irq_lock, flags);
+	return cpumask_intersects(mask, allowed) ? -ENOSPC : -EINVAL;
+out:
 	raw_spin_unlock_irqrestore(&p4_irq_lock, flags);
 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
 	return IRQ_SET_MASK_OK_DONE;
@@ -167,22 +198,30 @@ static int p4_domain_map(struct irq_domain *d, unsigned int virq,
 {
 	struct p4_irq_route *r;
 	unsigned long flags;
-	unsigned int bit;
+	unsigned int cpu, hart;
+	int slot;
 
 	if (source >= P4_SOURCES ||
 	    source == P4_IPI_SOURCE(0) || source == P4_IPI_SOURCE(1))
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&p4_irq_lock, flags);
-	bit = find_first_zero_bit(&p4_slots, P4_IPI_SLOT - P4_FIRST_SLOT);
-	if (bit >= P4_IPI_SLOT - P4_FIRST_SLOT) {
+	for_each_online_cpu(cpu) {
+		hart = cpuid_to_hartid_map(cpu);
+		if (hart > 1)
+			continue;
+		slot = p4_free_slot(hart);
+		if (slot >= 0)
+			break;
+	}
+	if (cpu >= nr_cpu_ids) {
 		raw_spin_unlock_irqrestore(&p4_irq_lock, flags);
 		return -ENOSPC;
 	}
-	__set_bit(bit, &p4_slots);
+	__set_bit(slot - P4_FIRST_SLOT, &p4_slots[hart]);
 	r = &p4_routes[source];
-	r->slot = P4_FIRST_SLOT + bit;
-	r->hart = cpuid_to_hartid_map(0);
+	r->slot = slot;
+	r->hart = hart;
 	r->type = IRQ_TYPE_LEVEL_HIGH;
 	r->enabled = false;
 	WRITE_ONCE(p4_slot_source[r->hart][r->slot], source + 1);
@@ -191,7 +230,7 @@ static int p4_domain_map(struct irq_domain *d, unsigned int virq,
 	raw_spin_unlock_irqrestore(&p4_irq_lock, flags);
 	irq_domain_set_info(d, virq, source, &p4_irq_chip, r,
 			    handle_level_irq, NULL, NULL);
-	irq_data_update_effective_affinity(irq_get_irq_data(virq), cpumask_of(0));
+	irq_data_update_effective_affinity(irq_get_irq_data(virq), cpumask_of(cpu));
 	return 0;
 }
 
@@ -205,7 +244,7 @@ static void p4_domain_unmap(struct irq_domain *d, unsigned int virq)
 	writeb(0, p4_slot_reg(r->hart, r->slot) + 1);
 	p4_route(r->hart, data->hwirq, 0);
 	WRITE_ONCE(p4_slot_source[r->hart][r->slot], 0);
-	__clear_bit(r->slot - P4_FIRST_SLOT, &p4_slots);
+	__clear_bit(r->slot - P4_FIRST_SLOT, &p4_slots[r->hart]);
 	r->slot = 0;
 	r->enabled = false;
 	raw_spin_unlock_irqrestore(&p4_irq_lock, flags);

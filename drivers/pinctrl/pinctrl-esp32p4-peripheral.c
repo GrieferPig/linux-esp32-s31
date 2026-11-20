@@ -108,6 +108,18 @@ static const struct p4_route i2c1_routes[] = {
 	{ 70, 70, true, true },
 };
 
+/* TRM ch.11 GPIO Matrix — I3C master SDA/SCL signals 135/134. */
+static const unsigned int i3c_header_pins[] = { 4, 5 }; /* SDA, SCL */
+static const struct p4_route i3c_mst_routes[] = {
+	{ 135, 135, false, true },
+	{ 134, 134, false, true },
+};
+
+static const struct p4_route i3c_legacy_routes[] = {
+	{ 135, 135, true, true },
+	{ 134, 134, true, true },
+};
+
 /* TRM ch.11 GPIO Matrix and IO MUX — LP I2C SDA/SCL and LP SPI CK/D/Q/CS. */
 static const struct p4_route lp_i2c_routes[] = {
 	{ 1, 1, true, true },
@@ -298,10 +310,21 @@ static const struct p4_route adc1_header_routes[] = {
 	{ P4_SIGNAL_NONE, P4_SIGNAL_NONE },
 };
 
+/* P4 v1.3 TRM ch.9 GPIO matrix — PARLIO CLK and data targets. */
+static const unsigned int parlio_loop_pins[] = { 4, 3, 5, 20, 21 };
+static const struct p4_route parlio_loop_routes[] = {
+	{ 186, 187 },
+	{ 188, 188 }, { 189, 189 }, { 190, 190 }, { 191, 191 },
+};
+
 static const struct p4_group p4_groups[] = {
 	{ .name = "usbfs-device", .usbfs_device = true },
 	{ "adc1-header", adc1_header_pins, adc1_header_routes,
 	  ARRAY_SIZE(adc1_header_pins) },
+	{ "parlio-loopback", parlio_loop_pins, parlio_loop_routes,
+	  ARRAY_SIZE(parlio_loop_pins) },
+	{ "i3c-master", i3c_header_pins, i3c_mst_routes, ARRAY_SIZE(i3c_header_pins) },
+	{ "i3c-legacy", display_i2c_pins, i3c_legacy_routes, ARRAY_SIZE(display_i2c_pins) },
 	{ "i2c1", display_i2c_pins, i2c1_routes, ARRAY_SIZE(display_i2c_pins) },
 	{ "i2c0", display_i2c_pins, i2c0_routes, ARRAY_SIZE(display_i2c_pins) },
 	{ "lp-i2c", display_i2c_pins, lp_i2c_routes, ARRAY_SIZE(display_i2c_pins), .lp = true },

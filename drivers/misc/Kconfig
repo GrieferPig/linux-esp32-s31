@@ -661,4 +661,11 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+config ESP32P4_PARLIO
+	tristate "Espressif ESP32-P4 parallel I/O controller"
+	depends on OF && DMA_ENGINE && COMMON_CLK
+	depends on RISCV || COMPILE_TEST
+	help
+	  Expose the ESP32-P4 parallel I/O controller as a framed DMA device.
+
 endmenu

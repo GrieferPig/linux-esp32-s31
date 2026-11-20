@@ -1607,14 +1607,14 @@ config SERIAL_ESP32
 	    earlycon=esp32uart,mmio32,0x3ff40000,115200n8
 
 config SERIAL_ESP32_UHCI
-	bool "ESP32-S31 UHCI UART DMA"
+	bool "Espressif UHCI UART DMA"
 	depends on SERIAL_ESP32
 	depends on ESPRESSIF_GDMA_AHB
-	depends on SOC_ESP32S31
+	depends on SOC_ESP32S31 || SOC_ESP32P4
 	select DMA_ENGINE
 	help
-	  Use the ESP32-S31 UHCI0 bridge and AHB-GDMA as the asynchronous
-	  TX/RX backend for the standard ttyS0 UART driver.
+	  Use the UHCI bridge and AHB GDMA for asynchronous TX and RX
+	  on an ESP32-S31 or ESP32-P4 UART selected by the device tree.
 
 config SERIAL_ESP32_ACM
 	tristate "Espressif ESP32 USB ACM gadget support"

@@ -23,6 +23,12 @@
 #define P4_UART_STATUS		0x500ca01cUL
 #define P4_UART_FSM		0x500ca070UL
 #define P4_UART_CLK_CONF		0x500ca088UL
+/* TRM ch.12 and ch.46 — UHCI clocks and UHCI_CONF0 UART_SEL. */
+#define P4_UHCI_CONF0		0x500df000UL
+#define P4_UHCI_SYS_EN		BIT(17)
+#define P4_UHCI_APB_EN		BIT(6)
+#define P4_UHCI_CLK_EN		BIT(11)
+#define P4_UHCI_UART_SEL		GENMASK(4, 2)
 #define P4_UART_READ_BUDGET	(1U << 20)
 
 static bool p4_diag_ready __ro_after_init;
@@ -57,10 +63,19 @@ static u32 p4_diag_read(unsigned long address)
 
 static bool p4_diag_uart_ready(void)
 {
-	if (!(p4_diag_read(P4_UART_SYS_CLOCK) & BIT(18)) ||
-	    !(p4_diag_read(P4_UART_APB_CLOCK) & BIT(7)) ||
+	u32 sys = p4_diag_read(P4_UART_SYS_CLOCK);
+	u32 apb = p4_diag_read(P4_UART_APB_CLOCK);
+
+	if (!(sys & BIT(18)) || !(apb & BIT(7)) ||
 	    !(p4_diag_read(P4_UART_SCLK) & BIT(26)))
 		return false;
+	/* A live UHCI route to UART0 owns its FIFO. */
+	if ((sys & P4_UHCI_SYS_EN) && (apb & P4_UHCI_APB_EN)) {
+		u32 uhci = p4_diag_read(P4_UHCI_CONF0);
+
+		if ((uhci & P4_UHCI_CLK_EN) && !(uhci & P4_UHCI_UART_SEL))
+			return false;
+	}
 	return p4_diag_read(P4_UART_CLK_CONF) & BIT(24);
 }
 
@@ -139,7 +154,6 @@ void esp32p4_backtrace_snapshot(bool after)
 	u32 bus, gate = 0;
 
 	BUILD_BUG_ON(IS_ENABLED(CONFIG_MMU));
-	BUILD_BUG_ON(IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI));
 
 	if (!READ_ONCE(p4_diag_ready) || !p4_diag_uart_ready())
 		return;

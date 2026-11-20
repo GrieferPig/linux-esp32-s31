@@ -39,6 +39,8 @@
 #define TWAI_CLK115		0x7c
 #define GPSPI_CLK116		0x80
 #define GPSPI_CLK117		0x84
+#define PARLIO_CLK118		0x88
+#define I3C_CLK119		0x8c
 #define TIMER_CLK20		0x94
 #define TIMER_CLK21		0x98
 #define LEDC_CLK22		0x9c
@@ -62,6 +64,33 @@
 /* TRM ch.40.7.1 and ch.12 — PPA_SYS_CLK_EN and RST_EN_PPA. */
 #define PPA_SYS_EN		BIT(9)
 #define HP_PPA_RESET		BIT(0)
+/* TRM ch.12 Reset and Clock — UHCI_SYS_CLK_EN, APB_CLK_EN and RST_EN. */
+#define UHCI_SYS_EN		BIT(17)
+#define UHCI_APB_EN		BIT(6)
+#define HP_UHCI_RESET		BIT(18)
+/* P4 v1.3 TRM ch.10 Reset and Clock — PARLIO gates and root selections. */
+#define PARLIO_SYS_EN		BIT(23)
+#define PARLIO_APB_EN		BIT(31)
+#define PARLIO_RX_SRC		GENMASK(18, 17)
+#define PARLIO_RX_EN		BIT(19)
+#define PARLIO_RX_DIV		GENMASK(27, 20)
+#define PARLIO_RX_FRAC		GENMASK(15, 0)
+#define PARLIO_TX_SRC		GENMASK(17, 16)
+#define PARLIO_TX_EN		BIT(18)
+#define PARLIO_TX_DIV		GENMASK(26, 19)
+#define PARLIO_TX_FRAC		GENMASK(15, 0)
+#define PARLIO_PAD_RX_EN	BIT(4)
+#define PARLIO_PAD_TX_EN	BIT(3)
+#define PARLIO_PAD_SRC		3
+#define HP_PARLIO_RESET		BIT(1)
+#define HP_PARLIO_RX_RESET	BIT(2)
+#define HP_PARLIO_TX_RESET	BIT(3)
+/* TRM ch.12 Reset and Clock — I3C_MST_CLK_SRC_SEL, DIV_NUM and RST_EN. */
+#define I3C_MST_APB_EN		BIT(17)
+#define I3C_MST_SRC		GENMASK(17, 16)
+#define I3C_MST_EN		BIT(18)
+#define I3C_MST_DIV		GENMASK(26, 19)
+#define HP_I3C_MST_RESET	BIT(19)
 #define SDMMC_SYS_EN		BIT(14)
 #define USB_OTG20_SYS_EN	BIT(16)
 #define USB_OTG11_SYS_EN	BIT(15)
@@ -543,6 +572,26 @@ static int p4_clk_enable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), true);
 		break;
+	case ESP32P4_CLK_UHCI:
+		p4_update(cc, SOC_CLK1, UHCI_SYS_EN, UHCI_SYS_EN);
+		p4_update(cc, SOC_CLK2, UHCI_APB_EN, UHCI_APB_EN);
+		break;
+	case ESP32P4_CLK_PARLIO_BUS:
+		p4_update(cc, SOC_CLK1, PARLIO_SYS_EN, PARLIO_SYS_EN);
+		p4_update(cc, SOC_CLK2, PARLIO_APB_EN, PARLIO_APB_EN);
+		break;
+	case ESP32P4_CLK_PARLIO_RX:
+		p4_update(cc, GPSPI_CLK117, PARLIO_RX_EN, PARLIO_RX_EN);
+		break;
+	case ESP32P4_CLK_PARLIO_TX:
+		p4_update(cc, PARLIO_CLK118, PARLIO_TX_SRC | PARLIO_TX_EN, PARLIO_TX_EN);
+		break;
+	case ESP32P4_CLK_I3C:
+		p4_update(cc, SOC_CLK2, I3C_MST_APB_EN, I3C_MST_APB_EN);
+		p4_update(cc, I3C_CLK119, I3C_MST_EN, 0);
+		p4_update(cc, I3C_CLK119, I3C_MST_SRC | I3C_MST_DIV, 0);
+		p4_update(cc, I3C_CLK119, I3C_MST_EN, I3C_MST_EN);
+		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, PPA_SYS_EN);
 		break;
@@ -699,6 +748,24 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), false);
 		break;
+	case ESP32P4_CLK_UHCI:
+		p4_update(cc, SOC_CLK2, UHCI_APB_EN, 0);
+		p4_update(cc, SOC_CLK1, UHCI_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_PARLIO_BUS:
+		p4_update(cc, SOC_CLK2, PARLIO_APB_EN, 0);
+		p4_update(cc, SOC_CLK1, PARLIO_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_PARLIO_RX:
+		p4_update(cc, GPSPI_CLK117, PARLIO_RX_EN, 0);
+		break;
+	case ESP32P4_CLK_PARLIO_TX:
+		p4_update(cc, PARLIO_CLK118, PARLIO_TX_EN, 0);
+		break;
+	case ESP32P4_CLK_I3C:
+		p4_update(cc, I3C_CLK119, I3C_MST_EN, 0);
+		p4_update(cc, SOC_CLK2, I3C_MST_APB_EN, 0);
+		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, 0);
 		break;
@@ -758,6 +825,92 @@ static const struct clk_ops p4_clk_ops = {
 	.enable = p4_clk_enable,
 	.disable = p4_clk_disable,
 	.recalc_rate = p4_clk_rate,
+};
+
+static u8 p4_parlio_rx_parent(struct clk_hw *hw)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	u32 value = readl(clk->cc->base + GPSPI_CLK117);
+
+	switch (FIELD_GET(PARLIO_RX_SRC, value)) {
+	case 0:
+		return 0;
+	case PARLIO_PAD_SRC:
+		return 1;
+	default:
+		return 2;
+	}
+}
+
+static int p4_parlio_rx_set_parent(struct clk_hw *hw, u8 index)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	struct p4_cc *cc = clk->cc;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cc->lock, flags);
+	p4_update_external(cc->lp_hp_clk, PARLIO_PAD_RX_EN, index ? PARLIO_PAD_RX_EN : 0);
+	p4_update(cc, PARLIO_CLK118, PARLIO_RX_FRAC, 0);
+	p4_update(cc, GPSPI_CLK117, PARLIO_RX_DIV | PARLIO_RX_SRC,
+		  index ? FIELD_PREP(PARLIO_RX_SRC, PARLIO_PAD_SRC) : 0);
+	spin_unlock_irqrestore(&cc->lock, flags);
+
+	return 0;
+}
+
+static const struct clk_ops p4_parlio_rx_ops = {
+	.enable = p4_clk_enable,
+	.disable = p4_clk_disable,
+	.get_parent = p4_parlio_rx_parent,
+	.set_parent = p4_parlio_rx_set_parent,
+	.determine_rate = __clk_mux_determine_rate,
+};
+
+static unsigned long p4_parlio_tx_rate(struct clk_hw *hw, unsigned long parent)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	u32 value = readl(clk->cc->base + PARLIO_CLK118);
+
+	return parent / (FIELD_GET(PARLIO_TX_DIV, value) + 1);
+}
+
+static unsigned int p4_parlio_tx_div(unsigned long parent, unsigned long rate)
+{
+	return clamp_t(unsigned int, DIV_ROUND_CLOSEST(parent, rate), 1, 256);
+}
+
+static int p4_parlio_tx_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
+{
+	unsigned long parent = req->best_parent_rate;
+
+	req->rate = parent / p4_parlio_tx_div(parent, max(1UL, req->rate));
+	return 0;
+}
+
+static int p4_parlio_tx_set_rate(struct clk_hw *hw, unsigned long rate,
+				 unsigned long parent)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	struct p4_cc *cc = clk->cc;
+	unsigned long flags;
+	unsigned int div = p4_parlio_tx_div(parent, rate);
+
+	spin_lock_irqsave(&cc->lock, flags);
+	p4_update_external(cc->lp_hp_clk, PARLIO_PAD_TX_EN, 0);
+	p4_update(cc, I3C_CLK119, PARLIO_TX_FRAC, 0);
+	p4_update(cc, PARLIO_CLK118, PARLIO_TX_SRC | PARLIO_TX_DIV,
+		  FIELD_PREP(PARLIO_TX_DIV, div - 1));
+	spin_unlock_irqrestore(&cc->lock, flags);
+
+	return 0;
+}
+
+static const struct clk_ops p4_parlio_tx_ops = {
+	.enable = p4_clk_enable,
+	.disable = p4_clk_disable,
+	.recalc_rate = p4_parlio_tx_rate,
+	.determine_rate = p4_parlio_tx_determine_rate,
+	.set_rate = p4_parlio_tx_set_rate,
 };
 
 static unsigned long p4_uart_rate(struct clk_hw *hw, unsigned long parent)
@@ -984,6 +1137,26 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		bit = UART_CORE_RST(port) | UART_APB_RST(port);
 		break;
 	}
+	case ESP32P4_RST_UHCI:
+		reg = HP_RST1;
+		bit = HP_UHCI_RESET;
+		break;
+	case ESP32P4_RST_PARLIO_BUS:
+		reg = HP_RST2;
+		bit = HP_PARLIO_RESET;
+		break;
+	case ESP32P4_RST_PARLIO_RX:
+		reg = HP_RST2;
+		bit = HP_PARLIO_RX_RESET;
+		break;
+	case ESP32P4_RST_PARLIO_TX:
+		reg = HP_RST2;
+		bit = HP_PARLIO_TX_RESET;
+		break;
+	case ESP32P4_RST_I3C:
+		reg = HP_RST1;
+		bit = HP_I3C_MST_RESET;
+		break;
 	case ESP32P4_RST_PPA:
 		reg = HP_RST1;
 		bit = HP_PPA_RESET;
@@ -1089,7 +1262,8 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-lp-spi",
 		"p4-uart1", "p4-uart2", "p4-uart3", "p4-uart4",
 		"p4-lp-uart",
-		"p4-usbfs", "p4-adc", "p4-ppa",
+		"p4-usbfs", "p4-adc", "p4-ppa", "p4-uhci", "p4-i3c",
+		"p4-parlio-bus", "p4-parlio-rx", "p4-parlio-tx",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -1132,22 +1306,30 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	data->num = ESP32P4_CLK_NR;
 	for (i = 0; i < data->num; i++) {
-		const struct clk_parent_data parent = {
-			.index = i == ESP32P4_CLK_EMAC_RMII ? 2 :
-				 i == ESP32P4_CLK_SDMMC ? 1 : 0,
+		const struct clk_parent_data parents[] = {
+			{ .index = i == ESP32P4_CLK_EMAC_RMII ? 2 :
+				   i == ESP32P4_CLK_SDMMC ? 1 : 0 },
+			{ .index = 3 },
 		};
 		const struct clk_init_data init = {
 			.name = names[i],
 			.ops = i == ESP32P4_CLK_EMAC_RMII ? &p4_rmii_clk_ops :
+			       i == ESP32P4_CLK_PARLIO_RX ? &p4_parlio_rx_ops :
+			       i == ESP32P4_CLK_PARLIO_TX ? &p4_parlio_tx_ops :
 			       p4_i2s_layout(i) ? &p4_i2s_clk_ops :
 			       i >= ESP32P4_CLK_UART1 && i <= ESP32P4_CLK_UART4 ?
 			       &p4_uart_clk_ops : &p4_clk_ops,
-			.parent_data = &parent,
-			.num_parents = (i == ESP32P4_CLK_USBHS || i == ESP32P4_CLK_USBFS ||
+			.flags = i == ESP32P4_CLK_PARLIO_RX ? CLK_SET_PARENT_GATE :
+				 i == ESP32P4_CLK_PARLIO_TX ? CLK_SET_RATE_GATE : 0,
+			.parent_data = parents,
+			.num_parents = i == ESP32P4_CLK_PARLIO_RX ? 2 :
+				       (i == ESP32P4_CLK_PARLIO_BUS ||
+					i == ESP32P4_CLK_USBHS || i == ESP32P4_CLK_USBFS ||
 					i == ESP32P4_CLK_EMAC ||
 					i == ESP32P4_CLK_AHB_GDMA ||
 					i == ESP32P4_CLK_AXI_GDMA ||
 					i == ESP32P4_CLK_DMA2D || i == ESP32P4_CLK_PPA ||
+					i == ESP32P4_CLK_UHCI ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};
 		struct p4_clk *clk;
@@ -1155,7 +1337,9 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		if (((i == ESP32P4_CLK_SDMMC || i == ESP32P4_CLK_EMAC) &&
 		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->lp_hp_clk) ||
 		    ((i == ESP32P4_CLK_LP_I2C || i == ESP32P4_CLK_LP_UART) && !cc->lpperi) ||
-		    (i == ESP32P4_CLK_LP_SPI && (!cc->lpperi || !cc->lp_fast_clksel))) {
+		    (i == ESP32P4_CLK_LP_SPI && (!cc->lpperi || !cc->lp_fast_clksel)) ||
+		    ((i == ESP32P4_CLK_PARLIO_TX || i == ESP32P4_CLK_PARLIO_RX) &&
+		     !cc->lp_hp_clk)) {
 			data->hws[i] = ERR_PTR(-ENOENT);
 			continue;
 		}

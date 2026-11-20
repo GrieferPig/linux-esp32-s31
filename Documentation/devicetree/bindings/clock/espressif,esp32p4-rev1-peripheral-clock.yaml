@@ -39,6 +39,7 @@ properties:
       - description: Crystal reference
       - description: PLL_F160M reference for SDMMC
       - description: External 50 MHz RMII reference
+      - description: PARLIO clock at the external RX pad
 
   '#clock-cells':
     const: 1
