@@ -149,3 +149,4 @@
 #include "esp32p4-waveshare-peripheral-pins.dtsi"
 
 #include "esp32p4-waveshare-gpspi.dtsi"
+#include "esp32p4-waveshare-uart.dtsi"

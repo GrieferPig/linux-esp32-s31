@@ -14,16 +14,16 @@ properties:
     const: espressif,esp32p4-rev1-usb-phy
 
   reg:
-    items:
-      - description: UTMI PHY
-      - description: USB clock and reset control
-      - description: USB high-speed OTG system control
+    minItems: 2
+    maxItems: 3
 
   reg-names:
-    items:
-      - const: utmi
-      - const: otg-ctrl
-      - const: phy-ctrl
+    minItems: 2
+    maxItems: 3
+
+  espressif,otg-clkrst:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared USB clock/reset register, LP_CLKRST_HP_USB_CLKRST_CTRL1.
 
   clocks:
     maxItems: 1
@@ -38,5 +38,27 @@ required:
   - reg-names
   - clocks
   - '#phy-cells'
+
+allOf:
+  - if:
+      required:
+        - espressif,otg-clkrst
+    then:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          items:
+            - const: utmi
+            - const: phy-ctrl
+    else:
+      properties:
+        reg:
+          minItems: 3
+        reg-names:
+          items:
+            - const: utmi
+            - const: otg-ctrl
+            - const: phy-ctrl
 
 additionalProperties: false

@@ -10,10 +10,12 @@
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/regmap.h>
 
 #define ESP32S31_USB_CLK_APB_EN		BIT(0)
 #define ESP32S31_USB_CLK_SYS_EN		BIT(1)
@@ -59,6 +61,7 @@ struct espressif_usb_phy {
 	void __iomem *utmi;
 	void __iomem *clkrst;
 	void __iomem *otg_ctrl;
+	struct regmap *otg_clkrst;
 	void __iomem *usb_ctrl;
 	void __iomem *phy_ctrl;
 	struct phy *phy;
@@ -78,6 +81,24 @@ static void espressif_usb_update(void __iomem *reg, u32 clear, u32 set)
 	value &= ~clear;
 	value |= set;
 	writel(value, reg);
+}
+
+static int espressif_usb_otg_update(struct espressif_usb_phy *priv,
+				    u32 clear, u32 set)
+{
+	if (priv->otg_clkrst)
+		return regmap_update_bits(priv->otg_clkrst, 0, clear | set, set);
+	espressif_usb_update(priv->otg_ctrl, clear, set);
+	return 0;
+}
+
+static void espressif_usb_disable_bus_clock(struct espressif_usb_phy *priv)
+{
+	if (priv->bus_clock)
+		clk_disable_unprepare(priv->bus_clock);
+	else
+		espressif_usb_update(priv->clkrst, ESP32S31_USB_CLK_APB_EN |
+				     ESP32S31_USB_CLK_SYS_EN, 0);
 }
 
 static void espressif_usb_set_pulldowns(struct espressif_usb_phy *priv)
@@ -104,16 +125,24 @@ static int espressif_usb_phy_init(struct phy *phy)
 		espressif_usb_update(priv->clkrst, 0, ESP32S31_USB_CLK_APB_EN |
 				     ESP32S31_USB_CLK_SYS_EN);
 	}
-	espressif_usb_update(priv->otg_ctrl, 0, variant->refclk);
+	ret = espressif_usb_otg_update(priv, 0, variant->refclk);
+	if (ret)
+		goto stop_bus_clock;
 
 	/* S31 routes suspend and PLL control to DWC2. */
 	if (variant->overrides)
 		espressif_usb_update(priv->phy_ctrl, variant->overrides, 0);
 
 	/* Release the PHY before the controller-side reset lines. */
-	espressif_usb_update(priv->otg_ctrl, 0, resets);
-	espressif_usb_update(priv->otg_ctrl, variant->phy_reset, 0);
-	espressif_usb_update(priv->otg_ctrl, variant->core_reset, 0);
+	ret = espressif_usb_otg_update(priv, 0, resets);
+	if (ret)
+		goto stop_refclk;
+	ret = espressif_usb_otg_update(priv, variant->phy_reset, 0);
+	if (ret)
+		goto stop_refclk;
+	ret = espressif_usb_otg_update(priv, variant->core_reset, 0);
+	if (ret)
+		goto stop_refclk;
 
 	espressif_usb_update(priv->phy_ctrl, 0, variant->suspendm);
 	espressif_usb_update(priv->utmi + ESP32S31_UTMI_FC06, 0,
@@ -122,21 +151,26 @@ static int espressif_usb_phy_init(struct phy *phy)
 	priv->powered = true;
 
 	return 0;
+
+stop_refclk:
+	espressif_usb_otg_update(priv, variant->refclk, 0);
+stop_bus_clock:
+	espressif_usb_disable_bus_clock(priv);
+	return ret;
 }
 
 static int espressif_usb_phy_exit(struct phy *phy)
 {
 	struct espressif_usb_phy *priv = phy_get_drvdata(phy);
 	const struct espressif_usb_phy_variant *variant = priv->variant;
+	int ret;
 
 	if (variant->pulldowns)
 		espressif_usb_update(priv->usb_ctrl, variant->pulldowns, 0);
-	espressif_usb_update(priv->otg_ctrl, variant->refclk, 0);
-	if (priv->bus_clock)
-		clk_disable_unprepare(priv->bus_clock);
-	else
-		espressif_usb_update(priv->clkrst, ESP32S31_USB_CLK_APB_EN |
-				     ESP32S31_USB_CLK_SYS_EN, 0);
+	ret = espressif_usb_otg_update(priv, variant->refclk, 0);
+	if (ret)
+		return ret;
+	espressif_usb_disable_bus_clock(priv);
 	priv->powered = false;
 
 	return 0;
@@ -193,10 +227,16 @@ static int espressif_usb_phy_probe(struct platform_device *pdev)
 			return PTR_ERR(priv->clkrst);
 	}
 
-	priv->otg_ctrl = devm_platform_ioremap_resource_byname(pdev,
-							 "otg-ctrl");
-	if (IS_ERR(priv->otg_ctrl))
-		return PTR_ERR(priv->otg_ctrl);
+	/* P4 OTG FS and HS reset fields share LP_CLKRST_HP_USB_CLKRST_CTRL1. */
+	priv->otg_clkrst = syscon_regmap_lookup_by_phandle_optional(pdev->dev.of_node,
+								     "espressif,otg-clkrst");
+	if (IS_ERR(priv->otg_clkrst))
+		return PTR_ERR(priv->otg_clkrst);
+	if (!priv->otg_clkrst) {
+		priv->otg_ctrl = devm_platform_ioremap_resource_byname(pdev, "otg-ctrl");
+		if (IS_ERR(priv->otg_ctrl))
+			return PTR_ERR(priv->otg_ctrl);
+	}
 
 	if (priv->variant->pulldowns) {
 		priv->usb_ctrl = devm_platform_ioremap_resource_byname(pdev, "usb-ctrl");

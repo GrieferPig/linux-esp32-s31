@@ -68,6 +68,14 @@
 #define LP_GPIO_OUT_FUNC	GENMASK(8, 3)
 #define LP_GPIO_OUT_SW		32
 
+/* TRM ch.11 GPIO Matrix — constant inputs for the fixed-role OTG FS port. */
+#define P4_GPIO_INPUT_LOW	0x3e
+#define P4_GPIO_INPUT_HIGH	0x3f
+#define P4_USB_FS_IDDIG		110
+#define P4_USB_FS_AVALID	111
+#define P4_USB_FS_BVALID	112
+#define P4_USB_FS_VBUSVALID	113
+
 #define P4_SIGNAL_NONE		(-1)
 
 struct p4_route {
@@ -85,6 +93,7 @@ struct p4_group {
 	bool iomux;
 	u8 iomux_func;
 	bool lp;
+	bool usbfs_device;
 };
 
 static const unsigned int display_i2c_pins[] = { 7, 8 };	/* SDA, SCL */
@@ -148,6 +157,41 @@ static const struct p4_route gpspi3_loop_routes[] = {
 	{ 48, 49 },
 	{ P4_SIGNAL_NONE, 52, false, true },
 };
+
+/* TRM ch.11 GPIO Matrix — UART1/2/3/4 TXD and RXD signals. */
+static const unsigned int uart_pins[] = { 4, 5 };	/* TX, RX */
+static const unsigned int uart_loop_pin[] = { 3 };
+
+/* TRM ch.11 LP GPIO Matrix — LP_UART TXD and RXD signal 2. */
+static const struct p4_route lp_uart_routes[] = {
+	{ P4_SIGNAL_NONE, 2 },
+	{ 2, P4_SIGNAL_NONE, false, true },
+};
+static const struct p4_route lp_uart_loop[] = { { 2, 2 } };
+
+static const struct p4_route uart1_routes[] = {
+	{ P4_SIGNAL_NONE, 13 },
+	{ 13, P4_SIGNAL_NONE },
+};
+static const struct p4_route uart1_loop[] = { { 13, 13 } };
+
+static const struct p4_route uart2_routes[] = {
+	{ P4_SIGNAL_NONE, 16 },
+	{ 16, P4_SIGNAL_NONE },
+};
+static const struct p4_route uart2_loop[] = { { 16, 16 } };
+
+static const struct p4_route uart3_routes[] = {
+	{ P4_SIGNAL_NONE, 19 },
+	{ 19, P4_SIGNAL_NONE },
+};
+static const struct p4_route uart3_loop[] = { { 19, 19 } };
+
+static const struct p4_route uart4_routes[] = {
+	{ P4_SIGNAL_NONE, 22 },
+	{ 22, P4_SIGNAL_NONE },
+};
+static const struct p4_route uart4_loop[] = { { 22, 22 } };
 
 /* TRM ch.59 SD/MMC Host Controller and ch.11 GPIO Matrix and IO MUX: slot 0 pads. */
 static const unsigned int sdmmc0_pins[] = { 43, 44, 39, 40, 41, 42 };
@@ -255,6 +299,7 @@ static const struct p4_route adc1_header_routes[] = {
 };
 
 static const struct p4_group p4_groups[] = {
+	{ .name = "usbfs-device", .usbfs_device = true },
 	{ "adc1-header", adc1_header_pins, adc1_header_routes,
 	  ARRAY_SIZE(adc1_header_pins) },
 	{ "i2c1", display_i2c_pins, i2c1_routes, ARRAY_SIZE(display_i2c_pins) },
@@ -263,6 +308,17 @@ static const struct p4_group p4_groups[] = {
 	{ "lp-spi", lp_spi_pins, lp_spi_routes, ARRAY_SIZE(lp_spi_pins), .lp = true },
 	{ "lp-spi-loopback", lp_spi_loop_pins, lp_spi_loop_routes,
 	  ARRAY_SIZE(lp_spi_loop_pins), .lp = true },
+	{ "lp-uart", uart_pins, lp_uart_routes, ARRAY_SIZE(uart_pins), .lp = true },
+	{ "lp-uart-loopback", uart_loop_pin, lp_uart_loop,
+	  ARRAY_SIZE(uart_loop_pin), .lp = true },
+	{ "uart1", uart_pins, uart1_routes, ARRAY_SIZE(uart_pins) },
+	{ "uart1-loopback", uart_loop_pin, uart1_loop, ARRAY_SIZE(uart_loop_pin) },
+	{ "uart2", uart_pins, uart2_routes, ARRAY_SIZE(uart_pins) },
+	{ "uart2-loopback", uart_loop_pin, uart2_loop, ARRAY_SIZE(uart_loop_pin) },
+	{ "uart3", uart_pins, uart3_routes, ARRAY_SIZE(uart_pins) },
+	{ "uart3-loopback", uart_loop_pin, uart3_loop, ARRAY_SIZE(uart_loop_pin) },
+	{ "uart4", uart_pins, uart4_routes, ARRAY_SIZE(uart_pins) },
+	{ "uart4-loopback", uart_loop_pin, uart4_loop, ARRAY_SIZE(uart_loop_pin) },
 	{ "gpspi2", gpspi_pins, gpspi2_routes, ARRAY_SIZE(gpspi_pins) },
 	{ "gpspi3", gpspi_pins, gpspi3_routes, ARRAY_SIZE(gpspi_pins) },
 	{ "gpspi2-loopback", gpspi_loop_pins, gpspi2_loop_routes, ARRAY_SIZE(gpspi_loop_pins) },
@@ -411,6 +467,18 @@ static int p4_set_mux(struct pinctrl_dev *pctldev, unsigned int function,
 
 	val = readl(pc->gpio + GPIO_CLOCK_GATE);
 	writel(val | GPIO_CLK_EN, pc->gpio + GPIO_CLOCK_GATE);
+	if (pg->usbfs_device) {
+		/* Fixed B-device on a board without separate VBUS sensing. */
+		writel(GPIO_IN_MATRIX | P4_GPIO_INPUT_HIGH,
+		       pc->gpio + GPIO_IN_SEL(P4_USB_FS_IDDIG));
+		writel(GPIO_IN_MATRIX | P4_GPIO_INPUT_LOW,
+		       pc->gpio + GPIO_IN_SEL(P4_USB_FS_AVALID));
+		writel(GPIO_IN_MATRIX | P4_GPIO_INPUT_HIGH,
+		       pc->gpio + GPIO_IN_SEL(P4_USB_FS_BVALID));
+		writel(GPIO_IN_MATRIX | P4_GPIO_INPUT_HIGH,
+		       pc->gpio + GPIO_IN_SEL(P4_USB_FS_VBUSVALID));
+		return 0;
+	}
 	if (pg->lp)
 		return p4_lp_set_mux(pc, pg);
 

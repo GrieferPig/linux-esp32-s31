@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/espressif,esp32p4-rev1-usb-fs-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ESP32-P4 rev1 USB full-speed internal PHY
+
+maintainers:
+  - GrieferPig <noreply@example.com>
+
+description: |
+  The full-speed OTG controller can select either internal FS/LS PHY.
+  PHY 0 normally belongs to the native USB Serial/JTAG controller.
+  Boards that share connector pins with Serial/JTAG must disable that
+  controller when using the connector for full-speed OTG.
+
+properties:
+  compatible:
+    const: espressif,esp32p4-rev1-usb-fs-phy
+
+  reg:
+    items:
+      - description: USB_WRAP_OTG_CONF
+      - description: LP_CLKRST_HP_USB_CLKRST_CTRL0
+      - description: LP_SYSTEM_USB_CTRL
+
+  reg-names:
+    items:
+      - const: wrap
+      - const: phy-clock
+      - const: phy-route
+
+  clocks:
+    maxItems: 1
+
+  espressif,otg-clkrst:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared LP_CLKRST_HP_USB_CLKRST_CTRL1.
+
+  espressif,phy-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: The internal transceiver wired to the OTG connector.
+
+  espressif,shared-serial-jtag:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Native USB Serial/JTAG controller sharing PHY 0.
+
+  '#phy-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - espressif,otg-clkrst
+  - espressif,phy-index
+  - '#phy-cells'
+
+additionalProperties: false

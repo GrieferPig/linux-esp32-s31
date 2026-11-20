@@ -62,12 +62,12 @@ config PHY_ESP32S31_USB
 	  controller in host mode.
 
 config PHY_ESP32P4_USB
-	bool "Espressif ESP32-P4 rev1 USB2 UTMI PHY"
+	bool "Espressif ESP32-P4 rev1 USB2 PHYs"
 	depends on OF && SOC_ESP32P4
 	select GENERIC_PHY
 	help
-	  Enable the integrated USB2 high-speed UTMI PHY and its
-	  clock and reset glue for the Espressif ESP32-P4 rev1.
+	  Enable the integrated high-speed UTMI and full-speed OTG PHYs
+	  and their clock and reset glue for the Espressif ESP32-P4 rev1.
 
 config PHY_ESPRESSIF_USB
 	def_bool PHY_ESP32S31_USB || PHY_ESP32P4_USB

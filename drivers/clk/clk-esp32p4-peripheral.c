@@ -33,6 +33,9 @@
 #define I2S_CLK17		0x5c
 #define I2S_CLK18		0x60
 #define I2S_CLK19		0x64
+#define UART_CLK_CTRL(port)	(0x68 + 4 * (port))
+/* CLK_SRC_SEL is in the preceding word, alongside UART(n - 1)'s divider. */
+#define UART_CLK_DIV_CTRL(port)	(0x6c + 4 * (port))
 #define TWAI_CLK115		0x7c
 #define GPSPI_CLK116		0x80
 #define GPSPI_CLK117		0x84
@@ -57,6 +60,7 @@
 #define HP_DMA2D_RESET		BIT(31)
 #define SDMMC_SYS_EN		BIT(14)
 #define USB_OTG20_SYS_EN	BIT(16)
+#define USB_OTG11_SYS_EN	BIT(15)
 #define SDIO_HS_MODE		BIT(22)
 #define SDIO_LS_SRC		BIT(23)
 #define SDIO_LS_EN		BIT(24)
@@ -249,6 +253,21 @@ static const struct p4_i2s_layout *p4_i2s_layout(unsigned int id)
 #define LP_FAST_CLK_XTAL	1
 #define LP_SPI_CLOCK_EN		BIT(22)
 #define LP_SPI_RESET_EN		BIT(23)
+/* TRM ch.12 — LP_UART_CLK_SEL, CK_EN_LP_UART and RST_EN_LP_UART. */
+#define LP_UART_CLK_SEL		GENMASK(31, 30)
+#define LP_UART_XTAL_D2		BIT(30)
+#define LP_UART_CLOCK_EN	BIT(29)
+#define LP_UART_RESET_EN	BIT(28)
+
+/* TRM ch.12 — UARTn SYS/APB gates, CLK_SRC_SEL and CORE/APB reset. */
+#define UART_SYS_EN(port)	BIT(18 + (port))
+#define UART_APB_EN(port)	BIT(7 + (port))
+#define UART_CORE_RST(port)	BIT(8 + (port))
+#define UART_APB_RST(port)	BIT(13 + (port))
+#define UART_SCLK_DIV		GENMASK(7, 0)
+#define UART_SCLK_FRAC		GENMASK(23, 8)
+#define UART_SCLK_SRC		GENMASK(25, 24)
+#define UART_SCLK_EN		BIT(26)
 
 /* TRM ch.12 — GPSPI2/3 gates and PERI_CLK_CTRL116/117 source/divider fields. */
 #define GPSPI2_SYS_EN		BIT(0)
@@ -345,6 +364,14 @@ static int p4_clk_enable(struct clk_hw *hw)
 	unsigned long flags;
 	int ret;
 
+	if (clk->id == ESP32P4_CLK_LP_UART) {
+		ret = regmap_update_bits(cc->lpperi, LP_PERI_CLOCK_SEL,
+					 LP_UART_CLK_SEL, LP_UART_XTAL_D2);
+		if (ret)
+			return ret;
+		return regmap_set_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_UART_CLOCK_EN);
+	}
+
 	if (clk->id == ESP32P4_CLK_LP_SPI) {
 		if (FIELD_GET(LP_FAST_CLK_SEL, readl(cc->lp_fast_clksel)) !=
 		    LP_FAST_CLK_XTAL)
@@ -384,6 +411,18 @@ static int p4_clk_enable(struct clk_hw *hw)
 			  FIELD_PREP(GPSPI2_MST_DIV, 1) | GPSPI2_HS_EN |
 			  GPSPI2_MST_EN);
 		break;
+	case ESP32P4_CLK_UART1 ... ESP32P4_CLK_UART4: {
+		unsigned int port = 1 + clk->id - ESP32P4_CLK_UART1;
+		u32 reg = UART_CLK_CTRL(port);
+
+		p4_update(cc, SOC_CLK1, UART_SYS_EN(port), UART_SYS_EN(port));
+		p4_update(cc, SOC_CLK2, UART_APB_EN(port), UART_APB_EN(port));
+		p4_update(cc, reg, UART_SCLK_EN, 0);
+		/* Use XTAL and retain the selected integer divider across opens. */
+		p4_update(cc, UART_CLK_DIV_CTRL(port), UART_SCLK_FRAC, 0);
+		p4_update(cc, reg, UART_SCLK_SRC | UART_SCLK_EN, UART_SCLK_EN);
+		break;
+	}
 	case ESP32P4_CLK_GPSPI3:
 		p4_update(cc, SOC_CLK1, GPSPI3_SYS_EN, GPSPI3_SYS_EN);
 		p4_update(cc, SOC_CLK2, GPSPI3_APB_EN, GPSPI3_APB_EN);
@@ -490,6 +529,10 @@ static int p4_clk_enable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), true);
 		break;
+	case ESP32P4_CLK_USBFS:
+		/* TRM ch.12 — SOC_CLK_CTRL1.USB_OTG11_SYS_CLK_EN. */
+		p4_update(cc, SOC_CLK1, USB_OTG11_SYS_EN, USB_OTG11_SYS_EN);
+		break;
 	case ESP32P4_CLK_USBHS:
 		/* TRM ch.12 Reset and Clock - USB_OTG20_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, USB_OTG20_SYS_EN, USB_OTG20_SYS_EN);
@@ -527,6 +570,13 @@ static void p4_clk_disable(struct clk_hw *hw)
 	struct p4_cc *cc = clk->cc;
 	unsigned long flags;
 	int ret;
+
+	if (clk->id == ESP32P4_CLK_LP_UART) {
+		ret = regmap_clear_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_UART_CLOCK_EN);
+		if (ret)
+			dev_err(cc->reset.dev, "cannot gate LP UART clock: %d\n", ret);
+		return;
+	}
 
 	if (clk->id == ESP32P4_CLK_LP_SPI) {
 		ret = regmap_clear_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_SPI_CLOCK_EN);
@@ -624,6 +674,9 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), false);
 		break;
+	case ESP32P4_CLK_USBFS:
+		p4_update(cc, SOC_CLK1, USB_OTG11_SYS_EN, 0);
+		break;
 	case ESP32P4_CLK_USBHS:
 		p4_update(cc, SOC_CLK1, USB_OTG20_SYS_EN, 0);
 		break;
@@ -632,6 +685,14 @@ static void p4_clk_disable(struct clk_hw *hw)
 		p4_update(cc, SDIO_CLK_SOURCE, SDIO_LS_EN, 0);
 		p4_update(cc, SOC_CLK1, SDMMC_SYS_EN, 0);
 		break;
+	case ESP32P4_CLK_UART1 ... ESP32P4_CLK_UART4: {
+		unsigned int port = 1 + clk->id - ESP32P4_CLK_UART1;
+
+		p4_update(cc, UART_CLK_CTRL(port), UART_SCLK_EN, 0);
+		p4_update(cc, SOC_CLK2, UART_APB_EN(port), 0);
+		p4_update(cc, SOC_CLK1, UART_SYS_EN(port), 0);
+		break;
+	}
 	case ESP32P4_CLK_GPSPI3:
 		p4_update(cc, GPSPI_CLK117, GPSPI3_MST_EN, 0);
 		p4_update(cc, GPSPI_CLK116, GPSPI3_HS_EN, 0);
@@ -654,7 +715,7 @@ static unsigned long p4_clk_rate(struct clk_hw *hw, unsigned long parent_rate)
 	if (clk->id == ESP32P4_CLK_SDMMC)
 		return parent_rate / SDIO_CLOCK_DIV;
 	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_GPSPI3 ||
-	    clk->id == ESP32P4_CLK_LP_I2C)
+	    clk->id == ESP32P4_CLK_LP_I2C || clk->id == ESP32P4_CLK_LP_UART)
 		return parent_rate / 2;
 	return parent_rate;
 }
@@ -663,6 +724,52 @@ static const struct clk_ops p4_clk_ops = {
 	.enable = p4_clk_enable,
 	.disable = p4_clk_disable,
 	.recalc_rate = p4_clk_rate,
+};
+
+static unsigned long p4_uart_rate(struct clk_hw *hw, unsigned long parent)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	unsigned int port = 1 + clk->id - ESP32P4_CLK_UART1;
+	u32 val = readl(clk->cc->base + UART_CLK_DIV_CTRL(port));
+
+	return parent / (FIELD_GET(UART_SCLK_DIV, val) + 1);
+}
+
+static int p4_uart_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
+{
+	unsigned long parent = req->best_parent_rate;
+	unsigned long min_rate = DIV_ROUND_UP(parent, FIELD_MAX(UART_SCLK_DIV) + 1);
+	unsigned long rate = clamp(req->rate, min_rate, parent);
+
+	req->rate = parent / DIV_ROUND_UP(parent, rate);
+	return 0;
+}
+
+static int p4_uart_set_rate(struct clk_hw *hw, unsigned long rate,
+			    unsigned long parent)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	unsigned int port = 1 + clk->id - ESP32P4_CLK_UART1;
+	struct p4_cc *cc = clk->cc;
+	unsigned long flags;
+	unsigned int div = DIV_ROUND_CLOSEST(parent, rate);
+
+	if (!div || div > FIELD_MAX(UART_SCLK_DIV) + 1)
+		return -ERANGE;
+	spin_lock_irqsave(&cc->lock, flags);
+	p4_update(cc, UART_CLK_DIV_CTRL(port), UART_SCLK_DIV | UART_SCLK_FRAC,
+		  FIELD_PREP(UART_SCLK_DIV, div - 1));
+	spin_unlock_irqrestore(&cc->lock, flags);
+
+	return 0;
+}
+
+static const struct clk_ops p4_uart_clk_ops = {
+	.enable = p4_clk_enable,
+	.disable = p4_clk_disable,
+	.recalc_rate = p4_uart_rate,
+	.determine_rate = p4_uart_determine_rate,
+	.set_rate = p4_uart_set_rate,
 };
 
 static unsigned long p4_rmii_rate(struct clk_hw *hw, unsigned long parent)
@@ -802,6 +909,15 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 	u32 reg, bit;
 	int ret;
 
+	if (id == ESP32P4_RST_LP_UART) {
+		if (!cc->lpperi)
+			return -ENODEV;
+		ret = regmap_set_bits(cc->lpperi, LP_PERI_RESET_EN, LP_UART_RESET_EN);
+		if (ret)
+			return ret;
+		return regmap_clear_bits(cc->lpperi, LP_PERI_RESET_EN, LP_UART_RESET_EN);
+	}
+
 	if (id == ESP32P4_RST_LP_SPI) {
 		if (!cc->lpperi)
 			return -ENODEV;
@@ -827,6 +943,13 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST1;
 		bit = I2C1_RST;
 		break;
+	case ESP32P4_RST_UART1 ... ESP32P4_RST_UART4: {
+		unsigned int port = 1 + id - ESP32P4_RST_UART1;
+
+		reg = HP_RST1;
+		bit = UART_CORE_RST(port) | UART_APB_RST(port);
+		break;
+	}
 	case ESP32P4_RST_GPSPI3:
 		reg = HP_RST2;
 		bit = GPSPI3_RST;
@@ -922,6 +1045,9 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-i2s1", "p4-i2s2",
 		"p4-gpspi3",
 		"p4-lp-spi",
+		"p4-uart1", "p4-uart2", "p4-uart3", "p4-uart4",
+		"p4-lp-uart",
+		"p4-usbfs",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -971,9 +1097,11 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		const struct clk_init_data init = {
 			.name = names[i],
 			.ops = i == ESP32P4_CLK_EMAC_RMII ? &p4_rmii_clk_ops :
-			       p4_i2s_layout(i) ? &p4_i2s_clk_ops : &p4_clk_ops,
+			       p4_i2s_layout(i) ? &p4_i2s_clk_ops :
+			       i >= ESP32P4_CLK_UART1 && i <= ESP32P4_CLK_UART4 ?
+			       &p4_uart_clk_ops : &p4_clk_ops,
 			.parent_data = &parent,
-			.num_parents = (i == ESP32P4_CLK_USBHS ||
+			.num_parents = (i == ESP32P4_CLK_USBHS || i == ESP32P4_CLK_USBFS ||
 					i == ESP32P4_CLK_EMAC ||
 					i == ESP32P4_CLK_AHB_GDMA ||
 					i == ESP32P4_CLK_AXI_GDMA ||
@@ -984,7 +1112,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 
 		if (((i == ESP32P4_CLK_SDMMC || i == ESP32P4_CLK_EMAC) &&
 		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->lp_hp_clk) ||
-		    (i == ESP32P4_CLK_LP_I2C && !cc->lpperi) ||
+		    ((i == ESP32P4_CLK_LP_I2C || i == ESP32P4_CLK_LP_UART) && !cc->lpperi) ||
 		    (i == ESP32P4_CLK_LP_SPI && (!cc->lpperi || !cc->lp_fast_clksel))) {
 			data->hws[i] = ERR_PTR(-ENOENT);
 			continue;

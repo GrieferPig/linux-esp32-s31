@@ -25,7 +25,8 @@
 
 #define DRIVER_NAME	"esp32-uart"
 #define DEV_NAME	"ttyS"
-#define UART_NR		4
+/* P4 has five HP UARTs and a separate LP UART. */
+#define UART_NR		(IS_ENABLED(CONFIG_SOC_ESP32P4) ? 6 : 4)
 
 #define ESP32_UART_TX_FIFO_SIZE	127
 #define ESP32_UART_RX_FIFO_SIZE	127
@@ -75,12 +76,10 @@
 #define UART_STATUS_REG			0x1c
 #define ESP32_UART_RXFIFO_CNT			GENMASK(7, 0)
 #define ESP32S3_UART_RXFIFO_CNT			GENMASK(9, 0)
-#define UART_RXFIFO_CNT_SHIFT			0
 #define UART_DSRN				BIT(13)
 #define UART_CTSN				BIT(14)
 #define ESP32_UART_TXFIFO_CNT			GENMASK(23, 16)
 #define ESP32S3_UART_TXFIFO_CNT			GENMASK(25, 16)
-#define UART_TXFIFO_CNT_SHIFT			16
 #define UART_CONF0_REG			0x20
 #define UART_RXFIFO_RST			BIT(22)
 #define UART_TXFIFO_RST			BIT(23)
@@ -104,7 +103,6 @@
 #define UART_RTS_INV				BIT(23)
 #define UART_DTR_INV				BIT(24)
 #define UART_CONF1_REG			0x24
-#define UART_RXFIFO_FULL_THRHD_SHIFT		0
 #define ESP32_UART_TXFIFO_EMPTY_THRHD_SHIFT	8
 #define ESP32S3_UART_TXFIFO_EMPTY_THRHD_SHIFT	10
 #define ESP32_UART_RX_FLOW_EN			BIT(23)
@@ -193,16 +191,28 @@ struct esp32_port {
 #endif
 };
 
+/* P4 TRM ch.46 UART — LP_UART_STATUS FIFO counts and LP_UART_CONF1. */
+#define ESP32P4_LP_RXFIFO_CNT		GENMASK(7, 3)
+#define ESP32P4_LP_TXFIFO_CNT		GENMASK(23, 19)
+#define ESP32P4_LP_RXFIFO_THRHD_SHIFT	3
+#define ESP32P4_LP_TXFIFO_THRHD_SHIFT	11
+#define ESP32P4_LP_FIFO_SIZE		16
+
 struct esp32_uart_variant {
 	u32 clkdiv_mask;
 	u32 rxfifo_cnt_mask;
 	u32 txfifo_cnt_mask;
 	u32 txfifo_empty_thrhd_shift;
 	u32 rx_flow_en;
+	u8 fifo_size;
+	u8 rxfifo_full_thrhd_shift;
+	u8 rx_batch_threshold;
 	u32 rx_flow_reg;
 	const char *type;
 	bool has_clkconf;
+	bool has_ccf_divider;
 	bool needs_reg_update;
+	bool supports_rs485_irda;
 	bool uhci_dma;
 };
 
@@ -236,6 +246,36 @@ static const struct esp32_uart_variant esp32s31_variant = {
 	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
 	.type = "ESP32-S31 UART",
 	.needs_reg_update = true,
+	.supports_rs485_irda = true,
+	.rx_batch_threshold = 32,
+};
+
+static const struct esp32_uart_variant esp32p4_variant = {
+	.clkdiv_mask = ESP32S3_UART_CLKDIV,
+	.rxfifo_cnt_mask = ESP32_UART_RXFIFO_CNT,
+	.txfifo_cnt_mask = ESP32_UART_TXFIFO_CNT,
+	.txfifo_empty_thrhd_shift = ESP32S3_UART_TXFIFO_EMPTY_THRHD_SHIFT,
+	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
+	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
+	.type = "ESP32-P4 UART",
+	.has_ccf_divider = true,
+	.needs_reg_update = true,
+	.supports_rs485_irda = true,
+	.rx_batch_threshold = 32,
+};
+
+static const struct esp32_uart_variant esp32p4_lp_variant = {
+	.clkdiv_mask = ESP32S3_UART_CLKDIV,
+	.rxfifo_cnt_mask = ESP32P4_LP_RXFIFO_CNT,
+	.txfifo_cnt_mask = ESP32P4_LP_TXFIFO_CNT,
+	.txfifo_empty_thrhd_shift = ESP32P4_LP_TXFIFO_THRHD_SHIFT,
+	.rxfifo_full_thrhd_shift = ESP32P4_LP_RXFIFO_THRHD_SHIFT,
+	.rx_flow_en = ESP32S31_UART_RX_FLOW_EN,
+	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
+	.fifo_size = ESP32P4_LP_FIFO_SIZE,
+	.rx_batch_threshold = 4,
+	.type = "ESP32-P4 LP UART",
+	.needs_reg_update = true,
 };
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
@@ -248,6 +288,8 @@ static const struct esp32_uart_variant esp32s31_uhci_variant = {
 	.rx_flow_reg = ESP32S31_UART_HWFC_CONF_REG,
 	.type = "ESP32-S31 UHCI UART",
 	.needs_reg_update = true,
+	.supports_rs485_irda = true,
+	.rx_batch_threshold = 32,
 	.uhci_dma = true,
 };
 #endif
@@ -255,7 +297,10 @@ static const struct esp32_uart_variant esp32s31_uhci_variant = {
 static const struct of_device_id esp32_uart_dt_ids[] = {
 	{
 		.compatible = "espressif,esp32p4-uart",
-		.data = &esp32s31_variant,
+		.data = &esp32p4_variant,
+	}, {
+		.compatible = "espressif,esp32p4-lp-uart",
+		.data = &esp32p4_lp_variant,
 	},
 	{
 		.compatible = "esp,esp32-uart",
@@ -313,18 +358,25 @@ static void esp32_uart_update(struct uart_port *port)
 	esp32_uart_sync_regs(port);
 }
 
+static unsigned int esp32_uart_fifo_size(struct uart_port *port)
+{
+	return port_variant(port)->fifo_size ?: ESP32_UART_TX_FIFO_SIZE;
+}
+
 static u32 esp32_uart_tx_fifo_cnt(struct uart_port *port)
 {
 	u32 status = esp32_uart_read(port, UART_STATUS_REG);
+	u32 mask = port_variant(port)->txfifo_cnt_mask;
 
-	return (status & port_variant(port)->txfifo_cnt_mask) >> UART_TXFIFO_CNT_SHIFT;
+	return (status & mask) >> __ffs(mask);
 }
 
 static u32 esp32_uart_rx_fifo_cnt(struct uart_port *port)
 {
 	u32 status = esp32_uart_read(port, UART_STATUS_REG);
+	u32 mask = port_variant(port)->rxfifo_cnt_mask;
 
-	return (status & port_variant(port)->rxfifo_cnt_mask) >> UART_RXFIFO_CNT_SHIFT;
+	return (status & mask) >> __ffs(mask);
 }
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
@@ -787,7 +839,7 @@ static void esp32_uart_put_char_sync(struct uart_port *port, u8 c)
 {
 	unsigned long timeout = jiffies + HZ;
 
-	while (esp32_uart_tx_fifo_cnt(port) >= ESP32_UART_TX_FIFO_SIZE) {
+	while (esp32_uart_tx_fifo_cnt(port) >= esp32_uart_fifo_size(port)) {
 		if (time_after(jiffies, timeout)) {
 			dev_warn(port->dev, "timeout waiting for TX FIFO\n");
 			return;
@@ -803,11 +855,11 @@ static void esp32_uart_transmit_buffer(struct uart_port *port)
 	unsigned int pending;
 	u8 ch;
 
-	if (tx_fifo_used >= ESP32_UART_TX_FIFO_SIZE)
+	if (tx_fifo_used >= esp32_uart_fifo_size(port))
 		return;
 
 	pending = uart_port_tx_limited(port, ch,
-				       ESP32_UART_TX_FIFO_SIZE - tx_fifo_used,
+				       esp32_uart_fifo_size(port) - tx_fifo_used,
 				       true, esp32_uart_put_char(port, ch),
 				       ({}));
 	if (pending) {
@@ -936,12 +988,10 @@ static int esp32_uart_startup(struct uart_port *port)
 	if (port_variant(port)->needs_reg_update) {
 		u32 tout = esp32_uart_read(port, ESP32S31_UART_TOUT_CONF_REG);
 
-		/* Batch a continuous stream rather than interrupting per byte.
-		 * S31's timeout is in bit periods: two idle 8N1 characters flush
-		 * a short batch, including a single console keystroke. A 32-byte
-		 * threshold leaves 96 bytes of FIFO headroom for IRQ latency.
+		/* Two idle 8N1 characters flush a short batch. Keep most of
+		 * each variant's FIFO available for interrupt latency.
 		 */
-		rx_threshold = 32;
+		rx_threshold = port_variant(port)->rx_batch_threshold;
 		rx_interrupts |= UART_RXFIFO_TOUT_INT;
 		tout &= ~ESP32S31_UART_RX_TOUT_THRHD;
 		tout |= FIELD_PREP(ESP32S31_UART_RX_TOUT_THRHD, 20) |
@@ -949,7 +999,7 @@ static int esp32_uart_startup(struct uart_port *port)
 		esp32_uart_write(port, ESP32S31_UART_TOUT_CONF_REG, tout);
 	}
 	esp32_uart_write(port, UART_CONF1_REG,
-			 (rx_threshold << UART_RXFIFO_FULL_THRHD_SHIFT) |
+			 (rx_threshold << port_variant(port)->rxfifo_full_thrhd_shift) |
 			 (1 << port_variant(port)->txfifo_empty_thrhd_shift));
 	esp32_uart_sync_regs(port);	/* latch the RX-FIFO-full threshold */
 	esp32_uart_write(port, UART_INT_CLR_REG, rx_interrupts);
@@ -1019,13 +1069,45 @@ static bool esp32_uart_set_baud(struct uart_port *port, u32 baud)
 	return false;
 }
 
+/*
+ * P4 TRM ch.12 and ch.46 — HP_SYS_CLKRST_UARTn_SCLK_DIV_NUM precedes the
+ * UART core's 12-bit integer and 4-bit fractional baud-rate divider.
+ */
+static int esp32_uart_ccf_baud(struct uart_port *port, struct ktermios *termios,
+			      const struct ktermios *old, u32 *sclk, u32 *baud)
+{
+	struct esp32_port *sport = container_of(port, struct esp32_port, port);
+	u32 max_div = port_variant(port)->clkdiv_mask;
+	long min = clk_round_rate(sport->clk, 1);
+	long max = clk_round_rate(sport->clk, ULONG_MAX);
+	unsigned long rate;
+	int ret;
+
+	if (min <= 0 || max < min)
+		return -ERANGE;
+
+	*baud = uart_get_baud_rate(port, termios, old, DIV_ROUND_UP(min, max_div),
+				  max / 16);
+	if (!*baud)
+		return 0;
+
+	/* Choose the fastest available clock that fits the UART divider. */
+	rate = min_t(u64, (u64)*baud * max_div, max);
+	ret = clk_set_rate(sport->clk, rate);
+	if (ret)
+		return ret;
+	*sclk = clk_get_rate(sport->clk);
+	return 0;
+}
+
 static void esp32_uart_set_termios(struct uart_port *port,
 				   struct ktermios *termios,
 				   const struct ktermios *old)
 {
 	unsigned long flags;
 	u32 conf0, flow_conf;
-	u32 baud;
+	u32 baud, sclk = port->uartclk;
+	int ret;
 	const u32 rx_flow_en = port_variant(port)->rx_flow_en;
 	const u32 rx_flow_reg = port_variant(port)->rx_flow_reg;
 	u32 max_div = port_variant(port)->clkdiv_mask;
@@ -1035,15 +1117,26 @@ static void esp32_uart_set_termios(struct uart_port *port,
 	if (port_variant(port)->has_clkconf)
 		max_div *= FIELD_MAX(ESP32S3_UART_SCLK_DIV_NUM);
 
-	baud = uart_get_baud_rate(port, termios, old,
-				  port->uartclk / max_div,
-				  port->uartclk / 16);
+	if (port_variant(port)->has_ccf_divider) {
+		ret = esp32_uart_ccf_baud(port, termios, old, &sclk, &baud);
+		if (ret) {
+			if (old)
+				tty_termios_copy_hw(termios, old);
+			dev_err(port->dev, "cannot configure UART clock: %d\n", ret);
+			return;
+		}
+	} else {
+		baud = uart_get_baud_rate(port, termios, old,
+					  port->uartclk / max_div,
+					  port->uartclk / 16);
+	}
 
 	spin_lock_irqsave(&port->lock, flags);
+	port->uartclk = sclk;
 
 	conf0 = esp32_uart_read(port, UART_CONF0_REG);
 	conf0 &= ~(UART_PARITY_EN | UART_PARITY | UART_BIT_NUM | UART_STOP_BIT_NUM);
-	if (port_variant(port)->needs_reg_update) {
+	if (port_variant(port)->supports_rs485_irda) {
 		conf0 &= ~ESP32S31_UART_IRDA_EN;
 		if (container_of(port, struct esp32_port, port)->irda_mode &&
 		    !(port->rs485.flags & SER_RS485_ENABLED))
@@ -1488,9 +1581,9 @@ static int esp32_uart_probe(struct platform_device *pdev)
 	port->ops = &esp32_uart_pops;
 	port->flags = UPF_BOOT_AUTOCONF;
 	port->has_sysrq = 1;
-	port->fifosize = ESP32_UART_TX_FIFO_SIZE;
 	port->private_data = (void *)variant;
-	if (variant->needs_reg_update) {
+	port->fifosize = esp32_uart_fifo_size(port);
+	if (variant->supports_rs485_irda) {
 		sport->irda_mode = device_property_read_bool(&pdev->dev,
 						       "espressif,irda-mode");
 		port->rs485_config = esp32s31_uart_rs485_config;

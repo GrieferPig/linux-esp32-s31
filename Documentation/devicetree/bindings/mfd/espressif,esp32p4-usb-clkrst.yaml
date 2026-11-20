@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mfd/espressif,esp32p4-usb-clkrst.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ESP32-P4 shared USB OTG clock and reset register
+
+maintainers:
+  - GrieferPig <noreply@example.com>
+
+properties:
+  compatible:
+    items:
+      - const: espressif,esp32p4-usb-clkrst
+      - const: syscon
+
+  reg:
+    maxItems: 1
+    description: LP_CLKRST_HP_USB_CLKRST_CTRL1.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

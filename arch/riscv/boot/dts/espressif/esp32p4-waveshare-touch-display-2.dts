@@ -3,6 +3,7 @@
 #include "esp32p4-hardware.dts"
 #include "esp32p4-waveshare-peripheral-pins.dtsi"
 #include "esp32p4-waveshare-gpspi.dtsi"
+#include "esp32p4-waveshare-uart.dtsi"
 
 / {
 	model = "Waveshare ESP32-P4-WIFI6-DEV-KIT with 5-inch Raspberry Pi Touch Display 2";
@@ -13,6 +14,7 @@
 	aliases {
 		i2c1 = &i2c1;
 		spi4 = &lp_spi;
+		serial5 = &lp_uart;
 		mmc0 = &sd_slot;
 		mmc1 = &c6_slot;
 		ethernet0 = &emac;
@@ -166,6 +168,14 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		function = "lp-i2c";
 	};
 
+	pins_usbfs_device: usbfs-device-pins {
+		function = "usbfs-device";
+	};
+
+	pins_lp_uart: lp-uart-pins {
+		function = "lp-uart";
+	};
+
 	pins_lp_spi: lp-spi-pins {
 		function = "lp-spi";
 	};
@@ -200,8 +210,9 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	/* TRM ch.54 USB 2.0 High-Speed OTG - UTMI PHY and host controller. */
 	usb_phy: phy@5009c000 {
 		compatible = "espressif,esp32p4-rev1-usb-phy";
-		reg = <0x5009c000 0x20>, <0x50111048 0x4>, <0x500e515c 0x4>;
-		reg-names = "utmi", "otg-ctrl", "phy-ctrl";
+		reg = <0x5009c000 0x20>, <0x500e515c 0x4>;
+		reg-names = "utmi", "phy-ctrl";
+		espressif,otg-clkrst = <&usb_clkrst>;
 		clocks = <&periphclk ESP32P4_CLK_USBHS>;
 		#phy-cells = <0>;
 	};
@@ -214,6 +225,43 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		phys = <&usb_phy>;
 		phy-names = "usb2-phy";
 		dr_mode = "host";
+	};
+
+	/* TRM ch.12 — FS/HS resets share LP_CLKRST_HP_USB_CLKRST_CTRL1. */
+	usb_clkrst: syscon@50111048 {
+		compatible = "espressif,esp32p4-usb-clkrst", "syscon";
+		reg = <0x50111048 0x4>;
+	};
+
+	/* TRM ch.55 USB Full-Speed OTG — internal PHY 0 on the debug connector. */
+	usbfs_phy: phy@50080000 {
+		compatible = "espressif,esp32p4-rev1-usb-fs-phy";
+		reg = <0x50080000 0x4>, <0x50111044 0x4>, <0x50110100 0x4>;
+		reg-names = "wrap", "phy-clock", "phy-route";
+		clocks = <&periphclk ESP32P4_CLK_USBFS>;
+		espressif,otg-clkrst = <&usb_clkrst>;
+		espressif,phy-index = <0>;
+		espressif,shared-serial-jtag = <&usb_serial_jtag>;
+		#phy-cells = <0>;
+		status = "disabled";
+	};
+
+	usb@50040000 {
+		compatible = "espressif,esp32p4-fs-dwc2";
+		reg = <0x50040000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <103 4>;
+		phys = <&usbfs_phy>;
+		phy-names = "usb2-phy";
+		maximum-speed = "full-speed";
+		dr_mode = "peripheral";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_usbfs_device>;
+		/* TRM ch.55 GHWCFG3.DFIFO_DEPTH reports 200 words on rev1.3. */
+		g-rx-fifo-size = <64>;
+		g-np-tx-fifo-size = <16>;
+		g-tx-fifo-size = <32 32 16 16>;
+		status = "disabled";
 	};
 
 	/* TRM ch.10 eFuse Controller - RD_MAC_SYS0 through RD_MAC_SYS1. */
@@ -525,6 +573,19 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		resets = <&periphclk ESP32P4_RST_PCNT>;
 		pinctrl-0 = <&pins_pcnt0>;
 		pinctrl-names = "default";
+	};
+
+	/* TRM ch.46 UART Controller — LP UART at 0x50121000. */
+	lp_uart: serial@50121000 {
+		compatible = "espressif,esp32p4-lp-uart";
+		reg = <0x50121000 0x100>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <16 4>;
+		clocks = <&periphclk ESP32P4_CLK_LP_UART>;
+		resets = <&periphclk ESP32P4_RST_LP_UART>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_lp_uart>;
+		status = "disabled";
 	};
 
 	/* TRM ch.47 SPI Controller — LP SPI with a single native CS. */

@@ -93,6 +93,14 @@ static void dwc2_set_esp32p4_params(struct dwc2_hsotg *hsotg)
 	p->host_perio_tx_fifo_size = 128;
 }
 
+static void dwc2_set_esp32p4_fs_params(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_core_params *p = &hsotg->params;
+
+	p->phy_type = DWC2_PHY_TYPE_PARAM_FS;
+	p->speed = DWC2_SPEED_PARAM_FULL;
+}
+
 static void dwc2_set_jz4775_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -354,6 +362,8 @@ const struct of_device_id dwc2_of_match_table[] = {
 	  .data = dwc2_set_esp32s31_params },
 	{ .compatible = "espressif,esp32p4-dwc2",
 	  .data = dwc2_set_esp32p4_params },
+	{ .compatible = "espressif,esp32p4-fs-dwc2",
+	  .data = dwc2_set_esp32p4_fs_params },
 	{ .compatible = "hisilicon,hi6220-usb", .data = dwc2_set_his_params },
 	{ .compatible = "ingenic,jz4775-otg", .data = dwc2_set_jz4775_params },
 	{ .compatible = "ingenic,jz4780-otg", .data = dwc2_set_jz4775_params },

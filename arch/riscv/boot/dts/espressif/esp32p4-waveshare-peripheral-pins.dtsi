@@ -100,6 +100,22 @@
 			function = "twai2-loopback";
 		};
 
+		pins_uart1: uart1-pins {
+			function = "uart1";
+		};
+
+		pins_uart2: uart2-pins {
+			function = "uart2";
+		};
+
+		pins_uart3: uart3-pins {
+			function = "uart3";
+		};
+
+		pins_uart4: uart4-pins {
+			function = "uart4";
+		};
+
 		pins_gpspi2: gpspi2-pins {
 			function = "gpspi2";
 		};

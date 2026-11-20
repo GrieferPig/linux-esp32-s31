@@ -34,7 +34,9 @@ allOf:
           compatible:
             not:
               contains:
-                const: espressif,esp32p4-dwc2
+                enum:
+                  - espressif,esp32p4-dwc2
+                  - espressif,esp32p4-fs-dwc2
       then:
         required:
           - clocks
@@ -47,6 +49,7 @@ properties:
           - const: espressif,esp32s31-dwc2
           - const: snps,dwc2
       - const: espressif,esp32p4-dwc2
+      - const: espressif,esp32p4-fs-dwc2
       - const: brcm,bcm2835-usb
       - const: hisilicon,hi6220-usb
       - const: ingenic,jz4775-otg
