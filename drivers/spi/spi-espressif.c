@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* ESP32-S31 GPSPI2/GPSPI3 host and target driver. */
+/* Espressif ESP32-S31 and ESP32-P4 GPSPI2/GPSPI3 driver. */
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
@@ -82,6 +82,11 @@
 #define S31_SPI_CLK_GATE		0xe8
 #define S31_SPI_W0		0x98
 
+/* ESP32-P4 TRM ch.47 SPI — LP_SPI_CTRL bit order and single native CS. */
+#define LP_SPI_CTRL_RD_LSB	BIT(25)
+#define LP_SPI_CTRL_WR_LSB	BIT(26)
+#define LP_SPI_CS0_DISABLE	BIT(0)
+
 struct esp32s31_spi {
 	struct device *dev;
 	void __iomem *base;
@@ -100,6 +105,7 @@ struct esp32s31_spi {
 	u32 gpio_cs_drive_strength;
 	int irq;
 	bool target;
+	bool low_power;
 	bool target_aborted;
 };
 
@@ -627,6 +633,8 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 				     struct spi_transfer *xfer)
 {
 	struct esp32s31_spi *s = spi_controller_get_devdata(ctlr);
+	const u32 fifo_conf = s->low_power ? 0 : (S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
+						 S31_SPI_SLV_TX_SEG_TRANS_CLR_EN);
 	u32 ctrl, user, misc;
 	u32 cs = spi_get_chipselect(spi, 0);
 	bool gpio_cs = spi_get_csgpiod(spi, 0);
@@ -647,18 +655,24 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 					xfer->speed_hz ?: spi->max_speed_hz);
 
 	ctrl = readl(s->base + S31_SPI_CTRL);
-	ctrl &= ~(S31_SPI_CTRL_RD_LSB | S31_SPI_CTRL_WR_LSB |
-		  S31_SPI_CTRL_FREAD_DUAL | S31_SPI_CTRL_FREAD_QUAD |
-		  S31_SPI_CTRL_FREAD_OCT | S31_SPI_CTRL_DATA_IDLE);
-	if (spi->mode & SPI_LSB_FIRST)
-		ctrl |= FIELD_PREP(S31_SPI_CTRL_RD_LSB, 1) |
-			FIELD_PREP(S31_SPI_CTRL_WR_LSB, 1);
-	if (xfer->rx_nbits == 2)
-		ctrl |= S31_SPI_CTRL_FREAD_DUAL;
-	else if (xfer->rx_nbits == 4)
-		ctrl |= S31_SPI_CTRL_FREAD_QUAD;
-	else if (xfer->rx_nbits == 8)
-		ctrl |= S31_SPI_CTRL_FREAD_OCT;
+	if (s->low_power) {
+		ctrl &= ~(LP_SPI_CTRL_RD_LSB | LP_SPI_CTRL_WR_LSB);
+		if (spi->mode & SPI_LSB_FIRST)
+			ctrl |= LP_SPI_CTRL_RD_LSB | LP_SPI_CTRL_WR_LSB;
+	} else {
+		ctrl &= ~(S31_SPI_CTRL_RD_LSB | S31_SPI_CTRL_WR_LSB |
+			  S31_SPI_CTRL_FREAD_DUAL | S31_SPI_CTRL_FREAD_QUAD |
+			  S31_SPI_CTRL_FREAD_OCT | S31_SPI_CTRL_DATA_IDLE);
+		if (spi->mode & SPI_LSB_FIRST)
+			ctrl |= FIELD_PREP(S31_SPI_CTRL_RD_LSB, 1) |
+				FIELD_PREP(S31_SPI_CTRL_WR_LSB, 1);
+		if (xfer->rx_nbits == 2)
+			ctrl |= S31_SPI_CTRL_FREAD_DUAL;
+		else if (xfer->rx_nbits == 4)
+			ctrl |= S31_SPI_CTRL_FREAD_QUAD;
+		else if (xfer->rx_nbits == 8)
+			ctrl |= S31_SPI_CTRL_FREAD_OCT;
+	}
 	writel(ctrl, s->base + S31_SPI_CTRL);
 
 	user = S31_SPI_CS_HOLD;
@@ -698,7 +712,7 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 	 * prepare/data/done timing even when gpiolib drives the physical CS.  Use
 	 * the last native CS, which this pinctrl state never routes to a pad.
 	 */
-	misc = S31_SPI_CS_DIS_MASK &
+	misc = (s->low_power ? LP_SPI_CS0_DISABLE : S31_SPI_CS_DIS_MASK) &
 		~BIT(gpio_cs ? ctlr->num_chipselect - 1 : cs);
 	if (!gpio_cs && (spi->mode & SPI_CS_HIGH))
 		misc |= BIT(cs + 7);
@@ -720,14 +734,10 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 		writel(misc | (keep_active ? S31_SPI_CS_KEEP_ACTIVE : 0),
 		       s->base + S31_SPI_MISC);
 		writel(chunk * 8 - 1, s->base + S31_SPI_MS_DLEN);
-		/* Reset the CPU-controlled TX/RX FIFOs before refilling them. */
-		writel(S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
-		       S31_SPI_SLV_TX_SEG_TRANS_CLR_EN |
-		       S31_SPI_RX_AFIFO_RST | S31_SPI_BUF_AFIFO_RST,
+		/* LP-SPI has the CPU FIFOs without the GDMA segment controls. */
+		writel(fifo_conf | S31_SPI_RX_AFIFO_RST | S31_SPI_BUF_AFIFO_RST,
 		       s->base + S31_SPI_DMA_CONF);
-		writel(S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
-		       S31_SPI_SLV_TX_SEG_TRANS_CLR_EN,
-		       s->base + S31_SPI_DMA_CONF);
+		writel(fifo_conf, s->base + S31_SPI_DMA_CONF);
 		if (xfer->tx_buf) {
 			const u8 *tx = xfer->tx_buf;
 
@@ -789,11 +799,13 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	struct reset_control *rst;
 	struct resource *res;
 	u32 num_chipselect = 3;
-	bool p4_native, target;
+	bool p4_native, low_power, target;
 	int irq, ret;
 
-	p4_native = of_device_is_compatible(pdev->dev.of_node,
-					    "espressif,esp32p4-rev1-gpspi");
+	low_power = of_device_is_compatible(pdev->dev.of_node,
+					    "espressif,esp32p4-rev1-lp-spi");
+	p4_native = low_power || of_device_is_compatible(pdev->dev.of_node,
+							 "espressif,esp32p4-rev1-gpspi");
 	target = device_property_read_bool(&pdev->dev, "spi-slave");
 	if (p4_native &&
 	    (target || device_property_present(&pdev->dev, "dmas") ||
@@ -801,7 +813,7 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	     !IS_ENABLED(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) ||
 	     !of_find_property(pdev->dev.of_node, "pinctrl-0", NULL)))
 		return dev_err_probe(&pdev->dev, -EINVAL,
-				     "P4 GPSPI2 requires native CS, pinctrl and PIO master mode\n");
+				     "P4 GPSPI requires native CS, pinctrl and PIO master mode\n");
 	if (target)
 		ctlr = devm_spi_alloc_target(&pdev->dev, sizeof(*s));
 	else
@@ -812,6 +824,7 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	s = spi_controller_get_devdata(ctlr);
 	s->dev = &pdev->dev;
 	s->target = target;
+	s->low_power = low_power;
 	s->max_data_lines = 4;
 	device_property_read_u32(&pdev->dev, "espressif,max-data-lines",
 				 &s->max_data_lines);
@@ -826,8 +839,13 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
 		return -ENODEV;
-	if (p4_native && (res->start != 0x500d0000 || resource_size(res) < 0xfc))
-		return dev_err_probe(&pdev->dev, -EINVAL, "invalid P4 GPSPI2 resource\n");
+	/* P4 TRM ch.9 System and Memory and ch.47 SPI Controller — SPI2/3. */
+	if (low_power && (res->start != 0x50123000 || resource_size(res) < 0xfc))
+		return dev_err_probe(&pdev->dev, -EINVAL, "invalid P4 LP-SPI resource\n");
+	if (p4_native && !low_power &&
+	    ((res->start != 0x500d0000 && res->start != 0x500d1000) ||
+	     resource_size(res) < 0xfc))
+		return dev_err_probe(&pdev->dev, -EINVAL, "invalid P4 GPSPI resource\n");
 	s->fifo_addr = res->start + S31_SPI_W0;
 	s->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(s->base))
@@ -906,11 +924,12 @@ init_fifo:
 	       ~S31_SPI_MST_WFULL_ERR_END_EN, s->base + S31_SPI_USER1);
 	writel(readl(s->base + S31_SPI_USER2) &
 	       ~S31_SPI_MST_REMPTY_ERR_END_EN, s->base + S31_SPI_USER2);
-	writel(target ? 0 : (S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
+	writel((target || low_power) ? 0 : (S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
 			      S31_SPI_SLV_TX_SEG_TRANS_CLR_EN),
 	       s->base + S31_SPI_DMA_CONF);
-	/* The clock provider owns the GPSPI HS/MST clock path. */
-	writel(0, s->base + S31_SPI_CLK_GATE);
+	/* The clock provider owns the clock path. */
+	if (!low_power)
+		writel(0, s->base + S31_SPI_CLK_GATE);
 
 	ctlr->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST |
 			  SPI_TX_DUAL | SPI_RX_DUAL | SPI_TX_QUAD | SPI_RX_QUAD;
@@ -949,6 +968,7 @@ init_fifo:
 static const struct of_device_id esp32s31_spi_of_match[] = {
 	{ .compatible = "espressif,esp32s31-gpspi" },
 	{ .compatible = "espressif,esp32p4-rev1-gpspi" },
+	{ .compatible = "espressif,esp32p4-rev1-lp-spi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_spi_of_match);

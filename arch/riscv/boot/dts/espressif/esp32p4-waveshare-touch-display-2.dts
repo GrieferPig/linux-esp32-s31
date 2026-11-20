@@ -2,6 +2,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include "esp32p4-hardware.dts"
 #include "esp32p4-waveshare-peripheral-pins.dtsi"
+#include "esp32p4-waveshare-gpspi.dtsi"
 
 / {
 	model = "Waveshare ESP32-P4-WIFI6-DEV-KIT with 5-inch Raspberry Pi Touch Display 2";
@@ -11,6 +12,7 @@
 
 	aliases {
 		i2c1 = &i2c1;
+		spi4 = &lp_spi;
 		mmc0 = &sd_slot;
 		mmc1 = &c6_slot;
 		ethernet0 = &emac;
@@ -164,6 +166,10 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		function = "lp-i2c";
 	};
 
+	pins_lp_spi: lp-spi-pins {
+		function = "lp-spi";
+	};
+
 	pins_adc1_header: adc1-header-pins {
 		function = "adc1-header";
 	};
@@ -177,7 +183,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 &periphclk {
 	espressif,lpperi = <&lpperi>;
 	reg = <0x500e6000 0x100>, <0x5011104c 0x4>,
-	      <0x50111040 0x4>, <0x500e514c 0x4>;
+	      <0x50111040 0x4>, <0x500e514c 0x4>, <0x50111000 0x4>;
 	clocks = <&xtal>, <&pll_f160m>, <&rmii_ref>;
 };
 
@@ -521,6 +527,22 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		pinctrl-names = "default";
 	};
 
+	/* TRM ch.47 SPI Controller — LP SPI with a single native CS. */
+	lp_spi: spi@50123000 {
+		compatible = "espressif,esp32p4-rev1-lp-spi";
+		reg = <0x50123000 0x100>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <13 4>;
+		clocks = <&periphclk ESP32P4_CLK_LP_SPI>;
+		resets = <&periphclk ESP32P4_RST_LP_SPI>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_lp_spi>;
+		num-cs = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
 	/* TRM ch.51 I2S Controller and ch.6 GDMA - I2S0 request 3. */
 	i2s0: i2s@500c6000 {
 		compatible = "espressif,esp32p4-i2s";
@@ -533,6 +555,36 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		pinctrl-names = "default";
 		#sound-dai-cells = <0>;
 		espressif,external-card;
+	};
+
+	/* TRM ch.51 I2S and ch.6 GDMA — I2S1 trigger 4. */
+	i2s1: i2s@500c7000 {
+		compatible = "espressif,esp32p4-i2s";
+		reg = <0x500c7000 0x1000>;
+		clocks = <&periphclk ESP32P4_CLK_I2S1>;
+		resets = <&periphclk ESP32P4_RST_I2S1>;
+		dmas = <&ahb_dma 1 4>, <&ahb_dma 0 4>;
+		dma-names = "tx", "rx";
+		pinctrl-0 = <&pins_i2s1>;
+		pinctrl-names = "default";
+		#sound-dai-cells = <0>;
+		espressif,external-card;
+		status = "disabled";
+	};
+
+	/* TRM ch.51 I2S and ch.6 GDMA — I2S2 trigger 5. */
+	i2s2: i2s@500c8000 {
+		compatible = "espressif,esp32p4-i2s";
+		reg = <0x500c8000 0x1000>;
+		clocks = <&periphclk ESP32P4_CLK_I2S2>;
+		resets = <&periphclk ESP32P4_RST_I2S2>;
+		dmas = <&ahb_dma 1 5>, <&ahb_dma 0 5>;
+		dma-names = "tx", "rx";
+		pinctrl-0 = <&pins_i2s2>;
+		pinctrl-names = "default";
+		#sound-dai-cells = <0>;
+		espressif,external-card;
+		status = "disabled";
 	};
 
 	/* TRM ch.59 SD/MMC Host Controller - dedicated IOMUX slot 0. */

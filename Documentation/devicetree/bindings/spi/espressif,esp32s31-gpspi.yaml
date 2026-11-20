@@ -13,7 +13,7 @@ description: |
   The S31 controller can switch between host and target through runtime overlays.
   Target mode keeps the base tree's address-cell count; changing it on a live
   node is rejected by OF overlay. The target child has no reg property.
-  ESP32-P4 rev1 GPSPI2 supports single-bit PIO master mode and native CS0 in
+  ESP32-P4 rev1 GPSPI2, GPSPI3 and LP-SPI support single-bit PIO master mode and native CS0 in
   this binding. Flash/PSRAM peripherals are not described by this binding.
 
 allOf:
@@ -21,7 +21,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: espressif,esp32p4-rev1-gpspi
+          enum:
+            - espressif,esp32p4-rev1-gpspi
+            - espressif,esp32p4-rev1-lp-spi
     then:
       properties:
         dmas: false
@@ -42,6 +44,7 @@ properties:
     enum:
       - espressif,esp32s31-gpspi
       - espressif,esp32p4-rev1-gpspi
+      - espressif,esp32p4-rev1-lp-spi
 
   reg:
     maxItems: 1

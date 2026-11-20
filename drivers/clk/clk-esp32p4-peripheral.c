@@ -28,8 +28,14 @@
 #define I2S_CLK12		0x48
 #define I2S_CLK13		0x4c
 #define I2S_CLK14		0x50
+#define I2S_CLK15		0x54
+#define I2S_CLK16		0x58
+#define I2S_CLK17		0x5c
+#define I2S_CLK18		0x60
+#define I2S_CLK19		0x64
 #define TWAI_CLK115		0x7c
 #define GPSPI_CLK116		0x80
+#define GPSPI_CLK117		0x84
 #define TIMER_CLK20		0x94
 #define TIMER_CLK21		0x98
 #define LEDC_CLK22		0x9c
@@ -127,25 +133,79 @@
 #define LEDC_CLK_EN		BIT(2)
 #define LEDC_RESET		BIT(29)
 
-/* TRM ch.12 Reset and Clock - I2S0 RX/TX_CLK_SRC_SEL, DIV_X/Y/Z/N. */
-#define I2S0_APB_EN		BIT(14)
-#define I2S0_APB_RESET		BIT(4)
-#define I2S_RX_EN		BIT(24)
-#define I2S_RX_SRC		GENMASK(26, 25)
-#define I2S_RX_N		GENMASK(7, 0)
-#define I2S_RX_X		GENMASK(16, 8)
-#define I2S_RX_Y		GENMASK(25, 17)
-#define I2S_RX_Z		GENMASK(8, 0)
-#define I2S_RX_YN1		BIT(9)
-#define I2S_TX_EN		BIT(10)
-#define I2S_TX_SRC		GENMASK(12, 11)
-#define I2S_TX_N		GENMASK(20, 13)
-#define I2S_TX_X		GENMASK(29, 21)
-#define I2S_TX_Y		GENMASK(8, 0)
-#define I2S_TX_Z		GENMASK(17, 9)
-#define I2S_TX_YN1		BIT(18)
-#define I2S_MCLK_TX		BIT(19)
+/* TRM ch.12 Reset and Clock — I2S<n> APB gates and PERI_CLK_CTRL11–19. */
+#define I2S_APB_EN(port)	BIT(14 + (port))
+#define I2S_APB_RESET(port)	BIT(4 + (port))
+#define I2S_PAD_MCLK_EN(port)	BIT(12 - (port))
 #define I2S_DIV_MAX		511
+
+struct p4_i2s_field {
+	u8 reg;
+	u8 shift;
+};
+
+struct p4_i2s_div {
+	struct p4_i2s_field gate;
+	struct p4_i2s_field n;
+	struct p4_i2s_field x;
+	struct p4_i2s_field y;
+	struct p4_i2s_field z;
+	struct p4_i2s_field yn1;
+};
+
+struct p4_i2s_layout {
+	struct p4_i2s_div rx;
+	struct p4_i2s_div tx;
+	struct p4_i2s_field mclk;
+	unsigned int port;
+};
+
+static const struct p4_i2s_layout p4_i2s_layouts[] = {
+	[0] = {
+		.rx = { .gate = { I2C_I2S_CLK11, 24 }, .n = { I2S_CLK12, 0 },
+			.x = { I2S_CLK12, 8 }, .y = { I2S_CLK12, 17 },
+			.z = { I2S_CLK13, 0 }, .yn1 = { I2S_CLK13, 9 } },
+		.tx = { .gate = { I2S_CLK13, 10 }, .n = { I2S_CLK13, 13 },
+			.x = { I2S_CLK13, 21 }, .y = { I2S_CLK14, 0 },
+			.z = { I2S_CLK14, 9 }, .yn1 = { I2S_CLK14, 18 } },
+		.mclk = { I2S_CLK14, 19 },
+		.port = 0,
+	},
+	[1] = {
+		.rx = { .gate = { I2S_CLK14, 20 }, .n = { I2S_CLK14, 23 },
+			.x = { I2S_CLK15, 0 }, .y = { I2S_CLK15, 9 },
+			.z = { I2S_CLK15, 18 }, .yn1 = { I2S_CLK15, 27 } },
+		.tx = { .gate = { I2S_CLK15, 28 }, .n = { I2S_CLK16, 0 },
+			.x = { I2S_CLK16, 8 }, .y = { I2S_CLK16, 17 },
+			.z = { I2S_CLK17, 0 }, .yn1 = { I2S_CLK17, 9 } },
+		.mclk = { I2S_CLK17, 10 },
+		.port = 1,
+	},
+	[2] = {
+		.rx = { .gate = { I2S_CLK17, 11 }, .n = { I2S_CLK17, 14 },
+			.x = { I2S_CLK17, 22 }, .y = { I2S_CLK18, 0 },
+			.z = { I2S_CLK18, 9 }, .yn1 = { I2S_CLK18, 18 } },
+		.tx = { .gate = { I2S_CLK18, 19 }, .n = { I2S_CLK18, 22 },
+			.x = { I2S_CLK19, 0 }, .y = { I2S_CLK19, 9 },
+			.z = { I2S_CLK19, 18 }, .yn1 = { I2S_CLK19, 27 } },
+		.mclk = { I2S_CLK19, 28 },
+		.port = 2,
+	},
+};
+
+static const struct p4_i2s_layout *p4_i2s_layout(unsigned int id)
+{
+	switch (id) {
+	case ESP32P4_CLK_I2S0:
+		return &p4_i2s_layouts[0];
+	case ESP32P4_CLK_I2S1:
+		return &p4_i2s_layouts[1];
+	case ESP32P4_CLK_I2S2:
+		return &p4_i2s_layouts[2];
+	default:
+		return NULL;
+	}
+}
 
 /* TRM ch.12 Reset and Clock - TIMERGRP<n>_T<m>_SRC_SEL and CLK_EN. */
 #define GPTIMER0_SRC		(GENMASK(23, 22) | GENMASK(26, 25))
@@ -184,7 +244,13 @@
 #define LP_I2C_CLK_SEL_MASK	GENMASK(29, 28)
 #define LP_I2C_CLOCK_EN		BIT(28)
 #define LP_I2C_RESET_EN		BIT(27)
+/* TRM ch.12 — LP_FAST_CLK_SEL, CK_EN_LP_SPI and RST_EN_LP_SPI. */
+#define LP_FAST_CLK_SEL		GENMASK(3, 2)
+#define LP_FAST_CLK_XTAL	1
+#define LP_SPI_CLOCK_EN		BIT(22)
+#define LP_SPI_RESET_EN		BIT(23)
 
+/* TRM ch.12 — GPSPI2/3 gates and PERI_CLK_CTRL116/117 source/divider fields. */
 #define GPSPI2_SYS_EN		BIT(0)
 #define GPSPI2_APB_EN		BIT(19)
 #define GPSPI2_SRC		GENMASK(2, 0)
@@ -193,6 +259,14 @@
 #define GPSPI2_MST_DIV		GENMASK(19, 12)
 #define GPSPI2_MST_EN		BIT(20)
 #define GPSPI2_RST		BIT(7)
+#define GPSPI3_SYS_EN		BIT(1)
+#define GPSPI3_APB_EN		BIT(20)
+#define GPSPI3_SRC		GENMASK(23, 21)
+#define GPSPI3_HS_EN		BIT(24)
+#define GPSPI3_HS_DIV		GENMASK(7, 0)
+#define GPSPI3_MST_DIV		GENMASK(15, 8)
+#define GPSPI3_MST_EN		BIT(16)
+#define GPSPI3_RST		BIT(8)
 
 #define IOMUX_APB_EN		BIT(3)
 #define IOMUX_FUNC_EN		BIT(9)
@@ -200,7 +274,8 @@
 struct p4_cc {
 	void __iomem *base;
 	void __iomem *lp_reset;
-	void __iomem *emac_ref;
+	void __iomem *lp_hp_clk;
+	void __iomem *lp_fast_clksel;
 	void __iomem *emac_ctrl;
 	struct regmap *lpperi;
 	spinlock_t lock;
@@ -223,6 +298,39 @@ static void p4_update_external(void __iomem *reg, u32 mask, u32 val)
 	writel((readl(reg) & ~mask) | val, reg);
 }
 
+static void p4_i2s_write(struct p4_cc *cc, struct p4_i2s_field field,
+			 u32 mask, u32 val)
+{
+	p4_update(cc, field.reg, mask << field.shift, val << field.shift);
+}
+
+static u32 p4_i2s_read(struct p4_cc *cc, struct p4_i2s_field field, u32 mask)
+{
+	return (readl(cc->base + field.reg) >> field.shift) & mask;
+}
+
+static void p4_i2s_gate(struct p4_cc *cc, const struct p4_i2s_layout *layout,
+			bool enable)
+{
+	u32 gate = I2S_APB_EN(layout->port);
+	u32 pad = I2S_PAD_MCLK_EN(layout->port);
+
+	if (enable)
+		p4_update(cc, SOC_CLK2, gate, gate);
+
+	/* The two bits above each enable select the source. Zero is XTAL. */
+	p4_i2s_write(cc, layout->rx.gate, enable ? 7 : 1, enable);
+	p4_i2s_write(cc, layout->tx.gate, enable ? 7 : 1, enable);
+
+	/* TRM ch.12 — I2S<n>_MST_CLK_SEL and LP_HP_CLK_CTRL pad gate. */
+	if (enable)
+		p4_i2s_write(cc, layout->mclk, 1, 1);
+	if (cc->lp_hp_clk)
+		p4_update_external(cc->lp_hp_clk, pad, enable ? pad : 0);
+	if (!enable)
+		p4_update(cc, SOC_CLK2, gate, 0);
+}
+
 static void p4_lp_pulse_reset(struct p4_cc *cc, u32 mask)
 {
 	p4_update_external(cc->lp_reset, mask, mask);
@@ -236,6 +344,13 @@ static int p4_clk_enable(struct clk_hw *hw)
 	struct p4_cc *cc = clk->cc;
 	unsigned long flags;
 	int ret;
+
+	if (clk->id == ESP32P4_CLK_LP_SPI) {
+		if (FIELD_GET(LP_FAST_CLK_SEL, readl(cc->lp_fast_clksel)) !=
+		    LP_FAST_CLK_XTAL)
+			return -EINVAL;
+		return regmap_set_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_SPI_CLOCK_EN);
+	}
 
 	if (clk->id == ESP32P4_CLK_LP_I2C) {
 		ret = regmap_update_bits(cc->lpperi, LP_PERI_CLOCK_SEL,
@@ -269,6 +384,17 @@ static int p4_clk_enable(struct clk_hw *hw)
 			  FIELD_PREP(GPSPI2_MST_DIV, 1) | GPSPI2_HS_EN |
 			  GPSPI2_MST_EN);
 		break;
+	case ESP32P4_CLK_GPSPI3:
+		p4_update(cc, SOC_CLK1, GPSPI3_SYS_EN, GPSPI3_SYS_EN);
+		p4_update(cc, SOC_CLK2, GPSPI3_APB_EN, GPSPI3_APB_EN);
+		p4_update(cc, GPSPI_CLK116, GPSPI3_HS_EN, 0);
+		p4_update(cc, GPSPI_CLK117, GPSPI3_MST_EN, 0);
+		p4_update(cc, GPSPI_CLK116, GPSPI3_SRC, 0);
+		p4_update(cc, GPSPI_CLK117, GPSPI3_HS_DIV | GPSPI3_MST_DIV,
+			  FIELD_PREP(GPSPI3_MST_DIV, 1));
+		p4_update(cc, GPSPI_CLK116, GPSPI3_HS_EN, GPSPI3_HS_EN);
+		p4_update(cc, GPSPI_CLK117, GPSPI3_MST_EN, GPSPI3_MST_EN);
+		break;
 	case ESP32P4_CLK_EMAC:
 		p4_update(cc, SOC_CLK1, EMAC_SYS_EN, EMAC_SYS_EN);
 		p4_lp_pulse_reset(cc, LP_EMAC_RESET);
@@ -281,7 +407,7 @@ static int p4_clk_enable(struct clk_hw *hw)
 			  RMII_CLK_EN | RMII_RX_CLK_EN);
 		p4_update(cc, SDIO_CLK_SOURCE, RMII_TX_CLK_SRC | RMII_TX_CLK_EN,
 			  RMII_TX_CLK_EN);
-		p4_update_external(cc->emac_ref, LP_EMAC_PAD_TX | LP_EMAC_PAD_RX |
+		p4_update_external(cc->lp_hp_clk, LP_EMAC_PAD_TX | LP_EMAC_PAD_RX |
 				   LP_EMAC_PAD_TXRX, LP_EMAC_PAD_TXRX);
 		break;
 	case ESP32P4_CLK_EMAC_PTP:
@@ -360,11 +486,9 @@ static int p4_clk_enable(struct clk_hw *hw)
 		p4_update(cc, TIMER_CLK21, MWDT1_SRC | MWDT1_EN, MWDT1_EN);
 		break;
 	case ESP32P4_CLK_I2S0:
-		p4_update(cc, SOC_CLK2, I2S0_APB_EN, I2S0_APB_EN);
-		/* Source encoding zero selects XTAL for both clock domains. */
-		p4_update(cc, I2C_I2S_CLK11, I2S_RX_EN | I2S_RX_SRC, I2S_RX_EN);
-		p4_update(cc, I2S_CLK13, I2S_TX_EN | I2S_TX_SRC, I2S_TX_EN);
-		p4_update(cc, I2S_CLK14, I2S_MCLK_TX, I2S_MCLK_TX);
+	case ESP32P4_CLK_I2S1:
+	case ESP32P4_CLK_I2S2:
+		p4_i2s_gate(cc, p4_i2s_layout(clk->id), true);
 		break;
 	case ESP32P4_CLK_USBHS:
 		/* TRM ch.12 Reset and Clock - USB_OTG20_SYS_CLK_EN. */
@@ -404,6 +528,13 @@ static void p4_clk_disable(struct clk_hw *hw)
 	unsigned long flags;
 	int ret;
 
+	if (clk->id == ESP32P4_CLK_LP_SPI) {
+		ret = regmap_clear_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_SPI_CLOCK_EN);
+		if (ret)
+			dev_err(clk->cc->reset.dev, "cannot gate LP SPI clock: %d\n", ret);
+		return;
+	}
+
 	if (clk->id == ESP32P4_CLK_LP_I2C) {
 		ret = regmap_clear_bits(cc->lpperi, LP_PERI_CLOCK_EN, LP_I2C_CLOCK_EN);
 		if (ret)
@@ -426,7 +557,7 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_EMAC_RMII:
 		p4_update(cc, SDIO_CLK_SOURCE, RMII_TX_CLK_EN, 0);
 		p4_update(cc, EMAC_RMII_CLK_CTRL, RMII_CLK_EN | RMII_RX_CLK_EN, 0);
-		p4_update_external(cc->emac_ref, LP_EMAC_PAD_TXRX, 0);
+		p4_update_external(cc->lp_hp_clk, LP_EMAC_PAD_TXRX, 0);
 		break;
 	case ESP32P4_CLK_EMAC_PTP:
 		p4_update(cc, SDIO_CLK_SOURCE, EMAC_PTP_CLK_EN, 0);
@@ -489,9 +620,9 @@ static void p4_clk_disable(struct clk_hw *hw)
 		p4_update(cc, TIMER_CLK21, MWDT1_EN, 0);
 		break;
 	case ESP32P4_CLK_I2S0:
-		p4_update(cc, I2S_CLK13, I2S_TX_EN, 0);
-		p4_update(cc, I2C_I2S_CLK11, I2S_RX_EN, 0);
-		p4_update(cc, SOC_CLK2, I2S0_APB_EN, 0);
+	case ESP32P4_CLK_I2S1:
+	case ESP32P4_CLK_I2S2:
+		p4_i2s_gate(cc, p4_i2s_layout(clk->id), false);
 		break;
 	case ESP32P4_CLK_USBHS:
 		p4_update(cc, SOC_CLK1, USB_OTG20_SYS_EN, 0);
@@ -500,6 +631,12 @@ static void p4_clk_disable(struct clk_hw *hw)
 		p4_update(cc, SDIO_CLK_EDGES, SDIO_EDGE_ENABLE, 0);
 		p4_update(cc, SDIO_CLK_SOURCE, SDIO_LS_EN, 0);
 		p4_update(cc, SOC_CLK1, SDMMC_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_GPSPI3:
+		p4_update(cc, GPSPI_CLK117, GPSPI3_MST_EN, 0);
+		p4_update(cc, GPSPI_CLK116, GPSPI3_HS_EN, 0);
+		p4_update(cc, SOC_CLK2, GPSPI3_APB_EN, 0);
+		p4_update(cc, SOC_CLK1, GPSPI3_SYS_EN, 0);
 		break;
 	case ESP32P4_CLK_GPSPI2:
 		p4_update(cc, GPSPI_CLK116, GPSPI2_HS_EN | GPSPI2_MST_EN, 0);
@@ -516,7 +653,8 @@ static unsigned long p4_clk_rate(struct clk_hw *hw, unsigned long parent_rate)
 
 	if (clk->id == ESP32P4_CLK_SDMMC)
 		return parent_rate / SDIO_CLOCK_DIV;
-	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_LP_I2C)
+	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_GPSPI3 ||
+	    clk->id == ESP32P4_CLK_LP_I2C)
 		return parent_rate / 2;
 	return parent_rate;
 }
@@ -576,18 +714,18 @@ static unsigned long p4_i2s_rate(struct clk_hw *hw, unsigned long parent)
 {
 	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
 	struct p4_cc *cc = clk->cc;
-	u32 high = readl(cc->base + I2S_CLK13);
-	u32 low = readl(cc->base + I2S_CLK14);
-	u32 integer = FIELD_GET(I2S_TX_N, high) ?: 256;
-	u32 z = FIELD_GET(I2S_TX_Z, low);
+	const struct p4_i2s_div *tx = &p4_i2s_layout(clk->id)->tx;
+	u32 integer = p4_i2s_read(cc, tx->n, 0xff) ?: 256;
+	u32 z = p4_i2s_read(cc, tx->z, I2S_DIV_MAX);
 	u32 denom, num;
 
 	integer = max(integer, 2U);
 	if (!z)
 		return parent / integer;
 
-	denom = (FIELD_GET(I2S_TX_X, high) + 1) * z + FIELD_GET(I2S_TX_Y, low);
-	num = low & I2S_TX_YN1 ? denom - z : z;
+	denom = (p4_i2s_read(cc, tx->x, I2S_DIV_MAX) + 1) * z +
+		p4_i2s_read(cc, tx->y, I2S_DIV_MAX);
+	num = p4_i2s_read(cc, tx->yn1, 1) ? denom - z : z;
 	return DIV_ROUND_CLOSEST_ULL((u64)parent * denom, integer * denom + num);
 }
 
@@ -599,11 +737,22 @@ static int p4_i2s_determine_rate(struct clk_hw *hw, struct clk_rate_request *req
 	return 0;
 }
 
+static void p4_i2s_write_div(struct p4_cc *cc, const struct p4_i2s_div *div,
+			    u32 integer, u32 x, u32 y, u32 z, bool yn1)
+{
+	p4_i2s_write(cc, div->n, 0xff, integer & 0xff);
+	p4_i2s_write(cc, div->x, I2S_DIV_MAX, x);
+	p4_i2s_write(cc, div->y, I2S_DIV_MAX, y);
+	p4_i2s_write(cc, div->z, I2S_DIV_MAX, z);
+	p4_i2s_write(cc, div->yn1, 1, yn1);
+}
+
 static int p4_i2s_set_rate(struct clk_hw *hw, unsigned long rate,
 			  unsigned long parent)
 {
 	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
 	struct p4_cc *cc = clk->cc;
+	const struct p4_i2s_layout *layout = p4_i2s_layout(clk->id);
 	unsigned long flags, num, denom;
 	u32 integer, x = 0, y = 0, z = 0;
 	bool yn1 = false;
@@ -632,15 +781,8 @@ static int p4_i2s_set_rate(struct clk_hw *hw, unsigned long rate,
 		return -ERANGE;
 
 	spin_lock_irqsave(&cc->lock, flags);
-	p4_update(cc, I2S_CLK12, I2S_RX_N | I2S_RX_X | I2S_RX_Y,
-		  FIELD_PREP(I2S_RX_N, integer & 0xff) |
-		  FIELD_PREP(I2S_RX_X, x) | FIELD_PREP(I2S_RX_Y, y));
-	p4_update(cc, I2S_CLK13, I2S_RX_Z | I2S_RX_YN1 | I2S_TX_N | I2S_TX_X,
-		  FIELD_PREP(I2S_RX_Z, z) | (yn1 ? I2S_RX_YN1 : 0) |
-		  FIELD_PREP(I2S_TX_N, integer & 0xff) | FIELD_PREP(I2S_TX_X, x));
-	p4_update(cc, I2S_CLK14, I2S_TX_Y | I2S_TX_Z | I2S_TX_YN1,
-		  FIELD_PREP(I2S_TX_Y, y) | FIELD_PREP(I2S_TX_Z, z) |
-		  (yn1 ? I2S_TX_YN1 : 0));
+	p4_i2s_write_div(cc, &layout->rx, integer, x, y, z, yn1);
+	p4_i2s_write_div(cc, &layout->tx, integer, x, y, z, yn1);
 	spin_unlock_irqrestore(&cc->lock, flags);
 	return 0;
 }
@@ -660,6 +802,15 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 	u32 reg, bit;
 	int ret;
 
+	if (id == ESP32P4_RST_LP_SPI) {
+		if (!cc->lpperi)
+			return -ENODEV;
+		ret = regmap_set_bits(cc->lpperi, LP_PERI_RESET_EN, LP_SPI_RESET_EN);
+		if (ret)
+			return ret;
+		return regmap_clear_bits(cc->lpperi, LP_PERI_RESET_EN, LP_SPI_RESET_EN);
+	}
+
 	switch (id) {
 	case ESP32P4_RST_LP_I2C:
 		if (!cc->lpperi)
@@ -675,6 +826,10 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 	case ESP32P4_RST_I2C1:
 		reg = HP_RST1;
 		bit = I2C1_RST;
+		break;
+	case ESP32P4_RST_GPSPI3:
+		reg = HP_RST2;
+		bit = GPSPI3_RST;
 		break;
 	case ESP32P4_RST_GPSPI2:
 		reg = HP_RST2;
@@ -718,7 +873,11 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		break;
 	case ESP32P4_RST_I2S0:
 		reg = HP_RST2;
-		bit = I2S0_APB_RESET;
+		bit = I2S_APB_RESET(0);
+		break;
+	case ESP32P4_RST_I2S1 ... ESP32P4_RST_I2S2:
+		reg = HP_RST2;
+		bit = I2S_APB_RESET(1 + id - ESP32P4_RST_I2S1);
 		break;
 	default:
 		return -EINVAL;
@@ -760,6 +919,9 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-i2c0",
 		"p4-lp-i2c",
 		"p4-dma2d",
+		"p4-i2s1", "p4-i2s2",
+		"p4-gpspi3",
+		"p4-lp-spi",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -778,12 +940,17 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 			return PTR_ERR(cc->lp_reset);
 	}
 	if (platform_get_resource(pdev, IORESOURCE_MEM, 2)) {
-		cc->emac_ref = devm_platform_ioremap_resource(pdev, 2);
-		if (IS_ERR(cc->emac_ref))
-			return PTR_ERR(cc->emac_ref);
+		cc->lp_hp_clk = devm_platform_ioremap_resource(pdev, 2);
+		if (IS_ERR(cc->lp_hp_clk))
+			return PTR_ERR(cc->lp_hp_clk);
 		cc->emac_ctrl = devm_platform_ioremap_resource(pdev, 3);
 		if (IS_ERR(cc->emac_ctrl))
 			return PTR_ERR(cc->emac_ctrl);
+	}
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 4)) {
+		cc->lp_fast_clksel = devm_platform_ioremap_resource(pdev, 4);
+		if (IS_ERR(cc->lp_fast_clksel))
+			return PTR_ERR(cc->lp_fast_clksel);
 	}
 	cc->lpperi = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
 							     "espressif,lpperi");
@@ -804,7 +971,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		const struct clk_init_data init = {
 			.name = names[i],
 			.ops = i == ESP32P4_CLK_EMAC_RMII ? &p4_rmii_clk_ops :
-			       i == ESP32P4_CLK_I2S0 ? &p4_i2s_clk_ops : &p4_clk_ops,
+			       p4_i2s_layout(i) ? &p4_i2s_clk_ops : &p4_clk_ops,
 			.parent_data = &parent,
 			.num_parents = (i == ESP32P4_CLK_USBHS ||
 					i == ESP32P4_CLK_EMAC ||
@@ -816,8 +983,9 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		struct p4_clk *clk;
 
 		if (((i == ESP32P4_CLK_SDMMC || i == ESP32P4_CLK_EMAC) &&
-		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->emac_ref) ||
-		    (i == ESP32P4_CLK_LP_I2C && !cc->lpperi)) {
+		     !cc->lp_reset) || (i == ESP32P4_CLK_EMAC_RMII && !cc->lp_hp_clk) ||
+		    (i == ESP32P4_CLK_LP_I2C && !cc->lpperi) ||
+		    (i == ESP32P4_CLK_LP_SPI && (!cc->lpperi || !cc->lp_fast_clksel))) {
 			data->hws[i] = ERR_PTR(-ENOENT);
 			continue;
 		}

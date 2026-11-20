@@ -66,6 +66,7 @@
 #define LP_GPIO_IN_PIN		GENMASK(7, 2)
 #define LP_GPIO_OUT_SEL(n)	(0xf4 + 4 * (n))
 #define LP_GPIO_OUT_FUNC	GENMASK(8, 3)
+#define LP_GPIO_OUT_SW		32
 
 #define P4_SIGNAL_NONE		(-1)
 
@@ -83,7 +84,7 @@ struct p4_group {
 	unsigned int npins;
 	bool iomux;
 	u8 iomux_func;
-	bool lp_i2c;
+	bool lp;
 };
 
 static const unsigned int display_i2c_pins[] = { 7, 8 };	/* SDA, SCL */
@@ -98,12 +99,54 @@ static const struct p4_route i2c1_routes[] = {
 	{ 70, 70, true, true },
 };
 
-static const unsigned int gpspi2_pins[] = { 20, 21, 22, 23 };
+/* TRM ch.11 GPIO Matrix and IO MUX — LP I2C SDA/SCL and LP SPI CK/D/Q/CS. */
+static const struct p4_route lp_i2c_routes[] = {
+	{ 1, 1, true, true },
+	{ 0, 0, true, true },
+};
+
+static const unsigned int lp_spi_pins[] = { 5, 3, 2, 4 };
+static const struct p4_route lp_spi_routes[] = {
+	{ P4_SIGNAL_NONE, 5 },
+	{ P4_SIGNAL_NONE, 7 },
+	{ 8, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, 6, false, true },
+};
+
+static const unsigned int lp_spi_loop_pins[] = { 5, 3, 4 };
+static const struct p4_route lp_spi_loop_routes[] = {
+	{ P4_SIGNAL_NONE, 5 },
+	{ 8, 7 },
+	{ P4_SIGNAL_NONE, 6, false, true },
+};
+
+static const unsigned int gpspi_pins[] = { 20, 21, 22, 23 };
 static const struct p4_route gpspi2_routes[] = {
 	{ P4_SIGNAL_NONE, 53 },			/* SCK */
 	{ P4_SIGNAL_NONE, 55 },			/* MOSI */
 	{ 54, P4_SIGNAL_NONE },			/* MISO */
 	{ P4_SIGNAL_NONE, 62, false, true },	/* CS0 */
+};
+
+/* TRM ch.11 GPIO Matrix and IO MUX — SPI3 CK, D, Q and CS0. */
+static const struct p4_route gpspi3_routes[] = {
+	{ P4_SIGNAL_NONE, 47 },			/* SCK */
+	{ P4_SIGNAL_NONE, 49 },			/* MOSI */
+	{ 48, P4_SIGNAL_NONE },			/* MISO */
+	{ P4_SIGNAL_NONE, 52, false, true },	/* CS0 */
+};
+
+static const unsigned int gpspi_loop_pins[] = { 20, 21, 23 };
+static const struct p4_route gpspi2_loop_routes[] = {
+	{ P4_SIGNAL_NONE, 53 },
+	{ 54, 55 },
+	{ P4_SIGNAL_NONE, 62, false, true },
+};
+
+static const struct p4_route gpspi3_loop_routes[] = {
+	{ P4_SIGNAL_NONE, 47 },
+	{ 48, 49 },
+	{ P4_SIGNAL_NONE, 52, false, true },
 };
 
 /* TRM ch.59 SD/MMC Host Controller and ch.11 GPIO Matrix and IO MUX: slot 0 pads. */
@@ -149,13 +192,30 @@ static const struct p4_route emac_mdio_routes[] = {
 /* TRM ch.11 GPIO Matrix and IO MUX - I2S0 TX/RX BCK and WS inputs.
  * The codec drives BCK/WS; the controller provides MCLK to the codec.
  */
-static const unsigned int i2s0_pins[] = { 13, 12, 10, 11, 9 };
+static const unsigned int i2s_codec_pins[] = { 13, 12, 10, 11, 9 };
 static const struct p4_route i2s0_routes[] = {
 	{ P4_SIGNAL_NONE, 26 },			/* MCLK */
 	{ 25, P4_SIGNAL_NONE, .in_alt = 29 },	/* TX/RX BCK */
 	{ 27, P4_SIGNAL_NONE, .in_alt = 30 },	/* TX/RX WS */
 	{ 28, P4_SIGNAL_NONE },			/* SD from codec */
 	{ P4_SIGNAL_NONE, 28 },			/* SD to codec */
+};
+
+/* Alternate routes to the same board codec, selected one at a time. */
+static const struct p4_route i2s1_routes[] = {
+	{ P4_SIGNAL_NONE, 32 },
+	{ 31, P4_SIGNAL_NONE, .in_alt = 35 },
+	{ 33, P4_SIGNAL_NONE, .in_alt = 36 },
+	{ 34, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, 34 },
+};
+
+static const struct p4_route i2s2_routes[] = {
+	{ P4_SIGNAL_NONE, 38 },
+	{ 37, P4_SIGNAL_NONE, .in_alt = 41 },
+	{ 39, P4_SIGNAL_NONE, .in_alt = 42 },
+	{ 40, P4_SIGNAL_NONE },
+	{ P4_SIGNAL_NONE, 40 },
 };
 
 /* TRM ch.11 - PCNT_SIG_CH0_PAD_IN0 on the board's GPIO2 header pin. */
@@ -199,16 +259,23 @@ static const struct p4_group p4_groups[] = {
 	  ARRAY_SIZE(adc1_header_pins) },
 	{ "i2c1", display_i2c_pins, i2c1_routes, ARRAY_SIZE(display_i2c_pins) },
 	{ "i2c0", display_i2c_pins, i2c0_routes, ARRAY_SIZE(display_i2c_pins) },
-	{ .name = "lp-i2c", .pins = display_i2c_pins,
-	  .npins = ARRAY_SIZE(display_i2c_pins), .lp_i2c = true },
-	{ "gpspi2", gpspi2_pins, gpspi2_routes, ARRAY_SIZE(gpspi2_pins) },
+	{ "lp-i2c", display_i2c_pins, lp_i2c_routes, ARRAY_SIZE(display_i2c_pins), .lp = true },
+	{ "lp-spi", lp_spi_pins, lp_spi_routes, ARRAY_SIZE(lp_spi_pins), .lp = true },
+	{ "lp-spi-loopback", lp_spi_loop_pins, lp_spi_loop_routes,
+	  ARRAY_SIZE(lp_spi_loop_pins), .lp = true },
+	{ "gpspi2", gpspi_pins, gpspi2_routes, ARRAY_SIZE(gpspi_pins) },
+	{ "gpspi3", gpspi_pins, gpspi3_routes, ARRAY_SIZE(gpspi_pins) },
+	{ "gpspi2-loopback", gpspi_loop_pins, gpspi2_loop_routes, ARRAY_SIZE(gpspi_loop_pins) },
+	{ "gpspi3-loopback", gpspi_loop_pins, gpspi3_loop_routes, ARRAY_SIZE(gpspi_loop_pins) },
 	{ "sdmmc0", sdmmc0_pins, sdmmc0_routes, ARRAY_SIZE(sdmmc0_pins), true },
 	{ "sdmmc1", sdmmc1_pins, sdmmc1_routes, ARRAY_SIZE(sdmmc1_pins) },
 	{ "emac-rmii", emac_rmii_pins, emac_rmii_routes,
 	  ARRAY_SIZE(emac_rmii_pins), true, 3 },
 	{ "emac-mdio", emac_mdio_pins, emac_mdio_routes,
 	  ARRAY_SIZE(emac_mdio_pins) },
-	{ "i2s0", i2s0_pins, i2s0_routes, ARRAY_SIZE(i2s0_pins) },
+	{ "i2s0", i2s_codec_pins, i2s0_routes, ARRAY_SIZE(i2s_codec_pins) },
+	{ "i2s1", i2s_codec_pins, i2s1_routes, ARRAY_SIZE(i2s_codec_pins) },
+	{ "i2s2", i2s_codec_pins, i2s2_routes, ARRAY_SIZE(i2s_codec_pins) },
 	{ "pcnt0", pcnt0_pins, pcnt0_routes, ARRAY_SIZE(pcnt0_pins) },
 	{ "ledc0", ledc0_pins, ledc0_routes, ARRAY_SIZE(ledc0_pins) },
 	{ "mcpwm0", mcpwm_pins, mcpwm0_routes, ARRAY_SIZE(mcpwm_pins) },
@@ -294,32 +361,39 @@ static int p4_dt_node_to_map(struct pinctrl_dev *pctldev, struct device_node *np
 	return -EINVAL;
 }
 
-static int p4_lp_i2c_set_mux(struct p4_pinctrl *pc)
+static int p4_lp_set_mux(struct p4_pinctrl *pc, const struct p4_group *pg)
 {
 	unsigned int i;
 
 	if (!pc->lp_gpio || !pc->lp_iomux)
 		return -ENODEV;
-	for (i = 0; i < ARRAY_SIZE(display_i2c_pins); i++) {
-		unsigned int pin = display_i2c_pins[i];
-		unsigned int signal = i ? 0 : 1;
+	for (i = 0; i < pg->npins; i++) {
+		const struct p4_route *route = &pg->routes[i];
+		unsigned int pin = pg->pins[i];
 		void __iomem *pad = pc->lp_iomux + LP_PAD(pin);
+		void __iomem *gpio = pc->lp_gpio + LP_GPIO_PIN(pin);
+		u32 out = route->out == P4_SIGNAL_NONE ? LP_GPIO_OUT_SW : route->out;
 		u32 val;
 
-		/* Park both GPIO output drivers before asking LP I2C for OE. */
+		/* TRM ch.11 — park both GPIO drivers before selecting peripheral OE. */
 		writel(BIT(pin), pc->gpio + GPIO_ENABLE_CLR);
 		writel(BIT(pin), pc->lp_gpio + LP_GPIO_ENABLE_CLR);
-		writel(readl(pc->lp_gpio + LP_GPIO_PIN(pin)) | LP_GPIO_OPEN_DRAIN,
-		       pc->lp_gpio + LP_GPIO_PIN(pin));
-		writel(LP_GPIO_IN_MATRIX | FIELD_PREP(LP_GPIO_IN_PIN, pin),
-		       pc->lp_gpio + LP_GPIO_IN_SEL(signal));
-		writel(FIELD_PREP(LP_GPIO_OUT_FUNC, signal),
+		val = readl(gpio) & ~LP_GPIO_OPEN_DRAIN;
+		writel(val | (route->open_drain ? LP_GPIO_OPEN_DRAIN : 0), gpio);
+		if (route->in != P4_SIGNAL_NONE)
+			writel(LP_GPIO_IN_MATRIX | FIELD_PREP(LP_GPIO_IN_PIN, pin),
+			       pc->lp_gpio + LP_GPIO_IN_SEL(route->in));
+		writel(FIELD_PREP(LP_GPIO_OUT_FUNC, out),
 		       pc->lp_gpio + LP_GPIO_OUT_SEL(pin));
 
 		val = readl(pad);
-		val &= ~(LP_PAD_PULLDOWN | LP_PAD_FUNC | LP_PAD_SLEEP);
-		writel(val | LP_PAD_MUX | LP_PAD_MATRIX | LP_PAD_PULLUP | LP_PAD_INPUT,
-		       pad);
+		val &= ~(LP_PAD_PULLDOWN | LP_PAD_PULLUP | LP_PAD_FUNC |
+			 LP_PAD_SLEEP | LP_PAD_INPUT);
+		if (route->pull_up)
+			val |= LP_PAD_PULLUP;
+		if (route->in != P4_SIGNAL_NONE)
+			val |= LP_PAD_INPUT;
+		writel(val | LP_PAD_MUX | LP_PAD_MATRIX, pad);
 	}
 	return 0;
 }
@@ -337,8 +411,8 @@ static int p4_set_mux(struct pinctrl_dev *pctldev, unsigned int function,
 
 	val = readl(pc->gpio + GPIO_CLOCK_GATE);
 	writel(val | GPIO_CLK_EN, pc->gpio + GPIO_CLOCK_GATE);
-	if (pg->lp_i2c)
-		return p4_lp_i2c_set_mux(pc);
+	if (pg->lp)
+		return p4_lp_set_mux(pc, pg);
 
 	for (i = 0; i < pg->npins; i++) {
 		const struct p4_route *route = &pg->routes[i];

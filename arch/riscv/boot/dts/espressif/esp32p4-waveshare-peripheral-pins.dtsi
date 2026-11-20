@@ -60,6 +60,14 @@
 			function = "i2s0";
 		};
 
+		pins_i2s1: i2s1-pins {
+			function = "i2s1";
+		};
+
+		pins_i2s2: i2s2-pins {
+			function = "i2s2";
+		};
+
 		pins_pcnt0: pcnt0-pins {
 			function = "pcnt0";
 		};
@@ -94,6 +102,10 @@
 
 		pins_gpspi2: gpspi2-pins {
 			function = "gpspi2";
+		};
+
+		pins_gpspi3: gpspi3-pins {
+			function = "gpspi3";
 		};
 	};
 };

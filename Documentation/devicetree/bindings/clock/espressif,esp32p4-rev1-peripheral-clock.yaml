@@ -25,8 +25,9 @@ properties:
     items:
       - description: High-performance clock and reset block
       - description: Low-power SDMMC and EMAC reset register
-      - description: Low-power EMAC input clock register
+      - description: Low-power HP pad clock control register
       - description: High-performance system GMAC mode register
+      - description: Low-power clock source selection register
 
   espressif,lpperi:
     $ref: /schemas/types.yaml#/definitions/phandle
