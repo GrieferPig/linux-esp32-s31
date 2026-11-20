@@ -42,6 +42,7 @@
 #define TIMER_CLK20		0x94
 #define TIMER_CLK21		0x98
 #define LEDC_CLK22		0x9c
+#define ADC_CLK23		0xa0
 #define CRYPTO_CLK25		0xa8
 #define IOMUX_CLK26		0xac
 #define HP_RST0			0xc0
@@ -58,6 +59,9 @@
 /* TRM ch.12 Reset and Clock — DMA2D_SYS_CLK_EN and RST_EN_DMA2D. */
 #define DMA2D_SYS_EN		BIT(6)
 #define HP_DMA2D_RESET		BIT(31)
+/* TRM ch.40.7.1 and ch.12 — PPA_SYS_CLK_EN and RST_EN_PPA. */
+#define PPA_SYS_EN		BIT(9)
+#define HP_PPA_RESET		BIT(0)
 #define SDMMC_SYS_EN		BIT(14)
 #define USB_OTG20_SYS_EN	BIT(16)
 #define USB_OTG11_SYS_EN	BIT(15)
@@ -130,6 +134,16 @@
 #define RMT_FUNC_EN		BIT(5)
 #define RMT_DIV_FIELDS		GENMASK(29, 6)
 #define RMT_RESET		BIT(23)
+
+/* TRM ch.12 Reset and Clock — ADC_APB_CLK_EN and PERI_CLK_CTRL22/23. */
+#define ADC_APB_EN		BIT(5)
+#define ADC_CLK_SRC		GENMASK(31, 30)
+#define ADC_CLK_EN		BIT(0)
+#define ADC_CLK_DIV		GENMASK(8, 1)
+#define ADC_CLK_DIV_NUM		GENMASK(16, 9)
+#define ADC_CLK_DIV_DEN		GENMASK(24, 17)
+#define ADC_XTAL_DIV		8
+#define ADC_RESET		BIT(10)
 
 /* TRM ch.60 LED PWM Controller - LEDC clock source, gate and reset. */
 #define LEDC_APB_EN		BIT(0)
@@ -529,6 +543,17 @@ static int p4_clk_enable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), true);
 		break;
+	case ESP32P4_CLK_PPA:
+		p4_update(cc, SOC_CLK1, PPA_SYS_EN, PPA_SYS_EN);
+		break;
+	case ESP32P4_CLK_ADC:
+		p4_update(cc, SOC_CLK2, ADC_APB_EN, ADC_APB_EN);
+		p4_update(cc, LEDC_CLK22, ADC_CLK_SRC, 0);
+		p4_update(cc, ADC_CLK23,
+			  ADC_CLK_DIV | ADC_CLK_DIV_NUM | ADC_CLK_DIV_DEN | ADC_CLK_EN,
+			  FIELD_PREP(ADC_CLK_DIV, ADC_XTAL_DIV - 1) |
+			  FIELD_PREP(ADC_CLK_DIV_DEN, 1) | ADC_CLK_EN);
+		break;
 	case ESP32P4_CLK_USBFS:
 		/* TRM ch.12 — SOC_CLK_CTRL1.USB_OTG11_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, USB_OTG11_SYS_EN, USB_OTG11_SYS_EN);
@@ -674,6 +699,13 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_I2S2:
 		p4_i2s_gate(cc, p4_i2s_layout(clk->id), false);
 		break;
+	case ESP32P4_CLK_PPA:
+		p4_update(cc, SOC_CLK1, PPA_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_ADC:
+		p4_update(cc, ADC_CLK23, ADC_CLK_EN, 0);
+		p4_update(cc, SOC_CLK2, ADC_APB_EN, 0);
+		break;
 	case ESP32P4_CLK_USBFS:
 		p4_update(cc, SOC_CLK1, USB_OTG11_SYS_EN, 0);
 		break;
@@ -712,6 +744,8 @@ static unsigned long p4_clk_rate(struct clk_hw *hw, unsigned long parent_rate)
 {
 	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
 
+	if (clk->id == ESP32P4_CLK_ADC)
+		return parent_rate / ADC_XTAL_DIV;
 	if (clk->id == ESP32P4_CLK_SDMMC)
 		return parent_rate / SDIO_CLOCK_DIV;
 	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_GPSPI3 ||
@@ -950,6 +984,14 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		bit = UART_CORE_RST(port) | UART_APB_RST(port);
 		break;
 	}
+	case ESP32P4_RST_PPA:
+		reg = HP_RST1;
+		bit = HP_PPA_RESET;
+		break;
+	case ESP32P4_RST_ADC:
+		reg = HP_RST2;
+		bit = ADC_RESET;
+		break;
 	case ESP32P4_RST_GPSPI3:
 		reg = HP_RST2;
 		bit = GPSPI3_RST;
@@ -1047,7 +1089,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-lp-spi",
 		"p4-uart1", "p4-uart2", "p4-uart3", "p4-uart4",
 		"p4-lp-uart",
-		"p4-usbfs",
+		"p4-usbfs", "p4-adc", "p4-ppa",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -1105,7 +1147,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 					i == ESP32P4_CLK_EMAC ||
 					i == ESP32P4_CLK_AHB_GDMA ||
 					i == ESP32P4_CLK_AXI_GDMA ||
-					i == ESP32P4_CLK_DMA2D ||
+					i == ESP32P4_CLK_DMA2D || i == ESP32P4_CLK_PPA ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};
 		struct p4_clk *clk;

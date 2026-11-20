@@ -8,12 +8,15 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_dma.h>
 #include <linux/of_device.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
 
+#include "dmaengine.h"
+#include "espressif-dma2d.h"
 #include "virt-dma.h"
 
 /* ESP32-P4 TRM ch.8 2D-DMA — channel registers and linked descriptors. */
@@ -28,6 +31,7 @@
 #define D2D_STATE		0x24
 #define D2D_TX_PERI		0x38
 #define D2D_RX_PERI		0x3c
+#define D2D_TX_PORT_BLK		0x6c
 
 #define D2D_RST_CONF		0xa04
 #define D2D_MEM_START		0xa08
@@ -43,6 +47,7 @@
 #define D2D_TX_START		BIT(21)
 #define D2D_RX_START		BIT(22)
 #define D2D_REG_CLK_EN		BIT(2)
+#define D2D_PORT_ENABLE		BIT(11)
 
 #define D2D_TX_ERROR		BIT(2)
 #define D2D_RX_EOF		BIT(1)
@@ -57,6 +62,11 @@
 #define D2D_COUNT_MAX		FIELD_MAX(D2D_DESC_VERT)
 #define D2D_COPY_MAX		GENMASK(27, 0)
 #define D2D_M2M_DUMMY		4
+/* TRM ch.40 PPA: the SRM uses a dedicated input and output selector. */
+#define D2D_PPA_SRM		1
+#define D2D_SRM_RGB565		3
+#define D2D_SRM_RGB_PADDING	18
+#define D2D_SRM_RX_BLOCK	2
 #define D2D_MAX_PAIRS		2
 
 struct esp_dma2d_hw_desc {
@@ -71,6 +81,7 @@ struct esp_dma2d_desc {
 	struct virt_dma_desc vd;
 	struct esp_dma2d_hw_desc *hw;
 	dma_addr_t dma;
+	bool srm;
 };
 
 struct esp_dma2d_soc {
@@ -78,6 +89,7 @@ struct esp_dma2d_soc {
 	u32 sram_end;
 	u32 ext_start;
 	u32 ext_end;
+	bool has_srm;
 };
 
 struct esp_dma2d_chan {
@@ -89,6 +101,7 @@ struct esp_dma2d_chan {
 	dma_cookie_t error_cookie;
 	int tx_irq;
 	int rx_irq;
+	bool has_srm;
 };
 
 struct esp_dma2d {
@@ -196,6 +209,48 @@ esp_dma2d_prep_interleaved(struct dma_chan *dchan,
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 
+static void esp_dma2d_srm_desc(struct esp_dma2d_hw_desc *hw,
+			      const struct esp_dma2d_image *image,
+			      unsigned int width, unsigned int height)
+{
+	hw->control = cpu_to_le32(D2D_DESC_OWNER | D2D_DESC_EOF | D2D_DESC_2D |
+				  FIELD_PREP(D2D_DESC_HORIZ, width) | height);
+	hw->frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, D2D_SRM_RGB565) |
+				FIELD_PREP(D2D_DESC_HORIZ, image->width) | image->height);
+	hw->buffer = cpu_to_le32(image->address);
+}
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_srm(struct dma_chan *dchan, const struct esp_dma2d_image *src,
+		      const struct esp_dma2d_image *dst, unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+
+	if (dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !IS_ALIGNED(src->address | dst->address, 4) ||
+	    !IS_ALIGNED(src->width | dst->width, 2) ||
+	    !src->width || !src->height || !dst->width || !dst->height ||
+	    src->width > D2D_COUNT_MAX || src->height > D2D_COUNT_MAX ||
+	    dst->width > D2D_COUNT_MAX || dst->height > D2D_COUNT_MAX ||
+	    upper_32_bits(src->address) || upper_32_bits(dst->address))
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	desc->srm = true;
+	esp_dma2d_srm_desc(&desc->hw[0], src, src->width, src->height);
+	/* With the descriptor port enabled, SRM supplies actual RX blocks. */
+	esp_dma2d_srm_desc(&desc->hw[1], dst, D2D_SRM_RX_BLOCK, D2D_SRM_RX_BLOCK);
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_srm);
+
 /* TRM ch.8.7.7 — CMD_DISABLE then RESET_AVAIL before reset or freeing memory. */
 static int esp_dma2d_stop(struct esp_dma2d_chan *chan)
 {
@@ -204,8 +259,10 @@ static int esp_dma2d_stop(struct esp_dma2d_chan *chan)
 
 	writel(0, chan->tx + D2D_INT_ENA);
 	writel(0, chan->rx + D2D_INT_ENA);
-	writel(D2D_CMD_DISABLE, chan->tx + D2D_CONF0);
-	writel(D2D_CMD_DISABLE | D2D_RX_M2M, chan->rx + D2D_CONF0);
+	writel(readl(chan->tx + D2D_CONF0) | D2D_CMD_DISABLE,
+	       chan->tx + D2D_CONF0);
+	writel(readl(chan->rx + D2D_CONF0) | D2D_CMD_DISABLE,
+	       chan->rx + D2D_CONF0);
 
 	ret = read_poll_timeout_atomic(readl, tx,
 				       (tx & D2D_TX_RESET_AVAIL) &&
@@ -217,7 +274,7 @@ static int esp_dma2d_stop(struct esp_dma2d_chan *chan)
 	writel(D2D_CH_RST | D2D_CMD_DISABLE, chan->tx + D2D_CONF0);
 	writel(D2D_CH_RST | D2D_CMD_DISABLE, chan->rx + D2D_CONF0);
 	writel(0, chan->tx + D2D_CONF0);
-	writel(D2D_RX_M2M, chan->rx + D2D_CONF0);
+	writel(chan->has_srm ? 0 : D2D_RX_M2M, chan->rx + D2D_CONF0);
 	writel(U32_MAX, chan->tx + D2D_INT_CLR);
 	writel(U32_MAX, chan->rx + D2D_INT_CLR);
 	return 0;
@@ -236,6 +293,21 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 	chan->active = desc;
 	if (desc->vd.tx.cookie == chan->error_cookie)
 		WRITE_ONCE(chan->error_cookie, 0);
+	if (desc->srm) {
+		/* TRM ch.8.7.3–4: reset the channel FSMs before configuring a port. */
+		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
+		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
+		writel(D2D_PORT_ENABLE, chan->tx + D2D_CONF0);
+		writel(D2D_PORT_ENABLE, chan->rx + D2D_CONF0);
+		writel(D2D_SRM_RGB_PADDING | (D2D_SRM_RGB_PADDING << 14),
+		       chan->tx + D2D_TX_PORT_BLK);
+		writel(D2D_PPA_SRM, chan->tx + D2D_TX_PERI);
+		writel(D2D_PPA_SRM, chan->rx + D2D_RX_PERI);
+	} else if (chan->has_srm) {
+		writel(D2D_RX_M2M, chan->rx + D2D_CONF0);
+		writel(D2D_M2M_DUMMY, chan->tx + D2D_TX_PERI);
+		writel(D2D_M2M_DUMMY, chan->rx + D2D_RX_PERI);
+	}
 	dma_wmb();
 	writel(desc->dma, chan->tx + D2D_LINK_ADDR);
 	writel(desc->dma + sizeof(*desc->hw), chan->rx + D2D_LINK_ADDR);
@@ -347,6 +419,11 @@ static void esp_dma2d_free_chan_resources(struct dma_chan *dchan)
 	vchan_free_chan_resources(&to_dma2d_chan(dchan)->vc);
 }
 
+static void esp_dma2d_unregister_of(void *data)
+{
+	of_dma_controller_free(data);
+}
+
 static int esp_dma2d_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -414,6 +491,7 @@ static int esp_dma2d_probe(struct platform_device *pdev)
 		struct esp_dma2d_chan *chan = &dma->chan[i];
 
 		chan->pool = pool;
+		chan->has_srm = soc->has_srm;
 		chan->tx = base + i * D2D_CH_STRIDE;
 		chan->rx = base + D2D_RX_BASE + i * D2D_CH_STRIDE;
 		chan->tx_irq = platform_get_irq(pdev, 2 * i);
@@ -425,11 +503,13 @@ static int esp_dma2d_probe(struct platform_device *pdev)
 
 		chan->vc.desc_free = esp_dma2d_desc_free;
 		vchan_init(&chan->vc, engine);
-		ret = esp_dma2d_stop(chan);
-		if (ret)
-			return dev_err_probe(dev, ret, "channel %u did not reset\n", i);
-		writel(D2D_M2M_DUMMY, chan->tx + D2D_TX_PERI);
-		writel(D2D_M2M_DUMMY, chan->rx + D2D_RX_PERI);
+		if (!chan->has_srm) {
+			ret = esp_dma2d_stop(chan);
+			if (ret)
+				return dev_err_probe(dev, ret, "channel %u did not reset\n", i);
+			writel(D2D_M2M_DUMMY, chan->tx + D2D_TX_PERI);
+			writel(D2D_M2M_DUMMY, chan->rx + D2D_RX_PERI);
+		}
 
 		ret = devm_request_irq(dev, chan->tx_irq, esp_dma2d_irq, 0,
 				       dev_name(dev), chan);
@@ -441,7 +521,13 @@ static int esp_dma2d_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	return dmaenginem_async_device_register(engine);
+	ret = dmaenginem_async_device_register(engine);
+	if (ret || !of_property_present(dev->of_node, "#dma-cells"))
+		return ret;
+	ret = of_dma_controller_register(dev->of_node, of_dma_xlate_by_chan_id, engine);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(dev, esp_dma2d_unregister_of, dev->of_node);
 }
 
 /* TRM ch.8.4.11 Accessing Memory and ch.9 System and Memory. */
@@ -450,6 +536,7 @@ static const struct esp_dma2d_soc esp32p4_dma2d = {
 	.sram_end = 0x4ffc0000,
 	.ext_start = 0x48000000,
 	.ext_end = 0x4c000000,
+	.has_srm = true,
 };
 
 /* The S31 uses the same descriptor and channel registers with its bus apertures. */

@@ -387,7 +387,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	};
 
 	/* TRM ch.8 2D-DMA and ch.14 Interrupt Matrix — two M2M RX/TX pairs. */
-	dma-controller@50088000 {
+	dma2d: dma-controller@50088000 {
 		compatible = "espressif,esp32p4-dma2d";
 		reg = <0x50088000 0x1000>;
 		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
@@ -395,6 +395,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		interrupt-names = "tx0", "rx0", "tx1", "rx1";
 		clocks = <&periphclk ESP32P4_CLK_DMA2D>;
 		resets = <&periphclk ESP32P4_RST_DMA2D>;
+		#dma-cells = <1>;
 	};
 
 	/* TRM ch.6 GDMA Controller — AXI RX/TX interrupts and linked lists. */
@@ -537,10 +538,15 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		analog-supply = <&analog_power>;
 	};
 
-	/* TRM ch.67 ADC Controller — four available ADC1 header inputs. */
+	/* TRM ch.67 ADC Controller — shared SAR1, LP one-shot and HP DMA. */
 	adc@50127000 {
 		compatible = "espressif,esp32p4-lp-adc";
-		reg = <0x50127000 0x100>;
+		reg = <0x50127000 0x100>, <0x500de000 0x100>;
+		reg-names = "lp", "hp";
+		clocks = <&periphclk ESP32P4_CLK_ADC>;
+		resets = <&periphclk ESP32P4_RST_ADC>;
+		dmas = <&ahb_dma 2 8>;
+		dma-names = "rx";
 		espressif,lpperi = <&lpperi>;
 		espressif,adc-inputs = <4 5 6 7>;
 		espressif,analog-i2c = <&analog_i2c>;
@@ -690,6 +696,11 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 };
 
 &{/soc/pixel-processor@50087000} {
+	compatible = "espressif,esp32p4-ppa";
 	reg = <0x50087000 0x1000>;
 	interrupts = <96 4>;
+	clocks = <&periphclk ESP32P4_CLK_PPA>;
+	resets = <&periphclk ESP32P4_RST_PPA>;
+	dmas = <&dma2d 0>;
+	dma-names = "srm";
 };
