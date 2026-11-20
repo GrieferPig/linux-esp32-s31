@@ -399,6 +399,18 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		status = "disabled";
 	};
 
+	/* TRM rev1.3 ch.33 JPEG and ch.12 Interrupt Matrix. */
+	jpeg@50086000 {
+		compatible = "espressif,esp32p4-jpeg";
+		reg = <0x50086000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <95 4>;
+		clocks = <&periphclk ESP32P4_CLK_JPEG>;
+		resets = <&periphclk ESP32P4_RST_JPEG>;
+		dmas = <&dma2d 1>;
+		dma-names = "codec";
+	};
+
 	/* TRM ch.8 2D-DMA and ch.14 Interrupt Matrix — two M2M RX/TX pairs. */
 	dma2d: dma-controller@50088000 {
 		compatible = "espressif,esp32p4-dma2d";

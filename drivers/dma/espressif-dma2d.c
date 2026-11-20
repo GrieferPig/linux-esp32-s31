@@ -61,6 +61,10 @@
 #define D2D_DESC_VERT		GENMASK(13, 0)
 #define D2D_COUNT_MAX		FIELD_MAX(D2D_DESC_VERT)
 #define D2D_COPY_MAX		GENMASK(27, 0)
+/* ESP32-P4 rev1.3 TRM ch.6 and 33: JPEG linked list and MCU layout. */
+#define D2D_DESC_MULTIPLE	BIT(28)
+#define D2D_JPEG		0
+#define D2D_JPEG_GRAY_MCU	8
 #define D2D_M2M_DUMMY		4
 /* TRM ch.40 PPA: the SRM uses a dedicated input and output selector. */
 #define D2D_PPA_SRM		1
@@ -81,7 +85,11 @@ struct esp_dma2d_desc {
 	struct virt_dma_desc vd;
 	struct esp_dma2d_hw_desc *hw;
 	dma_addr_t dma;
-	bool srm;
+	enum {
+		D2D_MEMCPY,
+		D2D_PPA,
+		D2D_JPEG_GRAY,
+	} mode;
 };
 
 struct esp_dma2d_soc {
@@ -242,7 +250,7 @@ esp_dma2d_prep_ppa_srm(struct dma_chan *dchan, const struct esp_dma2d_image *src
 	if (!desc)
 		return NULL;
 
-	desc->srm = true;
+	desc->mode = D2D_PPA;
 	esp_dma2d_srm_desc(&desc->hw[0], src, src->width, src->height);
 	/* With the descriptor port enabled, SRM supplies actual RX blocks. */
 	esp_dma2d_srm_desc(&desc->hw[1], dst, D2D_SRM_RX_BLOCK, D2D_SRM_RX_BLOCK);
@@ -250,6 +258,48 @@ esp_dma2d_prep_ppa_srm(struct dma_chan *dchan, const struct esp_dma2d_image *src
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_srm);
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_jpeg_gray(struct dma_chan *dchan, dma_addr_t src, size_t len,
+		       const struct esp_dma2d_image *dst, unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+	u32 high = len >> 14, low = len & D2D_COUNT_MAX;
+
+	if (dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !len || len > D2D_COPY_MAX ||
+	    upper_32_bits(src) || upper_32_bits(dst->address) ||
+	    !IS_ALIGNED(dst->address, 4) ||
+	    !dst->width || !dst->height ||
+	    !IS_ALIGNED(dst->width | dst->height, D2D_JPEG_GRAY_MCU) ||
+	    dst->width > D2D_COUNT_MAX || dst->height > D2D_COUNT_MAX)
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	/* JPEG consumes a linear scan; the RX stream walks 8x8 blocks. */
+	desc->mode = D2D_JPEG_GRAY;
+	desc->hw[0].control = cpu_to_le32(D2D_DESC_OWNER |
+					 FIELD_PREP(D2D_DESC_HORIZ, low) | low);
+	desc->hw[0].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, 1) |
+				       FIELD_PREP(D2D_DESC_HORIZ, high) | high);
+	desc->hw[0].buffer = cpu_to_le32(src);
+	desc->hw[1].control = cpu_to_le32(D2D_DESC_OWNER | D2D_DESC_2D |
+					 FIELD_PREP(D2D_DESC_HORIZ, D2D_JPEG_GRAY_MCU) |
+					 D2D_JPEG_GRAY_MCU);
+	desc->hw[1].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, 1) |
+				       FIELD_PREP(D2D_DESC_HORIZ, dst->width) | dst->height);
+	desc->hw[1].position = cpu_to_le32(D2D_DESC_MULTIPLE);
+	desc->hw[1].buffer = cpu_to_le32(dst->address);
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_jpeg_gray);
 
 /* TRM ch.8.7.7 — CMD_DISABLE then RESET_AVAIL before reset or freeing memory. */
 static int esp_dma2d_stop(struct esp_dma2d_chan *chan)
@@ -293,7 +343,7 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 	chan->active = desc;
 	if (desc->vd.tx.cookie == chan->error_cookie)
 		WRITE_ONCE(chan->error_cookie, 0);
-	if (desc->srm) {
+	if (desc->mode == D2D_PPA) {
 		/* TRM ch.8.7.3–4: reset the channel FSMs before configuring a port. */
 		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
 		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
@@ -303,6 +353,14 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 		       chan->tx + D2D_TX_PORT_BLK);
 		writel(D2D_PPA_SRM, chan->tx + D2D_TX_PERI);
 		writel(D2D_PPA_SRM, chan->rx + D2D_RX_PERI);
+	} else if (desc->mode == D2D_JPEG_GRAY) {
+		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
+		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
+		/* JPEG uses linked descriptors, with DSCR_PORT_EN clear. */
+		writel(0, chan->tx + D2D_CONF0);
+		writel(0, chan->rx + D2D_CONF0);
+		writel(D2D_JPEG, chan->tx + D2D_TX_PERI);
+		writel(D2D_JPEG, chan->rx + D2D_RX_PERI);
 	} else if (chan->has_srm) {
 		writel(D2D_RX_M2M, chan->rx + D2D_CONF0);
 		writel(D2D_M2M_DUMMY, chan->tx + D2D_TX_PERI);

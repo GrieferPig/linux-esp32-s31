@@ -64,6 +64,9 @@
 /* TRM ch.40.7.1 and ch.12 — PPA_SYS_CLK_EN and RST_EN_PPA. */
 #define PPA_SYS_EN		BIT(9)
 #define HP_PPA_RESET		BIT(0)
+/* TRM rev1.3 ch.10 and ch.33.7: JPEG_SYS_CLK_EN and RST_EN_JPEG. */
+#define JPEG_SYS_EN		BIT(8)
+#define HP_JPEG_RESET		BIT(30)
 /* TRM ch.12 Reset and Clock — UHCI_SYS_CLK_EN, APB_CLK_EN and RST_EN. */
 #define UHCI_SYS_EN		BIT(17)
 #define UHCI_APB_EN		BIT(6)
@@ -592,6 +595,9 @@ static int p4_clk_enable(struct clk_hw *hw)
 		p4_update(cc, I3C_CLK119, I3C_MST_SRC | I3C_MST_DIV, 0);
 		p4_update(cc, I3C_CLK119, I3C_MST_EN, I3C_MST_EN);
 		break;
+	case ESP32P4_CLK_JPEG:
+		p4_update(cc, SOC_CLK1, JPEG_SYS_EN, JPEG_SYS_EN);
+		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, PPA_SYS_EN);
 		break;
@@ -765,6 +771,9 @@ static void p4_clk_disable(struct clk_hw *hw)
 	case ESP32P4_CLK_I3C:
 		p4_update(cc, I3C_CLK119, I3C_MST_EN, 0);
 		p4_update(cc, SOC_CLK2, I3C_MST_APB_EN, 0);
+		break;
+	case ESP32P4_CLK_JPEG:
+		p4_update(cc, SOC_CLK1, JPEG_SYS_EN, 0);
 		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, 0);
@@ -1157,6 +1166,10 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST1;
 		bit = HP_I3C_MST_RESET;
 		break;
+	case ESP32P4_RST_JPEG:
+		reg = HP_RST0;
+		bit = HP_JPEG_RESET;
+		break;
 	case ESP32P4_RST_PPA:
 		reg = HP_RST1;
 		bit = HP_PPA_RESET;
@@ -1263,7 +1276,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-uart1", "p4-uart2", "p4-uart3", "p4-uart4",
 		"p4-lp-uart",
 		"p4-usbfs", "p4-adc", "p4-ppa", "p4-uhci", "p4-i3c",
-		"p4-parlio-bus", "p4-parlio-rx", "p4-parlio-tx",
+		"p4-parlio-bus", "p4-parlio-rx", "p4-parlio-tx", "p4-jpeg",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -1329,6 +1342,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 					i == ESP32P4_CLK_AHB_GDMA ||
 					i == ESP32P4_CLK_AXI_GDMA ||
 					i == ESP32P4_CLK_DMA2D || i == ESP32P4_CLK_PPA ||
+					i == ESP32P4_CLK_JPEG ||
 					i == ESP32P4_CLK_UHCI ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};

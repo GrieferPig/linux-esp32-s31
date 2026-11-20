@@ -17,3 +17,14 @@ config VIDEO_ESP32P4_PPA
 	help
 	  V4L2 memory-to-memory RGB565 scaling, rotation and mirroring
 	  through the ESP32-P4 PPA and 2D DMA.
+
+config VIDEO_ESP32P4_JPEG
+	bool "ESP32-P4 JPEG decoder"
+	depends on SOC_ESP32P4 && VIDEO_DEV && ESPRESSIF_DMA2D=y
+	select V4L2_JPEG_HELPER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  Decode baseline grayscale JPEG images through the ESP32-P4 JPEG
+	  codec and 2D DMA using the V4L2 memory-to-memory interface.
