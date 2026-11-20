@@ -1,0 +1,14 @@
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+#ifndef _DT_BINDINGS_ESP32P4_PERIPHERAL_CLOCK_H
+#define _DT_BINDINGS_ESP32P4_PERIPHERAL_CLOCK_H
+
+#define ESP32P4_CLK_I2C1	0
+#define ESP32P4_CLK_GPSPI2	1
+#define ESP32P4_CLK_IOMUX	2
+#define ESP32P4_CLK_NR		3
+
+#define ESP32P4_RST_I2C1	0
+#define ESP32P4_RST_GPSPI2	1
+#define ESP32P4_RST_NR		2
+
+#endif

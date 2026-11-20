@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/espressif,esp32p4-rev1-peripheral-clock.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ESP32-P4 rev1 peripheral clock and reset subset
+
+maintainers:
+  - GrieferPig <noreply@example.com>
+
+description: |
+  The HP_SYS_CLKRST I2C1, GPSPI2 and IOMUX gates and the I2C1/GPSPI2 reset
+  controls on ESP32-P4 hw_ver1. Clock/reset identifiers are in
+  dt-bindings/clock/esp32p4-peripheral-clock.h. Boot-critical clocks are not
+  exposed. I2C1 and GPSPI2 take XTAL as the clock source.
+
+properties:
+  compatible:
+    const: espressif,esp32p4-rev1-peripheral-clock
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+    description: The board's crystal reference clock.
+
+  '#clock-cells':
+    const: 1
+
+  '#reset-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - '#clock-cells'
+  - '#reset-cells'
+
+additionalProperties: false

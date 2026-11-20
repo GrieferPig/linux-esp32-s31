@@ -47,11 +47,13 @@
  * The IDF-derived portions are licensed Apache-2.0 OR MIT.
  */
 
+#include <linux/backlight.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -241,6 +243,8 @@ struct esp32p4_dsi {
 	void __iomem *pmu;
 	void __iomem *efuse;
 	struct i2c_client *mcu;
+	struct gpio_desc *panel_reset;
+	struct backlight_device *backlight;
 
 	struct esp32p4_dsi_lli *lli;
 	dma_addr_t lli_dma;
@@ -1490,10 +1494,12 @@ static int dsi_handle_irq_locked(struct esp32p4_dsi *dsi)
  */
 int esp32p4_dsi_late_init(struct esp32p4_dsi *dsi)
 {
-	int ret, i;
+	int ret;
 
 	if (!dsi)
 		return -EINVAL;
+	if (dsi->backlight)
+		return backlight_enable(dsi->backlight);
 	msleep(200);
 
 	dev_info(dsi->dev, "dsi st: host0=0x%08x host1=0x%08x phy=0x%08x brg=0x%08x fifo=0x%08x en=0x%08x\n",
@@ -1621,17 +1627,28 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 		return ERR_PTR(-ENOMEM);
 	dsi->gdma = (dw_gdma_dev_t *)dsi->gdma_base;
 
-	np = of_find_compatible_node(NULL, NULL,
-				     "raspberrypi,touch-display-2-backlight");
-	if (!np)
-		return ERR_PTR(-ENODEV);
-	dsi->mcu = of_find_i2c_device_by_node(np);
-	of_node_put(np);
-	if (!dsi->mcu)
-		return ERR_PTR(-EPROBE_DEFER);
-	if (dsi->mcu->addr != DSI_MCU_I2C_ADDR) {
-		ret = -ENODEV;
-		goto err_mcu;
+	dsi->panel_reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(dsi->panel_reset))
+		return ERR_CAST(dsi->panel_reset);
+	if (dsi->panel_reset) {
+		dsi->backlight = devm_of_find_backlight(dev);
+		if (IS_ERR(dsi->backlight))
+			return ERR_CAST(dsi->backlight);
+		if (!dsi->backlight)
+			return ERR_PTR(-EINVAL);
+	} else {
+		np = of_find_compatible_node(NULL, NULL,
+					     "raspberrypi,touch-display-2-backlight");
+		if (!np)
+			return ERR_PTR(-ENODEV);
+		dsi->mcu = of_find_i2c_device_by_node(np);
+		of_node_put(np);
+		if (!dsi->mcu)
+			return ERR_PTR(-EPROBE_DEFER);
+		if (dsi->mcu->addr != DSI_MCU_I2C_ADDR) {
+			ret = -ENODEV;
+			goto err_mcu;
+		}
 	}
 
 	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
@@ -1683,7 +1700,8 @@ err_lli:
 				  dsi->lli_dma);
 	dsi->lli = NULL;
 err_mcu:
-	put_device(&dsi->mcu->dev);
+	if (dsi->mcu)
+		put_device(&dsi->mcu->dev);
 	dsi->mcu = NULL;
 	return ERR_PTR(ret);
 }
@@ -1711,22 +1729,34 @@ int esp32p4_dsi_probe(struct esp32p4_dsi *dsi)
 		return ret;
 	dsi->hw_ready = true;
 
-	/*
-	 * The panel controller answers only once the link is up, and its reset
-	 * sequence holds the panel in reset, so it must run before the panel is
-	 * initialised. Retry while the controller boots.
-	 */
-	for (i = 0; i < 20; i++) {
-		ret = dsi_panel_mcu_reset(dsi);
-		if (!ret)
-			break;
-		msleep(50);
-	}
-	if (ret) {
-		dev_warn(dsi->dev,
-			 "panel controller did not answer (%d); continuing on DSI only\n",
-			 ret);
-		ret = 0;
+	if (dsi->panel_reset) {
+		/*
+		 * Only release LCD reset here. The touchscreen's supply
+		 * owns CTP reset and sequences it before Goodix probes.
+		 */
+		ret = gpiod_set_value_cansleep(dsi->panel_reset, 0);
+		if (ret)
+			return ret;
+		/* Touch Display 2 requires 120 ms after LCD reset before DCS. */
+		msleep(120);
+	} else {
+		/*
+		 * The panel controller answers only once the link is up, and its reset
+		 * sequence holds the panel in reset, so it must run before the panel is
+		 * initialised. Retry while the controller boots.
+		 */
+		for (i = 0; i < 20; i++) {
+			ret = dsi_panel_mcu_reset(dsi);
+			if (!ret)
+				break;
+			msleep(50);
+		}
+		if (ret) {
+			dev_warn(dsi->dev,
+				 "panel controller did not answer (%d); continuing on DSI only\n",
+				 ret);
+			ret = 0;
+		}
 	}
 
 	ret = dsi_panel_dcs_init(dsi);
@@ -1743,10 +1773,12 @@ int esp32p4_dsi_probe(struct esp32p4_dsi *dsi)
 	if (ret)
 		return ret;
 
-	/* Half brightness; a backlight driver may override this later. */
-	ret = dsi_mcu_write(dsi, 3, DSI_MCU_BRIGHTNESS);
-	if (ret)
-		dev_warn(dsi->dev, "backlight write failed: %d (continuing)\n", ret);
+	/* Retained-loader DTBs provide only the raw MCU brightness register. */
+	if (dsi->mcu) {
+		ret = dsi_mcu_write(dsi, 3, DSI_MCU_BRIGHTNESS);
+		if (ret)
+			dev_warn(dsi->dev, "backlight write failed: %d\n", ret);
+	}
 
 	dev_info(dsi->dev, "ESP32-P4 DSI panel ready (%ux%u)\n",
 		 dsi->width, dsi->height);
@@ -1757,6 +1789,9 @@ void esp32p4_dsi_destroy(struct esp32p4_dsi *dsi)
 {
 	if (!dsi)
 		return;
+
+	if (dsi->backlight)
+		backlight_disable(dsi->backlight);
 
 	if (dsi->hw_ready) {
 		esp32p4_dsi_stop(dsi);

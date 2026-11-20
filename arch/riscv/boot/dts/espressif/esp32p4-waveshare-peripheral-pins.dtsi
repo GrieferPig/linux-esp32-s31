@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+#include <dt-bindings/clock/esp32p4-peripheral-clock.h>
+
+&{/soc} {
+	periphclk: clock-controller@500e6000 {
+		compatible = "espressif,esp32p4-rev1-peripheral-clock";
+		reg = <0x500e6000 0x100>;
+		clocks = <&xtal>;
+		#clock-cells = <1>;
+		#reset-cells = <1>;
+	};
+
+	pinctrl@500e0000 {
+		compatible = "waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl";
+		reg = <0x500e0000 0x700>, <0x500e1000 0x100>;
+		clocks = <&periphclk ESP32P4_CLK_IOMUX>;
+
+		pins_i2c1: i2c1-pins {
+			function = "i2c1";
+		};
+
+		pins_gpspi2: gpspi2-pins {
+			function = "gpspi2";
+		};
+	};
+};

@@ -31,6 +31,16 @@ config DEBUG_PINCTRL
 	help
 	  Say Y here to add some extra checks and diagnostics to PINCTRL calls.
 
+config PINCTRL_ESP32P4_PERIPHERAL
+	bool "ESP32-P4 rev1 Waveshare expansion pin groups"
+	depends on SOC_ESP32P4 && OF && ESP32P4_PERIPHERAL_CLK
+	select PINMUX
+	help
+	  Expose only the I2C1 and GPSPI2 pad groups on the Waveshare
+	  ESP32-P4-WIFI6-DEV-KIT. This is not a general GPIO controller.
+	  Boot, memory and console pins are not managed by this driver.
+	  Leave disabled on boards without these exact expansion routes.
+
 config PINCTRL_ESPRESSIF
 	bool "Espressif ESP32-S31 pinctrl and GPIO controller"
 	depends on SOC_ESP32S31 || COMPILE_TEST

@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+#include <dt-bindings/gpio/gpio.h>
+#include "esp32p4-hardware.dts"
+#include "esp32p4-waveshare-peripheral-pins.dtsi"
+
+/ {
+	model = "Waveshare ESP32-P4-WIFI6-DEV-KIT with 5-inch Raspberry Pi Touch Display 2";
+	compatible = "waveshare,esp32p4-wifi6-dev-kit-touch-display-2",
+		     "waveshare,esp32p4-wifi6-dev-kit",
+		     "espressif,esp32p4-generic", "espressif,esp32p4";
+
+	aliases {
+		i2c1 = &i2c1;
+	};
+
+	/* The panel MCU exposes LCD reset on GPIO0 and CTP reset on GPIO1. */
+	touch_supply: regulator-touch {
+		compatible = "regulator-fixed";
+		regulator-name = "touch-display-2";
+		gpio = <&panel_mcu 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <50000>;
+	};
+
+	panel_backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&panel_mcu 0 200000 0>;
+		brightness-levels = <0 31>;
+		num-interpolated-steps = <31>;
+		default-brightness-level = <16>;
+	};
+};
+
+/* TRM ch.48 I2C Controller - I2C1 APB gate, XTAL source and master mode.
+ * The panel MCU and touchscreen are on GPIO7 (SDA) and GPIO8 (SCL).
+ */
+&i2c1 {
+	compatible = "espressif,esp32p4-rev1-i2c";
+	reg = <0x500c5000 0x100>;
+	clocks = <&periphclk ESP32P4_CLK_I2C1>;
+	resets = <&periphclk ESP32P4_RST_I2C1>;
+	pinctrl-0 = <&pins_i2c1>;
+	pinctrl-names = "default";
+	clock-frequency = <100000>;
+};
+
+&{/chosen/framebuffer@49000000} {
+	reset-gpios = <&panel_mcu 0 GPIO_ACTIVE_LOW>;
+	backlight = <&panel_backlight>;
+};
+
+panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
+	compatible = "raspberrypi,touchscreen-panel-regulator-v2";
+	gpio-controller;
+	#gpio-cells = <2>;
+	#pwm-cells = <3>;
+};
+
+&{/soc/i2c@500c5000/touchscreen@5d} {
+	AVDD28-supply = <&touch_supply>;
+};

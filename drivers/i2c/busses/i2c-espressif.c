@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Espressif ESP32-S31 high-performance I2C master controller.
+ * Shared FIFO I2C engine for ESP32-S31 and ESP32-P4 HP controllers.
  *
  * The register layout and command encoding follow ESP-IDF's esp32s31
  * i2c_ll implementation.  Linux owns only HP I2C0/I2C1; LP I2C ownership is
@@ -123,7 +123,16 @@
 #define S31_I2C_COMMANDS			8
 #define S31_I2C_XFER_TIMEOUT_MS		500
 
-struct esp32s31_i2c {
+struct esp_i2c;
+
+struct esp_i2c_variant {
+	const char *adapter_name;
+	int (*prepare)(struct device *dev, struct esp_i2c *i2c,
+		       const struct resource *res);
+	bool hardware_bus_clear;
+};
+
+struct esp_i2c {
 	void __iomem *base;
 	struct clk *clk;
 	struct completion complete;
@@ -132,20 +141,20 @@ struct esp32s31_i2c {
 	int irq;
 	int result;
 	u32 frequency;
-	bool retained;
-	u32 retained_source_rate;	/* 0: derive from the controller clock */
+	const struct esp_i2c_variant *variant;
+	unsigned long source_rate;
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
 	struct i2c_client *slave;
 	bool slave_active;
 #endif
 };
 
-static inline u32 s31_i2c_read(struct esp32s31_i2c *i2c, u32 reg)
+static inline u32 s31_i2c_read(struct esp_i2c *i2c, u32 reg)
 {
 	return readl(i2c->base + reg);
 }
 
-static inline void s31_i2c_write(struct esp32s31_i2c *i2c, u32 reg, u32 value)
+static inline void s31_i2c_write(struct esp_i2c *i2c, u32 reg, u32 value)
 {
 	writel(value, i2c->base + reg);
 }
@@ -298,7 +307,7 @@ static int s31_i2c_build_commands(struct i2c_msg *msgs, int num,
 				   S31_I2C_CMD_STOP, 0, false, false);
 }
 
-static void s31_i2c_reset_fifos(struct esp32s31_i2c *i2c)
+static void s31_i2c_reset_fifos(struct esp_i2c *i2c)
 {
 	u32 value = s31_i2c_read(i2c, S31_I2C_FIFO_CONF);
 
@@ -310,7 +319,7 @@ static void s31_i2c_reset_fifos(struct esp32s31_i2c *i2c)
 	s31_i2c_write(i2c, S31_I2C_FIFO_CONF, value);
 }
 
-static void s31_i2c_reset_fsm(struct esp32s31_i2c *i2c)
+static void s31_i2c_reset_fsm(struct esp_i2c *i2c)
 {
 	u32 ctr = s31_i2c_read(i2c, S31_I2C_CTR);
 
@@ -320,17 +329,15 @@ static void s31_i2c_reset_fsm(struct esp32s31_i2c *i2c)
 
 static int s31_i2c_recover_bus(struct i2c_adapter *adapter)
 {
-	struct esp32s31_i2c *i2c = i2c_get_adapdata(adapter);
+	struct esp_i2c *i2c = i2c_get_adapdata(adapter);
 	u32 value;
 	int ret;
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
 	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
 	s31_i2c_reset_fsm(i2c);
-	/* The P4 loader owns clock/pad configuration. Do not run the S31 bus
-	 * clear sequencer or poll its status on that retained controller.
-	 */
-	if (i2c->retained) {
+	/* Retained firmware leaves ownership of pin recovery outside Linux. */
+	if (!i2c->variant->hardware_bus_clear) {
 		s31_i2c_reset_fifos(i2c);
 		return s31_i2c_read(i2c, S31_I2C_SR) & S31_I2C_SR_BUS_BUSY ?
 			-EBUSY : 0;
@@ -350,7 +357,7 @@ static int s31_i2c_recover_bus(struct i2c_adapter *adapter)
 }
 
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
-static void s31_i2c_slave_tx_byte(struct esp32s31_i2c *i2c)
+static void s31_i2c_slave_tx_byte(struct esp_i2c *i2c)
 {
 	u8 value = 0xff;
 
@@ -361,7 +368,7 @@ static void s31_i2c_slave_tx_byte(struct esp32s31_i2c *i2c)
 	s31_i2c_write(i2c, S31_I2C_DATA, value);
 }
 
-static irqreturn_t s31_i2c_slave_irq(struct esp32s31_i2c *i2c, u32 status)
+static irqreturn_t s31_i2c_slave_irq(struct esp_i2c *i2c, u32 status)
 {
 	u32 sr = s31_i2c_read(i2c, S31_I2C_SR);
 	bool read = sr & S31_I2C_SR_SLAVE_RW;
@@ -405,7 +412,7 @@ static irqreturn_t s31_i2c_slave_irq(struct esp32s31_i2c *i2c, u32 status)
 
 static irqreturn_t s31_i2c_irq(int irq, void *data)
 {
-	struct esp32s31_i2c *i2c = data;
+	struct esp_i2c *i2c = data;
 	u32 status = s31_i2c_read(i2c, S31_I2C_INT_STATUS);
 
 	if (!status)
@@ -439,7 +446,7 @@ static irqreturn_t s31_i2c_irq(int irq, void *data)
 /* END pauses the command engine with the bus owned; unlike STOP it does
  * not terminate the peripheral transaction.  Each batch fits the FIFOs,
  * so IRQ latency cannot cause an RX overflow or TX underrun. */
-static int s31_i2c_batch(struct esp32s31_i2c *i2c, const u32 *commands,
+static int s31_i2c_batch(struct esp_i2c *i2c, const u32 *commands,
 		       unsigned int ncommands, const u8 *tx, unsigned int ntx,
 		       u8 *rx, unsigned int nrx)
 {
@@ -479,7 +486,7 @@ static int s31_i2c_batch(struct esp32s31_i2c *i2c, const u32 *commands,
 	return 0;
 }
 
-static int s31_i2c_long_xfer(struct esp32s31_i2c *i2c,
+static int s31_i2c_long_xfer(struct esp_i2c *i2c,
 			   struct i2c_msg *msgs, int num)
 {
 	u32 commands[S31_I2C_COMMANDS];
@@ -551,7 +558,7 @@ static int s31_i2c_long_xfer(struct esp32s31_i2c *i2c,
 static int s31_i2c_xfer(struct i2c_adapter *adapter,
 			 struct i2c_msg *msgs, int num)
 {
-	struct esp32s31_i2c *i2c = i2c_get_adapdata(adapter);
+	struct esp_i2c *i2c = i2c_get_adapdata(adapter);
 	u32 commands[S31_I2C_COMMANDS] = {};
 	u8 tx_fifo[S31_I2C_FIFO_LEN];
 	unsigned int command_count, tx_count, rx_count;
@@ -662,7 +669,7 @@ static u32 s31_i2c_functionality(struct i2c_adapter *adapter)
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
 static int s31_i2c_reg_slave(struct i2c_client *slave)
 {
-	struct esp32s31_i2c *i2c = i2c_get_adapdata(slave->adapter);
+	struct esp_i2c *i2c = i2c_get_adapdata(slave->adapter);
 	u32 address, ctr, fifo;
 
 	if (i2c->slave)
@@ -704,7 +711,7 @@ static int s31_i2c_reg_slave(struct i2c_client *slave)
 
 static int s31_i2c_unreg_slave(struct i2c_client *slave)
 {
-	struct esp32s31_i2c *i2c = i2c_get_adapdata(slave->adapter);
+	struct esp_i2c *i2c = i2c_get_adapdata(slave->adapter);
 	u32 ctr;
 
 	if (i2c->slave != slave)
@@ -735,10 +742,9 @@ static const struct i2c_adapter_quirks s31_i2c_quirks = {
 	.flags = I2C_AQ_NO_ZERO_LEN_READ,
 };
 
-static int s31_i2c_init_hardware(struct esp32s31_i2c *i2c)
+static int s31_i2c_init_hardware(struct esp_i2c *i2c)
 {
-	unsigned long source_rate = i2c->retained_source_rate ?:
-				    clk_get_rate(i2c->clk);
+	unsigned long source_rate = i2c->source_rate;
 	u32 half_cycle, wait_high, high, timeout_exp;
 	u32 ctr;
 
@@ -791,55 +797,19 @@ static void s31_i2c_disable_clock(void *data)
 
 static void s31_i2c_quiesce(void *data)
 {
-	struct esp32s31_i2c *i2c = data;
+	struct esp_i2c *i2c = data;
 
 	s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
 	synchronize_irq(i2c->irq);
 	s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
 }
 
-static int s31_i2c_probe(struct platform_device *pdev)
+static int esp_i2c_prepare_clocked(struct device *dev, struct esp_i2c *i2c,
+				   bool require_reset)
 {
-	struct device *dev = &pdev->dev;
-	struct esp32s31_i2c *i2c;
 	struct reset_control *rst;
-	int irq, ret;
+	int ret;
 
-	i2c = devm_kzalloc(dev, sizeof(*i2c), GFP_KERNEL);
-	if (!i2c)
-		return -ENOMEM;
-	i2c->base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(i2c->base))
-		return PTR_ERR(i2c->base);
-	i2c->retained = of_device_is_compatible(dev->of_node,
-					     "espressif,esp32p4-idf-i2c");
-	if (i2c->retained) {
-		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-
-		/* Only the revision-103 display loader's HP I2C1 handoff is used.
-		 * It leaves the master at 100 kHz on SDA7/SCL8 with clocks enabled.
-		 * Refuse a cold/uninitialized controller instead of guessing clocks.
-		 */
-		if (!IS_ENABLED(CONFIG_SOC_ESP32P4) ||
-		    res->start != 0x500c5000 || resource_size(res) < 0xfc ||
-		    !(s31_i2c_read(i2c, S31_I2C_CTR) & S31_I2C_CTR_MASTER))
-			return dev_err_probe(dev, -ENODEV, "missing P4 IDF I2C1 handoff\n");
-		/*
-		 * The loader leaves the bus clocked from XTAL on SDA7/SCL8 and stops
-		 * there; it never talks to a device. Reprogam the command and timing
-		 * registers for this driver's algorithm, keeping that clock source.
-		 */
-		device_property_read_u32(dev, "clock-frequency", &i2c->frequency);
-		if (i2c->frequency < 50000)
-			i2c->frequency = 100000;
-		i2c->retained_source_rate = 40000000;
-		ret = s31_i2c_init_hardware(i2c);
-		if (ret)
-			return dev_err_probe(dev, ret, "invalid bus timing\n");
-		s31_i2c_write(i2c, S31_I2C_INT_ENA, 0);
-		s31_i2c_write(i2c, S31_I2C_INT_CLR, S31_I2C_INT_ALL);
-		goto request_irq;
-	}
 	i2c->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(i2c->clk))
 		return dev_err_probe(dev, PTR_ERR(i2c->clk),
@@ -850,20 +820,103 @@ static int s31_i2c_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, s31_i2c_disable_clock, i2c->clk);
 	if (ret)
 		return ret;
-	rst = devm_reset_control_get_optional_exclusive(dev, NULL);
+
+	rst = require_reset ? devm_reset_control_get_exclusive(dev, NULL) :
+			      devm_reset_control_get_optional_exclusive(dev, NULL);
 	if (IS_ERR(rst))
 		return dev_err_probe(dev, PTR_ERR(rst), "reset unavailable\n");
 	ret = reset_control_reset(rst);
 	if (ret)
 		return dev_err_probe(dev, ret, "reset failed\n");
 
+	i2c->source_rate = clk_get_rate(i2c->clk);
 	i2c->frequency = 100000;
 	device_property_read_u32(dev, "clock-frequency", &i2c->frequency);
+	return 0;
+}
+
+static int esp_i2c_s31_prepare(struct device *dev, struct esp_i2c *i2c,
+			       const struct resource *res)
+{
+	return esp_i2c_prepare_clocked(dev, i2c, false);
+}
+
+static bool esp_i2c_is_p4_i2c1(const struct resource *res)
+{
+	return res->start == 0x500c5000 && resource_size(res) >= 0xfc;
+}
+
+static int esp_i2c_p4_prepare(struct device *dev, struct esp_i2c *i2c,
+			      const struct resource *res)
+{
+	/*
+	 * TRM ch.48 I2C Controller - HP I2C1 APB and XTAL clocks must
+	 * be active before setting I2C_CTR_REG.I2C_MS_MODE.
+	 */
+	if (!esp_i2c_is_p4_i2c1(res) ||
+	    !IS_ENABLED(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) ||
+	    !of_find_property(dev->of_node, "pinctrl-0", NULL))
+		return dev_err_probe(dev, -EINVAL, "invalid native P4 I2C1 resources\n");
+
+	return esp_i2c_prepare_clocked(dev, i2c, true);
+}
+
+static int esp_i2c_p4_retained_prepare(struct device *dev, struct esp_i2c *i2c,
+				       const struct resource *res)
+{
+	/* The revision-103 loader supplies the XTAL, pins and master mode. */
+	if (!IS_ENABLED(CONFIG_SOC_ESP32P4) || !esp_i2c_is_p4_i2c1(res) ||
+	    !(s31_i2c_read(i2c, S31_I2C_CTR) & S31_I2C_CTR_MASTER))
+		return dev_err_probe(dev, -ENODEV, "missing P4 IDF I2C1 handoff\n");
+
+	device_property_read_u32(dev, "clock-frequency", &i2c->frequency);
+	if (i2c->frequency < 50000)
+		i2c->frequency = 100000;
+	i2c->source_rate = 40000000;
+	return 0;
+}
+
+static const struct esp_i2c_variant esp_i2c_s31 = {
+	.adapter_name = "ESP32-S31 I2C",
+	.prepare = esp_i2c_s31_prepare,
+	.hardware_bus_clear = true,
+};
+
+static const struct esp_i2c_variant esp_i2c_p4 = {
+	.adapter_name = "ESP32-P4 native I2C",
+	.prepare = esp_i2c_p4_prepare,
+	.hardware_bus_clear = true,
+};
+
+static const struct esp_i2c_variant esp_i2c_p4_retained = {
+	.adapter_name = "ESP32-P4 retained I2C",
+	.prepare = esp_i2c_p4_retained_prepare,
+};
+
+static int s31_i2c_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct esp_i2c *i2c;
+	struct resource *res;
+	int irq, ret;
+
+	i2c = devm_kzalloc(dev, sizeof(*i2c), GFP_KERNEL);
+	if (!i2c)
+		return -ENOMEM;
+	i2c->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+	if (IS_ERR(i2c->base))
+		return PTR_ERR(i2c->base);
+
+	i2c->variant = device_get_match_data(dev);
+	if (!i2c->variant)
+		i2c->variant = &esp_i2c_s31;
+	ret = i2c->variant->prepare(dev, i2c, res);
+	if (ret)
+		return ret;
 	ret = s31_i2c_init_hardware(i2c);
 	if (ret)
 		return dev_err_probe(dev, ret, "invalid bus timing\n");
 
-request_irq:
 	init_completion(&i2c->complete);
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
@@ -884,8 +937,8 @@ request_irq:
 	i2c->adapter.dev.parent = dev;
 	i2c->adapter.dev.of_node = dev->of_node;
 	i2c->adapter.timeout = msecs_to_jiffies(S31_I2C_XFER_TIMEOUT_MS);
-	snprintf(i2c->adapter.name, sizeof(i2c->adapter.name),
-		 "ESP32-%s I2C", i2c->retained ? "P4 retained" : "S31");
+	strscpy(i2c->adapter.name, i2c->variant->adapter_name,
+		sizeof(i2c->adapter.name));
 	i2c_set_adapdata(&i2c->adapter, i2c);
 	platform_set_drvdata(pdev, i2c);
 
@@ -899,8 +952,9 @@ request_irq:
 }
 
 static const struct of_device_id s31_i2c_of_match[] = {
-	{ .compatible = "espressif,esp32s31-i2c" },
-	{ .compatible = "espressif,esp32p4-idf-i2c" },
+	{ .compatible = "espressif,esp32s31-i2c", .data = &esp_i2c_s31 },
+	{ .compatible = "espressif,esp32p4-idf-i2c", .data = &esp_i2c_p4_retained },
+	{ .compatible = "espressif,esp32p4-rev1-i2c", .data = &esp_i2c_p4 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s31_i2c_of_match);

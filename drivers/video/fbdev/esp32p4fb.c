@@ -372,8 +372,12 @@ static int p4_fb_probe(struct platform_device *pdev)
 		ret = -EIO;
 		goto free_irq;
 	}
-	/* The stream is running; release the panel reset and set the backlight. */
-	esp32p4_dsi_late_init(fb->dsi);
+	/* Turn on the backlight once the stream is running. */
+	ret = esp32p4_dsi_late_init(fb->dsi);
+	if (ret) {
+		p4_fb_stop(fb);
+		goto free_irq;
+	}
 	ret = register_framebuffer(info);
 	if (ret) {
 		p4_fb_stop(fb);

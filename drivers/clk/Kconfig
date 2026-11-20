@@ -33,6 +33,16 @@ menuconfig COMMON_CLK
 
 if COMMON_CLK
 
+config ESP32P4_PERIPHERAL_CLK
+	bool "ESP32-P4 rev1 peripheral clock/reset subset"
+	depends on SOC_ESP32P4 && OF
+	select RESET_CONTROLLER
+	help
+	  Provide the XTAL-derived I2C1 and GPSPI2 clocks and resets, plus
+	  the existing IOMUX clock gates. This provider is limited to the
+	  rev1 clock register layout. Boot clocks and MSPI are untouched.
+	  Say N unless the board describes those peripherals separately.
+
 config ESPRESSIF_CLK
 	bool "Clock driver for Espressif ESP32-S31"
 	depends on SOC_ESP32S31 || COMPILE_TEST

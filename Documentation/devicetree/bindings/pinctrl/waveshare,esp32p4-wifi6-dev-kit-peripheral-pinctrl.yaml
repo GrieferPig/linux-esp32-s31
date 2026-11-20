@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pinctrl/waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Waveshare ESP32-P4-WIFI6-DEV-KIT rev1 peripheral pin groups
+
+maintainers:
+  - GrieferPig <noreply@example.com>
+
+description: |
+  Board-specific fixed routing, not a GPIO controller. The only supported pad
+  groups are I2C1 (GPIO7/8) and GPSPI2 (expansion GPIO20..23). This binding is
+  for the ESP32-P4 hw_ver1 GPIO matrix and IOMUX.
+
+properties:
+  compatible:
+    const: waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl
+
+  reg:
+    items:
+      - description: GPIO matrix
+      - description: IO_MUX pads
+
+  clocks:
+    maxItems: 1
+    description: IOMUX clock
+
+patternProperties:
+  '^(i2c1|gpspi2)-pins$':
+    type: object
+    properties:
+      function:
+        enum: [i2c1, gpspi2]
+    required:
+      - function
+    additionalProperties: false
+
+required:
+  - compatible
+  - reg
+  - clocks
+
+additionalProperties: false

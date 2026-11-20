@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pinctrl/pinconf-generic.h>
 #include <linux/reset.h>
@@ -788,10 +789,19 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	struct reset_control *rst;
 	struct resource *res;
 	u32 num_chipselect = 3;
-	bool target;
+	bool p4_native, target;
 	int irq, ret;
 
+	p4_native = of_device_is_compatible(pdev->dev.of_node,
+					    "espressif,esp32p4-rev1-gpspi");
 	target = device_property_read_bool(&pdev->dev, "spi-slave");
+	if (p4_native &&
+	    (target || device_property_present(&pdev->dev, "dmas") ||
+	     device_property_present(&pdev->dev, "cs-gpios") ||
+	     !IS_ENABLED(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) ||
+	     !of_find_property(pdev->dev.of_node, "pinctrl-0", NULL)))
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "P4 GPSPI2 requires native CS, pinctrl and PIO master mode\n");
 	if (target)
 		ctlr = devm_spi_alloc_target(&pdev->dev, sizeof(*s));
 	else
@@ -805,7 +815,9 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	s->max_data_lines = 4;
 	device_property_read_u32(&pdev->dev, "espressif,max-data-lines",
 				 &s->max_data_lines);
-	if (s->max_data_lines != 4 && s->max_data_lines != 8)
+	if (p4_native)
+		s->max_data_lines = 1;
+	else if (s->max_data_lines != 4 && s->max_data_lines != 8)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "max-data-lines must be 4 or 8\n");
 	device_property_read_u32(&pdev->dev,
@@ -814,6 +826,8 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
 		return -ENODEV;
+	if (p4_native && (res->start != 0x500d0000 || resource_size(res) < 0xfc))
+		return dev_err_probe(&pdev->dev, -EINVAL, "invalid P4 GPSPI2 resource\n");
 	s->fifo_addr = res->start + S31_SPI_W0;
 	s->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(s->base))
@@ -821,7 +835,8 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	s->clk = devm_clk_get_enabled(&pdev->dev, NULL);
 	if (IS_ERR(s->clk))
 		return PTR_ERR(s->clk);
-	rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
+	rst = p4_native ? devm_reset_control_get_exclusive(&pdev->dev, NULL) :
+			  devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
 	if (IS_ERR(rst))
 		return dev_err_probe(&pdev->dev, PTR_ERR(rst),
 				     "reset unavailable\n");
@@ -839,6 +854,9 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 			       dev_name(&pdev->dev), s);
 	if (ret)
 		return ret;
+	if (p4_native)
+		goto init_fifo;
+
 	s->tx_dma = devm_dma_request_chan(&pdev->dev, "tx");
 	if (IS_ERR(s->tx_dma)) {
 		ret = PTR_ERR(s->tx_dma);
@@ -879,6 +897,7 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 			return -ENOMEM;
 	}
 
+init_fifo:
 	/* CPU FIFO mode; leave all DMA paths disabled. */
 	writel(target ? S31_SPI_SLAVE_MODE : 0, s->base + S31_SPI_SLAVE);
 	writel(0, s->base + S31_SPI_USER);
@@ -890,11 +909,13 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	writel(target ? 0 : (S31_SPI_SLV_RX_SEG_TRANS_CLR_EN |
 			      S31_SPI_SLV_TX_SEG_TRANS_CLR_EN),
 	       s->base + S31_SPI_DMA_CONF);
-	/* The clock provider owns the S31 GPSPI HS/MST clock path. */
+	/* The clock provider owns the GPSPI HS/MST clock path. */
 	writel(0, s->base + S31_SPI_CLK_GATE);
 
 	ctlr->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST |
 			  SPI_TX_DUAL | SPI_RX_DUAL | SPI_TX_QUAD | SPI_RX_QUAD;
+	if (p4_native)
+		ctlr->mode_bits = SPI_CPOL | SPI_CPHA;
 	if (s->max_data_lines == 8)
 		ctlr->mode_bits |= SPI_TX_OCTAL | SPI_RX_OCTAL;
 	ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
@@ -906,16 +927,16 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	/* Allow boards to use a GPIO chip select when the native CS output is
 	 * unsuitable for a matrix-routed or long-wire fixture.  The SPI core owns
 	 * assertion across the complete message, including our FIFO chunks. */
-	ctlr->use_gpio_descriptors = true;
+	ctlr->use_gpio_descriptors = !p4_native;
 	device_property_read_u32(&pdev->dev, "num-cs", &num_chipselect);
-	if (target)
+	if (target || p4_native)
 		num_chipselect = 1;
 	if (!num_chipselect || num_chipselect > 6)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "num-cs must be between 1 and 6\n");
 	ctlr->num_chipselect = num_chipselect;
 	ctlr->min_speed_hz = DIV_ROUND_UP(clk_get_rate(s->clk), 16 * 64);
-	ctlr->max_speed_hz = clk_get_rate(s->clk);
+	ctlr->max_speed_hz = p4_native ? 2000000 : clk_get_rate(s->clk);
 	ctlr->max_transfer_size = esp32s31_spi_max_transfer_size;
 	ctlr->setup = esp32s31_spi_setup;
 	ctlr->transfer_one = esp32s31_spi_transfer_one;
@@ -927,6 +948,7 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 
 static const struct of_device_id esp32s31_spi_of_match[] = {
 	{ .compatible = "espressif,esp32s31-gpspi" },
+	{ .compatible = "espressif,esp32p4-rev1-gpspi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_spi_of_match);
