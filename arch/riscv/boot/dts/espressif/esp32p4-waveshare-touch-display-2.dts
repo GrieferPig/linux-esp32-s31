@@ -332,7 +332,17 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		status = "disabled";
 	};
 
-	/* TRM ch.6 GDMA Controller - three coupled AHB RX/TX channel pairs. */
+	/* TRM ch.8 2D-DMA and ch.14 Interrupt Matrix — two M2M RX/TX pairs. */
+	dma-controller@50088000 {
+		compatible = "espressif,esp32p4-dma2d";
+		reg = <0x50088000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <106 4>, <104 4>, <107 4>, <105 4>;
+		interrupt-names = "tx0", "rx0", "tx1", "rx1";
+		clocks = <&periphclk ESP32P4_CLK_DMA2D>;
+		resets = <&periphclk ESP32P4_RST_DMA2D>;
+	};
+
 	/* TRM ch.6 GDMA Controller — AXI RX/TX interrupts and linked lists. */
 	axi_dma: dma-controller@5008a000 {
 		compatible = "espressif,esp32p4-axi-gdma";
@@ -345,6 +355,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		#dma-cells = <2>;
 	};
 
+	/* TRM ch.6 GDMA Controller - three coupled AHB RX/TX channel pairs. */
 	ahb_dma: dma-controller@50085000 {
 		compatible = "espressif,esp32p4-ahb-gdma";
 		reg = <0x50085000 0x1000>;
@@ -563,4 +574,9 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 			no-sd;
 		};
 	};
+};
+
+&{/soc/pixel-processor@50087000} {
+	reg = <0x50087000 0x1000>;
+	interrupts = <96 4>;
 };

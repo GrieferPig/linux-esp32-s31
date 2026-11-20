@@ -126,6 +126,14 @@ config AXI_DMAC
 	  controller is often used in Analog Devices' reference designs for FPGA
 	  platforms.
 
+config ESPRESSIF_DMA2D
+	tristate "Espressif ESP32-S31 and ESP32-P4 2D DMA support"
+	depends on (SOC_ESP32S31 || SOC_ESP32P4) && OF
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Enable linear and strided memory copies through Espressif 2D DMA.
+
 config ESPRESSIF_GDMA_AXI
 	tristate "Espressif ESP32-S31 and ESP32-P4 AXI GDMA support"
 	depends on SOC_ESP32S31 || SOC_ESP32P4

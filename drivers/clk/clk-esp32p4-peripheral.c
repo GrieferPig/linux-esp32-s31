@@ -46,6 +46,9 @@
 #define HP_AHB_PDMA_RESET	BIT(1)
 #define AXI_PDMA_SYS_EN		BIT(4)
 #define HP_AXI_PDMA_RESET	BIT(2)
+/* TRM ch.12 Reset and Clock — DMA2D_SYS_CLK_EN and RST_EN_DMA2D. */
+#define DMA2D_SYS_EN		BIT(6)
+#define HP_DMA2D_RESET		BIT(31)
 #define SDMMC_SYS_EN		BIT(14)
 #define USB_OTG20_SYS_EN	BIT(16)
 #define SDIO_HS_MODE		BIT(22)
@@ -286,6 +289,9 @@ static int p4_clk_enable(struct clk_hw *hw)
 		p4_update(cc, SDIO_CLK_SOURCE, EMAC_PTP_CLK_SRC | EMAC_PTP_CLK_EN,
 			  EMAC_PTP_CLK_EN);
 		break;
+	case ESP32P4_CLK_DMA2D:
+		p4_update(cc, SOC_CLK1, DMA2D_SYS_EN, DMA2D_SYS_EN);
+		break;
 	case ESP32P4_CLK_AXI_GDMA:
 		/* TRM ch.12 Reset and Clock — AXI_PDMA_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, AXI_PDMA_SYS_EN, AXI_PDMA_SYS_EN);
@@ -424,6 +430,9 @@ static void p4_clk_disable(struct clk_hw *hw)
 		break;
 	case ESP32P4_CLK_EMAC_PTP:
 		p4_update(cc, SDIO_CLK_SOURCE, EMAC_PTP_CLK_EN, 0);
+		break;
+	case ESP32P4_CLK_DMA2D:
+		p4_update(cc, SOC_CLK1, DMA2D_SYS_EN, 0);
 		break;
 	case ESP32P4_CLK_AXI_GDMA:
 		p4_update(cc, SOC_CLK1, AXI_PDMA_SYS_EN, 0);
@@ -671,6 +680,10 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST2;
 		bit = GPSPI2_RST;
 		break;
+	case ESP32P4_RST_DMA2D:
+		reg = HP_RST0;
+		bit = HP_DMA2D_RESET;
+		break;
 	case ESP32P4_RST_AXI_GDMA:
 		reg = HP_RST0;
 		bit = HP_AXI_PDMA_RESET;
@@ -746,6 +759,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-axi-gdma",
 		"p4-i2c0",
 		"p4-lp-i2c",
+		"p4-dma2d",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -796,6 +810,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 					i == ESP32P4_CLK_EMAC ||
 					i == ESP32P4_CLK_AHB_GDMA ||
 					i == ESP32P4_CLK_AXI_GDMA ||
+					i == ESP32P4_CLK_DMA2D ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};
 		struct p4_clk *clk;
