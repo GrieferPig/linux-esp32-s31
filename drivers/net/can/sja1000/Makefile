@@ -13,4 +13,5 @@ obj-$(CONFIG_CAN_PLX_PCI) += plx_pci.o
 obj-$(CONFIG_CAN_SJA1000) += sja1000.o
 obj-$(CONFIG_CAN_SJA1000_ISA) += sja1000_isa.o
 obj-$(CONFIG_CAN_SJA1000_PLATFORM) += sja1000_platform.o
+obj-$(CONFIG_CAN_ESP32P4_TWAI) += esp32p4-twai.o
 obj-$(CONFIG_CAN_TSCAN1) += tscan1.o

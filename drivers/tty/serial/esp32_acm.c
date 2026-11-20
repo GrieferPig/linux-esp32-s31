@@ -170,33 +170,51 @@ static void esp32s3_acm_put_char_sync(struct uart_port *port, u8 c)
 	esp32s3_acm_push(port);
 }
 
+static void esp32s3_acm_enable_tx_irq(struct uart_port *port)
+{
+	u32 int_ena = esp32s3_acm_read(port, USB_SERIAL_JTAG_INT_ENA_REG);
+
+	esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG,
+			  int_ena | USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA);
+}
+
 static void esp32s3_acm_transmit_buffer(struct uart_port *port)
 {
-	u32 tx_fifo_used;
-	unsigned int pending;
+	unsigned int pending, written = 0;
 	u8 ch;
 
-	if (!esp32s3_acm_tx_fifo_free(port))
+	lockdep_assert_held(&port->lock);
+
+	/*
+	 * TRM ch.56 USB Serial/JTAG - SERIAL_IN_EP_DATA_FREE goes low
+	 * after WR_DONE or a full packet and rises when the host reads it.
+	 * Arm IN_EMPTY even when this write cannot enter the endpoint yet.
+	 */
+	if (!esp32s3_acm_tx_fifo_free(port)) {
+		esp32s3_acm_enable_tx_irq(port);
 		return;
-
-	tx_fifo_used = esp32s3_acm_tx_fifo_cnt(port);
-	pending = uart_port_tx_limited(port, ch,
-				       ESP32S3_ACM_TX_FIFO_SIZE - tx_fifo_used,
-				       true, esp32s3_acm_put_char(port, ch),
-				       ({}));
-	if (pending) {
-		u32 int_ena;
-
-		int_ena = esp32s3_acm_read(port, USB_SERIAL_JTAG_INT_ENA_REG);
-		int_ena |= USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_ENA;
-		esp32s3_acm_write(port, USB_SERIAL_JTAG_INT_ENA_REG, int_ena);
 	}
+
+	pending = uart_port_tx_limited(port, ch, ESP32S3_ACM_TX_FIFO_SIZE,
+				       esp32s3_acm_tx_fifo_free(port),
+				       ({ esp32s3_acm_put_char(port, ch); written++; }),
+				       ({}));
+
+	/* A full 64-byte packet needs a following short packet or ZLP. */
+	if (pending || (written == ESP32S3_ACM_TX_FIFO_SIZE &&
+			!esp32s3_acm_tx_fifo_free(port)))
+		esp32s3_acm_enable_tx_irq(port);
 	esp32s3_acm_push(port);
 }
 
 static void esp32s3_acm_txint(struct uart_port *port)
 {
+	unsigned long flags;
+
+	/* start_tx and IN_EMPTY drain the same serial-core transmit FIFO. */
+	uart_port_lock_irqsave(port, &flags);
 	esp32s3_acm_transmit_buffer(port);
+	uart_port_unlock_irqrestore(port, flags);
 }
 
 static irqreturn_t esp32s3_acm_int(int irq, void *dev_id)

@@ -8,7 +8,7 @@
 
 	chosen {
 		ranges;
-		bootargs = "console=tty0 console=ttyS0,115200 clk_ignore_unused";
+		bootargs = "clk_ignore_unused";
 		#size-cells = <0x01>;
 		#address-cells = <0x01>;
 		espressif,cache-sync-entry = <0x00>;

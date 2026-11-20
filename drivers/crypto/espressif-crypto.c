@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* ESP32-S31 AES and SHA Crypto API providers. */
+/* Espressif ESP32-P4 and ESP32-S31 Crypto API providers. */
 
 #include <crypto/aes.h>
 #include <crypto/akcipher.h>
@@ -17,6 +17,7 @@
 #include <crypto/sha1.h>
 #include <crypto/sha2.h>
 #include <linux/bitops.h>
+#include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/io.h>
@@ -24,11 +25,18 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 
+/*
+ * The common PIO registers match ESP32-P4 TRM ch.28 AES and ch.32 SHA.
+ * RSA uses the common MPI registers (TRM ch.31). ECC layout and
+ * clock setup differ by SoC. The SHA DMA path is for S31.
+ */
+#define P4_AES_DMA_ENABLE	0x090
 #define S31_AES_KEY		0x000
 #define S31_AES_TEXT_IN		0x020
 #define S31_AES_TEXT_OUT	0x030
@@ -62,14 +70,14 @@
 #define S31_RSA_CONSTANT_TIME	0x820
 #define S31_RSA_SEARCH_ENABLE	0x824
 #define S31_RSA_SEARCH_POS	0x828
+#define P4_RSA_INT_ENA		0x82c
 
 #define S31_ECC_BASE		0x3000
 #define S31_ECC_INT_RAW		0x00c
+#define P4_ECC_INT_ENA		0x014
 #define S31_ECC_INT_CLR		0x018
 #define S31_ECC_CONF		0x01c
 #define S31_ECC_K_MEM		0x100
-#define S31_ECC_PX_MEM		0x130
-#define S31_ECC_PY_MEM		0x160
 
 #define S31_RSA_MAX_BYTES	512
 #define S31_RSA_MAX_WORDS	(S31_RSA_MAX_BYTES / sizeof(u32))
@@ -77,9 +85,9 @@
 
 #define S31_ECC_START		BIT(0)
 #define S31_ECC_KEY_LENGTH_SHIFT	2
-#define S31_ECC_WORK_MODE_SHIFT	5
-#define S31_ECC_SECURITY_MODE	BIT(9)
 #define S31_ECC_VERIFY_RESULT	BIT(29)
+/* TRM ch.22 SYSREG - HP_ECC_PD_CTRL memory power-down bits. */
+#define P4_ECC_MEM_PD		(BIT(2) | BIT(0))
 
 #define S31_ECC_MODE_POINT_MUL		0
 #define S31_ECC_MODE_VERIFY_THEN_POINT_MUL	3
@@ -99,10 +107,28 @@ enum s31_aes_mode {
 	S31_AES_CTR,
 };
 
+struct esp_ecc_layout {
+	u16 px, py;
+	u8 mem_bytes, work_mode_shift;
+	u32 security_mode;
+};
+
+struct esp_crypto_variant {
+	struct skcipher_alg *aes;
+	struct shash_alg *sha;
+	struct akcipher_alg *rsa;
+	struct kpp_alg *ecdh;
+	unsigned int num_ecdh;
+	const struct esp_ecc_layout *ecc_layout;
+	bool s31;
+};
+
 struct s31_crypto_dev {
+	const struct esp_crypto_variant *variant;
 	struct device *dev;
 	void __iomem *base;
-	void __iomem *clkrst;
+	void __iomem *rsa;
+	void __iomem *ecc;
 	struct dma_chan *sha_dma;
 	raw_spinlock_t lock;
 };
@@ -290,14 +316,16 @@ S31_AES_CRYPT(s31_ctr_crypt, true, S31_AES_CTR)
 		.cra_ctxsize = sizeof(struct s31_aes_ctx), .cra_module = THIS_MODULE } \
 }
 
-static struct skcipher_alg s31_aes_algs[] = {
-	S31_AES_ALG("ecb(aes)", "ecb-aes-esp32s31", s31_ecb_encrypt,
-		    s31_ecb_decrypt, 0, AES_BLOCK_SIZE),
-	S31_AES_ALG("cbc(aes)", "cbc-aes-esp32s31", s31_cbc_encrypt,
-		    s31_cbc_decrypt, AES_BLOCK_SIZE, AES_BLOCK_SIZE),
-	S31_AES_ALG("ctr(aes)", "ctr-aes-esp32s31", s31_ctr_crypt,
-		    s31_ctr_crypt, AES_BLOCK_SIZE, 1),
-};
+#define ESP_AES_ALGS(soc) \
+	S31_AES_ALG("ecb(aes)", "ecb-aes-" soc, s31_ecb_encrypt, \
+		    s31_ecb_decrypt, 0, AES_BLOCK_SIZE), \
+	S31_AES_ALG("cbc(aes)", "cbc-aes-" soc, s31_cbc_encrypt, \
+		    s31_cbc_decrypt, AES_BLOCK_SIZE, AES_BLOCK_SIZE), \
+	S31_AES_ALG("ctr(aes)", "ctr-aes-" soc, s31_ctr_crypt, \
+		    s31_ctr_crypt, AES_BLOCK_SIZE, 1)
+
+static struct skcipher_alg s31_aes_algs[] = { ESP_AES_ALGS("esp32s31") };
+static struct skcipher_alg p4_aes_algs[] = { ESP_AES_ALGS("esp32p4") };
 
 static void s31_sha_config(struct s31_sha_ctx *ctx, struct crypto_shash *tfm,
 			   u8 type)
@@ -516,22 +544,24 @@ static int s31_sha_finup(struct shash_desc *desc, const u8 *data,
 		.cra_priority = 300, .cra_blocksize = _block, .cra_module = THIS_MODULE } \
 }
 
-static struct shash_alg s31_sha_algs[] = {
-	S31_SHA_ALG("sha1", "sha1-esp32s31", SHA1_DIGEST_SIZE, SHA1_BLOCK_SIZE,
-		    s31_sha1_init),
-	S31_SHA_ALG("sha224", "sha224-esp32s31", SHA224_DIGEST_SIZE, SHA224_BLOCK_SIZE,
-		    s31_sha224_init),
-	S31_SHA_ALG("sha256", "sha256-esp32s31", SHA256_DIGEST_SIZE, SHA256_BLOCK_SIZE,
-		    s31_sha256_init),
-	S31_SHA_ALG("sha384", "sha384-esp32s31", SHA384_DIGEST_SIZE, SHA384_BLOCK_SIZE,
-		    s31_sha384_init),
-	S31_SHA_ALG("sha512", "sha512-esp32s31", SHA512_DIGEST_SIZE, SHA512_BLOCK_SIZE,
-		    s31_sha512_init),
-	S31_SHA_ALG("sha512-224", "sha512-224-esp32s31", SHA224_DIGEST_SIZE,
-		    SHA512_BLOCK_SIZE, s31_sha512_224_init),
-	S31_SHA_ALG("sha512-256", "sha512-256-esp32s31", SHA256_DIGEST_SIZE,
-		    SHA512_BLOCK_SIZE, s31_sha512_256_init),
-};
+#define ESP_SHA_ALGS(soc) \
+	S31_SHA_ALG("sha1", "sha1-" soc, SHA1_DIGEST_SIZE, SHA1_BLOCK_SIZE, \
+		    s31_sha1_init), \
+	S31_SHA_ALG("sha224", "sha224-" soc, SHA224_DIGEST_SIZE, SHA224_BLOCK_SIZE, \
+		    s31_sha224_init), \
+	S31_SHA_ALG("sha256", "sha256-" soc, SHA256_DIGEST_SIZE, SHA256_BLOCK_SIZE, \
+		    s31_sha256_init), \
+	S31_SHA_ALG("sha384", "sha384-" soc, SHA384_DIGEST_SIZE, SHA384_BLOCK_SIZE, \
+		    s31_sha384_init), \
+	S31_SHA_ALG("sha512", "sha512-" soc, SHA512_DIGEST_SIZE, SHA512_BLOCK_SIZE, \
+		    s31_sha512_init), \
+	S31_SHA_ALG("sha512-224", "sha512-224-" soc, SHA224_DIGEST_SIZE, \
+		    SHA512_BLOCK_SIZE, s31_sha512_224_init), \
+	S31_SHA_ALG("sha512-256", "sha512-256-" soc, SHA256_DIGEST_SIZE, \
+		    SHA512_BLOCK_SIZE, s31_sha512_256_init)
+
+static struct shash_alg s31_sha_algs[] = { ESP_SHA_ALGS("esp32s31") };
+static struct shash_alg p4_sha_algs[] = { ESP_SHA_ALGS("esp32p4") };
 
 static void s31_be_to_limbs(u32 *dst, unsigned int words, const u8 *src,
 			    unsigned int len)
@@ -615,7 +645,7 @@ static int s31_rsa_modexp(struct s31_crypto_dev *dev,
 			  const u32 *exponent, unsigned int exponent_bits,
 			  bool constant_time, u32 *output)
 {
-	void __iomem *rsa = dev->base + S31_RSA_BASE;
+	void __iomem *rsa = dev->rsa;
 	unsigned long flags;
 	u32 value;
 	int ret;
@@ -814,23 +844,26 @@ static void s31_rsa_exit_tfm(struct crypto_akcipher *tfm)
 	s31_rsa_clear_key(&ctx->key);
 }
 
-static struct akcipher_alg s31_rsa_alg = {
-	.encrypt = s31_rsa_encrypt,
-	.decrypt = s31_rsa_decrypt,
-	.set_pub_key = s31_rsa_set_pub_key,
-	.set_priv_key = s31_rsa_set_priv_key,
-	.max_size = s31_rsa_max_size,
-	.init = s31_rsa_init_tfm,
-	.exit = s31_rsa_exit_tfm,
-	.base = {
-		.cra_name = "rsa",
-		.cra_driver_name = "rsa-esp32s31",
-		.cra_priority = 300,
-		.cra_flags = CRYPTO_ALG_NEED_FALLBACK,
-		.cra_module = THIS_MODULE,
-		.cra_ctxsize = sizeof(struct s31_rsa_ctx),
-	},
-};
+#define ESP_RSA_ALG(soc) { \
+	.encrypt = s31_rsa_encrypt, \
+	.decrypt = s31_rsa_decrypt, \
+	.set_pub_key = s31_rsa_set_pub_key, \
+	.set_priv_key = s31_rsa_set_priv_key, \
+	.max_size = s31_rsa_max_size, \
+	.init = s31_rsa_init_tfm, \
+	.exit = s31_rsa_exit_tfm, \
+	.base = { \
+		.cra_name = "rsa", \
+		.cra_driver_name = "rsa-" soc, \
+		.cra_priority = 300, \
+		.cra_flags = CRYPTO_ALG_NEED_FALLBACK, \
+		.cra_module = THIS_MODULE, \
+		.cra_ctxsize = sizeof(struct s31_rsa_ctx), \
+	}, \
+}
+
+static struct akcipher_alg s31_rsa_alg = ESP_RSA_ALG("esp32s31");
+static struct akcipher_alg p4_rsa_alg = ESP_RSA_ALG("esp32p4");
 
 static const u8 s31_p256_gx[32] = {
 	0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47,
@@ -881,40 +914,41 @@ static int s31_ecc_point_mul(struct s31_crypto_dev *dev, unsigned int bytes,
 	u8 py_le[S31_ECC_MAX_BYTES] = { };
 	u8 qx_le[S31_ECC_MAX_BYTES];
 	u8 qy_le[S31_ECC_MAX_BYTES];
-	void __iomem *ecc = dev->base + S31_ECC_BASE;
+	const struct esp_ecc_layout *layout = dev->variant->ecc_layout;
+	void __iomem *ecc = dev->ecc;
 	unsigned long flags;
 	u32 value;
 	int ret;
 
-	if (bytes != 32 && bytes != 48)
+	if ((bytes != 32 && bytes != 48) || bytes > layout->mem_bytes)
 		return -EINVAL;
 	s31_reverse(scalar_le, scalar, bytes);
 	s31_reverse(px_le, px, bytes);
 	s31_reverse(py_le, py, bytes);
 	raw_spin_lock_irqsave(&dev->lock, flags);
-	s31_write_words(ecc, S31_ECC_K_MEM, scalar_le, S31_ECC_MAX_BYTES);
-	s31_write_words(ecc, S31_ECC_PX_MEM, px_le, S31_ECC_MAX_BYTES);
-	s31_write_words(ecc, S31_ECC_PY_MEM, py_le, S31_ECC_MAX_BYTES);
+	s31_write_words(ecc, S31_ECC_K_MEM, scalar_le, layout->mem_bytes);
+	s31_write_words(ecc, layout->px, px_le, layout->mem_bytes);
+	s31_write_words(ecc, layout->py, py_le, layout->mem_bytes);
 	writel(BIT(0), ecc + S31_ECC_INT_CLR);
 	writel((bytes == 48 ? S31_ECC_CURVE_P384 : S31_ECC_CURVE_P256)
 		       << S31_ECC_KEY_LENGTH_SHIFT |
 		       (verify ? S31_ECC_MODE_VERIFY_THEN_POINT_MUL :
-			 S31_ECC_MODE_POINT_MUL) << S31_ECC_WORK_MODE_SHIFT |
-		       S31_ECC_SECURITY_MODE, ecc + S31_ECC_CONF);
+			 S31_ECC_MODE_POINT_MUL) << layout->work_mode_shift |
+		       layout->security_mode, ecc + S31_ECC_CONF);
 	writel(readl(ecc + S31_ECC_CONF) | S31_ECC_START, ecc + S31_ECC_CONF);
 	ret = readl_poll_timeout_atomic(ecc + S31_ECC_INT_RAW, value,
 					 value & BIT(0), 1, 2000000);
 	if (!ret && verify && !(readl(ecc + S31_ECC_CONF) & S31_ECC_VERIFY_RESULT))
 		ret = -EINVAL;
 	if (!ret) {
-		s31_read_words(ecc, S31_ECC_PX_MEM, qx_le, bytes);
-		s31_read_words(ecc, S31_ECC_PY_MEM, qy_le, bytes);
+		s31_read_words(ecc, layout->px, qx_le, bytes);
+		s31_read_words(ecc, layout->py, qy_le, bytes);
 		s31_reverse(qx, qx_le, bytes);
 		s31_reverse(qy, qy_le, bytes);
 	}
-	memset_io(ecc + S31_ECC_K_MEM, 0, S31_ECC_MAX_BYTES);
-	memset_io(ecc + S31_ECC_PX_MEM, 0, S31_ECC_MAX_BYTES);
-	memset_io(ecc + S31_ECC_PY_MEM, 0, S31_ECC_MAX_BYTES);
+	memset_io(ecc + S31_ECC_K_MEM, 0, layout->mem_bytes);
+	memset_io(ecc + layout->px, 0, layout->mem_bytes);
+	memset_io(ecc + layout->py, 0, layout->mem_bytes);
 	writel(BIT(0), ecc + S31_ECC_INT_CLR);
 	raw_spin_unlock_irqrestore(&dev->lock, flags);
 	memzero_explicit(scalar_le, sizeof(scalar_le));
@@ -1050,7 +1084,32 @@ static struct kpp_alg s31_ecdh_algs[] = {
 		     s31_ecdh_p384_init),
 };
 
-static int s31_crypto_selftest(struct s31_crypto_dev *dev)
+static struct kpp_alg p4_ecdh_algs[] = {
+	S31_ECDH_ALG("ecdh-nist-p256", "ecdh-nist-p256-esp32p4",
+		     s31_ecdh_p256_init),
+};
+
+static const struct esp_ecc_layout s31_ecc_layout = {
+	.px = 0x130,
+	.py = 0x160,
+	.mem_bytes = 48,
+	.work_mode_shift = 5,
+	.security_mode = BIT(9),
+};
+
+/*
+ * TRM ch.29 ECC - the rev1.3 banks are 32 bytes and CURVE_MODE has one bit.
+ * Use the hw_ver1 KEY_LENGTH, WORK_MODE and SECURITY_MODE positions.
+ */
+static const struct esp_ecc_layout p4_ecc_layout = {
+	.px = 0x120,
+	.py = 0x140,
+	.mem_bytes = 32,
+	.work_mode_shift = 4,
+	.security_mode = BIT(8),
+};
+
+static int esp_crypto_asymmetric_selftest(struct s31_crypto_dev *dev)
 {
 	struct s31_rsa_key *key;
 	u32 input = 65;
@@ -1085,6 +1144,8 @@ static int s31_crypto_selftest(struct s31_crypto_dev *dev)
 	if (ret || memcmp(qx, s31_p256_gx, sizeof(qx)) ||
 	    memcmp(qy, s31_p256_gy, sizeof(qy)))
 		goto fail;
+	if (dev->variant->ecc_layout->mem_bytes < sizeof(scalar384))
+		goto out;
 	scalar384[47] = 1;
 	ret = s31_ecc_point_mul(dev, sizeof(scalar384), scalar384, s31_p384_gx,
 			s31_p384_gy, true, qx384, qy384);
@@ -1105,23 +1166,42 @@ fail:
 	goto out;
 }
 
-static int s31_crypto_probe(struct platform_device *pdev)
+static const struct esp_crypto_variant esp32s31_crypto = {
+	.aes = s31_aes_algs,
+	.sha = s31_sha_algs,
+	.rsa = &s31_rsa_alg,
+	.ecdh = s31_ecdh_algs,
+	.num_ecdh = ARRAY_SIZE(s31_ecdh_algs),
+	.ecc_layout = &s31_ecc_layout,
+	.s31 = true,
+};
+
+static const struct esp_crypto_variant esp32p4_crypto = {
+	.aes = p4_aes_algs,
+	.sha = p4_sha_algs,
+	.rsa = &p4_rsa_alg,
+	.ecdh = p4_ecdh_algs,
+	.num_ecdh = ARRAY_SIZE(p4_ecdh_algs),
+	.ecc_layout = &p4_ecc_layout,
+};
+
+static const struct esp_crypto_variant esp32p4_aes_sha = {
+	.aes = p4_aes_algs,
+	.sha = p4_sha_algs,
+};
+
+static int s31_crypto_setup(struct platform_device *pdev,
+			    struct s31_crypto_dev *dev)
 {
-	struct s31_crypto_dev *dev;
+	void __iomem *clkrst;
 	u32 value;
 	int ret;
 
-	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
-	dev->dev = &pdev->dev;
-	dev->base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(dev->base))
-		return PTR_ERR(dev->base);
-	dev->clkrst = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(dev->clkrst))
-		return PTR_ERR(dev->clkrst);
-	raw_spin_lock_init(&dev->lock);
+	clkrst = devm_platform_ioremap_resource(pdev, 1);
+	if (IS_ERR(clkrst))
+		return PTR_ERR(clkrst);
+	dev->rsa = dev->base + S31_RSA_BASE;
+	dev->ecc = dev->base + S31_ECC_BASE;
 	dev->sha_dma = dma_request_chan(&pdev->dev, "sha");
 	if (IS_ERR(dev->sha_dma)) {
 		ret = PTR_ERR(dev->sha_dma);
@@ -1130,56 +1210,115 @@ static int s31_crypto_probe(struct platform_device *pdev)
 			return ret;
 		dev_warn(&pdev->dev, "SHA DMA unavailable (%d), using PIO\n", ret);
 	}
-	value = readl(dev->clkrst);
+	value = readl(clkrst);
 	writel(value | S31_CRYPTO_SYS_CLK | S31_CRYPTO_AES_CLK |
 	       S31_CRYPTO_SHA_CLK | S31_CRYPTO_RSA_CLK | S31_CRYPTO_ECC_CLK,
-	       dev->clkrst);
-	ret = s31_crypto_selftest(dev);
-	if (ret) {
-		if (dev->sha_dma)
-			dma_release_channel(dev->sha_dma);
-		return dev_err_probe(&pdev->dev, ret,
-				     "RSA/MPI or ECC hardware self-test failed\n");
+	       clkrst);
+	return 0;
+}
+
+static int p4_crypto_setup(struct platform_device *pdev,
+			   struct s31_crypto_dev *dev)
+{
+	struct clk_bulk_data *clocks;
+	void __iomem *ecc_power;
+	int count;
+
+	count = devm_clk_bulk_get_all_enabled(dev->dev, &clocks);
+	if (count < 0)
+		return dev_err_probe(dev->dev, count, "crypto clocks unavailable\n");
+	if (count != (dev->variant->rsa ? 3 : 1))
+		return dev_err_probe(dev->dev, -EINVAL, "invalid clock count\n");
+
+	/* TRM ch.28 AES, Typical AES Working Mode - AES_DMA_ENABLE must be 0. */
+	writel(0, dev->base + P4_AES_DMA_ENABLE);
+	if (!dev->variant->rsa)
+		return 0;
+
+	dev->rsa = devm_platform_ioremap_resource_byname(pdev, "rsa");
+	if (IS_ERR(dev->rsa))
+		return PTR_ERR(dev->rsa);
+	dev->ecc = devm_platform_ioremap_resource_byname(pdev, "ecc");
+	if (IS_ERR(dev->ecc))
+		return PTR_ERR(dev->ecc);
+	ecc_power = devm_platform_ioremap_resource_byname(pdev, "ecc-power");
+	if (IS_ERR(ecc_power))
+		return PTR_ERR(ecc_power);
+
+	writel(readl(ecc_power) & ~P4_ECC_MEM_PD, ecc_power);
+	/* PIO polls the idle and raw status bits. */
+	writel(0, dev->rsa + P4_RSA_INT_ENA);
+	writel(0, dev->ecc + P4_ECC_INT_ENA);
+	return 0;
+}
+
+static int s31_crypto_probe(struct platform_device *pdev)
+{
+	const struct esp_crypto_variant *variant = device_get_match_data(&pdev->dev);
+	struct s31_crypto_dev *dev;
+	unsigned int i;
+	int ret;
+
+	if (!variant)
+		return -ENODEV;
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+	dev->dev = &pdev->dev;
+	dev->variant = variant;
+	dev->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(dev->base))
+		return PTR_ERR(dev->base);
+	raw_spin_lock_init(&dev->lock);
+	ret = variant->s31 ? s31_crypto_setup(pdev, dev) :
+	      p4_crypto_setup(pdev, dev);
+	if (ret)
+		goto release_dma;
+	if (variant->rsa) {
+		ret = esp_crypto_asymmetric_selftest(dev);
+		if (ret) {
+			dev_err_probe(&pdev->dev, ret, "RSA/MPI or ECC hardware self-test failed\n");
+			goto release_dma;
+		}
 	}
+
 	WRITE_ONCE(s31_crypto, dev);
-	ret = crypto_register_skciphers(s31_aes_algs, ARRAY_SIZE(s31_aes_algs));
-	if (ret) {
-		WRITE_ONCE(s31_crypto, NULL);
-		if (dev->sha_dma)
-			dma_release_channel(dev->sha_dma);
-		return ret;
+	ret = crypto_register_skciphers(variant->aes, ARRAY_SIZE(s31_aes_algs));
+	if (ret)
+		goto clear_device;
+	ret = crypto_register_shashes(variant->sha, ARRAY_SIZE(s31_sha_algs));
+	if (ret)
+		goto unregister_aes;
+	if (variant->rsa) {
+		ret = crypto_register_akcipher(variant->rsa);
+		if (ret)
+			goto unregister_shashes;
+		for (i = 0; i < variant->num_ecdh; i++) {
+			ret = crypto_register_kpp(&variant->ecdh[i]);
+			if (ret)
+				goto unregister_kpps;
+		}
 	}
-	ret = crypto_register_shashes(s31_sha_algs, ARRAY_SIZE(s31_sha_algs));
-	if (ret) {
-		crypto_unregister_skciphers(s31_aes_algs, ARRAY_SIZE(s31_aes_algs));
-		WRITE_ONCE(s31_crypto, NULL);
-		if (dev->sha_dma)
-			dma_release_channel(dev->sha_dma);
-		return ret;
-	}
-	ret = crypto_register_akcipher(&s31_rsa_alg);
-	if (ret)
-		goto unregister_shashes;
-	ret = crypto_register_kpp(&s31_ecdh_algs[0]);
-	if (ret)
-		goto unregister_rsa;
-	ret = crypto_register_kpp(&s31_ecdh_algs[1]);
-	if (ret)
-		goto unregister_ecdh_p256;
 	platform_set_drvdata(pdev, dev);
-	dev_info(&pdev->dev,
-		 "AES PIO, SHA %s, RSA/MPI and P-256/P-384 ECDH providers registered\n",
-		 dev->sha_dma ? "DMA" : "PIO");
+	if (variant->rsa)
+		dev_info(&pdev->dev, "AES PIO, SHA %s, RSA/MPI and %s providers registered\n",
+			 dev->sha_dma ? "DMA" : "PIO",
+			 variant->num_ecdh > 1 ? "P-256/P-384 ECDH" : "P-256 ECDH");
+	else
+		dev_info(&pdev->dev, "AES and SHA PIO providers registered\n");
 	return 0;
 
-unregister_ecdh_p256:
-	crypto_unregister_kpp(&s31_ecdh_algs[0]);
-unregister_rsa:
-	crypto_unregister_akcipher(&s31_rsa_alg);
+unregister_kpps:
+	while (i)
+		crypto_unregister_kpp(&variant->ecdh[--i]);
+	crypto_unregister_akcipher(variant->rsa);
 unregister_shashes:
-	crypto_unregister_shashes(s31_sha_algs, ARRAY_SIZE(s31_sha_algs));
-	crypto_unregister_skciphers(s31_aes_algs, ARRAY_SIZE(s31_aes_algs));
+	crypto_unregister_shashes(variant->sha, ARRAY_SIZE(s31_sha_algs));
+unregister_aes:
+	crypto_unregister_skciphers(variant->aes, ARRAY_SIZE(s31_aes_algs));
+clear_device:
 	WRITE_ONCE(s31_crypto, NULL);
+release_dma:
 	if (dev->sha_dma)
 		dma_release_channel(dev->sha_dma);
 	return ret;
@@ -1188,19 +1327,25 @@ unregister_shashes:
 static void s31_crypto_remove(struct platform_device *pdev)
 {
 	struct s31_crypto_dev *dev = platform_get_drvdata(pdev);
+	const struct esp_crypto_variant *variant = dev->variant;
 
-	crypto_unregister_kpp(&s31_ecdh_algs[1]);
-	crypto_unregister_kpp(&s31_ecdh_algs[0]);
-	crypto_unregister_akcipher(&s31_rsa_alg);
-	crypto_unregister_shashes(s31_sha_algs, ARRAY_SIZE(s31_sha_algs));
-	crypto_unregister_skciphers(s31_aes_algs, ARRAY_SIZE(s31_aes_algs));
+	unsigned int i;
+
+	for (i = variant->num_ecdh; i; i--)
+		crypto_unregister_kpp(&variant->ecdh[i - 1]);
+	if (variant->rsa)
+		crypto_unregister_akcipher(variant->rsa);
+	crypto_unregister_shashes(variant->sha, ARRAY_SIZE(s31_sha_algs));
+	crypto_unregister_skciphers(variant->aes, ARRAY_SIZE(s31_aes_algs));
 	WRITE_ONCE(s31_crypto, NULL);
 	if (dev->sha_dma)
 		dma_release_channel(dev->sha_dma);
 }
 
 static const struct of_device_id s31_crypto_of_match[] = {
-	{ .compatible = "espressif,esp32s31-crypto" },
+	{ .compatible = "espressif,esp32s31-crypto", .data = &esp32s31_crypto },
+	{ .compatible = "espressif,esp32p4-crypto", .data = &esp32p4_crypto },
+	{ .compatible = "espressif,esp32p4-aes-sha", .data = &esp32p4_aes_sha },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s31_crypto_of_match);
@@ -1215,5 +1360,5 @@ static struct platform_driver s31_crypto_driver = {
 };
 module_platform_driver(s31_crypto_driver);
 
-MODULE_DESCRIPTION("ESP32-S31 AES, SHA, RSA/MPI and ECC Crypto API driver");
+MODULE_DESCRIPTION("Espressif ESP32-P4 and ESP32-S31 Crypto API driver");
 MODULE_LICENSE("GPL");

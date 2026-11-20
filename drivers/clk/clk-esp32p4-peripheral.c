@@ -26,10 +26,12 @@
 #define I2S_CLK12		0x48
 #define I2S_CLK13		0x4c
 #define I2S_CLK14		0x50
+#define TWAI_CLK115		0x7c
 #define GPSPI_CLK116		0x80
 #define TIMER_CLK20		0x94
 #define TIMER_CLK21		0x98
 #define LEDC_CLK22		0x9c
+#define CRYPTO_CLK25		0xa8
 #define IOMUX_CLK26		0xac
 #define HP_RST0			0xc0
 #define HP_RST1			0xc4
@@ -76,6 +78,12 @@
 #define EMAC_PHY_INTF		GENMASK(4, 2)
 #define EMAC_PHY_RMII		4
 
+/* TRM ch.12 - TWAI<n>_APB_CLK_EN, CLK_SRC_SEL, CLK_EN and RST_EN. */
+#define TWAI_APB_EN(n)		BIT(24 + (n))
+#define TWAI_CLK_SRC(n)		BIT(24 + 2 * (n))
+#define TWAI_CLK_EN(n)		BIT(25 + 2 * (n))
+#define TWAI_RESET(n)		BIT(26 + (n))
+
 /* TRM ch.61 Motor Control PWM - MCPWMn clock source, gate and reset. */
 #define MCPWM0_APB_EN		BIT(27)
 #define MCPWM1_APB_EN		BIT(28)
@@ -85,6 +93,19 @@
 #define MCPWM1_CLK_EN		BIT(13)
 #define MCPWM0_RESET		BIT(24)
 #define MCPWM1_RESET		BIT(25)
+
+/*
+ * TRM ch.12 Reset and Clock - PERI_CLK_CTRL25 and HP_RST_EN2.
+ * TRM ch.28 AES and ch.32 SHA require the shared engines out of reset.
+ */
+#define AES_SHA_CLK_SRC		GENMASK(13, 12)
+#define AES_SHA_CLK_ENABLE	(BIT(14) | BIT(20))
+#define AES_SHA_RESET		(BIT(14) | GENMASK(20, 16) | BIT(23))
+/* TRM ch.31 RSA / ch.29 ECC - clear the dependent reset lines as well. */
+#define RSA_CLK_ENABLE		BIT(18)
+#define RSA_RESET		(BIT(14) | BIT(17) | BIT(20) | BIT(21))
+#define ECC_CLK_ENABLE		BIT(16)
+#define ECC_RESET		(BIT(14) | BIT(20) | BIT(22))
 
 /* TRM ch.62 RMT and ch.12 Reset and Clock - RMT_SYS_CLK_EN, RMT_CLK_SRC_SEL. */
 #define RMT_SYS_EN		BIT(0)
@@ -242,6 +263,27 @@ static int p4_clk_enable(struct clk_hw *hw)
 		p4_update(cc, LEDC_CLK22, RMT_CLK_SRC | RMT_DIV_FIELDS | RMT_FUNC_EN,
 			  RMT_FUNC_EN);
 		break;
+	case ESP32P4_CLK_AES_SHA:
+		p4_update(cc, CRYPTO_CLK25, AES_SHA_CLK_SRC | AES_SHA_CLK_ENABLE,
+			  AES_SHA_CLK_ENABLE);
+		p4_update(cc, HP_RST2, AES_SHA_RESET, 0);
+		break;
+	case ESP32P4_CLK_RSA:
+		p4_update(cc, CRYPTO_CLK25, RSA_CLK_ENABLE, RSA_CLK_ENABLE);
+		p4_update(cc, HP_RST2, RSA_RESET, 0);
+		break;
+	case ESP32P4_CLK_ECC:
+		p4_update(cc, CRYPTO_CLK25, ECC_CLK_ENABLE, ECC_CLK_ENABLE);
+		p4_update(cc, HP_RST2, ECC_RESET, 0);
+		break;
+	case ESP32P4_CLK_TWAI0 ... ESP32P4_CLK_TWAI2: {
+		unsigned int n = clk->id - ESP32P4_CLK_TWAI0;
+
+		p4_update(cc, SOC_CLK2, TWAI_APB_EN(n), TWAI_APB_EN(n));
+		p4_update(cc, TWAI_CLK115, TWAI_CLK_SRC(n) | TWAI_CLK_EN(n),
+			  TWAI_CLK_EN(n));
+		break;
+	}
 	case ESP32P4_CLK_LEDC:
 		p4_update(cc, SOC_CLK3, LEDC_APB_EN, LEDC_APB_EN);
 		p4_update(cc, LEDC_CLK22, LEDC_SRC | LEDC_CLK_EN, LEDC_CLK_EN);
@@ -333,6 +375,22 @@ static void p4_clk_disable(struct clk_hw *hw)
 		p4_update(cc, LEDC_CLK22, RMT_FUNC_EN, 0);
 		p4_update(cc, SOC_CLK2, RMT_SYS_EN, 0);
 		break;
+	case ESP32P4_CLK_AES_SHA:
+		p4_update(cc, CRYPTO_CLK25, AES_SHA_CLK_ENABLE, 0);
+		break;
+	case ESP32P4_CLK_RSA:
+		p4_update(cc, CRYPTO_CLK25, RSA_CLK_ENABLE, 0);
+		break;
+	case ESP32P4_CLK_ECC:
+		p4_update(cc, CRYPTO_CLK25, ECC_CLK_ENABLE, 0);
+		break;
+	case ESP32P4_CLK_TWAI0 ... ESP32P4_CLK_TWAI2: {
+		unsigned int n = clk->id - ESP32P4_CLK_TWAI0;
+
+		p4_update(cc, TWAI_CLK115, TWAI_CLK_EN(n), 0);
+		p4_update(cc, SOC_CLK2, TWAI_APB_EN(n), 0);
+		break;
+	}
 	case ESP32P4_CLK_LEDC:
 		p4_update(cc, LEDC_CLK22, LEDC_CLK_EN, 0);
 		p4_update(cc, SOC_CLK3, LEDC_APB_EN, 0);
@@ -548,6 +606,10 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST1;
 		bit = PCNT_APB_RESET;
 		break;
+	case ESP32P4_RST_TWAI0 ... ESP32P4_RST_TWAI2:
+		reg = HP_RST1;
+		bit = TWAI_RESET(id - ESP32P4_RST_TWAI0);
+		break;
 	case ESP32P4_RST_I2S0:
 		reg = HP_RST2;
 		bit = I2S0_APB_RESET;
@@ -584,6 +646,9 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-mcpwm0",
 		"p4-mcpwm1",
 		"p4-rmt",
+		"p4-aes-sha",
+		"p4-twai0", "p4-twai1", "p4-twai2",
+		"p4-rsa", "p4-ecc",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;

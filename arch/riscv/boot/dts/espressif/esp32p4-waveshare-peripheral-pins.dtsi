@@ -59,6 +59,18 @@
 			function = "rmt-loopback";
 		};
 
+		pins_twai0_loopback: twai0-loopback-pins {
+			function = "twai0-loopback";
+		};
+
+		pins_twai1_loopback: twai1-loopback-pins {
+			function = "twai1-loopback";
+		};
+
+		pins_twai2_loopback: twai2-loopback-pins {
+			function = "twai2-loopback";
+		};
+
 		pins_gpspi2: gpspi2-pins {
 			function = "gpspi2";
 		};

@@ -257,6 +257,54 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		};
 	};
 
+	/*
+	 * TRM ch.28/32 AES/SHA, ch.31 RSA, and ch.29 ECC. On rev1.3,
+	 * ECC_MULT_DATE at 0x500930fc reads 0x02305040, matching the
+	 * hw_ver1 ECC block. The summary map lists the crypto banks in
+	 * a different order.
+	 */
+	crypto@50090000 {
+		compatible = "espressif,esp32p4-crypto";
+		reg = <0x50090000 0x2000>, <0x50092000 0x1000>,
+		      <0x50093000 0x1000>, <0x500e51d4 0x4>;
+		reg-names = "aes-sha", "rsa", "ecc", "ecc-power";
+		clocks = <&periphclk ESP32P4_CLK_AES_SHA>,
+			 <&periphclk ESP32P4_CLK_RSA>,
+			 <&periphclk ESP32P4_CLK_ECC>;
+		clock-names = "aes-sha", "rsa", "ecc";
+	};
+
+	/* TRM ch.58 TWAI, Classic CAN controllers. Assign board pins to enable. */
+	twai0: can@500d7000 {
+		compatible = "espressif,esp32p4-twai";
+		reg = <0x500d7000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <40 4>;
+		clocks = <&periphclk ESP32P4_CLK_TWAI0>;
+		resets = <&periphclk ESP32P4_RST_TWAI0>;
+		status = "disabled";
+	};
+
+	twai1: can@500d8000 {
+		compatible = "espressif,esp32p4-twai";
+		reg = <0x500d8000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <41 4>;
+		clocks = <&periphclk ESP32P4_CLK_TWAI1>;
+		resets = <&periphclk ESP32P4_RST_TWAI1>;
+		status = "disabled";
+	};
+
+	twai2: can@500d9000 {
+		compatible = "espressif,esp32p4-twai";
+		reg = <0x500d9000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <42 4>;
+		clocks = <&periphclk ESP32P4_CLK_TWAI2>;
+		resets = <&periphclk ESP32P4_RST_TWAI2>;
+		status = "disabled";
+	};
+
 	/* TRM ch.6 GDMA Controller - three coupled AHB RX/TX channel pairs. */
 	ahb_dma: dma-controller@50085000 {
 		compatible = "espressif,esp32p4-ahb-gdma";

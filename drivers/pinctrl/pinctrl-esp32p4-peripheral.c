@@ -154,6 +154,12 @@ static const struct p4_route mcpwm1_routes[] = { { P4_SIGNAL_NONE, 95 } };
 static const unsigned int rmt_pins[] = { 3 };
 static const struct p4_route rmt_routes[] = { { 246, 246 } };
 
+/* TRM ch.11 GPIO Matrix - optional TWAI self-test routes through GPIO3. */
+static const unsigned int twai_pins[] = { 3 };
+static const struct p4_route twai0_routes[] = { { 80, 80 } };
+static const struct p4_route twai1_routes[] = { { 83, 83 } };
+static const struct p4_route twai2_routes[] = { { 86, 86 } };
+
 static const struct p4_group p4_groups[] = {
 	{ "i2c1", i2c1_pins, i2c1_routes, ARRAY_SIZE(i2c1_pins) },
 	{ "gpspi2", gpspi2_pins, gpspi2_routes, ARRAY_SIZE(gpspi2_pins) },
@@ -169,6 +175,9 @@ static const struct p4_group p4_groups[] = {
 	{ "mcpwm0", mcpwm_pins, mcpwm0_routes, ARRAY_SIZE(mcpwm_pins) },
 	{ "mcpwm1", mcpwm_pins, mcpwm1_routes, ARRAY_SIZE(mcpwm_pins) },
 	{ "rmt-loopback", rmt_pins, rmt_routes, ARRAY_SIZE(rmt_pins) },
+	{ "twai0-loopback", twai_pins, twai0_routes, ARRAY_SIZE(twai_pins) },
+	{ "twai1-loopback", twai_pins, twai1_routes, ARRAY_SIZE(twai_pins) },
+	{ "twai2-loopback", twai_pins, twai2_routes, ARRAY_SIZE(twai_pins) },
 };
 
 #define P4_PIN(n) PINCTRL_PIN(n, "GPIO" #n)
