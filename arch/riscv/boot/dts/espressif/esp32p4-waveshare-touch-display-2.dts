@@ -688,6 +688,8 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		clocks = <&periphclk ESP32P4_CLK_SDMMC>,
 			 <&periphclk ESP32P4_CLK_SDMMC>;
 		clock-names = "biu", "ciu";
+		assigned-clocks = <&periphclk ESP32P4_CLK_SDMMC>;
+		assigned-clock-rates = <40000000>;
 		pinctrl-0 = <&pins_sdmmc0 &pins_sdmmc1>;
 		pinctrl-names = "default";
 		espressif,num-slots = <2>;
@@ -698,7 +700,8 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 			reg = <0>;
 			vmmc-supply = <&sd_vdd>;
 			bus-width = <4>;
-			max-frequency = <20000000>;
+			cap-sd-highspeed;
+			max-frequency = <40000000>;
 			no-1-8-v;
 			disable-wp;
 			broken-cd;

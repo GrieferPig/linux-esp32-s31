@@ -85,6 +85,12 @@ static void dwc2_set_esp32p4_params(struct dwc2_hsotg *hsotg)
 	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
 	p->phy_utmi_width = 16;
 	p->host_dma = true;
+	/*
+	 * TRM v1.3 ch.47, USB 2.0 High-Speed OTG. After partial power
+	 * down, GINTSTS.CURMODE reports device mode during host resume.
+	 * Keep HPRT0 bus suspend and use the DWC2 clock-gating path.
+	 */
+	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
 	/* SINGLE is the AHB burst used by the P4 IDF USB host. */
 	p->ahbcfg = GAHBCFG_HBSTLEN_SINGLE << GAHBCFG_HBSTLEN_SHIFT;
 	/* TRM ch.54 USB 2.0 High-Speed OTG - the 896-word FIFO RAM. */

@@ -108,7 +108,9 @@
 #define SDIO_DRIVE_EDGE		GENMASK(24, 23)
 #define SDIO_SELF_EDGE		GENMASK(22, 21)
 #define SDIO_EDGE_ENABLE	GENMASK(29, 27)
-#define SDIO_CLOCK_DIV		8
+#define SDIO_DEFAULT_DIV	8
+#define SDIO_MIN_DIV		2
+#define SDIO_MAX_DIV		16
 #define LP_SDMMC_RESET		BIT(28)
 
 /* TRM ch.12 Reset and Clock and ch.57 EMAC - external RMII reference. */
@@ -345,6 +347,7 @@ struct p4_cc {
 	struct regmap *lpperi;
 	spinlock_t lock;
 	struct reset_controller_dev reset;
+	unsigned int sdmmc_div;
 };
 
 struct p4_clk {
@@ -617,22 +620,26 @@ static int p4_clk_enable(struct clk_hw *hw)
 		/* TRM ch.12 Reset and Clock - USB_OTG20_SYS_CLK_EN. */
 		p4_update(cc, SOC_CLK1, USB_OTG20_SYS_EN, USB_OTG20_SYS_EN);
 		break;
-	case ESP32P4_CLK_SDMMC:
+	case ESP32P4_CLK_SDMMC: {
+		unsigned int div = cc->sdmmc_div;
+
 		p4_update(cc, SOC_CLK1, SDMMC_SYS_EN, SDMMC_SYS_EN);
 		/* LP_CLKRST_HP_SDMMC_EMAC_RST_CTRL, TRM ch.12. */
 		p4_lp_pulse_reset(cc, LP_SDMMC_RESET);
 		p4_update(cc, SDIO_CLK_SOURCE, SDIO_HS_MODE | SDIO_LS_SRC |
 			  SDIO_LS_EN, SDIO_LS_EN);
+		/* TRM rev1.3 ch.10 PERI_CLK_CTRL02: latch EDGE_L/H/N together. */
 		p4_update(cc, SDIO_CLK_EDGES, SDIO_EDGE_L | SDIO_EDGE_H | SDIO_EDGE_N |
 			  SDIO_EDGE_ENABLE | SDIO_SAMPLE_EDGE | SDIO_DRIVE_EDGE |
 			  SDIO_SELF_EDGE,
-			  FIELD_PREP(SDIO_EDGE_L, SDIO_CLOCK_DIV - 1) |
-			  FIELD_PREP(SDIO_EDGE_H, SDIO_CLOCK_DIV / 2 - 1) |
-			  FIELD_PREP(SDIO_EDGE_N, SDIO_CLOCK_DIV - 1) |
+			  FIELD_PREP(SDIO_EDGE_L, div - 1) |
+			  FIELD_PREP(SDIO_EDGE_H, div / 2 - 1) |
+			  FIELD_PREP(SDIO_EDGE_N, div - 1) |
 			  FIELD_PREP(SDIO_DRIVE_EDGE, 1) | SDIO_EDGE_ENABLE);
 		p4_update(cc, SDIO_CLK_EDGES, SDIO_EDGE_UPDATE, SDIO_EDGE_UPDATE);
 		p4_update(cc, SDIO_CLK_EDGES, SDIO_EDGE_UPDATE, 0);
 		break;
+	}
 	case ESP32P4_CLK_IOMUX:
 		/* Other pads are firmware-owned. Keep their existing source/divider. */
 		p4_update(cc, SOC_CLK3, IOMUX_APB_EN, IOMUX_APB_EN);
@@ -823,7 +830,7 @@ static unsigned long p4_clk_rate(struct clk_hw *hw, unsigned long parent_rate)
 	if (clk->id == ESP32P4_CLK_ADC)
 		return parent_rate / ADC_XTAL_DIV;
 	if (clk->id == ESP32P4_CLK_SDMMC)
-		return parent_rate / SDIO_CLOCK_DIV;
+		return parent_rate / READ_ONCE(clk->cc->sdmmc_div);
 	if (clk->id == ESP32P4_CLK_GPSPI2 || clk->id == ESP32P4_CLK_GPSPI3 ||
 	    clk->id == ESP32P4_CLK_LP_I2C || clk->id == ESP32P4_CLK_LP_UART)
 		return parent_rate / 2;
@@ -834,6 +841,51 @@ static const struct clk_ops p4_clk_ops = {
 	.enable = p4_clk_enable,
 	.disable = p4_clk_disable,
 	.recalc_rate = p4_clk_rate,
+};
+
+static int p4_sdmmc_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
+{
+	unsigned long parent_rate = req->best_parent_rate;
+	unsigned int div;
+
+	if (!req->rate || !parent_rate)
+		return -EINVAL;
+	/*
+	 * EDGE_H is half the period. Use even divisors and a resulting
+	 * frequency at or below the requested rate.
+	 */
+	div = max_t(unsigned int, SDIO_MIN_DIV,
+		    round_up(DIV_ROUND_UP(parent_rate, req->rate), 2));
+	if (div > SDIO_MAX_DIV)
+		return -EINVAL;
+	req->rate = parent_rate / div;
+	return 0;
+}
+
+static int p4_sdmmc_set_rate(struct clk_hw *hw, unsigned long rate,
+			     unsigned long parent_rate)
+{
+	struct p4_clk *clk = container_of(hw, struct p4_clk, hw);
+	unsigned int div;
+
+	if (!rate)
+		return -EINVAL;
+	div = DIV_ROUND_CLOSEST(parent_rate, rate);
+	if (div < SDIO_MIN_DIV || div > SDIO_MAX_DIV ||
+	    div % 2 || parent_rate / div != rate)
+		return -EINVAL;
+
+	/* The clock is gated. Program the new phase on the next enable. */
+	WRITE_ONCE(clk->cc->sdmmc_div, div);
+	return 0;
+}
+
+static const struct clk_ops p4_sdmmc_clk_ops = {
+	.enable = p4_clk_enable,
+	.disable = p4_clk_disable,
+	.recalc_rate = p4_clk_rate,
+	.determine_rate = p4_sdmmc_determine_rate,
+	.set_rate = p4_sdmmc_set_rate,
 };
 
 static u8 p4_parlio_rx_parent(struct clk_hw *hw)
@@ -1312,6 +1364,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 	if (IS_ERR(cc->lpperi))
 		return PTR_ERR(cc->lpperi);
 	spin_lock_init(&cc->lock);
+	cc->sdmmc_div = SDIO_DEFAULT_DIV;
 
 	data = devm_kzalloc(dev, struct_size(data, hws, ESP32P4_CLK_NR),
 			    GFP_KERNEL);
@@ -1327,13 +1380,15 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		const struct clk_init_data init = {
 			.name = names[i],
 			.ops = i == ESP32P4_CLK_EMAC_RMII ? &p4_rmii_clk_ops :
+			       i == ESP32P4_CLK_SDMMC ? &p4_sdmmc_clk_ops :
 			       i == ESP32P4_CLK_PARLIO_RX ? &p4_parlio_rx_ops :
 			       i == ESP32P4_CLK_PARLIO_TX ? &p4_parlio_tx_ops :
 			       p4_i2s_layout(i) ? &p4_i2s_clk_ops :
 			       i >= ESP32P4_CLK_UART1 && i <= ESP32P4_CLK_UART4 ?
 			       &p4_uart_clk_ops : &p4_clk_ops,
 			.flags = i == ESP32P4_CLK_PARLIO_RX ? CLK_SET_PARENT_GATE :
-				 i == ESP32P4_CLK_PARLIO_TX ? CLK_SET_RATE_GATE : 0,
+				 (i == ESP32P4_CLK_PARLIO_TX ||
+				  i == ESP32P4_CLK_SDMMC) ? CLK_SET_RATE_GATE : 0,
 			.parent_data = parents,
 			.num_parents = i == ESP32P4_CLK_PARLIO_RX ? 2 :
 				       (i == ESP32P4_CLK_PARLIO_BUS ||
