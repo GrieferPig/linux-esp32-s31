@@ -1834,4 +1834,10 @@ config REGULATOR_ESP32S31_ANA_I2C
 	  Centralize the PMU power/reset sequence for the analog register-I2C
 	  fabric shared by SAR ADC, temperature sensor and radio calibration.
 
+config REGULATOR_ESP32P4_VO4
+	tristate "Espressif ESP32-P4 VO4 bypass regulator"
+	depends on SOC_ESP32P4
+	help
+	  Enable the 3.3 V VO4 bypass regulator used by SD card supplies.
+
 endif

@@ -137,15 +137,15 @@ config ESPRESSIF_GDMA_AXI
 	  Enable the AXI general-purpose DMA controller found in the ESP32-S31.
 
 config ESPRESSIF_GDMA_AHB
-	tristate "Espressif ESP32-S31 AHB GDMA support"
-	depends on SOC_ESP32S31
+	tristate "Espressif ESP32-S31 and ESP32-P4 AHB GDMA support"
+	depends on SOC_ESP32S31 || SOC_ESP32P4
 	select DMA_ENGINE
 	select DMA_VIRTUAL_CHANNELS
 	select GENERIC_ALLOCATOR
 	help
-	  Enable all five memory-copy channel pairs in the S31 AHB GDMA.
-	  Each coupled TX/RX pair is exposed as one channel supporting memcpy,
-	  memset, slave scatter-gather and cyclic transfers.
+	  Enable the coupled RX/TX channel pairs in Espressif AHB GDMA.
+	  Each coupled TX/RX pair is exposed as one slave channel supporting
+	  scatter-gather and cyclic transfers. Both SoCs support memory copies.
 
 config BCM_SBA_RAID
 	tristate "Broadcom SBA RAID engine support"

@@ -1602,7 +1602,10 @@ static int stmmac_init_rx_buffers(struct stmmac_priv *priv,
 		stmmac_set_desc_sec_addr(priv, p, buf->sec_addr, false);
 	}
 
-	buf->addr = page_pool_get_dma_addr(buf->page) + buf->page_offset;
+	if (rx_q->coherent_rx)
+		buf->addr = rx_q->coherent_rx_dma + i * dma_conf->dma_buf_sz;
+	else
+		buf->addr = page_pool_get_dma_addr(buf->page) + buf->page_offset;
 
 	stmmac_set_desc_addr(priv, p, buf->addr);
 	if (dma_conf->dma_buf_sz == BUF_SIZE_16KiB)
@@ -2058,6 +2061,13 @@ static void __free_dma_rx_desc_resources(struct stmmac_priv *priv,
 	else
 		dma_free_rx_skbufs(priv, dma_conf, queue);
 
+	if (rx_q->coherent_rx) {
+		dma_free_coherent(priv->device,
+				  dma_conf->dma_rx_size * dma_conf->dma_buf_sz,
+				  rx_q->coherent_rx, rx_q->coherent_rx_dma);
+		rx_q->coherent_rx = NULL;
+	}
+
 	rx_q->buf_alloc_num = 0;
 	rx_q->xsk_pool = NULL;
 
@@ -2109,6 +2119,12 @@ static void __free_dma_tx_desc_resources(struct stmmac_priv *priv,
 
 	/* Release the DMA TX socket buffers */
 	dma_free_tx_skbufs(priv, dma_conf, queue);
+	if (tx_q->coherent_tx) {
+		dma_free_coherent(priv->device,
+				  dma_conf->dma_tx_size * STMMAC_COHERENT_TX_SLOT_SIZE,
+				  tx_q->coherent_tx, tx_q->coherent_tx_dma);
+		tx_q->coherent_tx = NULL;
+	}
 
 	if (priv->extend_desc) {
 		size = sizeof(struct dma_extended_desc);
@@ -2172,7 +2188,8 @@ static int __alloc_dma_rx_desc_resources(struct stmmac_priv *priv,
 	rx_q->priv_data = priv;
 	rx_q->napi_skb_frag_size = num_pages * PAGE_SIZE;
 
-	pp_params.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+	if (!priv->plat->rx_coherent_slots)
+		pp_params.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
 	pp_params.pool_size = dma_conf->dma_rx_size;
 	pp_params.order = order_base_2(num_pages);
 	pp_params.nid = dev_to_node(priv->device);
@@ -2215,6 +2232,15 @@ static int __alloc_dma_rx_desc_resources(struct stmmac_priv *priv,
 						  &rx_q->dma_rx_phy,
 						  &rx_q->dma_rx_alloc);
 		if (!rx_q->dma_rx)
+			return -ENOMEM;
+	}
+
+	if (priv->plat->rx_coherent_slots) {
+		size_t size = dma_conf->dma_rx_size * dma_conf->dma_buf_sz;
+
+		rx_q->coherent_rx = dma_alloc_coherent(priv->device, size,
+					      &rx_q->coherent_rx_dma, GFP_KERNEL);
+		if (!rx_q->coherent_rx)
 			return -ENOMEM;
 	}
 
@@ -2310,6 +2336,14 @@ static int __alloc_dma_tx_desc_resources(struct stmmac_priv *priv,
 		tx_q->dma_entx = addr;
 	else
 		tx_q->dma_tx = addr;
+
+	if (priv->plat->tx_coherent_slots) {
+		size = dma_conf->dma_tx_size * STMMAC_COHERENT_TX_SLOT_SIZE;
+		tx_q->coherent_tx = dma_alloc_coherent(priv->device, size,
+					      &tx_q->coherent_tx_dma, GFP_KERNEL);
+		if (!tx_q->coherent_tx)
+			return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -4023,7 +4057,7 @@ stmmac_setup_dma_desc(struct stmmac_priv *priv, unsigned int mtu)
 	if (!dma_conf->dma_tx_size)
 		dma_conf->dma_tx_size = DMA_DEFAULT_TX_SIZE;
 	if (!dma_conf->dma_rx_size)
-		dma_conf->dma_rx_size = DMA_DEFAULT_RX_SIZE;
+		dma_conf->dma_rx_size = priv->plat->rx_coherent_slots ?: DMA_DEFAULT_RX_SIZE;
 
 	/* Earlier check for TBS */
 	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++) {
@@ -4645,6 +4679,10 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
 	txq_stats = &priv->xstats.txq_stats[queue];
 	first_tx = tx_q->cur_tx;
 
+	if (tx_q->coherent_tx &&
+	    (skb->len > STMMAC_COHERENT_TX_SLOT_SIZE || skb_is_nonlinear(skb)))
+		goto max_sdu_err;
+
 	if (priv->tx_path_in_lpi_mode && priv->eee_sw_timer_en)
 		stmmac_stop_sw_lpi(priv);
 
@@ -4814,7 +4852,8 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
 		print_pkt(skb->data, skb->len);
 	}
 
-	if (unlikely(stmmac_tx_avail(priv, queue) <= (MAX_SKB_FRAGS + 1))) {
+	if (unlikely(stmmac_tx_avail(priv, queue) <=
+		     (tx_q->coherent_tx ? 1 : MAX_SKB_FRAGS + 1))) {
 		netif_dbg(priv, hw, priv->dev, "%s: stop transmitted packets\n",
 			  __func__);
 		netif_tx_stop_queue(netdev_get_tx_queue(priv->dev, queue));
@@ -4836,12 +4875,19 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (likely(!is_jumbo)) {
 		bool last_segment = (nfrags == 0);
 
-		des = dma_map_single(priv->device, skb->data,
-				     nopaged_len, DMA_TO_DEVICE);
-		if (dma_mapping_error(priv->device, des))
-			goto dma_map_err;
+		if (tx_q->coherent_tx) {
+			size_t offset = first_entry * STMMAC_COHERENT_TX_SLOT_SIZE;
 
-		tx_q->tx_skbuff_dma[first_entry].buf = des;
+			memcpy(tx_q->coherent_tx + offset, skb->data, nopaged_len);
+			dma_wmb();
+			des = tx_q->coherent_tx_dma + offset;
+		} else {
+			des = dma_map_single(priv->device, skb->data,
+					     nopaged_len, DMA_TO_DEVICE);
+			if (dma_mapping_error(priv->device, des))
+				goto dma_map_err;
+			tx_q->tx_skbuff_dma[first_entry].buf = des;
+		}
 		tx_q->tx_skbuff_dma[first_entry].buf_type = STMMAC_TXBUF_T_SKB;
 		tx_q->tx_skbuff_dma[first_entry].map_as_page = false;
 
@@ -4948,7 +4994,11 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
 			buf->sec_addr = page_pool_get_dma_addr(buf->sec_page);
 		}
 
-		buf->addr = page_pool_get_dma_addr(buf->page) + buf->page_offset;
+		if (rx_q->coherent_rx)
+			buf->addr = rx_q->coherent_rx_dma +
+				    entry * priv->dma_conf.dma_buf_sz;
+		else
+			buf->addr = page_pool_get_dma_addr(buf->page) + buf->page_offset;
 
 		stmmac_set_desc_addr(priv, p, buf->addr);
 		if (priv->sph)
@@ -5670,11 +5720,20 @@ read_again:
 			}
 		}
 
+		if (rx_q->coherent_rx && buf1_len) {
+			size_t slot_size = priv->dma_conf.dma_buf_sz;
+
+			dma_rmb();
+			memcpy(page_address(buf->page) + buf->page_offset,
+			       rx_q->coherent_rx + entry * slot_size, buf1_len);
+		}
+
 		if (!skb) {
 			unsigned int pre_len, sync_len;
 
-			dma_sync_single_for_cpu(priv->device, buf->addr,
-						buf1_len, dma_dir);
+			if (!rx_q->coherent_rx)
+				dma_sync_single_for_cpu(priv->device, buf->addr,
+						       buf1_len, dma_dir);
 			net_prefetch(page_address(buf->page) +
 				     buf->page_offset);
 
@@ -5752,8 +5811,9 @@ read_again:
 			skb_mark_for_recycle(skb);
 			buf->page = NULL;
 		} else if (buf1_len) {
-			dma_sync_single_for_cpu(priv->device, buf->addr,
-						buf1_len, dma_dir);
+			if (!rx_q->coherent_rx)
+				dma_sync_single_for_cpu(priv->device, buf->addr,
+						       buf1_len, dma_dir);
 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
 					buf->page, buf->page_offset, buf1_len,
 					priv->dma_conf.dma_buf_sz);
@@ -6808,6 +6868,9 @@ static int stmmac_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	if (priv->plat->tx_coherent_slots)
+		return -EOPNOTSUPP;
+
 	switch (bpf->command) {
 	case XDP_SETUP_PROG:
 		return stmmac_xdp_set_prog(priv, bpf->prog, bpf->extack);
@@ -7671,6 +7734,11 @@ int stmmac_dvr_probe(struct device *device,
 			    NETIF_F_RXCSUM;
 	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 			     NETDEV_XDP_ACT_XSK_ZEROCOPY;
+	if (priv->plat->tx_coherent_slots) {
+		priv->dma_conf.dma_tx_size = priv->plat->tx_coherent_slots;
+		ndev->hw_features &= ~NETIF_F_SG;
+		ndev->xdp_features = 0;
+	}
 
 	ret = stmmac_tc_init(priv, priv);
 	if (!ret) {

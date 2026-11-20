@@ -29,9 +29,16 @@ allOf:
         reg:
           maxItems: 1
         reg-names: false
-      required:
-        - clocks
-        - clock-names
+      if:
+        properties:
+          compatible:
+            not:
+              contains:
+                const: espressif,esp32p4-dwc2
+      then:
+        required:
+          - clocks
+          - clock-names
 
 properties:
   compatible:
@@ -39,6 +46,7 @@ properties:
       - items:
           - const: espressif,esp32s31-dwc2
           - const: snps,dwc2
+      - const: espressif,esp32p4-dwc2
       - const: brcm,bcm2835-usb
       - const: hisilicon,hi6220-usb
       - const: ingenic,jz4775-otg

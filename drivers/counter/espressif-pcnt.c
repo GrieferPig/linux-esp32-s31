@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 pulse counter driver.
+ * Espressif pulse counter driver.
  *
  * Each controller contains four independent signed 16-bit counters.  This
  * initial Counter framework mapping counts rising edges on channel 0; GPIO
@@ -18,24 +18,44 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 
-#define PCNT_CONF0(unit)		((unit) * 0x10)
-#define PCNT_CONF3(unit)		(0x0c + (unit) * 0x10)
-#define PCNT_COUNT(unit)		(0x40 + (unit) * 4)
-#define PCNT_INT_ST			0x54
-#define PCNT_INT_ENA			0x58
-#define PCNT_INT_CLR			0x5c
-#define PCNT_STATUS(unit)		(0x60 + (unit) * 4)
-#define PCNT_CTRL			0x70
 #define PCNT_CH0_POS_MODE		GENMASK(19, 18)
 #define PCNT_EDGE_INCREASE		1
 #define PCNT_STEP_FORWARD		GENMASK(15, 0)
 #define PCNT_STEP_BACKWARD		GENMASK(31, 16)
 #define PCNT_STEP_FORWARD_EVENT		BIT(7)
 #define PCNT_STEP_BACKWARD_EVENT	BIT(8)
-#define PCNT_STEP_ENABLE(unit)		BIT(8 + (unit))
 #define PCNT_STEP_CHANNEL(unit, backward)	((unit) * 2 + (backward))
 
+struct espressif_pcnt_layout {
+	u8 stride;
+	u8 threshold;
+	u8 count;
+	u8 int_st;
+	u8 int_ena;
+	u8 int_clr;
+	u8 status;
+	u8 ctrl;
+	u16 event[2];
+	bool step_events;
+};
+
+static const struct espressif_pcnt_layout esp32s31_pcnt_layout = {
+	.stride = 0x10, .threshold = 0x0c, .count = 0x40,
+	.int_st = 0x54, .int_ena = 0x58, .int_clr = 0x5c,
+	.status = 0x60, .ctrl = 0x70,
+	.event = { PCNT_STEP_FORWARD_EVENT, PCNT_STEP_BACKWARD_EVENT },
+	.step_events = true,
+};
+
+/* TRM ch.53 Pulse Count Controller - CONF0/1/2 and THR_THRESn. */
+static const struct espressif_pcnt_layout esp32p4_pcnt_layout = {
+	.stride = 0x0c, .threshold = 0x04, .count = 0x30,
+	.int_st = 0x44, .int_ena = 0x48, .int_clr = 0x4c,
+	.status = 0x50, .ctrl = 0x60, .event = { BIT(3), BIT(2) },
+};
+
 struct esp32s31_pcnt {
+	const struct espressif_pcnt_layout *layout;
 	void __iomem *base;
 	struct clk *clk;
 	struct mutex lock;
@@ -59,7 +79,7 @@ static int esp32s31_pcnt_count_read(struct counter_device *counter,
 {
 	struct esp32s31_pcnt *pcnt = counter_priv(counter);
 
-	*value = (u16)readl(pcnt->base + PCNT_COUNT(count->id));
+	*value = (u16)readl(pcnt->base + pcnt->layout->count + 4 * count->id);
 	return 0;
 }
 
@@ -73,9 +93,9 @@ static int esp32s31_pcnt_count_write(struct counter_device *counter,
 	if (value)
 		return -EINVAL;
 	mutex_lock(&pcnt->lock);
-	ctrl = readl(pcnt->base + PCNT_CTRL);
-	writel(ctrl | BIT(count->id * 2), pcnt->base + PCNT_CTRL);
-	writel(ctrl & ~BIT(count->id * 2), pcnt->base + PCNT_CTRL);
+	ctrl = readl(pcnt->base + pcnt->layout->ctrl);
+	writel(ctrl | BIT(count->id * 2), pcnt->base + pcnt->layout->ctrl);
+	writel(ctrl & ~BIT(count->id * 2), pcnt->base + pcnt->layout->ctrl);
 	mutex_unlock(&pcnt->lock);
 	return 0;
 }
@@ -102,7 +122,9 @@ static int esp32s31_pcnt_step_read(struct counter_device *counter,
 				   bool backward)
 {
 	struct esp32s31_pcnt *pcnt = counter_priv(counter);
-	u32 conf = readl(pcnt->base + PCNT_CONF3(count->id));
+	void __iomem *reg = pcnt->base + pcnt->layout->threshold +
+			    count->id * pcnt->layout->stride;
+	u32 conf = readl(reg);
 
 	*value = (conf >> (backward ? 16 : 0)) & U16_MAX;
 	return 0;
@@ -113,6 +135,8 @@ static int esp32s31_pcnt_step_write(struct counter_device *counter,
 				    bool backward)
 {
 	struct esp32s31_pcnt *pcnt = counter_priv(counter);
+	void __iomem *reg = pcnt->base + pcnt->layout->threshold +
+			    count->id * pcnt->layout->stride;
 	u32 conf, mask = backward ? PCNT_STEP_BACKWARD : PCNT_STEP_FORWARD;
 
 	/* PCNT is a signed 16-bit counter; a larger interval is unreachable. */
@@ -120,10 +144,10 @@ static int esp32s31_pcnt_step_write(struct counter_device *counter,
 		return -ERANGE;
 
 	mutex_lock(&pcnt->lock);
-	conf = readl(pcnt->base + PCNT_CONF3(count->id));
+	conf = readl(reg);
 	conf &= ~mask;
 	conf |= (u32)value << (backward ? 16 : 0);
-	writel(conf, pcnt->base + PCNT_CONF3(count->id));
+	writel(conf, reg);
 	mutex_unlock(&pcnt->lock);
 	return 0;
 }
@@ -161,28 +185,42 @@ static int esp32s31_pcnt_events_configure(struct counter_device *counter)
 	struct esp32s31_pcnt *pcnt = counter_priv(counter);
 	struct counter_event_node *event_node;
 	u32 enabled_units = 0;
+	u32 thresholds[4] = { };
 	u32 ctrl;
+	unsigned int unit;
 
 	list_for_each_entry(event_node, &counter->events_list, l) {
-		u32 unit = event_node->channel / 2;
 		bool backward = event_node->channel & 1;
 		u32 conf;
 
+		unit = event_node->channel / 2;
 		if (event_node->event != COUNTER_EVENT_THRESHOLD || unit >= 4)
 			continue;
-		conf = readl(pcnt->base + PCNT_CONF3(unit));
-		if ((conf >> (backward ? 16 : 0)) & U16_MAX)
+		conf = readl(pcnt->base + pcnt->layout->threshold +
+			     unit * pcnt->layout->stride);
+		if ((conf >> (backward ? 16 : 0)) & U16_MAX) {
 			enabled_units |= BIT(unit);
+			thresholds[unit] |= BIT(14 + backward);
+		}
 	}
 
 	mutex_lock(&pcnt->lock);
-	writel(0, pcnt->base + PCNT_INT_ENA);
-	writel(GENMASK(3, 0), pcnt->base + PCNT_INT_CLR);
-	ctrl = readl(pcnt->base + PCNT_CTRL);
-	ctrl &= ~GENMASK(11, 8);
-	ctrl |= enabled_units << 8;
-	writel(ctrl, pcnt->base + PCNT_CTRL);
-	writel(enabled_units, pcnt->base + PCNT_INT_ENA);
+	writel(0, pcnt->base + pcnt->layout->int_ena);
+	writel(GENMASK(3, 0), pcnt->base + pcnt->layout->int_clr);
+	if (pcnt->layout->step_events) {
+		ctrl = readl(pcnt->base + pcnt->layout->ctrl);
+		ctrl &= ~GENMASK(11, 8);
+		ctrl |= enabled_units << 8;
+		writel(ctrl, pcnt->base + pcnt->layout->ctrl);
+	} else {
+		for (unit = 0; unit < ARRAY_SIZE(thresholds); unit++) {
+			void __iomem *conf = pcnt->base + unit * pcnt->layout->stride;
+
+			ctrl = readl(conf) & ~GENMASK(15, 14);
+			writel(ctrl | thresholds[unit], conf);
+		}
+	}
+	writel(enabled_units, pcnt->base + pcnt->layout->int_ena);
 	mutex_unlock(&pcnt->lock);
 	return 0;
 }
@@ -199,7 +237,7 @@ static irqreturn_t esp32s31_pcnt_irq(int irq, void *data)
 {
 	struct counter_device *counter = data;
 	struct esp32s31_pcnt *pcnt = counter_priv(counter);
-	u32 pending = readl(pcnt->base + PCNT_INT_ST) & GENMASK(3, 0);
+	u32 pending = readl(pcnt->base + pcnt->layout->int_st) & GENMASK(3, 0);
 	u32 unit;
 
 	if (!pending)
@@ -210,15 +248,15 @@ static irqreturn_t esp32s31_pcnt_irq(int irq, void *data)
 
 		if (!(pending & BIT(unit)))
 			continue;
-		status = readl(pcnt->base + PCNT_STATUS(unit));
-		if (status & PCNT_STEP_FORWARD_EVENT)
+		status = readl(pcnt->base + pcnt->layout->status + unit * 4);
+		if (status & pcnt->layout->event[0])
 			counter_push_event(counter, COUNTER_EVENT_THRESHOLD,
 					   PCNT_STEP_CHANNEL(unit, 0));
-		if (status & PCNT_STEP_BACKWARD_EVENT)
+		if (status & pcnt->layout->event[1])
 			counter_push_event(counter, COUNTER_EVENT_THRESHOLD,
 					   PCNT_STEP_CHANNEL(unit, 1));
 	}
-	writel(pending, pcnt->base + PCNT_INT_CLR);
+	writel(pending, pcnt->base + pcnt->layout->int_clr);
 	return IRQ_HANDLED;
 }
 
@@ -244,6 +282,7 @@ static int esp32s31_pcnt_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	pcnt = counter_priv(counter);
 	pcnt->counter = counter;
+	pcnt->layout = device_get_match_data(&pdev->dev) ?: &esp32s31_pcnt_layout;
 	mutex_init(&pcnt->lock);
 	pcnt->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(pcnt->base))
@@ -277,11 +316,13 @@ static int esp32s31_pcnt_probe(struct platform_device *pdev)
 		pcnt->counts[i].synapses = &pcnt->synapses[i];
 		pcnt->counts[i].num_synapses = 1;
 		pcnt->count_ext[i][0] = (struct counter_comp)
-			COUNTER_COMP_COUNT_U64("forward_step_interval",
+			COUNTER_COMP_COUNT_U64(pcnt->layout->step_events ?
+				"forward_step_interval" : "threshold0",
 				esp32s31_pcnt_forward_step_read,
 				esp32s31_pcnt_forward_step_write);
 		pcnt->count_ext[i][1] = (struct counter_comp)
-			COUNTER_COMP_COUNT_U64("backward_step_interval",
+			COUNTER_COMP_COUNT_U64(pcnt->layout->step_events ?
+				"backward_step_interval" : "threshold1",
 				esp32s31_pcnt_backward_step_read,
 				esp32s31_pcnt_backward_step_write);
 		pcnt->counts[i].ext = pcnt->count_ext[i];
@@ -290,11 +331,13 @@ static int esp32s31_pcnt_probe(struct platform_device *pdev)
 			return -ENOMEM;
 
 		writel(FIELD_PREP(PCNT_CH0_POS_MODE, PCNT_EDGE_INCREASE),
-		       pcnt->base + PCNT_CONF0(i));
+		       pcnt->base + i * pcnt->layout->stride);
+		if (!pcnt->layout->step_events)
+			writel(SHRT_MAX, pcnt->base + i * pcnt->layout->stride + 0x08);
 	}
 	/* Clear then start all four units: clear bits 0/2/4/6, pause 1/3/5/7. */
-	writel(0x55, pcnt->base + PCNT_CTRL);
-	writel(0, pcnt->base + PCNT_CTRL);
+	writel(0x55, pcnt->base + pcnt->layout->ctrl);
+	writel(0, pcnt->base + pcnt->layout->ctrl);
 
 	counter->name = dev_name(&pdev->dev);
 	counter->parent = &pdev->dev;
@@ -317,7 +360,8 @@ static int esp32s31_pcnt_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id esp32s31_pcnt_of_match[] = {
-	{ .compatible = "espressif,esp32s31-pcnt" },
+	{ .compatible = "espressif,esp32s31-pcnt", .data = &esp32s31_pcnt_layout },
+	{ .compatible = "espressif,esp32p4-pcnt", .data = &esp32p4_pcnt_layout },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_pcnt_of_match);
@@ -331,6 +375,6 @@ static struct platform_driver esp32s31_pcnt_driver = {
 };
 module_platform_driver(esp32s31_pcnt_driver);
 
-MODULE_DESCRIPTION("ESP32-S31 pulse counter driver");
+MODULE_DESCRIPTION("Espressif pulse counter driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("COUNTER");

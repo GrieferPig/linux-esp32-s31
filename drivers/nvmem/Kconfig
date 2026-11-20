@@ -48,6 +48,17 @@ config NVMEM_ESP32S31_EFUSE
 	  from Espressif's eFuse byte ordering and supports the standard
 	  mac-base cell offset argument.
 
+config NVMEM_ESP32P4_EFUSE
+	tristate "Espressif ESP32-P4 eFuse read window"
+	depends on OF && SOC_ESP32P4
+	help
+	  Expose the ESP32-P4 read-only eFuse factory MAC address
+	  from the eFuse shadow registers.
+
+config NVMEM_ESPRESSIF_EFUSE
+	tristate
+	default NVMEM_ESP32S31_EFUSE || NVMEM_ESP32P4_EFUSE
+
 config NVMEM_APPLE_EFUSES
 	tristate "Apple eFuse support"
 	depends on ARCH_APPLE || COMPILE_TEST

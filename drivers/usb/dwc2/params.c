@@ -78,6 +78,21 @@ static void dwc2_set_esp32s31_params(struct dwc2_hsotg *hsotg)
 	p->host_perio_tx_fifo_size = 256;
 }
 
+static void dwc2_set_esp32p4_params(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_core_params *p = &hsotg->params;
+
+	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
+	p->phy_utmi_width = 16;
+	p->host_dma = true;
+	/* SINGLE is the AHB burst used by the P4 IDF USB host. */
+	p->ahbcfg = GAHBCFG_HBSTLEN_SINGLE << GAHBCFG_HBSTLEN_SHIFT;
+	/* TRM ch.54 USB 2.0 High-Speed OTG - the 896-word FIFO RAM. */
+	p->host_rx_fifo_size = 512;
+	p->host_nperio_tx_fifo_size = 256;
+	p->host_perio_tx_fifo_size = 128;
+}
+
 static void dwc2_set_jz4775_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -337,6 +352,8 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "brcm,bcm2835-usb", .data = dwc2_set_bcm_params },
 	{ .compatible = "espressif,esp32s31-dwc2",
 	  .data = dwc2_set_esp32s31_params },
+	{ .compatible = "espressif,esp32p4-dwc2",
+	  .data = dwc2_set_esp32p4_params },
 	{ .compatible = "hisilicon,hi6220-usb", .data = dwc2_set_his_params },
 	{ .compatible = "ingenic,jz4775-otg", .data = dwc2_set_jz4775_params },
 	{ .compatible = "ingenic,jz4780-otg", .data = dwc2_set_jz4775_params },

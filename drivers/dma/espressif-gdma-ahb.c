@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 AHB GDMA dmaengine driver.
+ * Espressif AHB GDMA dmaengine driver.
  *
- * Five coupled TX/RX pairs are exported as memcpy channels.  Descriptor
+ * The coupled TX/RX pairs are exported as memcpy and slave channels.  Descriptor
  * storage is carved from loader-reserved HP SRAM because this DMA cannot
  * fetch linked-list descriptors from cached PSRAM.
  */
@@ -18,42 +18,24 @@
 #include <linux/of.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/sizes.h>
 #include <linux/scatterlist.h>
 #include <linux/reset.h>
 
 #include "virt-dma.h"
 #include "espressif-gdma-ahb.h"
 
-#define AHB_CHANNELS			5
+#define AHB_MAX_CHANNELS		5
 #define AHB_DESC_MAX			4095U
 /* The M2M datapath ignores the low two buffer-address bits. */
 #define AHB_MEMCPY_DESC_MAX		4092U
 #define AHB_DESC_SIZE			12U
 #define AHB_RX_INT(ch)			((ch) * 0x10)
-#define AHB_TX_INT(ch)			(0x50 + (ch) * 0x10)
 #define AHB_RX_RAW			0x00
 #define AHB_RX_ST			0x04
 #define AHB_RX_ENA			0x08
 #define AHB_RX_CLR			0x0c
-#define AHB_CH_BASE(ch)			(0x100 + (ch) * 0x100)
-#define AHB_RX_CONF0			0x00
-#define AHB_RX_CONF1			0x04
-#define AHB_RX_LINK			0x10
-#define AHB_RX_LINK_ADDR		0x14
-#define AHB_RX_STATE			0x18
-#define AHB_RX_PERI_SEL			0x38
-#define AHB_TX_CONF0			0x80
-#define AHB_TX_CONF1			0x84
-#define AHB_TX_LINK			0x90
-#define AHB_TX_LINK_ADDR		0x94
-#define AHB_TX_STATE			0x98
-#define AHB_TX_DSCR			0xa8
-#define AHB_TX_PERI_SEL			0xb8
-#define AHB_MISC_CONF			0x0a4
-#define AHB_DATE			0x0a8
-#define AHB_MEM_START			0x600
-#define AHB_MEM_END			0x604
-#define AHB_MODULE_CLK			0x618
 #define AHB_RX_RST			BIT(0)
 #define AHB_RX_DESC_BURST		BIT(2)
 #define AHB_RX_MEM_TRANS		BIT(4)
@@ -83,7 +65,92 @@
 #define AHB_DESC_EOF			BIT(30)
 #define AHB_DESC_OWNER			BIT(31)
 #define AHB_M2M_DUMMY			9
-#define AHB_RX_SUC_EOF_DESC		0x1c
+
+enum ahb_channel_reg {
+	AHB_RX_CONF0,
+	AHB_RX_CONF1,
+	AHB_RX_LINK,
+	AHB_RX_LINK_ADDR,
+	AHB_RX_STATE,
+	AHB_RX_SUC_EOF_DESC,
+	AHB_RX_PERI_SEL,
+	AHB_TX_CONF0,
+	AHB_TX_CONF1,
+	AHB_TX_LINK,
+	AHB_TX_LINK_ADDR,
+	AHB_TX_STATE,
+	AHB_TX_DSCR,
+	AHB_TX_PERI_SEL,
+	AHB_CHANNEL_REGS,
+};
+
+struct ahb_layout {
+	u8 num_channels;
+	u8 memcpy_first;
+	u16 channel_stride;
+	u16 link_addr_stride;
+	u16 misc_conf;
+	u16 date;
+	u16 module_clk;
+	u16 mem_start;
+	u16 mem_end;
+	u32 mem_first;
+	u32 mem_last;
+	u16 channel_regs[AHB_CHANNEL_REGS];
+	bool coherent_pool;
+};
+
+static const struct ahb_layout esp32s31_ahb_layout = {
+	.num_channels = 5,
+	.channel_stride = 0x100,
+	.link_addr_stride = 0x100,
+	.misc_conf = 0xa4,
+	.date = 0xa8,
+	.module_clk = 0x618,
+	.mem_start = 0x600,
+	.mem_end = 0x604,
+	.mem_first = 0x2f000000,
+	.mem_last = 0x53ffffff,
+	.channel_regs = {
+		[AHB_RX_CONF0] = 0x100, [AHB_RX_CONF1] = 0x104,
+		[AHB_RX_LINK] = 0x110, [AHB_RX_LINK_ADDR] = 0x114,
+		[AHB_RX_STATE] = 0x118, [AHB_RX_SUC_EOF_DESC] = 0x11c,
+		[AHB_RX_PERI_SEL] = 0x138,
+		[AHB_TX_CONF0] = 0x180, [AHB_TX_CONF1] = 0x184,
+		[AHB_TX_LINK] = 0x190, [AHB_TX_LINK_ADDR] = 0x194,
+		[AHB_TX_STATE] = 0x198, [AHB_TX_DSCR] = 0x1a8,
+		[AHB_TX_PERI_SEL] = 0x1b8,
+	},
+};
+
+/*
+ * TRM ch.6 GDMA Controller - AHB_DMA_IN/OUT_CONF, LINK and LINK_ADDR.
+ * P4 has three pairs with separate LINK_ADDR banks and one global clock.
+ */
+static const struct ahb_layout esp32p4_ahb_layout = {
+	.num_channels = 3,
+	.memcpy_first = 1, /* TRM ch.6 AHB_DMA_MEM_TRANS_EN (channels 1 and 2). */
+	.channel_stride = 0xc0,
+	.link_addr_stride = 4,
+	.misc_conf = 0x64,
+	.date = 0x68,
+	.mem_start = 0x3c4,
+	.mem_end = 0x3c8,
+	/* TRM ch.6 AHB_DMA_ACCESS_INTR_MEM covers PSRAM buffers and SRAM links. */
+	.mem_first = 0x48000000,
+	.mem_last = 0x4ff3ffff,
+	.channel_regs = {
+		[AHB_RX_CONF0] = 0x70, [AHB_RX_CONF1] = 0x74,
+		[AHB_RX_LINK] = 0x80, [AHB_RX_LINK_ADDR] = 0x3ac,
+		[AHB_RX_STATE] = 0x84, [AHB_RX_SUC_EOF_DESC] = 0x88,
+		[AHB_RX_PERI_SEL] = 0xa0,
+		[AHB_TX_CONF0] = 0xd0, [AHB_TX_CONF1] = 0xd4,
+		[AHB_TX_LINK] = 0xe0, [AHB_TX_LINK_ADDR] = 0x3b8,
+		[AHB_TX_STATE] = 0xe4, [AHB_TX_DSCR] = 0xf0,
+		[AHB_TX_PERI_SEL] = 0x100,
+	},
+	.coherent_pool = true,
+};
 
 struct esp32s31_ahb_hw_desc {
 	__le32 control;
@@ -128,11 +195,13 @@ struct esp32s31_ahb_chan {
 
 struct esp32s31_ahb {
 	struct dma_device dma_dev;
+	struct dma_device slave_dev;
 	struct device *dev;
 	void __iomem *base;
 	struct clk *clk;
 	struct gen_pool *pool;
-	struct esp32s31_ahb_chan chans[AHB_CHANNELS];
+	const struct ahb_layout *layout;
+	struct esp32s31_ahb_chan chans[AHB_MAX_CHANNELS];
 };
 
 static inline struct esp32s31_ahb_chan *to_ahb_chan(struct dma_chan *chan)
@@ -148,7 +217,28 @@ static inline struct esp32s31_ahb_desc *to_ahb_desc(struct virt_dma_desc *vd)
 static inline void __iomem *ahb_ch_reg(struct esp32s31_ahb_chan *chan,
 				       u32 reg)
 {
-	return chan->gdma->base + AHB_CH_BASE(chan->id) + reg;
+	const struct ahb_layout *layout = chan->gdma->layout;
+	u16 stride = layout->channel_stride;
+
+	if (reg == AHB_RX_LINK_ADDR || reg == AHB_TX_LINK_ADDR)
+		stride = layout->link_addr_stride;
+	return chan->gdma->base + layout->channel_regs[reg] + chan->id * stride;
+}
+
+static unsigned int ahb_tx_int(const struct esp32s31_ahb_chan *chan)
+{
+	return (chan->gdma->layout->num_channels + chan->id) * 0x10;
+}
+
+static void ahb_enable_channel_clock(struct esp32s31_ahb_chan *chan, u32 mask)
+{
+	u16 reg = chan->gdma->layout->module_clk;
+
+	if (reg) {
+		void __iomem *clk = chan->gdma->base + reg;
+
+		writel(readl(clk) | mask, clk);
+	}
 }
 
 static void esp32s31_ahb_free_desc(struct virt_dma_desc *vd)
@@ -176,9 +266,9 @@ static void esp32s31_ahb_reset(struct esp32s31_ahb_chan *chan,
 		writel(val & ~AHB_RX_RST, ahb_ch_reg(chan, AHB_RX_CONF0));
 	} else {
 		writel(AHB_TX_STOP, ahb_ch_reg(chan, AHB_TX_LINK));
-		writel(0, chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
+		writel(0, chan->gdma->base + ahb_tx_int(chan) + AHB_RX_ENA);
 		writel(GENMASK(7, 0),
-		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_CLR);
+		       chan->gdma->base + ahb_tx_int(chan) + AHB_RX_CLR);
 		val = readl(ahb_ch_reg(chan, AHB_TX_CONF0));
 		writel(val | AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
 		writel(val & ~AHB_TX_RST, ahb_ch_reg(chan, AHB_TX_CONF0));
@@ -192,8 +282,7 @@ static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
 		       BIT(10 + chan->id) | BIT(15 + chan->id) |
 		       BIT(20 + chan->id) | BIT(27) | BIT(28);
 
-	writel(readl(chan->gdma->base + AHB_MODULE_CLK) | clk_mask,
-	       chan->gdma->base + AHB_MODULE_CLK);
+	ahb_enable_channel_clock(chan, clk_mask);
 	/*
 	 * Do not reset a slave TX channel between adjacent descriptors.  The
 	 * TX EOF interrupt is configured for "data popped" mode, so the link
@@ -232,7 +321,7 @@ static void esp32s31_ahb_start(struct esp32s31_ahb_chan *chan,
 		/* RX EOF is the completion boundary for memory copies. */
 		writel((desc->direction == DMA_MEM_TO_MEM ? 0 : BIT(1)) |
 		       AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR,
-		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
+		       chan->gdma->base + ahb_tx_int(chan) + AHB_RX_ENA);
 		writel(AHB_TX_START, ahb_ch_reg(chan, AHB_TX_LINK));
 	}
 }
@@ -277,10 +366,9 @@ static void esp32s31_ahb_start_cyclic(struct esp32s31_ahb_chan *chan,
 		       BIT(10 + chan->id) | BIT(15 + chan->id) |
 		       BIT(20 + chan->id) | BIT(27) | BIT(28);
 
-	writel(readl(chan->gdma->base + AHB_MODULE_CLK) | clk_mask,
-	       chan->gdma->base + AHB_MODULE_CLK);
-	dev_info(chan->gdma->dev,
-		 "cyclic ch%u request=%u direction=%s bytes=%zu periods=%u first-control=%#08x first-buffer=%#08x\n",
+	ahb_enable_channel_clock(chan, clk_mask);
+	dev_dbg(chan->gdma->dev,
+		"cyclic ch%u request=%u direction=%s bytes=%zu periods=%u first-control=%#08x first-buffer=%#08x\n",
 		 chan->id, chan->request_id,
 		 desc->direction == DMA_MEM_TO_DEV ? "tx" : "rx",
 		 desc->len, desc->ndesc, readl(desc->pool),
@@ -295,7 +383,7 @@ static void esp32s31_ahb_start_cyclic(struct esp32s31_ahb_chan *chan,
 		writel(lower_32_bits(desc->tx_dma),
 		       ahb_ch_reg(chan, AHB_TX_LINK_ADDR));
 		writel(BIT(1) | AHB_TX_DSCR_ERR | AHB_TX_RESP_ERR,
-		       chan->gdma->base + AHB_TX_INT(chan->id) + AHB_RX_ENA);
+		       chan->gdma->base + ahb_tx_int(chan) + AHB_RX_ENA);
 		writel(AHB_TX_START, ahb_ch_reg(chan, AHB_TX_LINK));
 		return;
 	}
@@ -329,7 +417,8 @@ esp32s31_ahb_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	dma_addr_t pool_dma;
 	size_t remaining = len;
 
-	if (!len || !IS_ALIGNED(src, 4) || !IS_ALIGNED(dst, 4) ||
+	if (chan->id < chan->gdma->layout->memcpy_first ||
+	    !len || !IS_ALIGNED(src, 4) || !IS_ALIGNED(dst, 4) ||
 	    !IS_ALIGNED(len, 4) || upper_32_bits(src) || upper_32_bits(dst))
 		return NULL;
 	count = DIV_ROUND_UP(len, AHB_MEMCPY_DESC_MAX);
@@ -541,13 +630,13 @@ static irqreturn_t esp32s31_ahb_irq(int irq, void *data)
 
 	/* Serialize acknowledgement with reset/start and descriptor changes. */
 	spin_lock_irqsave(&chan->vc.lock, flags);
-	status = readl(chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
+	status = readl(chan->gdma->base + (tx ? ahb_tx_int(chan) :
 					     AHB_RX_INT(chan->id)) + AHB_RX_ST);
 	if (!status) {
 		spin_unlock_irqrestore(&chan->vc.lock, flags);
 		return IRQ_NONE;
 	}
-	writel(status, chan->gdma->base + (tx ? AHB_TX_INT(chan->id) :
+	writel(status, chan->gdma->base + (tx ? ahb_tx_int(chan) :
 					     AHB_RX_INT(chan->id)) + AHB_RX_CLR);
 	if (tx && chan->cyclic_tx) {
 		desc = chan->cyclic_tx;
@@ -828,12 +917,12 @@ static int esp32s31_ahb_terminate_all(struct dma_chan *dchan)
 
 	spin_lock_irqsave(&chan->vc.lock, flags);
 	if (chan->cyclic_tx) {
-		dev_info(chan->gdma->dev,
-			 "cyclic-stop ch%u tx irqs=%u node=%u raw=%#x st=%#x link=%#x addr=%#x state=%#x dscr=%#x first=%#x\n",
+		dev_dbg(chan->gdma->dev,
+			"cyclic-stop ch%u tx irqs=%u node=%u raw=%#x st=%#x link=%#x addr=%#x state=%#x dscr=%#x first=%#x\n",
 			 chan->id, chan->tx_irqs, chan->tx_node,
-			 readl(chan->gdma->base + AHB_TX_INT(chan->id) +
+			 readl(chan->gdma->base + ahb_tx_int(chan) +
 			       AHB_RX_RAW),
-			 readl(chan->gdma->base + AHB_TX_INT(chan->id) +
+			 readl(chan->gdma->base + ahb_tx_int(chan) +
 			       AHB_RX_ST),
 			 readl(ahb_ch_reg(chan, AHB_TX_LINK)),
 			 readl(ahb_ch_reg(chan, AHB_TX_LINK_ADDR)),
@@ -847,8 +936,8 @@ static int esp32s31_ahb_terminate_all(struct dma_chan *dchan)
 		chan->tx_node = 0;
 	}
 	if (chan->cyclic_rx) {
-		dev_info(chan->gdma->dev,
-			 "cyclic-stop ch%u rx irqs=%u node=%u raw=%#x st=%#x link=%#x addr=%#x state=%#x eof=%#x first=%#x\n",
+		dev_dbg(chan->gdma->dev,
+			"cyclic-stop ch%u rx irqs=%u node=%u raw=%#x st=%#x link=%#x addr=%#x state=%#x eof=%#x first=%#x\n",
 			 chan->id, chan->rx_irqs, chan->rx_node,
 			 readl(chan->gdma->base + AHB_RX_INT(chan->id) +
 			       AHB_RX_RAW),
@@ -985,7 +1074,7 @@ static struct dma_chan *esp32s31_ahb_of_xlate(struct of_phandle_args *spec,
 	struct esp32s31_ahb *gdma = ofdma->of_dma_data;
 	struct esp32s31_ahb_chan *chan;
 
-	if (spec->args_count != 2 || spec->args[0] >= AHB_CHANNELS ||
+	if (spec->args_count != 2 || spec->args[0] >= gdma->layout->num_channels ||
 	    spec->args[1] >= 32)
 		return NULL;
 	chan = &gdma->chans[spec->args[0]];
@@ -1011,6 +1100,7 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	if (!gdma)
 		return -ENOMEM;
 	gdma->dev = dev;
+	gdma->layout = device_get_match_data(dev);
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "32-bit DMA mask unavailable\n");
@@ -1029,29 +1119,36 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	gdma->pool = devm_gen_pool_create(dev, 4, -1, NULL);
 	if (IS_ERR(gdma->pool))
 		return PTR_ERR(gdma->pool);
-	{
+	if (gdma->layout->coherent_pool) {
+		dma_addr_t dma;
+		void *pool_base;
+
+		pool_base = dmam_alloc_coherent(dev, SZ_4K, &dma, GFP_KERNEL);
+		if (!pool_base)
+			return dev_err_probe(dev, -ENOMEM, "no internal DMA pool\n");
+		ret = gen_pool_add_virt(gdma->pool, (unsigned long)pool_base,
+					dma, SZ_4K, -1);
+	} else {
 		void __iomem *pool_base;
 
 		pool_base = devm_platform_get_and_ioremap_resource(pdev, 1,
-								   &pool_res);
+							   &pool_res);
 		if (IS_ERR(pool_base))
 			return PTR_ERR(pool_base);
 		ret = gen_pool_add_virt(gdma->pool, (unsigned long)pool_base,
 					pool_res->start, resource_size(pool_res), -1);
-		if (ret)
-			return ret;
 	}
+	if (ret)
+		return ret;
 
-	writel(0x2f000000, gdma->base + AHB_MEM_START);
-	writel(0x53ffffff, gdma->base + AHB_MEM_END);
-	/*
-	 * Use the reset-safe channel-0 synchronizer state.  The remaining
-	 * per-channel clocks are enabled lazily immediately before a transfer.
-	 */
-	writel(BIT(0), gdma->base + AHB_MODULE_CLK);
-	val = readl(gdma->base + AHB_MISC_CONF) | AHB_MISC_CLK;
-	writel(val | AHB_MISC_RESET, gdma->base + AHB_MISC_CONF);
-	writel(val, gdma->base + AHB_MISC_CONF);
+	writel(gdma->layout->mem_first, gdma->base + gdma->layout->mem_start);
+	writel(gdma->layout->mem_last, gdma->base + gdma->layout->mem_end);
+	/* S31 needs a reset-safe channel-0 synchronizer before lazy clocks. */
+	if (gdma->layout->module_clk)
+		writel(BIT(0), gdma->base + gdma->layout->module_clk);
+	val = readl(gdma->base + gdma->layout->misc_conf) | AHB_MISC_CLK;
+	writel(val | AHB_MISC_RESET, gdma->base + gdma->layout->misc_conf);
+	writel(val, gdma->base + gdma->layout->misc_conf);
 
 	dma_dev = &gdma->dma_dev;
 	dma_dev->dev = dev;
@@ -1077,7 +1174,16 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	dma_dev->device_terminate_all = esp32s31_ahb_terminate_all;
 	dma_dev->device_synchronize = esp32s31_ahb_synchronize;
 
-	for (i = 0; i < AHB_CHANNELS; i++) {
+	if (gdma->layout->memcpy_first) {
+		/* The DMAEngine advertises capabilities per device. */
+		gdma->slave_dev = *dma_dev;
+		INIT_LIST_HEAD(&gdma->slave_dev.channels);
+		dma_cap_clear(DMA_MEMCPY, gdma->slave_dev.cap_mask);
+		gdma->slave_dev.directions &= ~BIT(DMA_MEM_TO_MEM);
+		gdma->slave_dev.device_prep_dma_memcpy = NULL;
+	}
+
+	for (i = 0; i < gdma->layout->num_channels; i++) {
 		struct esp32s31_ahb_chan *chan = &gdma->chans[i];
 		int irq = platform_get_irq(pdev, i);
 
@@ -1088,12 +1194,13 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 		chan->request_id = U32_MAX;
 		chan->rx_irq = irq;
 		chan->vc.desc_free = esp32s31_ahb_free_desc;
-		vchan_init(&chan->vc, dma_dev);
+		vchan_init(&chan->vc, i < gdma->layout->memcpy_first ?
+			   &gdma->slave_dev : dma_dev);
 		ret = devm_request_irq(dev, irq, esp32s31_ahb_irq, 0,
 				       dev_name(dev), chan);
 		if (ret)
 			return ret;
-		chan->tx_irq = platform_get_irq(pdev, AHB_CHANNELS + i);
+		chan->tx_irq = platform_get_irq(pdev, gdma->layout->num_channels + i);
 		if (chan->tx_irq < 0)
 			return chan->tx_irq;
 		ret = devm_request_irq(dev, chan->tx_irq, esp32s31_ahb_irq, 0,
@@ -1104,16 +1211,27 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	ret = dma_async_device_register(dma_dev);
 	if (ret)
 		return ret;
+	if (gdma->layout->memcpy_first) {
+		ret = dma_async_device_register(&gdma->slave_dev);
+		if (ret)
+			goto unregister_dma;
+	}
 	ret = of_dma_controller_register(dev->of_node, esp32s31_ahb_of_xlate,
 					 gdma);
-	if (ret) {
-		dma_async_device_unregister(dma_dev);
-		return ret;
-	}
+	if (ret)
+		goto unregister_slave;
 	platform_set_drvdata(pdev, gdma);
-	dev_info(dev, "AHB GDMA ready: 5 memcpy/slave pairs, version %#x\n",
-		 readl(gdma->base + AHB_DATE));
+	dev_info(dev, "AHB GDMA ready: %u channel pairs, version %#x\n",
+		 gdma->layout->num_channels,
+		 readl(gdma->base + gdma->layout->date));
 	return 0;
+
+unregister_slave:
+	if (gdma->layout->memcpy_first)
+		dma_async_device_unregister(&gdma->slave_dev);
+unregister_dma:
+	dma_async_device_unregister(dma_dev);
+	return ret;
 }
 
 static void esp32s31_ahb_remove(struct platform_device *pdev)
@@ -1121,16 +1239,20 @@ static void esp32s31_ahb_remove(struct platform_device *pdev)
 	struct esp32s31_ahb *gdma = platform_get_drvdata(pdev);
 	unsigned int i;
 
-	dma_async_device_unregister(&gdma->dma_dev);
 	of_dma_controller_free(pdev->dev.of_node);
-	for (i = 0; i < AHB_CHANNELS; i++) {
+	if (gdma->layout->memcpy_first)
+		dma_async_device_unregister(&gdma->slave_dev);
+	dma_async_device_unregister(&gdma->dma_dev);
+	for (i = 0; i < gdma->layout->num_channels; i++) {
 		esp32s31_ahb_terminate_all(&gdma->chans[i].vc.chan);
 		tasklet_kill(&gdma->chans[i].vc.task);
 	}
 }
 
 static const struct of_device_id esp32s31_ahb_of_match[] = {
-	{ .compatible = "espressif,esp32s31-ahb-gdma" }, { }
+	{ .compatible = "espressif,esp32s31-ahb-gdma", .data = &esp32s31_ahb_layout },
+	{ .compatible = "espressif,esp32p4-ahb-gdma", .data = &esp32p4_ahb_layout },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_ahb_of_match);
 

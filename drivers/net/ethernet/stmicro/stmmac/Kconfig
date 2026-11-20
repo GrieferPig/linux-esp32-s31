@@ -42,6 +42,13 @@ config STMMAC_PLATFORM
 
 if STMMAC_PLATFORM
 
+config DWMAC_ESP32P4
+	tristate "Espressif ESP32-P4 DWMAC support"
+	depends on SOC_ESP32P4 && OF
+	help
+	  Enable the 10/100 Mbps Synopsys Ethernet MAC on ESP32-P4
+	  boards with an external RMII reference clock.
+
 config DWMAC_DWC_QOS_ETH
 	tristate "Support for snps,dwc-qos-ethernet.txt DT binding."
 	select CRC32

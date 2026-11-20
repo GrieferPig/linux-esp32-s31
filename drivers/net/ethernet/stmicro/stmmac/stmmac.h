@@ -59,6 +59,8 @@ struct stmmac_tx_info {
 #define STMMAC_TBS_EN		BIT(1)
 
 /* Frequently used values are kept adjacent for cache effect */
+#define STMMAC_COHERENT_TX_SLOT_SIZE	1536
+
 struct stmmac_tx_queue {
 	u32 tx_count_frames;
 	int tbs;
@@ -79,6 +81,8 @@ struct stmmac_tx_queue {
 	unsigned int dirty_tx;
 	dma_addr_t dma_tx_phy;
 	void *dma_tx_alloc;
+	void *coherent_tx;
+	dma_addr_t coherent_tx_dma;
 	dma_addr_t tx_tail_addr;
 	u32 mss;
 };
@@ -132,6 +136,8 @@ struct stmmac_rx_queue {
 	unsigned int napi_skb_frag_size;
 	dma_addr_t dma_rx_phy;
 	void *dma_rx_alloc;
+	void *coherent_rx;
+	dma_addr_t coherent_rx_dma;
 	u32 rx_tail_addr;
 	unsigned int state_saved;
 	struct {

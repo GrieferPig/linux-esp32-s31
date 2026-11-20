@@ -61,6 +61,17 @@ config PHY_ESP32S31_USB
 	  Espressif ESP32-S31. This is required when using the on-chip DWC2
 	  controller in host mode.
 
+config PHY_ESP32P4_USB
+	bool "Espressif ESP32-P4 rev1 USB2 UTMI PHY"
+	depends on OF && SOC_ESP32P4
+	select GENERIC_PHY
+	help
+	  Enable the integrated USB2 high-speed UTMI PHY and its
+	  clock and reset glue for the Espressif ESP32-P4 rev1.
+
+config PHY_ESPRESSIF_USB
+	def_bool PHY_ESP32S31_USB || PHY_ESP32P4_USB
+
 config PHY_XGENE
 	tristate "APM X-Gene 15Gbps PHY support"
 	depends on HAS_IOMEM && OF && (ARCH_XGENE || COMPILE_TEST)

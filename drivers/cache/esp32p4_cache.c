@@ -3,15 +3,19 @@
  * Independent reconstruction against the audited retained IDF callback ABI.
  * Does not implement DMA invalidation: only executable sync and display WB.
  */
+#include <linux/cacheflush.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/init.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/libfdt.h>
 #include <linux/printk.h>
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/soc/espressif/esp32p4.h>
+#include <asm/dma-noncoherent.h>
 #include <asm/soc.h>
 
 typedef int (*p4_cache_fn)(u32 start, u32 size);
@@ -22,6 +26,97 @@ static DEFINE_RAW_SPINLOCK(p4_cache_engine_lock);
 static u32 p4_exec_ram_end __ro_after_init = ESP32P4_RAM_END;
 /* The retained target is v1.3; IRQ init verifies chosen revision before enable. */
 u32 esp32p4_clic_rev1 = 1;
+
+/*
+ * TRM ch.9 System and Memory - external RAM and DMA bus paths.
+ * The public TRM does not describe the cache-sync register bank.
+ * See ESP-IDF cache_ll_writeback_addr() and cache_ll_invalidate_addr()
+ * for the rev1.x CACHE_SYNC_CTRL/MAP/ADDR/SIZE programming sequence.
+ */
+#define P4_CACHE_SYNC_BASE	0x3ff10098u
+#define P4_CACHE_SYNC_CTRL	0x00
+#define P4_CACHE_SYNC_MAP	0x04
+#define P4_CACHE_SYNC_ADDR	0x08
+#define P4_CACHE_SYNC_SIZE	0x0c
+#define P4_CACHE_SYNC_OPS	GENMASK(3, 0)
+#define P4_CACHE_SYNC_DONE	BIT(4)
+#define P4_CACHE_SYNC_WB	BIT(2)
+#define P4_CACHE_SYNC_INV	BIT(0)
+#define P4_CACHE_L1D		BIT(4)
+#define P4_CACHE_L2		BIT(5)
+#define P4_DMA_CACHE_ALIGN	128
+
+static int p4_cache_dma_sync(u32 start, u32 size, u32 map, u32 op)
+{
+	void __iomem *regs = (void __iomem *)P4_CACHE_SYNC_BASE;
+	u32 status;
+	int ret;
+
+	ret = readl_poll_timeout_atomic(regs + P4_CACHE_SYNC_CTRL, status,
+				       !(status & P4_CACHE_SYNC_OPS), 0, 1000);
+	if (ret)
+		return ret;
+	writel(start, regs + P4_CACHE_SYNC_ADDR);
+	writel(size, regs + P4_CACHE_SYNC_SIZE);
+	writel(map, regs + P4_CACHE_SYNC_MAP);
+	writel(op, regs + P4_CACHE_SYNC_CTRL);
+	return readl_poll_timeout_atomic(regs + P4_CACHE_SYNC_CTRL, status,
+					 (status & (P4_CACHE_SYNC_OPS |
+						    P4_CACHE_SYNC_DONE)) ==
+					 P4_CACHE_SYNC_DONE, 0, 1000);
+}
+
+static void p4_cache_dma_op(phys_addr_t paddr, size_t size, u32 op)
+{
+	unsigned long flags;
+	u32 start, end, len;
+	int ret = 0;
+
+	if (!size)
+		return;
+	if (paddr < ESP32P4_RAM_START || paddr >= p4_exec_ram_end ||
+	    size > p4_exec_ram_end - paddr)
+		panic("P4 DMA cache range outside PSRAM: %pa, %zu bytes", &paddr, size);
+
+	start = ALIGN_DOWN(paddr, P4_DMA_CACHE_ALIGN);
+	end = ALIGN(paddr + size, P4_DMA_CACHE_ALIGN);
+	raw_spin_lock_irqsave(&p4_cache_engine_lock, flags);
+	while (start < end) {
+		len = min_t(u32, end - start, SZ_64K - (start & (SZ_64K - 1)));
+		ret = p4_cache_dma_sync(start, len, P4_CACHE_L1D, op);
+		if (!ret)
+			ret = p4_cache_dma_sync(start, len, P4_CACHE_L2, op);
+		if (ret)
+			break;
+		start += len;
+	}
+	raw_spin_unlock_irqrestore(&p4_cache_engine_lock, flags);
+	if (ret)
+		panic("P4 DMA cache sync failed: %pa, %zu bytes, op %#x", &paddr,
+		      size, op);
+}
+
+static void p4_cache_dma_writeback(phys_addr_t paddr, size_t size)
+{
+	p4_cache_dma_op(paddr, size, P4_CACHE_SYNC_WB);
+}
+
+static void p4_cache_dma_invalidate(phys_addr_t paddr, size_t size)
+{
+	p4_cache_dma_op(paddr, size, P4_CACHE_SYNC_INV);
+}
+
+static void p4_cache_dma_writeback_invalidate(phys_addr_t paddr, size_t size)
+{
+	p4_cache_dma_writeback(paddr, size);
+	p4_cache_dma_invalidate(paddr, size);
+}
+
+static const struct riscv_nonstd_cache_ops p4_dma_cache_ops __initconst = {
+	.wback = p4_cache_dma_writeback,
+	.inv = p4_cache_dma_invalidate,
+	.wback_inv = p4_cache_dma_writeback_invalidate,
+};
 
 static u32 __init p4_fdt_u32(const void *fdt, int node, const char *name)
 {
@@ -85,6 +180,9 @@ static void __init p4_cache_early_init(const void *fdt)
 	if (rev != 103)
 		panic("P4 requires revision103 retained IDF handoff");
 	esp32p4_clic_rev1 = 1;
+	dma_cache_alignment = P4_DMA_CACHE_ALIGN;
+	riscv_noncoherent_register_cache_ops(&p4_dma_cache_ops);
+	riscv_noncoherent_supported();
 }
 SOC_EARLY_INIT_DECLARE(esp32p4_cache, "espressif,esp32p4", p4_cache_early_init);
 

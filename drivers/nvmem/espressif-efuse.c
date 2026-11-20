@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 eFuse read-shadow NVMEM provider
+ * Espressif eFuse read-shadow NVMEM provider
  *
  * The S31 hardware presents all ten eFuse blocks as one contiguous range of
  * little-endian 32-bit read-shadow registers. ESP-IDF describes MAC_FACTORY
@@ -14,19 +14,20 @@
 #include <linux/nvmem-provider.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 
-struct esp32s31_efuse {
+struct espressif_efuse {
 	void __iomem *base;
 };
 
-static int esp32s31_efuse_read(void *context, unsigned int offset,
+static int espressif_efuse_read(void *context, unsigned int offset,
 			       void *data, size_t bytes)
 {
-	struct esp32s31_efuse *efuse = context;
+	struct espressif_efuse *efuse = context;
 	u8 *buf = data;
 	size_t i;
 
-	/* S31 peripheral registers must be accessed as aligned 32-bit words. */
+	/* The eFuse shadow supports aligned 32-bit MMIO. */
 	for (i = 0; i < bytes; i++) {
 		unsigned int byte = offset + i;
 		u32 word = readl(efuse->base + (byte & ~3));
@@ -37,7 +38,7 @@ static int esp32s31_efuse_read(void *context, unsigned int offset,
 	return 0;
 }
 
-static int esp32s31_efuse_mac_base_pp(void *priv, const char *id, int index,
+static int espressif_efuse_mac_base_pp(void *priv, const char *id, int index,
 				      unsigned int offset, void *data,
 				      size_t bytes)
 {
@@ -57,17 +58,17 @@ static int esp32s31_efuse_mac_base_pp(void *priv, const char *id, int index,
 	return 0;
 }
 
-static void esp32s31_efuse_fixup_cell(struct nvmem_device *nvmem,
+static void espressif_efuse_fixup_cell(struct nvmem_device *nvmem,
 				      struct nvmem_cell_info *cell)
 {
 	if (of_device_is_compatible(cell->np, "mac-base"))
-		cell->read_post_process = esp32s31_efuse_mac_base_pp;
+		cell->read_post_process = espressif_efuse_mac_base_pp;
 }
 
-static int esp32s31_efuse_probe(struct platform_device *pdev)
+static int espressif_efuse_probe(struct platform_device *pdev)
 {
 	struct nvmem_config config = { };
-	struct esp32s31_efuse *efuse;
+	struct espressif_efuse *efuse;
 	struct resource *res;
 
 	efuse = devm_kzalloc(&pdev->dev, sizeof(*efuse), GFP_KERNEL);
@@ -79,34 +80,35 @@ static int esp32s31_efuse_probe(struct platform_device *pdev)
 		return PTR_ERR(efuse->base);
 
 	config.dev = &pdev->dev;
-	config.name = "esp32s31-efuse";
+	config.name = device_get_match_data(&pdev->dev);
 	config.id = NVMEM_DEVID_NONE;
 	config.type = NVMEM_TYPE_OTP;
 	config.read_only = true;
 	config.word_size = 1;
 	config.stride = 1;
 	config.size = resource_size(res);
-	config.reg_read = esp32s31_efuse_read;
-	config.fixup_dt_cell_info = esp32s31_efuse_fixup_cell;
+	config.reg_read = espressif_efuse_read;
+	config.fixup_dt_cell_info = espressif_efuse_fixup_cell;
 	config.priv = efuse;
 
 	return PTR_ERR_OR_ZERO(devm_nvmem_register(&pdev->dev, &config));
 }
 
-static const struct of_device_id esp32s31_efuse_of_match[] = {
-	{ .compatible = "espressif,esp32s31-efuse" },
+static const struct of_device_id espressif_efuse_of_match[] = {
+	{ .compatible = "espressif,esp32s31-efuse", .data = "esp32s31-efuse" },
+	{ .compatible = "espressif,esp32p4-efuse", .data = "esp32p4-efuse" },
 	{ }
 };
-MODULE_DEVICE_TABLE(of, esp32s31_efuse_of_match);
+MODULE_DEVICE_TABLE(of, espressif_efuse_of_match);
 
-static struct platform_driver esp32s31_efuse_driver = {
-	.probe = esp32s31_efuse_probe,
+static struct platform_driver espressif_efuse_driver = {
+	.probe = espressif_efuse_probe,
 	.driver = {
 		.name = "esp32s31-efuse",
-		.of_match_table = esp32s31_efuse_of_match,
+		.of_match_table = espressif_efuse_of_match,
 	},
 };
-module_platform_driver(esp32s31_efuse_driver);
+module_platform_driver(espressif_efuse_driver);
 
-MODULE_DESCRIPTION("Espressif ESP32-S31 eFuse NVMEM driver");
+MODULE_DESCRIPTION("Espressif eFuse NVMEM driver");
 MODULE_LICENSE("GPL");

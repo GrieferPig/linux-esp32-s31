@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mmc/espressif,esp32p4-dw-mshc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-P4 SD/MMC Host Controller
+
+maintainers:
+  - GrieferPig <noreply@example.com>
+
+allOf:
+  - $ref: synopsys-dw-mshc-common.yaml#
+
+properties:
+  compatible:
+    const: espressif,esp32p4-dw-mshc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: Bus interface clock
+      - description: Card interface clock
+
+  clock-names:
+    items:
+      - const: biu
+      - const: ciu
+
+  espressif,slot-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    default: 0
+    description: First physical slot exposed to Linux.
+
+  espressif,num-slots:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [1, 2]
+    default: 1
+    description: When set to two, both slots must have a slot node.
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+patternProperties:
+  '^slot@[01]$':
+    type: object
+    allOf:
+      - $ref: mmc-controller.yaml#
+    properties:
+      reg:
+        maxItems: 1
+    required:
+      - reg
+    unevaluatedProperties: false
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+
+unevaluatedProperties: false

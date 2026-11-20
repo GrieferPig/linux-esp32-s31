@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 timer-group main watchdog
+ * Espressif timer-group main watchdog
  */
 
 #include <linux/bitfield.h>
@@ -38,6 +38,7 @@
 #define ESP32S31_WDT_STAGE_RESET_SYSTEM	3
 
 #define ESP32S31_WDT_PRESCALE		GENMASK(31, 16)
+#define ESP32P4_WDT_DIVCNT_RST		BIT(0)
 
 #define ESP32S31_WDT_DEFAULT_TIMEOUT	30
 #define ESP32S31_WDT_MAX_TIMEOUT	(UINT_MAX / ESP32S31_WDT_TICKS_PER_SEC)
@@ -47,6 +48,7 @@ struct esp32s31_wdt {
 	struct clk *clk;
 	spinlock_t lock;
 	struct watchdog_device wdd;
+	u32 prescaler_reset;
 };
 
 static void esp32s31_wdt_unlock(struct esp32s31_wdt *priv)
@@ -83,9 +85,8 @@ static u32 esp32s31_wdt_config0(bool enable)
 
 static void esp32s31_wdt_program(struct esp32s31_wdt *priv, bool enable)
 {
-	writel(FIELD_PREP(ESP32S31_WDT_PRESCALE,
-			  ESP32S31_WDT_PRESCALER),
-	       priv->base + ESP32S31_WDT_CONFIG1);
+	writel(FIELD_PREP(ESP32S31_WDT_PRESCALE, ESP32S31_WDT_PRESCALER) |
+	       priv->prescaler_reset, priv->base + ESP32S31_WDT_CONFIG1);
 	writel(priv->wdd.timeout * ESP32S31_WDT_TICKS_PER_SEC,
 	       priv->base + ESP32S31_WDT_CONFIG2);
 	writel(esp32s31_wdt_config0(enable),
@@ -166,6 +167,11 @@ static const struct watchdog_info esp32s31_wdt_info = {
 	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
 };
 
+static const struct watchdog_info esp32p4_wdt_info = {
+	.identity = "ESP32-P4 timer-group watchdog",
+	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
+};
+
 static const struct watchdog_ops esp32s31_wdt_ops = {
 	.owner = THIS_MODULE,
 	.start = esp32s31_wdt_start,
@@ -194,7 +200,13 @@ static int esp32s31_wdt_probe(struct platform_device *pdev)
 				     "failed to enable watchdog clock\n");
 	spin_lock_init(&priv->lock);
 
-	priv->wdd.info = &esp32s31_wdt_info;
+	priv->wdd.info = device_get_match_data(dev) ?: &esp32s31_wdt_info;
+	if (priv->wdd.info == &esp32p4_wdt_info) {
+		/* TRM ch.19 - WDT_CLK_PRESCALE uses the selected 40 MHz XTAL. */
+		if (clk_get_rate(priv->clk) != 40000000)
+			return dev_err_probe(dev, -EINVAL, "expected 40 MHz watchdog clock\n");
+		priv->prescaler_reset = ESP32P4_WDT_DIVCNT_RST;
+	}
 	priv->wdd.ops = &esp32s31_wdt_ops;
 	priv->wdd.parent = dev;
 	priv->wdd.min_timeout = 1;
@@ -212,7 +224,7 @@ static int esp32s31_wdt_probe(struct platform_device *pdev)
 
 	/*
 	 * Boot ROM enables flash-boot protection independently of WDT_EN.
-	 * Linux owns TIMERG1, so leave it disabled until /dev/watchdog is
+	 * Keep the owned watchdog disabled until /dev/watchdog is
 	 * explicitly opened.
 	 */
 	esp32s31_wdt_stop(&priv->wdd);
@@ -221,7 +233,8 @@ static int esp32s31_wdt_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id esp32s31_wdt_of_match[] = {
-	{ .compatible = "espressif,esp32s31-timg-wdt" },
+	{ .compatible = "espressif,esp32s31-timg-wdt", .data = &esp32s31_wdt_info },
+	{ .compatible = "espressif,esp32p4-timg-wdt", .data = &esp32p4_wdt_info },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_wdt_of_match);

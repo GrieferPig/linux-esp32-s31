@@ -10,9 +10,8 @@ maintainers:
   - GrieferPig <noreply@example.com>
 
 description: |
-  Board-specific fixed routing, not a GPIO controller. The only supported pad
-  groups are I2C1 (GPIO7/8) and GPSPI2 (expansion GPIO20..23). This binding is
-  for the ESP32-P4 hw_ver1 GPIO matrix and IOMUX.
+  Board pin groups for I2C1, GPSPI2, SDMMC, Ethernet, I2S0 and PCNT on the ESP32-P4
+  hw_ver1 GPIO matrix and IO MUX. Board-owned GPIO ranges may be exported.
 
 properties:
   compatible:
@@ -27,12 +26,22 @@ properties:
     maxItems: 1
     description: IOMUX clock
 
+  gpio-controller: true
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-ranges:
+    maxItems: 1
+
+  gpio-reserved-ranges: true
+
 patternProperties:
-  '^(i2c1|gpspi2)-pins$':
+  '^(i2c1|gpspi2|sdmmc0|sdmmc1|emac-rmii|emac-mdio|i2s0|pcnt0)-pins$':
     type: object
     properties:
       function:
-        enum: [i2c1, gpspi2]
+        enum: [i2c1, gpspi2, sdmmc0, sdmmc1, emac-rmii, emac-mdio, i2s0, pcnt0]
     required:
       - function
     additionalProperties: false

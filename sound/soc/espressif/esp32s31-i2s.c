@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* ESP32-S31 I2S/TDM/PDM ASoC driver through AHB GDMA. */
+/* Espressif I2S ASoC driver through AHB GDMA. */
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
@@ -57,7 +57,23 @@
 #define S31_I2S_TDM_CHAN_MASK		GENMASK(15, 0)
 #define S31_I2S_TDM_CHAN_NUM		GENMASK(19, 16)
 
+struct espressif_i2s_layout {
+	u16 fifo_cnt;
+	u16 destination;
+};
+
+static const struct espressif_i2s_layout esp32s31_i2s_layout = {
+	.fifo_cnt = S31_I2S_FIFO_CNT,
+	.destination = S31_I2S_DESTINATION,
+};
+
+/* TRM ch.51 I2S Controller - FIFO_CNT and RX_EOF_NUM. */
+static const struct espressif_i2s_layout esp32p4_i2s_layout = {
+	.fifo_cnt = 0x74,
+};
+
 struct esp32s31_i2s {
+	const struct espressif_i2s_layout *layout;
 	struct device *dev;
 	void __iomem *base;
 	struct clk *clk;
@@ -334,6 +350,11 @@ static int esp32s31_i2s_hw_params(struct snd_pcm_substream *substream,
 
 	writel(conf1, i2s->base + S31_I2S_RX_CONF1);
 	writel(tdm, i2s->base + S31_I2S_RX_TDM_CTRL);
+	/*
+	 * TRM ch.51 I2S_RX_EOF_NUM sets the capture boundary. P4 rev1.3
+	 * counts stored bytes, as used in IDF i2s_ll_rx_set_eof_num().
+	 * A value of 511 terminated a 1024-byte DMA buffer at 512 bytes.
+	 */
 	writel(params_period_bytes(params), i2s->base + S31_I2S_RXEOF_NUM);
 	conf = readl(i2s->base + S31_I2S_RX_CONF);
 	conf &= ~(S31_I2S_RUNTIME_CONF_MASK | S31_I2S_STD_FORMAT_MASK);
@@ -377,25 +398,22 @@ static int esp32s31_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (cmd == SNDRV_PCM_TRIGGER_START) {
-			dev_info(i2s->dev,
-				 "%s start dma=%pad bytes=%zu head=%*ph\n",
-				 substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
-				 "playback" : "capture",
-				 &substream->runtime->dma_addr,
-				 substream->runtime->dma_bytes, 16,
-				 substream->runtime->dma_area);
+			dev_dbg(i2s->dev, "%s start dma=%pad bytes=%zu\n",
+				substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+				"playback" : "capture",
+				&substream->runtime->dma_addr,
+				substream->runtime->dma_bytes);
 		}
 		val |= S31_I2S_START;
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		dev_info(i2s->dev,
-			 "%s stop conf=%#x state=%#x fifo-count=%#x\n",
+		dev_dbg(i2s->dev, "%s stop conf=%#x state=%#x fifo-count=%#x\n",
 			 substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
 			 "playback" : "capture", val,
 			 readl(i2s->base + S31_I2S_STATE),
-			 readl(i2s->base + S31_I2S_FIFO_CNT));
+			 readl(i2s->base + i2s->layout->fifo_cnt));
 		val &= ~S31_I2S_START;
 		break;
 	default:
@@ -486,6 +504,7 @@ static int esp32s31_i2s_probe(struct platform_device *pdev)
 	if (!i2s)
 		return -ENOMEM;
 	i2s->dev = dev;
+	i2s->layout = device_get_match_data(dev);
 	i2s->tx_pdm = device_property_read_bool(dev, "espressif,tx-pdm");
 	i2s->rx_pdm = device_property_read_bool(dev, "espressif,rx-pdm");
 	i2s->tx_slave = device_property_read_bool(dev, "espressif,tx-slave");
@@ -525,7 +544,8 @@ static int esp32s31_i2s_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "reset failed\n");
 
-	writel(0, i2s->base + S31_I2S_DESTINATION);
+	if (i2s->layout->destination)
+		writel(0, i2s->base + i2s->layout->destination);
 	esp32s31_i2s_reset(i2s, S31_I2S_TX_CONF);
 	esp32s31_i2s_reset(i2s, S31_I2S_RX_CONF);
 
@@ -576,7 +596,8 @@ static int esp32s31_i2s_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id esp32s31_i2s_of_match[] = {
-	{ .compatible = "espressif,esp32s31-i2s" },
+	{ .compatible = "espressif,esp32s31-i2s", .data = &esp32s31_i2s_layout },
+	{ .compatible = "espressif,esp32p4-i2s", .data = &esp32p4_i2s_layout },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, esp32s31_i2s_of_match);
@@ -590,5 +611,5 @@ static struct platform_driver esp32s31_i2s_driver = {
 };
 module_platform_driver(esp32s31_i2s_driver);
 
-MODULE_DESCRIPTION("ESP32-S31 I2S ASoC driver");
+MODULE_DESCRIPTION("Espressif I2S ASoC driver");
 MODULE_LICENSE("GPL");

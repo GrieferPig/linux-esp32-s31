@@ -10,21 +10,30 @@ maintainers:
   - GrieferPig <noreply@example.com>
 
 description: |
-  The HP_SYS_CLKRST I2C1, GPSPI2 and IOMUX gates and the I2C1/GPSPI2 reset
-  controls on ESP32-P4 hw_ver1. Clock/reset identifiers are in
-  dt-bindings/clock/esp32p4-peripheral-clock.h. Boot-critical clocks are not
-  exposed. I2C1 and GPSPI2 take XTAL as the clock source.
+  The I2C1, GPSPI2, IOMUX, SDMMC, high-speed USB and Ethernet clocks on ESP32-P4 hw_ver1
+  and the I2C1 and GPSPI2 reset controls. Clock and reset identifiers are in
+  dt-bindings/clock/esp32p4-peripheral-clock.h. I2C1 and GPSPI2 use XTAL.
+  I2S0 takes XTAL through its fractional MCLK divider.
+  SDMMC uses PLL_F160M and requires the additional low-power reset register.
 
 properties:
   compatible:
     const: espressif,esp32p4-rev1-peripheral-clock
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: High-performance clock and reset block
+      - description: Low-power SDMMC and EMAC reset register
+      - description: Low-power EMAC input clock register
+      - description: High-performance system GMAC mode register
 
   clocks:
-    maxItems: 1
-    description: The board's crystal reference clock.
+    minItems: 1
+    items:
+      - description: Crystal reference
+      - description: PLL_F160M reference for SDMMC
+      - description: External 50 MHz RMII reference
 
   '#clock-cells':
     const: 1

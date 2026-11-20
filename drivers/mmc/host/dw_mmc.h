@@ -18,6 +18,8 @@
 #include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
 
 enum dw_mci_state {
 	STATE_IDLE = 0,
@@ -97,9 +99,9 @@ struct dw_mci_dma_slave {
  *	processed.
  * @state: BH work state.
  * @queue: List of slots waiting for access to the controller.
+ * @current_speed: Configured rate of a single-slot controller.
  * @bus_hz: The rate of @mck in Hz. This forms the basis for MMC bus
  *	rate and timeout calculations.
- * @current_speed: Configured rate of the controller.
  * @minimum_speed: Stored minimum rate of the controller.
  * @fifoth_val: The value of FIFOTH register.
  * @verid: Denote Version ID.
@@ -121,7 +123,6 @@ struct dw_mci_dma_slave {
  * @push_data: Pointer to FIFO push function.
  * @pull_data: Pointer to FIFO pull function.
  * @quirks: Set of quirks that apply to specific versions of the IP.
- * @vqmmc_enabled: Status of vqmmc, should be true or false.
  * @irq_flags: The flags to be passed to request_irq.
  * @irq: The irq value to be passed to request_irq.
  * @sdio_id0: Number of slot0 in the SDIO interrupt registers.
@@ -202,9 +203,12 @@ struct dw_mci {
 	unsigned long		completed_events;
 	enum dw_mci_state	state;
 	struct list_head	queue;
+	struct mutex		ios_lock;
+	wait_queue_head_t	idle_wait;
+	bool			ios_busy;
 
-	u32			bus_hz;
 	u32			current_speed;
+	u32			bus_hz;
 	u32			minimum_speed;
 	u32			fifoth_val;
 	u16			verid;
@@ -232,12 +236,11 @@ struct dw_mci {
 	void (*pull_data)(struct dw_mci *host, void *buf, int cnt);
 
 	u32			quirks;
-	bool			vqmmc_enabled;
 	unsigned long		irq_flags; /* IRQ flags */
 	int			irq;
 
 	int			sdio_id0;
-	/* First physical card index and number of registered S31 card ports. */
+	/* First physical card index and number of registered card ports. */
 	u8			slot_id;
 	u8			num_slots;
 
@@ -293,6 +296,7 @@ struct dw_mci_board {
 #define DW_MMC_QUIRK_FIFO64_32                 BIT(1)
 #define DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT    BIT(2)
 #define DW_MMC_QUIRK_LOST_IRQ_POLL             BIT(3)
+#define DW_MMC_QUIRK_SDIO_EDGE_IRQ              BIT(4)
 
 #define DW_MMC_240A		0x240a
 #define DW_MMC_280A		0x280a
@@ -414,6 +418,7 @@ struct dw_mci_board {
 #define SDMMC_CMD_CCS_EXP		BIT(23)
 #define SDMMC_CMD_CEATA_RD		BIT(22)
 #define SDMMC_CMD_UPD_CLK		BIT(21)
+#define SDMMC_CMD_CARD_NUM(slot)	((slot) << 16)
 #define SDMMC_CMD_INIT			BIT(15)
 #define SDMMC_CMD_STOP			BIT(14)
 #define SDMMC_CMD_PRV_DAT_WAIT		BIT(13)
@@ -577,6 +582,7 @@ struct dw_mci_slot {
 	struct dw_mci		*host;
 
 	u32			ctype;
+	bool			vqmmc_enabled;
 
 	struct mmc_request	*mrq;
 	struct list_head	queue_node;
@@ -617,6 +623,7 @@ struct dw_mci_drv_data {
 	u32		num_caps;
 	u32		common_caps;
 	int		(*init)(struct dw_mci *host);
+	struct device *(*slot_device)(struct dw_mci *host, unsigned int slot);
 	void		(*set_ios)(struct dw_mci *host, struct mmc_ios *ios);
 	int		(*parse_dt)(struct dw_mci *host);
 	int		(*execute_tuning)(struct dw_mci_slot *slot, u32 opcode);

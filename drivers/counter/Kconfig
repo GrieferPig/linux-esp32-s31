@@ -79,11 +79,11 @@ config INTERRUPT_CNT
 	  module will be called interrupt-cnt.
 
 config ESP32S31_PCNT
-	tristate "Espressif ESP32-S31 pulse counter"
-	depends on SOC_ESP32S31 || COMPILE_TEST
+	tristate "Espressif ESP32-S31 and ESP32-P4 pulse counters"
+	depends on SOC_ESP32S31 || SOC_ESP32P4 || COMPILE_TEST
 	depends on COMMON_CLK
 	help
-	  Counter framework support for the two four-unit S31 PCNT blocks.
+	  Counter framework support for Espressif four-unit PCNT blocks.
 
 config ESP32S31_SYSTEM_TIMERS
 	tristate "Espressif ESP32-S31 system and RTC timers"

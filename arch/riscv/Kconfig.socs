@@ -110,6 +110,9 @@ config SOC_ESP32P4
 	select ESP32P4_IRQCHIP
 	select ESP32P4_SYSTIMER
 	select ESP32P4_CACHE
+	select RISCV_DMA_NONCOHERENT
+	select RISCV_NONSTANDARD_CACHE_OPS
+	select DMA_GLOBAL_POOL
 	select COMMON_CLK
 	help
 	  Reconstructed Linux port for the retained IDF SRAM handoff.

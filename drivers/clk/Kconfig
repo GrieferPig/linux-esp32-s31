@@ -37,9 +37,11 @@ config ESP32P4_PERIPHERAL_CLK
 	bool "ESP32-P4 rev1 peripheral clock/reset subset"
 	depends on SOC_ESP32P4 && OF
 	select RESET_CONTROLLER
+	select RATIONAL
 	help
-	  Provide the XTAL-derived I2C1 and GPSPI2 clocks and resets, plus
-	  the existing IOMUX clock gates. This provider is limited to the
+	  Provide clocks and resets for the P4 I2C1, GPSPI2, I2S0, SDMMC,
+	  USB high-speed, Ethernet and AHB GDMA blocks, and the IOMUX gate.
+	  This provider is limited to the
 	  rev1 clock register layout. Boot clocks and MSPI are untouched.
 	  Say N unless the board describes those peripherals separately.
 

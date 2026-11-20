@@ -35,11 +35,11 @@ config PINCTRL_ESP32P4_PERIPHERAL
 	bool "ESP32-P4 rev1 Waveshare expansion pin groups"
 	depends on SOC_ESP32P4 && OF && ESP32P4_PERIPHERAL_CLK
 	select PINMUX
+	select GPIOLIB
 	help
-	  Expose only the I2C1 and GPSPI2 pad groups on the Waveshare
-	  ESP32-P4-WIFI6-DEV-KIT. This is not a general GPIO controller.
-	  Boot, memory and console pins are not managed by this driver.
-	  Leave disabled on boards without these exact expansion routes.
+	  Expose board-specific pin groups and available GPIO lines on the
+	  Waveshare ESP32-P4-WIFI6-DEV-KIT. The board device tree declares
+	  which GPIO lines are available to consumers.
 
 config PINCTRL_ESPRESSIF
 	bool "Espressif ESP32-S31 pinctrl and GPIO controller"

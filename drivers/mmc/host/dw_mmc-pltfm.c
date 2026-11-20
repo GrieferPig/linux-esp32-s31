@@ -18,6 +18,7 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/mfd/altera-sysmgr.h>
 #include <linux/regmap.h>
 
@@ -74,7 +75,7 @@ const struct dev_pm_ops dw_mci_pltfm_pmops = {
 };
 EXPORT_SYMBOL_GPL(dw_mci_pltfm_pmops);
 
-static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
+static int dw_mci_espressif_slots_init(struct dw_mci *host)
 {
 	u32 slot_id = 0;
 	u32 num_slots = 1;
@@ -90,11 +91,76 @@ static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
 				     slot_id, num_slots);
 	host->slot_id = slot_id;
 	host->num_slots = num_slots;
-	host->quirks |= DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT |
-			DW_MMC_QUIRK_LOST_IRQ_POLL;
 
 	return 0;
 }
+
+static int dw_mci_esp32s31_priv_init(struct dw_mci *host)
+{
+	int ret = dw_mci_espressif_slots_init(host);
+
+	if (ret)
+		return ret;
+	host->quirks |= DW_MMC_QUIRK_IDMAC_DESC_NONCOHERENT |
+			DW_MMC_QUIRK_LOST_IRQ_POLL;
+	return 0;
+}
+
+static void dw_mci_esp32p4_remove_slot_device(void *data)
+{
+	of_platform_device_destroy(data, NULL);
+}
+
+/*
+ * TRM ch.59 SD/MMC Host Controller - the two card buses share the controller
+ * and IDMAC, while the MMC core owns a separate regulator and power sequence
+ * for each physical slot.
+ */
+static struct device *dw_mci_esp32p4_slot_device(struct dw_mci *host,
+					       unsigned int slot)
+{
+	struct device_node *np = host->dev->of_node;
+	struct platform_device *pdev;
+	char name[48];
+	u32 reg;
+	int ret;
+
+	for_each_available_child_of_node_scoped(np, child) {
+		if (of_property_read_u32(child, "reg", &reg) || reg != slot)
+			continue;
+
+		snprintf(name, sizeof(name), "%s.slot%u", dev_name(host->dev), slot);
+		pdev = of_platform_device_create(child, name, host->dev);
+		if (!pdev)
+			return ERR_PTR(-ENODEV);
+		ret = devm_add_action_or_reset(host->dev,
+					      dw_mci_esp32p4_remove_slot_device,
+					      &pdev->dev);
+		return ret ? ERR_PTR(ret) : &pdev->dev;
+	}
+
+	/* Keep the single-slot DT ABI with properties on the controller. */
+	if (host->num_slots == 1)
+		return host->dev;
+	return ERR_PTR(dev_err_probe(host->dev, -EINVAL,
+				      "missing node for physical slot %u\n", slot));
+}
+
+static int dw_mci_esp32p4_priv_init(struct dw_mci *host)
+{
+	int ret = dw_mci_espressif_slots_init(host);
+
+	if (ret)
+		return ret;
+
+	host->quirks |= DW_MMC_QUIRK_SDIO_EDGE_IRQ;
+	return 0;
+}
+
+static const struct dw_mci_drv_data esp32p4_drv_data = {
+	.init = dw_mci_esp32p4_priv_init,
+	.slot_device = dw_mci_esp32p4_slot_device,
+};
 
 static void dw_mci_esp32s31_set_sample_tap(struct dw_mci *host,
 					   unsigned int tap)
@@ -187,6 +253,7 @@ static const struct dw_mci_drv_data socfpga_drv_data = {
 
 static const struct of_device_id dw_mci_pltfm_match[] = {
 	{ .compatible = "espressif,esp32s31-dw-mshc", .data = &esp32s31_drv_data, },
+	{ .compatible = "espressif,esp32p4-dw-mshc", .data = &esp32p4_drv_data, },
 	{ .compatible = "snps,dw-mshc", },
 	{ .compatible = "altr,socfpga-dw-mshc", .data = &socfpga_drv_data, },
 	{ .compatible = "img,pistachio-dw-mshc", },
