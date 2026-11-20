@@ -128,6 +128,17 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
  * mailbox at 0x4ff3c000. TRM ch.9 System and Memory - SRAM CPU/DMA aliases.
  */
 &{/reserved-memory} {
+	/*
+	 * TRM rev1.3 ch.7 System and Memory — GMAC uses the AHB L2MEM
+	 * alias. The CPU accesses this reclaimed U-Boot text through
+	 * the direct alias. U-Boot checks its retained objects against it.
+	 */
+	emac_dma: dma-pool@8ff04000 {
+		compatible = "shared-dma-pool";
+		reg = <0x8ff04000 0x10000>;
+		no-map;
+	};
+
 	p4_dma: dma-pool@8ff2b000 {
 		compatible = "shared-dma-pool";
 		reg = <0x8ff2b000 0x11000>;
@@ -139,6 +150,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 &{/soc} {
 	dma-noncoherent;
 	dma-ranges = <0x48000000 0x48000000 0x04000000>,
+		     <0x4ff04000 0x8ff04000 0x10000>,
 		     <0x4ff2b000 0x8ff2b000 0x11000>;
 };
 
@@ -303,6 +315,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	emac: ethernet@50098000 {
 		compatible = "espressif,esp32p4-dwmac";
 		reg = <0x50098000 0x2000>;
+		memory-region = <&emac_dma>;
 		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
 		interrupts = <92 4>, <91 4>, <90 4>;
 		interrupt-names = "macirq", "eth_wake_irq", "eth_lpi";

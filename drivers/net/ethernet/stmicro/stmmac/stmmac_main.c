@@ -4878,7 +4878,14 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
 		if (tx_q->coherent_tx) {
 			size_t offset = first_entry * STMMAC_COHERENT_TX_SLOT_SIZE;
 
-			memcpy(tx_q->coherent_tx + offset, skb->data, nopaged_len);
+#if IS_ENABLED(CONFIG_DWMAC_ESP32P4)
+			if (priv->plat->tx_coherent_copy)
+				priv->plat->tx_coherent_copy(tx_q->coherent_tx + offset,
+							    skb->data, nopaged_len);
+			else
+#endif
+				memcpy(tx_q->coherent_tx + offset, skb->data,
+				       nopaged_len);
 			dma_wmb();
 			des = tx_q->coherent_tx_dma + offset;
 		} else {

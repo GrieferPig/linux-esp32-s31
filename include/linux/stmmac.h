@@ -237,6 +237,9 @@ struct plat_stmmacenet_data {
 	int rx_fifo_size;
 	u16 tx_coherent_slots;
 	u16 rx_coherent_slots;
+#if IS_ENABLED(CONFIG_DWMAC_ESP32P4)
+	void (*tx_coherent_copy)(void *dst, const void *src, unsigned int len);
+#endif
 	u32 host_dma_width;
 	u32 rx_queues_to_use;
 	u32 tx_queues_to_use;

@@ -19,6 +19,10 @@ properties:
   reg:
     maxItems: 1
 
+  memory-region:
+    maxItems: 1
+    description: Coherent HP L2 SRAM for the DMA descriptor rings and frame buffers.
+
   clocks:
     items:
       - description: EMAC bus clock

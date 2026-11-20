@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/clk.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
 #include "stmmac.h"
@@ -10,6 +12,7 @@
 struct esp32p4_dwmac {
 	struct device *dev;
 	struct clk *rmii;
+	struct notifier_block netdev_notifier;
 };
 
 static void esp32p4_dwmac_set_speed(void *data, int speed, unsigned int mode)
@@ -34,6 +37,60 @@ static void esp32p4_dwmac_set_speed(void *data, int speed, unsigned int mode)
 	ret = clk_set_rate(dwmac->rmii, rate);
 	if (ret)
 		dev_err(dwmac->dev, "failed to set RMII rate %lu: %d\n", rate, ret);
+}
+
+static int esp32p4_dwmac_netdev_event(struct notifier_block *notifier,
+				      unsigned long event, void *ptr)
+{
+	struct esp32p4_dwmac *dwmac = container_of(notifier, struct esp32p4_dwmac,
+						  netdev_notifier);
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+	struct stmmac_priv *priv;
+
+	if (event != NETDEV_UP || netdev->dev.parent != dwmac->dev)
+		return NOTIFY_DONE;
+
+	/*
+	 * TRM v1.3 ch.50 EMAC: TDES0.IC signals TX completion. The
+	 * default 25-frame interval can fill the eight-slot SRAM ring
+	 * before an interrupt, leaving reclamation to the TX timer.
+	 * Apply the P4 threshold after stmmac initializes coalescing.
+	 */
+	priv = netdev_priv(netdev);
+	WRITE_ONCE(priv->tx_coal_frames[0], 4);
+	return NOTIFY_DONE;
+}
+
+static void esp32p4_dwmac_unregister_notifier(void *data)
+{
+	struct esp32p4_dwmac *dwmac = data;
+
+	unregister_netdevice_notifier(&dwmac->netdev_notifier);
+}
+
+static void esp32p4_dwmac_release_dma(void *data)
+{
+	of_reserved_mem_device_release(data);
+}
+
+static void esp32p4_dwmac_tx_copy(void *dst, const void *src, unsigned int len)
+{
+	const u16 *in = src;
+	u32 *out = dst;
+
+	/*
+	 * TRM ch.57 EMAC - TDES2 points at the TX buffer in coherent SRAM.
+	 * Leave that address word-aligned. For the usual skb alignment,
+	 * assemble each word from two aligned halfword loads.
+	 */
+	static_assert(STMMAC_COHERENT_TX_SLOT_SIZE % sizeof(u32) == 0);
+	if (((unsigned long)src & (sizeof(u32) - 1)) == sizeof(u16)) {
+		for (; len >= sizeof(u32); len -= sizeof(u32)) {
+			*out++ = in[0] | ((u32)in[1] << 16);
+			in += 2;
+		}
+	}
+	memcpy(out, in, len);
 }
 
 static int esp32p4_dwmac_probe(struct platform_device *pdev)
@@ -76,10 +133,31 @@ static int esp32p4_dwmac_probe(struct platform_device *pdev)
 	 */
 	/* Keep the two descriptor rings within one SRAM page each. */
 	plat->tx_coherent_slots = 8;
+	plat->tx_coherent_copy = esp32p4_dwmac_tx_copy;
 	plat->rx_coherent_slots = 8;
 	plat->maxmtu = ETH_DATA_LEN;
 	plat->bsp_priv = dwmac;
 	plat->fix_mac_speed = esp32p4_dwmac_set_speed;
+
+	if (of_property_present(dev->of_node, "memory-region")) {
+		ret = of_reserved_mem_device_init(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "could not attach EMAC DMA pool\n");
+
+		ret = devm_add_action_or_reset(dev, esp32p4_dwmac_release_dma, dev);
+		if (ret)
+			return ret;
+	}
+
+	dwmac->netdev_notifier.notifier_call = esp32p4_dwmac_netdev_event;
+	ret = register_netdevice_notifier(&dwmac->netdev_notifier);
+	if (ret)
+		return dev_err_probe(dev, ret, "could not register netdev notifier\n");
+
+	ret = devm_add_action_or_reset(dev, esp32p4_dwmac_unregister_notifier,
+				       dwmac);
+	if (ret)
+		return ret;
 
 	return devm_stmmac_pltfr_probe(pdev, plat, &res);
 }
