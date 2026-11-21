@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/espressif,esp32-rmt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-P4 Remote Control Peripheral
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  The driver uses transmit channel 0 and receive channel 4, with four
+  RAM blocks assigned to each. Configure the pin controller to route
+  channel 0 of the RMT output and input, respectively.
+
+properties:
+  compatible:
+    const: espressif,esp32p4-rmt
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  espressif,rx-active-low:
+    type: boolean
+    description: The external receiver pulls the input low during a pulse.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - resets
+
+additionalProperties: false

@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pinctrl/espressif,esp32-pinctrl.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32 pin controllers
+
+maintainers:
+  - Max Filippov <jcmvbkbc@gmail.com>
+  - GrieferPig <noreply@example.com>
+
+description: |
+  ESP32-S31 has 60 bonded GPIO pads in the GPIO0 through GPIO61 number
+  space. GPIO29 and GPIO41 are unbonded. Each pad has an IO_MUX function
+  selector and can also connect to peripheral inputs and outputs through the
+  GPIO matrix. The controller provides GPIO data, direction, pad electrical
+  configuration and per-pin interrupts through four aggregate outputs. This
+  binding uses aggregate output zero.
+
+  Pin configuration nodes are children of a pinctrl state node. Their pinmux
+  property consists of cells built with ESP32S31_IOMUX(),
+  ESP32S31_IOMUX_IN(), ESP32S31_MATRIX_IN(), ESP32S31_MATRIX_OUT(), or
+  ESP32S31_GPIO() from
+  dt-bindings/pinctrl/esp32s31-pinmux.h. A group may mix those cell types and
+  may contain both input and output routes for bidirectional peripherals.
+
+properties:
+  compatible:
+    enum:
+      - espressif,esp32s31-pinctrl
+      - waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl
+
+  gpio-controller: true
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-reserved-ranges: true
+
+required:
+  - compatible
+  - reg
+
+oneOf:
+  - properties:
+      compatible:
+        const: espressif,esp32s31-pinctrl
+
+      reg:
+        minItems: 3
+        maxItems: 3
+
+      reg-names:
+        items:
+          - const: gpio
+          - const: iomux
+          - const: cnnt-pad-ctrl
+
+      interrupt-controller: true
+
+      '#interrupt-cells':
+        const: 2
+
+      interrupts:
+        maxItems: 1
+
+    required:
+      - reg
+      - reg-names
+      - interrupt-controller
+      - '#interrupt-cells'
+      - interrupts
+
+    patternProperties:
+      '-pins$':
+        type: object
+        additionalProperties: false
+        patternProperties:
+          '(-pins|-pads|-signals|-in|-out|-capture|-fault|-sync)$|^(outputs|loopback-inputs|rx|tx)$':
+            type: object
+            additionalProperties: false
+
+            properties:
+              pinmux:
+                $ref: /schemas/types.yaml#/definitions/uint32-array
+                minItems: 1
+                maxItems: 124
+                description: Encoded IO_MUX and GPIO matrix operations.
+
+              espressif,route-name:
+                $ref: /schemas/types.yaml#/definitions/string
+                description: User-visible name of a scalar configurable GPIO route.
+              espressif,route-kind:
+                $ref: /schemas/types.yaml#/definitions/string
+                description: Hardware route class for the scalar route.
+                enum: [matrix-input, matrix-output, matrix-bidirectional]
+              espressif,route-names:
+                $ref: /schemas/types.yaml#/definitions/string-array
+                description: Configurable route name for each pinmux entry.
+                minItems: 1
+                maxItems: 124
+              espressif,route-kinds:
+                $ref: /schemas/types.yaml#/definitions/non-unique-string-array
+                description: Hardware route class for each pinmux entry.
+                minItems: 1
+                maxItems: 124
+                items:
+                  enum: [matrix-input, matrix-output, matrix-bidirectional]
+
+              bias-disable: true
+              bias-pull-up: true
+              bias-pull-down: true
+              input-enable: true
+              input-disable: true
+              input-schmitt-enable: true
+              input-debounce:
+                $ref: /schemas/types.yaml#/definitions/uint32-array
+                maxItems: 1
+                description: A nonzero value enables the fixed hardware glitch filter.
+              drive-open-drain: true
+              drive-push-pull: true
+              drive-strength:
+                $ref: /schemas/types.yaml#/definitions/uint32
+                enum: [5, 10, 20, 40]
+                description: Approximate pad drive strength in mA.
+              output-disable: true
+              output-high: true
+              output-low: true
+
+            required:
+              - pinmux
+  - properties:
+      compatible:
+        const: waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl
+
+      reg:
+        oneOf:
+          - items:
+              - description: HP GPIO matrix
+              - description: HP IO MUX pads
+          - items:
+              - description: HP GPIO matrix
+              - description: HP IO MUX pads
+              - description: LP GPIO matrix
+              - description: LP IO MUX pads
+
+      clocks:
+        maxItems: 1
+        description: IOMUX clock
+
+      gpio-controller: true
+
+      '#gpio-cells':
+        const: 2
+
+      gpio-ranges:
+        maxItems: 1
+
+    required:
+      - reg
+      - clocks
+
+    patternProperties:
+      '^(i2c[01]|gpspi[23]|sdmmc[01]|emac-(rmii|mdio)|i2s[0-2]|pcnt0|ledc0|mcpwm[01]|rmt-loopback|twai[0-2]-loopback|adc1-header|lp-(i2c|spi|uart)|uart[1-4]|usbfs-device|i3c-(master|legacy)|parlio-loopback)-pins$':
+        type: object
+        properties:
+          function:
+            $ref: /schemas/types.yaml#/definitions/string
+            enum: [i2c0, i2c1, gpspi2, gpspi3, sdmmc0, sdmmc1, emac-rmii,
+                   emac-mdio, i2s0, i2s1, i2s2, pcnt0, ledc0, mcpwm0,
+                   mcpwm1, rmt-loopback, twai0-loopback, twai1-loopback,
+                   twai2-loopback, adc1-header, lp-i2c, lp-spi, lp-uart,
+                   uart1, uart2, uart3, uart4, usbfs-device, i3c-master,
+                   i3c-legacy, parlio-loopback]
+        required:
+          - function
+        additionalProperties: false
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+    pinctrl@20583000 {
+        compatible = "espressif,esp32s31-pinctrl";
+        reg = <0x20583000 0x1000>, <0x20582000 0x1000>,
+              <0x20588000 0x1000>;
+        reg-names = "gpio", "iomux", "cnnt-pad-ctrl";
+        gpio-controller;
+        #gpio-cells = <2>;
+        interrupt-controller;
+        #interrupt-cells = <2>;
+        interrupts = <18 61 IRQ_TYPE_LEVEL_HIGH>;
+
+        uart-pins {
+            tx-pins {
+                pinmux = <ESP32S31_MATRIX_OUT(20, 10, 0)>;
+                drive-strength = <20>;
+            };
+            rx-pins {
+                pinmux = <ESP32S31_MATRIX_IN(21, 10, 0)>;
+                bias-pull-up;
+                input-enable;
+            };
+        };
+    };

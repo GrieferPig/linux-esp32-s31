@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spi/espressif,esp32-gpspi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Espressif ESP32-S31 and ESP32-P4 general-purpose SPI controllers
+
+maintainers:
+  - Espressif Linux Port Maintainers <linux-riscv@espressif.com>
+
+description: |
+  The S31 controller can switch between host and target through runtime overlays.
+  Target mode keeps the base tree's address-cell count; changing it on a live
+  node is rejected by OF overlay. The target child has no reg property.
+  ESP32-P4 rev1 GPSPI2, GPSPI3 and LP-SPI support single-bit PIO master mode and native CS0 in
+  this binding. Flash/PSRAM peripherals are not described by this binding.
+
+allOf:
+  - $ref: spi-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          enum:
+            - espressif,esp32p4-rev1-gpspi
+            - espressif,esp32p4-rev1-lp-spi
+    then:
+      properties:
+        dmas: false
+        dma-names: false
+        spi-slave: false
+        cs-gpios: false
+        num-cs:
+          const: 1
+        espressif,gpio-cs-drive-strength: false
+        espressif,max-data-lines: false
+      required:
+        - resets
+        - pinctrl-0
+        - pinctrl-names
+
+properties:
+  compatible:
+    enum:
+      - espressif,esp32s31-gpspi
+      - espressif,esp32p4-rev1-gpspi
+      - espressif,esp32p4-rev1-lp-spi
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  dmas:
+    minItems: 2
+    maxItems: 2
+
+  dma-names:
+    items:
+      - const: tx
+      - const: rx
+
+  espressif,gpio-cs-drive-strength:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: GPIO chip-select pad drive strength in mA.
+    enum: [5, 10, 20, 40]
+
+  espressif,max-data-lines:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Maximum controller data bus width.
+    enum: [4, 8]
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+
+unevaluatedProperties: false
+...
