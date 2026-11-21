@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0+
+
+/dts-v1/;
+#include "esp32s31-wroom-3.dtsi"
+
+/ {
+	model = "Espressif ESP32-S31-Korvo-1";
+	compatible = "espressif,esp32s31-korvo-1", "espressif,esp32s31";
+};
+
+&gpio {
+	korvo_i2c0: i2c0-pins {
+		scl-pins {
+			espressif,route-name = "i2c0.scl";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(1, 68, 0)>,
+				 <ESP32S31_MATRIX_IN(1, 68, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+		sda-pins {
+			espressif,route-name = "i2c0.sda";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(0, 69, 0)>,
+				 <ESP32S31_MATRIX_IN(0, 69, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+};
+
+&i2c0 {
+	pinctrl-0 = <&korvo_i2c0>;
+	status = "okay";
+};

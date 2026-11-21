@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+
+/ {
+	chosen {
+		espressif,chip-revision = <0x67>;
+		bootargs = "clk_ignore_unused root=/dev/mtdblock0 ro";
+	};
+
+	memory@48000000 {
+		device_type = "memory";
+		reg = <0x48000000 0x1000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <0x01>;
+		#size-cells = <0x01>;
+		ranges;
+
+		boot-dtb@48f00000 {
+			reg = <0x48f00000 0x10000>;
+			no-map;
+		};
+	};
+
+	/* TRM ch.9, External Memory Address Mapping: SPL maps the SPI NOR window.
+	 * Keep the bootloader, kernel and DTB outside this read-only MTD device.
+	 */
+	rootfs@40c00000 {
+		compatible = "mtd-rom";
+		linux,mtd-name = "rootfs";
+		reg = <0x40c00000 0x00400000>;
+		bank-width = <1>;
+	};
+};

@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0+
+#include "esp32s31.dtsi"
+
+/ {
+	memory@50000000 {
+		device_type = "memory";
+		reg = <0x50000000 0x01000000>;
+	};
+
+	soc {
+		/*
+		 * SPL maps all 16 MiB linearly: CPU address = 0x40000000 +
+		 * raw flash offset. Keep Linux at 0x40400000 for Sv32's 4 MiB
+		 * leaf mappings; its XIP image spans more than one leaf.
+		 */
+		flash: flash@40000000 {
+			compatible = "espressif,esp32s31-flash-mtd";
+			reg = <0x40000000 0x01000000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* Reserve 0x0..0x2000 for ROM FlashEncryption metadata. */
+				partition@2000 {
+					label = "spl";
+					reg = <0x002000 0x00c000>;
+					read-only;
+				};
+
+				partition@e000 {
+					label = "u-boot-fit";
+					reg = <0x00e000 0x050000>;
+					read-only;
+				};
+
+				partition@5e000 {
+					label = "dtb";
+					reg = <0x05e000 0x010000>;
+					read-only;
+				};
+
+				partition@6e000 {
+					label = "radio-bundle";
+					reg = <0x06e000 0x1c0000>;
+					read-only;
+				};
+
+				partition@22e000 {
+					label = "persist";
+					reg = <0x22e000 0x1d2000>;
+				};
+
+				partition@400000 {
+					label = "linux";
+					reg = <0x400000 0x600000>;
+					read-only;
+				};
+
+				partition@a00000 {
+					label = "rootfs";
+					reg = <0xa00000 0x600000>;
+					linux,rootfs;
+					read-only;
+				};
+			};
+		};
+
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+
+		opensbi-config {
+			compatible = "opensbi,config";
+			/* Match the U-Boot control FDT used for OpenSBI initialization. */
+			heap-size = <0x4000>;
+		};
+	};
+};
+
+&systimer { status = "okay"; };

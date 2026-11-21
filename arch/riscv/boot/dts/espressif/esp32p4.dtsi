@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+
+#include <dt-bindings/clock/esp32p4-peripheral-clock.h>
+
+/ {
+	compatible = "espressif,esp32p4";
+	#address-cells = <0x01>;
+	#size-cells = <0x01>;
+
+	chosen {
+		ranges;
+		#size-cells = <0x01>;
+		#address-cells = <0x01>;
+		stdout-path = "usbserial0:115200n8";
+	};
+
+	aliases {
+		usbserial0 = &usb_serial_jtag;
+		serial0 = "/soc/serial@500ca000";
+	};
+
+	cpus {
+		#address-cells = <0x01>;
+		#size-cells = <0x00>;
+		timebase-frequency = <0x15752a00>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "espressif,esp32p4-cpu\0riscv";
+			reg = <0x00>;
+			status = "okay";
+			riscv,isa = "rv32imafc_zicsr_zifencei_zicntr_zihpm_zcb_zcmp_zcmt";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i\0m\0a\0f\0c\0zicsr\0zifencei\0zicntr\0zihpm\0zmmul\0zaamo\0zalrsc\0zca\0zcb\0zcf\0zcmp\0zcmt";
+			clock-frequency = <0x15752a00>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "espressif,esp32p4-cpu\0riscv";
+			reg = <0x01>;
+			status = "okay";
+			riscv,isa = "rv32imafc_zicsr_zifencei_zicntr_zihpm_zcb_zcmp_zcmt";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i\0m\0a\0f\0c\0zicsr\0zifencei\0zicntr\0zihpm\0zmmul\0zaamo\0zalrsc\0zca\0zcb\0zcf\0zcmp\0zcmt";
+			clock-frequency = <0x15752a00>;
+		};
+	};
+
+	xtal: clock-xtal {
+		compatible = "fixed-clock";
+		#clock-cells = <0x00>;
+		clock-frequency = <0x2625a00>;
+		phandle = <0x02>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <0x01>;
+		#size-cells = <0x01>;
+		ranges;
+
+		usb_serial_jtag: serial@500d2000 {
+		compatible = "espressif,esp32p4-usb-serial-jtag";
+		reg = <0x500d2000 0x1000>;
+		interrupt-parent = <0x01>;
+		interrupts = <22 4>;
+		status = "okay";
+	};
+
+	interrupt-controller@20800000 {
+			compatible = "espressif,esp32p4-interrupt-controller";
+			reg = <0x20800000 0x12000 0x500d6000 0x1000 0x500e5000 0x1000>;
+			interrupt-controller;
+			#interrupt-cells = <0x02>;
+			#address-cells = <0x00>;
+			phandle = <0x01>;
+		};
+
+		timer@500e2000 {
+			compatible = "espressif,esp32p4-systimer";
+			reg = <0x500e2000 0x1000 0x500e6000 0x1000>;
+			interrupt-parent = <0x01>;
+			interrupts = <0x35 0x04 0x36 0x04>;
+		};
+
+		serial@500ca000 {
+			compatible = "espressif,esp32p4-uart";
+			reg = <0x500ca000 0x1000>;
+			clocks = <&xtal>;
+			interrupt-parent = <0x01>;
+			interrupts = <0x1f 0x04>;
+			status = "okay";
+		};
+
+		i2c1: i2c@500c5000 {
+			compatible = "espressif,esp32p4-idf-i2c";
+			reg = <0x500c5000 0x1000>;
+			interrupt-parent = <0x01>;
+			interrupts = <45 4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		periphclk: clock-controller@500e6000 {
+			compatible = "espressif,esp32p4-rev1-peripheral-clock";
+			reg = <0x500e6000 0x100>;
+			clocks = <&xtal>;
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+			status = "disabled";
+		};
+
+		/* TRM ch.58 TWAI, Classic CAN controllers. Assign board pins to enable. */
+		twai0: can@500d7000 {
+			compatible = "espressif,esp32p4-twai";
+			reg = <0x500d7000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <40 4>;
+			clocks = <&periphclk ESP32P4_CLK_TWAI0>;
+			resets = <&periphclk ESP32P4_RST_TWAI0>;
+			status = "disabled";
+		};
+
+		twai1: can@500d8000 {
+			compatible = "espressif,esp32p4-twai";
+			reg = <0x500d8000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <41 4>;
+			clocks = <&periphclk ESP32P4_CLK_TWAI1>;
+			resets = <&periphclk ESP32P4_RST_TWAI1>;
+			status = "disabled";
+		};
+
+		twai2: can@500d9000 {
+			compatible = "espressif,esp32p4-twai";
+			reg = <0x500d9000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <42 4>;
+			clocks = <&periphclk ESP32P4_CLK_TWAI2>;
+			resets = <&periphclk ESP32P4_RST_TWAI2>;
+			status = "disabled";
+		};
+
+		/* TRM rev1.3 ch.33 JPEG and ch.12 Interrupt Matrix. */
+		jpeg@50086000 {
+			compatible = "espressif,esp32p4-jpeg";
+			reg = <0x50086000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <95 4>;
+			clocks = <&periphclk ESP32P4_CLK_JPEG>;
+			resets = <&periphclk ESP32P4_RST_JPEG>;
+			dmas = <&dma2d 1>;
+			dma-names = "codec";
+			status = "disabled";
+		};
+
+		/* TRM ch.8 2D-DMA and ch.14 Interrupt Matrix — two M2M RX/TX pairs. */
+		dma2d: dma-controller@50088000 {
+			compatible = "espressif,esp32p4-dma2d";
+			reg = <0x50088000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <106 4>, <104 4>, <107 4>, <105 4>;
+			interrupt-names = "tx0", "rx0", "tx1", "rx1";
+			clocks = <&periphclk ESP32P4_CLK_DMA2D>;
+			resets = <&periphclk ESP32P4_RST_DMA2D>;
+			#dma-cells = <1>;
+			status = "disabled";
+		};
+
+		/* TRM ch.6 GDMA Controller — AXI RX/TX interrupts and linked lists. */
+		axi_dma: dma-controller@5008a000 {
+			compatible = "espressif,esp32p4-axi-gdma";
+			reg = <0x5008a000 0x2000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <62 4>, <63 4>, <64 4>, <65 4>, <66 4>, <67 4>;
+			interrupt-names = "rx0", "rx1", "rx2", "tx0", "tx1", "tx2";
+			clocks = <&periphclk ESP32P4_CLK_AXI_GDMA>;
+			resets = <&periphclk ESP32P4_RST_AXI_GDMA>;
+			#dma-cells = <2>;
+			status = "disabled";
+		};
+
+		/* TRM ch.6 GDMA Controller - three coupled AHB RX/TX channel pairs. */
+		ahb_dma: dma-controller@50085000 {
+			compatible = "espressif,esp32p4-ahb-gdma";
+			reg = <0x50085000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <56 4>, <57 4>, <58 4>, <59 4>, <60 4>, <61 4>;
+			clocks = <&periphclk ESP32P4_CLK_AHB_GDMA>;
+			resets = <&periphclk ESP32P4_RST_AHB_GDMA>;
+			#dma-cells = <2>;
+			status = "disabled";
+		};
+
+		/* TRM ch.20 RTC Timer - 48-bit RC_SLOW_CLK counter and capture buffers. */
+		rtc_counter: counter@50112000 {
+			compatible = "espressif,esp32p4-rtc-timer";
+			reg = <0x50112000 0x400>;
+			status = "disabled";
+		};
+
+		/* TRM ch.18 TIMG - T0CONFIG through T1LOAD, before watchdog registers. */
+		gptimer0: counter@500c2000 {
+			compatible = "espressif,esp32p4-gptimer";
+			reg = <0x500c2000 0x48>, <0x500c2070 0x10>;
+			reg-names = "counters", "interrupts";
+			clocks = <&periphclk ESP32P4_CLK_GPTIMER0>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <46 4>, <47 4>;
+			interrupt-names = "timer0", "timer1";
+			status = "disabled";
+		};
+
+		gptimer1: counter@500c3000 {
+			compatible = "espressif,esp32p4-gptimer";
+			reg = <0x500c3000 0x48>, <0x500c3070 0x10>;
+			reg-names = "counters", "interrupts";
+			clocks = <&periphclk ESP32P4_CLK_GPTIMER1>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <49 4>, <50 4>;
+			interrupt-names = "timer0", "timer1";
+			status = "disabled";
+		};
+
+		/* TRM ch.18 Timer Group - TIMG_WDTCONFIG0 through TIMG_WDTWPROTECT. */
+		mwdt0: watchdog@500c2048 {
+			compatible = "espressif,esp32p4-timg-wdt";
+			reg = <0x500c2048 0x20>;
+			clocks = <&periphclk ESP32P4_CLK_MWDT0>;
+			status = "disabled";
+		};
+
+		mwdt1: watchdog@500c3048 {
+			compatible = "espressif,esp32p4-timg-wdt";
+			reg = <0x500c3048 0x20>;
+			clocks = <&periphclk ESP32P4_CLK_MWDT1>;
+			status = "disabled";
+		};
+
+		/* TRM ch.62 RMT - pulse send and capture using the on-chip RAM. */
+		rmt@500a2000 {
+			compatible = "espressif,esp32p4-rmt";
+			reg = <0x500a2000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <43 4>;
+			clocks = <&periphclk ESP32P4_CLK_RMT>;
+			resets = <&periphclk ESP32P4_RST_RMT>;
+			status = "disabled";
+		};
+	};
+};

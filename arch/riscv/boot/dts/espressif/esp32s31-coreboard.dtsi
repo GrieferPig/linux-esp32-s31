@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0+
+
+&emac {
+	/* ESP32-S31-Function-CoreBoard-1 onboard YT8531DC-CA. */
+	phy-mode = "rgmii-id";
+	phy-handle = <&yt8531>;
+	max-speed = <1000>;
+
+	mdio {
+		compatible = "snps,dwmac-mdio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		yt8531: ethernet-phy@0 {
+			compatible = "ethernet-phy-id4f51.e91b";
+			reg = <0>;
+			reset-gpios = <&gpio 7 GPIO_ACTIVE_LOW>;
+			reset-assert-us = <10000>;
+			reset-deassert-us = <100000>;
+			/* PHY strap: RXDLY enabled, TXDLY disabled. */
+			rx-internal-delay-ps = <1950>;
+			tx-internal-delay-ps = <1950>;
+			motorcomm,auto-sleep-disabled;
+		};
+	};
+};
