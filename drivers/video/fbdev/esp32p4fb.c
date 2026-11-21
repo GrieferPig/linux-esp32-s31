@@ -401,6 +401,7 @@ static void p4_fb_remove(struct platform_device *pdev)
 
 	WRITE_ONCE(fb->removed, true);
 	p4_fb_stop(fb);
+	esp32p4_dsi_report_link(fb->dsi);
 	free_irq(fb->irq, fb);
 	/* Existing file references keep info alive through fb_destroy. */
 	unregister_framebuffer(info);

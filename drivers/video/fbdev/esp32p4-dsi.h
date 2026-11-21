@@ -40,6 +40,7 @@ int esp32p4_dsi_late_init(struct esp32p4_dsi *dsi);
  */
 int esp32p4_dsi_rearm(struct esp32p4_dsi *dsi);
 void esp32p4_dsi_stop(struct esp32p4_dsi *dsi);
+void esp32p4_dsi_report_link(struct esp32p4_dsi *dsi);
 int esp32p4_dsi_irq(struct esp32p4_dsi *dsi);
 unsigned int esp32p4_dsi_irq_number(struct esp32p4_dsi *dsi);
 void esp32p4_dsi_destroy(struct esp32p4_dsi *dsi);

@@ -54,13 +54,13 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gcd.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irqdomain.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
@@ -124,7 +124,10 @@
 
 /* Board DSI/DPI timing, from display_handoff.c and the panel datasheet. */
 #define DSI_NUM_DATA_LANES		2
-#define DSI_LANE_BIT_RATE_MBPS		1000
+/* ILI9881C datasheet rates two data lanes at up to 850 Mbps/lane.
+ * RGB565 at 80 MHz requires 640 Mbps/lane during active video.
+ */
+#define DSI_LANE_BIT_RATE_MBPS		800
 #define DSI_PHY_REF_MHZ			20
 #define DSI_DPI_CLK_SRC_MHZ		240	/* MIPI_DSI_DPI_CLK_SRC_DEFAULT */
 #define DSI_DPI_CLK_MHZ			80
@@ -154,15 +157,17 @@
 #define DSI_GDMA_MASTER_PORT_DSI	0
 #define DSI_DMA_EVENT_FRAME_DONE	BIT(1)
 #define DSI_DMA_EVENT_ERRORS		GENMASK(13, 5)
-#define DSI_DMA_EVENTS			(DSI_DMA_EVENT_FRAME_DONE | DSI_DMA_EVENT_ERRORS)
 #define DSI_GDMA_LLI_ALIGN		64
-#define DSI_GDMA_LINK_LIST_ITEMS	1
+#define DSI_DMA_MULTBLK_RELOAD		1
+#define DSI_DMA_MULTBLK_LINKED		3
 
 /* The DW_GDMA interrupt source on ESP32-P4 (soc/interrupts.h). */
 #define DSI_GDMA_HWIRQ			24
 
 /* Bridge start-up heuristic: wait until this many bytes are buffered. */
-#define DSI_BRIDGE_PREFILL_BYTES	512
+#define DSI_BRIDGE_FIFO_WORDS		1024
+#define DSI_BRIDGE_BURST_WORDS		256
+#define DSI_BRIDGE_PREFILL_WORDS		(DSI_BRIDGE_FIFO_WORDS - DSI_BRIDGE_BURST_WORDS)
 #define DSI_BRIDGE_PREFILL_US		2000
 
 #define DSI_DCS_SHORT_WRITE_0		0x05
@@ -175,9 +180,8 @@
 
 /* MIPI DSI LL flow-control / video constants (mipi_dsi_*_ll.h). */
 #define DSI_LL_FLOW_CONTROLLER_DMA	0
-/* MIPI DSI video burst type: 0 non-burst + sync pulses, 1 non-burst + sync
- * events, 2 burst + sync pulses.  The panel needs non-burst + sync events. */
-#define DSI_LL_VIDEO_NON_BURST_SYNC_EVENTS	1
+/* TRM ch.44 MIPI DSI - DSI_HOST_VID_MODE_TYPE. */
+#define DSI_LL_VIDEO_BURST_SYNC_PULSES	2
 #define DSI_LL_CLOCK_LANE_STATE_HS	1
 #define DSI_LL_TRANS_SPEED_HS		0
 #define DSI_LL_TRANS_SPEED_LP		1
@@ -603,9 +607,13 @@ static void dsi_host_phy_config(struct esp32p4_dsi *dsi)
 {
 	dsi_host_dev_t *host = dsi->host;
 
-	/* mipi_dsi_hal_init(): lanes, power, PHY reset, clock lane, force PLL. */
-	host->phy_if_cfg.n_lanes = DSI_NUM_DATA_LANES - 1;
-	host->pwr_up.shutdownz = 1;
+	/*
+	 * TRM ch.44 MIPI DSI - DSI_HOST_PHY_IF_CFG.
+	 * Program N_LANES and PHY_STOP_WAIT_TIME with one 32-bit access.
+	 * A byte write to PHY_STOP_WAIT_TIME clears N_LANES on rev1.3.
+	 */
+	host->pwr_up.val = 1;
+	writel((0x3f << 8) | (DSI_NUM_DATA_LANES - 1), &host->phy_if_cfg.val);
 	host->phy_rstz.phy_shutdownz = 1;
 	host->phy_rstz.phy_rstz = 0;
 	host->phy_rstz.phy_rstz = 1;
@@ -692,8 +700,8 @@ static int dsi_host_init(struct esp32p4_dsi *dsi)
 
 	/* Command mode until dpi_start(). */
 	host->mode_cfg.cmd_video_mode = 1;
-	/* clock_lane_force_hs = true for this board. */
-	host->lpclk_ctrl.auto_clklane_ctrl = 0;
+	/* Match mipi_dsi_host_ll_set_clock_lane_state(...AUTO) in IDF. */
+	host->lpclk_ctrl.auto_clklane_ctrl = 1;
 	host->lpclk_ctrl.phy_txrequestclkhs = 1;
 	/* mipi_dsi_phy_ll_set_switch_time(50, 104, 46, 128). */
 	host->phy_tmr_cfg.phy_hs2lp_time = 50;
@@ -711,8 +719,8 @@ static int dsi_host_init(struct esp32p4_dsi *dsi)
 			       DSI_DPI_TIMEOUT_CLK_MHZ);
 	esc_div = dsi_round_div((u64)DSI_LANE_BIT_RATE_MBPS, 8 *
 				DSI_DPI_ESCAPE_CLK_MHZ);
-	host->clkmgr_cfg.to_clk_division = to_div;
-	host->clkmgr_cfg.tx_esc_clk_division = esc_div;
+	/* TRM ch.44 MIPI DSI - DSI_HOST_CLKMGR_CFG, likewise word access. */
+	writel((to_div << 8) | esc_div, &host->clkmgr_cfg.val);
 
 	/* Disable all timeouts, as ESP-IDF does. */
 	host->to_cnt_cfg.hstx_to_cnt = 0;
@@ -724,7 +732,6 @@ static int dsi_host_init(struct esp32p4_dsi *dsi)
 	host->bta_timeout_cnt.bta_to_cnt = 0;
 
 	host->phy_tmr_rd_cfg.max_rd_time = 6000;
-	host->phy_if_cfg.phy_stop_wait_time = 0x3f;
 
 	dsi_host_dbi_modes(dsi);
 
@@ -995,7 +1002,8 @@ static int dsi_panel_mcu_reset(struct esp32p4_dsi *dsi)
 
 static int dsi_panel_dcs_init(struct esp32p4_dsi *dsi)
 {
-	u8 identity[3];
+	const u8 lane_mode = 0x03, madctl = 0x00, rgb565 = 0x55;
+	u8 identity[3], inversion, source_timing;
 	size_t i;
 	int ret, try;
 
@@ -1022,6 +1030,32 @@ static int dsi_panel_dcs_init(struct esp32p4_dsi *dsi)
 	    identity[2] != 0x1c)
 		return -EIO;
 
+	/*
+	 * The panel is still on command page 1. Match the verified IDF
+	 * esp_lcd_ili9881c panel_ili9881c_init() sequence and program the
+	 * panel's two-lane pad mode before waking it.
+	 */
+	ret = dsi_dcs_write(dsi, 0xb7, &lane_mode, 1);
+	if (ret)
+		return ret;
+	ret = dsi_panel_page(dsi, 0);
+	if (ret)
+		return ret;
+	/*
+	 * ILI9881C datasheet section 5.3.11: Sleep Out reloads the
+	 * supplier defaults. Program the vendor table after the reload.
+	 */
+	ret = dsi_dcs_write(dsi, 0x11, NULL, 0);
+	if (ret)
+		return ret;
+	msleep(120);
+	ret = dsi_dcs_write(dsi, 0x36, &madctl, 1);
+	if (ret)
+		return ret;
+	ret = dsi_dcs_write(dsi, 0x3a, &rgb565, 1);
+	if (ret)
+		return ret;
+
 	for (i = 0; i < ARRAY_SIZE(rpi_5inch_init); i++) {
 		u8 cmd = rpi_5inch_init[i][0];
 		u8 val = rpi_5inch_init[i][1];
@@ -1034,36 +1068,26 @@ static int dsi_panel_dcs_init(struct esp32p4_dsi *dsi)
 			return ret;
 	}
 
+	/* The vendor table ends on page 1. Verify the optical timing profile. */
+	ret = dsi_dcs_read(dsi, 0x31, &inversion, sizeof(inversion));
+	if (ret)
+		return ret;
+	ret = dsi_dcs_read(dsi, 0x60, &source_timing, sizeof(source_timing));
+	if (ret)
+		return ret;
+	if (inversion != 0x02 || source_timing != 0x20) {
+		dev_err(dsi->dev, "panel settings did not latch (inversion %#x, source timing %#x)\n",
+			inversion, source_timing);
+		return -EIO;
+	}
+	dev_info(dsi->dev, "panel readback: inversion %#x, source timing %#x\n",
+		 inversion, source_timing);
+
 	ret = dsi_panel_page(dsi, 0);
 	if (ret)
 		return ret;
-
-	/* 0x35 = 0: tear effect line off. */
-	{
-		u8 zero = 0;
-
-		ret = dsi_dcs_write(dsi, 0x35, &zero, 1);
-		if (ret)
-			return ret;
-	}
-	/* 0x3a = 0x55: RGB565 in PSRAM and in the DSI packet. */
-	{
-		u8 fmt = 0x55;
-
-		ret = dsi_dcs_write(dsi, 0x3a, &fmt, 1);
-		if (ret)
-			return ret;
-	}
-
-	ret = dsi_dcs_write(dsi, 0x11, NULL, 0);
-	if (ret)
-		return ret;
-	msleep(120);
-	ret = dsi_dcs_write(dsi, 0x29, NULL, 0);
-	if (ret)
-		return ret;
-	msleep(20);
-
+	/* Panel supplier sequence: let the vendor registers settle. */
+	msleep(200);
 	return 0;
 }
 
@@ -1074,35 +1098,28 @@ static int dsi_panel_dcs_init(struct esp32p4_dsi *dsi)
 static void dsi_set_horizontal_timing(struct esp32p4_dsi *dsi, u32 hsw,
 				      u32 hbp, u32 act, u32 hfp)
 {
-	u32 htotal = hsw + hbp + act + hfp;
-	u64 den = (u64)DSI_DPI_CLK_MHZ * 8;
-	u32 host_hsw = dsi_round_div((u64)hsw * DSI_LANE_BIT_RATE_MBPS, den);
-	u32 host_hbp = dsi_round_div((u64)hbp * DSI_LANE_BIT_RATE_MBPS, den);
-	u32 host_act = dsi_round_div((u64)act * DSI_LANE_BIT_RATE_MBPS, den);
-	u32 host_hfp = dsi_round_div((u64)hfp * DSI_LANE_BIT_RATE_MBPS, den);
-	u32 host_htotal = dsi_round_div((u64)htotal * DSI_LANE_BIT_RATE_MBPS,
-					den);
-	int compensation = (int)host_htotal -
-			   (int)(host_hsw + host_hbp + host_act + host_hfp);
-	int brg_compensation;
-	u32 brg_htotal;
-
-	/* Host timing is expressed in lane byte-clock cycles. */
-	dsi->host->vid_hsa_time.vid_hsa_time = host_hsw;
-	dsi->host->vid_hbp_time.vid_hbp_time = host_hbp;
-	dsi->host->vid_hline_time.vid_hline_time = host_hsw + host_hbp +
-		host_act + compensation + host_hfp;
+	u32 dpi_bits_mhz = DSI_DPI_CLK_MHZ * 8;
+	u32 dpi_line_unit = dpi_bits_mhz /
+			   gcd(dpi_bits_mhz, DSI_LANE_BIT_RATE_MBPS);
+	u32 htotal = roundup(hsw + hbp + act + hfp, dpi_line_unit);
+	u32 host_hsw = dsi_round_div((u64)hsw * DSI_LANE_BIT_RATE_MBPS,
+				     dpi_bits_mhz);
+	u32 host_hbp = dsi_round_div((u64)hbp * DSI_LANE_BIT_RATE_MBPS,
+				     dpi_bits_mhz);
 
 	/*
-	 * Compensate the bridge timing so that the refresh rate matches the
-	 * expected DPI clock, as mipi_dsi_hal_host_dpi_set_horizontal_timing()
-	 * does with real_dpi_clock_freq_mhz / expect_dpi_clock_freq_mhz.
+	 * TRM ch.44 MIPI DSI - DSI_BRG_HTOTAL and DSI_HOST_VID_HLINE_TIME.
+	 * Use whole clock cycles in both domains with identical line periods.
+	 * Round the front porch up to a whole clock ratio so no phase
+	 * error accumulates between the bridge and host.
 	 */
-	brg_htotal = dsi_round_div((u64)htotal * dsi->dpi_real_uhz,
-				   (u64)DSI_DPI_CLK_MHZ * 1000000);
-	brg_compensation = (int)brg_htotal - (int)htotal;
+	dsi->host->vid_hsa_time.vid_hsa_time = host_hsw;
+	dsi->host->vid_hbp_time.vid_hbp_time = host_hbp;
+	dsi->host->vid_hline_time.vid_hline_time =
+		div_u64((u64)htotal * DSI_LANE_BIT_RATE_MBPS, dpi_bits_mhz);
+
 	dsi->bridge->dpi_h_cfg0.hdisp = act;
-	dsi->bridge->dpi_h_cfg0.htotal = htotal + brg_compensation;
+	dsi->bridge->dpi_h_cfg0.htotal = htotal;
 	dsi->bridge->dpi_h_cfg1.hsync = hsw;
 	dsi->bridge->dpi_h_cfg1.hbank = hbp;
 }
@@ -1149,9 +1166,9 @@ static int dsi_dpi_init(struct esp32p4_dsi *dsi)
 	host->vid_mode_cfg.lp_vfp_en = 1;
 	host->vid_mode_cfg.lp_vact_en = 1;
 	host->vid_mode_cfg.lp_cmd_en = 1;
-	host->vid_mode_cfg.frame_bta_ack_en = 0;
-	host->vid_mode_cfg.vid_mode_type =
-		DSI_LL_VIDEO_NON_BURST_SYNC_EVENTS;
+	/* The IDF reference uses frame BTA with the clock lane in AUTO. */
+	host->vid_mode_cfg.frame_bta_ack_en = 1;
+	host->vid_mode_cfg.vid_mode_type = DSI_LL_VIDEO_BURST_SYNC_PULSES;
 	host->vid_pkt_size.vid_pkt_size = dsi->width;
 	host->vid_num_chunks.vid_num_chunks = 0;
 	host->vid_null_size.vid_null_size = 0;
@@ -1163,7 +1180,12 @@ static int dsi_dpi_init(struct esp32p4_dsi *dsi)
 	brg->raw_num_cfg.raw_num_total = (pixel_bits + 63) / 64;
 	brg->raw_num_cfg.unalign_64bit_en = pixel_bits % 64 ? 1 : 0;
 	brg->raw_num_cfg.raw_num_total_set = 1;
-	brg->dpi_misc_config.fifo_underrun_discard_vcnt = dsi->width;
+	/*
+	 * TRM ch.44 MIPI DSI - FIFO_UNDERRUN_DISCARD_VCNT suppresses
+	 * underrun events before the selected scanline. Detect them from
+	 * the first line, including when starting the next VDMA block.
+	 */
+	brg->dpi_misc_config.fifo_underrun_discard_vcnt = 0;
 	/*
 	 * Input and output are both RGB565 (chip revision >= 3.0 fields).
 	 * TODO(verify): on pre-3.0 silicon pixel_type.raw_type is also used for
@@ -1177,8 +1199,9 @@ static int dsi_dpi_init(struct esp32p4_dsi *dsi)
 		DSI_LL_FLOW_CONTROLLER_DMA;
 	brg->dma_flow_ctrl.dma_flow_multiblk_num = 1;
 	brg->dma_frame_interval.dma_multiblk_en = 0;
-	brg->dma_req_cfg.dma_burst_len = 256;
-	brg->raw_buf_almost_empty_thrd.dsi_raw_buf_almost_empty_thrd = 768;
+	brg->dma_req_cfg.dma_burst_len = DSI_BRIDGE_BURST_WORDS;
+	brg->raw_buf_almost_empty_thrd.dsi_raw_buf_almost_empty_thrd =
+		DSI_BRIDGE_PREFILL_WORDS;
 	brg->en.dsi_en = 1;
 	brg->dpi_misc_config.dpi_en = 0;
 	brg->int_ena.val = 0;
@@ -1223,14 +1246,21 @@ static void dsi_dma_channel_config(struct esp32p4_dsi *dsi)
 
 	/* Memory -> peripheral, DMA as flow controller. */
 	ch->cfg1.tt_fc = 1;
-	/* DW_GDMA block types: contiguous 0, reload 1, shadow 2, link list 3. */
-	ch->cfg0.src_multblk_type = 3;
-	ch->cfg0.dst_multblk_type = 3;
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
+		ch->cfg0.src_multblk_type = DSI_DMA_MULTBLK_RELOAD;
+		ch->cfg0.dst_multblk_type = DSI_DMA_MULTBLK_RELOAD;
+	} else {
+		ch->cfg0.src_multblk_type = DSI_DMA_MULTBLK_LINKED;
+		ch->cfg0.dst_multblk_type = DSI_DMA_MULTBLK_LINKED;
+	}
 	ch->cfg1.hs_sel_src = 0;	/* hardware handshake */
 	ch->cfg1.hs_sel_dst = 0;
 	ch->cfg1.src_per = DSI_GDMA_HW_HANDSHAKE_DSI;
 	ch->cfg1.dst_per = DSI_GDMA_HW_HANDSHAKE_DSI;
-	ch->cfg1.ch_prior = 1;
+	/* TRM ch.7 VDMA - DMAC_CHn_CFG1.CH_PRIOR. Scanout has a fixed
+	 * deadline and shares the VDMA read/write arbiters with CSI.
+	 */
+	ch->cfg1.ch_prior = 3;
 	ch->cfg1.src_osr_lmt = 5 - 1;
 	ch->cfg1.dst_osr_lmt = 2 - 1;
 	ch->sstatar0.sstatar0 = 0;
@@ -1252,38 +1282,56 @@ static struct esp32p4_dsi_lli *dsi_lli_view(struct esp32p4_dsi *dsi)
 					  DSI_SRAM_NC_OFFSET);
 }
 
-static void dsi_lli_program(struct esp32p4_dsi *dsi, u32 block_size)
+static void dsi_dma_program(struct esp32p4_dsi *dsi)
 {
-	struct esp32p4_dsi_lli *lli = dsi_lli_view(dsi);
+	dmac_chn_ctl0_reg_t ctl0 = {
+		.sms = DSI_GDMA_MASTER_PORT_MEMORY,
+		.dms = DSI_GDMA_MASTER_PORT_DSI,
+		.dinc = 1,		/* Fixed DSI FIFO address */
+		.src_tr_width = 3,	/* 64 bits */
+		.dst_tr_width = 3,
+		.src_msize = 8,		/* 512 items */
+		.dst_msize = 7,		/* 256 items */
+	};
+	/* TRM ch.7 VDMA - DMAC_CHn_CTL1.ARLEN and AWLEN. */
+	dmac_chn_ctl1_reg_t ctl1 = {
+		.arlen_en = 1,
+		.arlen = 16 - 1,
+		.awlen_en = 1,
+		.awlen = 16 - 1,
+	};
+	struct esp32p4_dsi_lli *lli;
 
-	dsi->block_size = block_size;
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
+		dmac_channel_reg_t *ch =
+			(dmac_channel_reg_t *)&dsi->gdma->ch[DSI_GDMA_CHANNEL];
+
+		/*
+		 * TRM ch.7 VDMA - Auto Reloading, DMAC_CHn_CFG0 and IOC_BLKTFR.
+		 * Reload the same RGB565 source and fixed DSI FIFO address at
+		 * every block boundary. Leave block completion disabled so the
+		 * next frame can start without the CPU servicing an interrupt.
+		 */
+		ch->sar0.val = lower_32_bits(dsi->fb_phys);
+		ch->dar0.val = DSI_BRIDGE_MEM_BASE;
+		ch->block_ts0.val = dsi->block_size - 1;
+		ch->ctl0.val = ctl0.val;
+		ch->ctl1.val = ctl1.val;
+		ch->llp0.val = 0;
+		ch->llp1.val = 0;
+		return;
+	}
+
+	lli = dsi_lli_view(dsi);
 	memset(lli, 0, sizeof(*lli));
-
 	lli->sar_lo.sar0 = lower_32_bits(dsi->fb_phys);
 	lli->dar_lo.dar0 = DSI_BRIDGE_MEM_BASE;
-	lli->block_ts_lo.block_ts = block_size - 1;
-
-	lli->ctrl_lo.sms = DSI_GDMA_MASTER_PORT_MEMORY;
-	lli->ctrl_lo.dms = DSI_GDMA_MASTER_PORT_DSI;
-	lli->ctrl_lo.sinc = 0;	/* increment */
-	lli->ctrl_lo.dinc = 1;	/* fixed */
-	lli->ctrl_lo.src_tr_width = 3;	/* 64 bits */
-	lli->ctrl_lo.dst_tr_width = 3;
-	lli->ctrl_lo.src_msize = 8;	/* 512 items */
-	lli->ctrl_lo.dst_msize = 7;	/* 256 items */
-
-	lli->ctrl_hi.arlen_en = 1;
-	lli->ctrl_hi.arlen = 16;
-	lli->ctrl_hi.awlen_en = 1;
-	lli->ctrl_hi.awlen = 16;
-	lli->ctrl_hi.ioc_blktfr = 0;
+	lli->block_ts_lo.block_ts = dsi->block_size - 1;
+	lli->ctrl_lo.val = ctl0.val;
+	lli->ctrl_hi.val = ctl1.val;
 	lli->ctrl_hi.shadowreg_or_lli_last = 1;
 	lli->ctrl_hi.shadowreg_or_lli_valid = 1;
-
 	lli->llp_lo.lms = DSI_GDMA_MASTER_PORT_MEMORY;
-	lli->llp_lo.loc0 = 0;
-	lli->llp_hi.val = 0;
-
 	dma_wmb();
 }
 
@@ -1309,18 +1357,13 @@ static int dsi_dma_init(struct esp32p4_dsi *dsi)
 		return ret;
 	}
 
+	dsi->block_size = block_size;
 	dsi_dma_channel_config(dsi);
-	dsi_lli_program(dsi, block_size);
 
-	dev_info(dsi->dev, "gdma id=0x%08x compver=0x%08x cfg0=0x%08x lli_ctrl_hi=0x%08x lli_ctrl_lo=0x%08x lli_llp=0x%08x\n",
-		 dsi->gdma->id0.val, dsi->gdma->compver0.val,
-		 dsi->gdma->cfg0.val,
-		 dsi_lli_view(dsi)->ctrl_hi.val,
-		 dsi_lli_view(dsi)->ctrl_lo.val,
-		 dsi_lli_view(dsi)->llp_lo.val);
-
-	dev_info(dsi->dev, "VDMA channel %d, %llu bytes, %u x 64-bit\n",
-		 DSI_GDMA_CHANNEL, frame_bytes, block_size);
+	dev_info(dsi->dev, "VDMA channel %d, %llu bytes, %u x 64-bit (%s)\n",
+		 DSI_GDMA_CHANNEL, frame_bytes, block_size,
+		 IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP) ? "address reload" :
+							"linked list");
 	return 0;
 }
 
@@ -1339,8 +1382,8 @@ static void dsi_channel_enable(struct esp32p4_dsi *dsi)
 }
 
 /*
- * Re-arm the single LLI.  Critical: the DMAC clears the LLI valid bit when
- * it fetches the descriptor, so it must be re-marked before every enable.
+ * Re-arm the legacy single LLI. VDMA clears its valid bit on descriptor
+ * writeback, so it must be set before every enable.
  * See mipi_dsi_dma_trans_done_cb() in esp_lcd_panel_dpi.c.
  */
 static void dsi_lli_rearm(struct esp32p4_dsi *dsi)
@@ -1364,17 +1407,14 @@ static void dsi_lli_rearm(struct esp32p4_dsi *dsi)
 
 static int dsi_stream_on(struct esp32p4_dsi *dsi)
 {
-	/*
-	 * Re-assert the host clock/lane/video-mode programming.  Compared with a
-	 * reference capture these three must be 0x0d07, 0x3f01 and 0xbf01.
-	 */
-	dsi->host->clkmgr_cfg.val = 0x00000d07;
-	dsi->host->phy_if_cfg.val = 0x00003f00 | (DSI_NUM_DATA_LANES - 1);
-	dsi->host->vid_mode_cfg.val = 0x0000bf01;
+	u32 events = DSI_DMA_EVENT_ERRORS;
+	u32 depth;
+	int ret;
 
-	/* Drop command-mode leftovers so the status reflects video only. */
-	dsi->host->int_st0.val = UINT_MAX;
-	dsi->host->int_st1.val = UINT_MAX;
+	if (!IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP))
+		events |= DSI_DMA_EVENT_FRAME_DONE;
+
+	/* Drop any bridge event left by command-mode initialization. */
 	dsi->bridge->int_clr.val = UINT_MAX;
 
 	/* Blank the buffer while the channel is idle so no stale pixels appear. */
@@ -1387,22 +1427,34 @@ static int dsi_stream_on(struct esp32p4_dsi *dsi)
 
 	/* Clear and arm the events before the channel can complete a block. */
 	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_clr0.val = UINT_MAX;
-	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_st_ena0.val = DSI_DMA_EVENTS;
-	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_sig_ena0.val = DSI_DMA_EVENTS;
-	dsi_lli_rearm(dsi);
+	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_st_ena0.val = events;
+	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_sig_ena0.val = events;
+	dsi_dma_program(dsi);
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP))
+		dsi_channel_enable(dsi);
+	else
+		dsi_lli_rearm(dsi);
 
-		/* Video mode on and DPI output on. */
+	/*
+	 * TRM ch.44 MIPI DSI - DSI_BRG_FIFO_FLOW_STATUS and DSI_BRG_DPI_EN.
+	 * Prime the raw FIFO while DPI is idle so the initial active line
+	 * does not compete with the first VDMA descriptor fetch.
+	 */
+	ret = readl_poll_timeout_atomic(&dsi->bridge->fifo_flow_status.val,
+					depth, (depth & GENMASK(13, 0)) >=
+					DSI_BRIDGE_PREFILL_WORDS,
+					1, DSI_BRIDGE_PREFILL_US);
+	if (ret) {
+		dsi_channel_disable(dsi);
+		dsi->gdma->ch[DSI_GDMA_CHANNEL].int_sig_ena0.val = 0;
+		dsi->gdma->ch[DSI_GDMA_CHANNEL].int_clr0.val = UINT_MAX;
+		dev_err(dsi->dev, "VDMA failed to prefill DSI FIFO (depth %u)\n", depth);
+		return ret;
+	}
+
 	dsi->host->mode_cfg.cmd_video_mode = 0;
-	/* The clock lane must stay out of low power for the video stream. */
-	dsi->host->lpclk_ctrl.auto_clklane_ctrl = 0;
-	dsi->host->lpclk_ctrl.phy_txrequestclkhs = 1;
 	dsi->bridge->dpi_misc_config.dpi_en = 1;
 	dsi->bridge->dpi_config_update.dpi_config_update = 1;
-
-	udelay(50);
-	dev_info(dsi->dev, "stream on: depth=%u status0=0x%x\n",
-		 (u32)dsi->bridge->fifo_flow_status.raw_buf_depth,
-		 ((dmac_channel_reg_t *)&dsi->gdma->ch[DSI_GDMA_CHANNEL])->status0.val);
 
 	return 0;
 }
@@ -1445,9 +1497,10 @@ void esp32p4_dsi_stop(struct esp32p4_dsi *dsi)
 	dsi_channel_disable(dsi);
 	dsi->host->mode_cfg.cmd_video_mode = 1;
 	dsi->gdma->ch[DSI_GDMA_CHANNEL].int_clr0.val = UINT_MAX;
-	/* Do not leave a valid descriptor behind for the next user. */
-	dsi_lli_view(dsi)->ctrl_hi.shadowreg_or_lli_valid = 0;
-	dma_wmb();
+	if (dsi->lli) {
+		dsi_lli_view(dsi)->ctrl_hi.shadowreg_or_lli_valid = 0;
+		dma_wmb();
+	}
 	dsi->started = false;
 	spin_unlock_irqrestore(&dsi->lock, flags);
 }
@@ -1479,10 +1532,11 @@ static int dsi_handle_irq_locked(struct esp32p4_dsi *dsi)
 		return -EIO;
 	}
 
-	if (!(status & DSI_DMA_EVENT_FRAME_DONE))
+	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP) ||
+	    !(status & DSI_DMA_EVENT_FRAME_DONE))
 		return 0;
 
-	/* DMA has fetched (and invalidated) the LLI; re-mark and restart. */
+	/* Restore the legacy descriptor after VDMA writes it back. */
 	dsi_lli_rearm(dsi);
 	ret = 1;
 
@@ -1499,6 +1553,11 @@ int esp32p4_dsi_late_init(struct esp32p4_dsi *dsi)
 
 	if (!dsi)
 		return -EINVAL;
+	/* Match the IDF panel enable order: video first, then DCS DISPON. */
+	ret = dsi_dcs_write(dsi, 0x29, NULL, 0);
+	if (ret)
+		return ret;
+
 	if (dsi->backlight)
 		return backlight_enable(dsi->backlight);
 	msleep(200);
@@ -1543,12 +1602,8 @@ unsigned int esp32p4_dsi_irq_number(struct esp32p4_dsi *dsi)
 /* ------------------------------------------------------------------------- */
 
 /*
- * The frame-done interrupt lives in the DW-GDMA, not in the DSI bridge.  The
- * board DTS routes the bridge interrupt (source 86) to this node; map the
- * DW-GDMA channel interrupt (source 24) through the same interrupt parent so
- * the fb driver can re-arm the channel from its hard IRQ handler.
- * TODO(verify): add a DMA interrupt to the display-controller DT node so this
- * mapping is not implied by the driver.
+ * DW-GDMA source 24 handles scanout DMA errors and, for the legacy linked
+ * list, completion. The DSI bridge interrupt is a separate source.
  */
 static int dsi_map_irq(struct esp32p4_dsi *dsi)
 {
@@ -1652,36 +1707,13 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 		}
 	}
 
-	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
-	if (ret)
-		goto err_mcu;
-	/*
-	 * TRM ch.9 System and Memory, DMA Address Space: VDMA sees HP L2MEM
-	 * at its direct address. CPU writes the descriptor at the uncached alias.
-	 */
-	if (IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
-		struct device_node *lli_node;
-		struct resource sram;
-
-		lli_node = of_parse_phandle(dev->of_node, "memory-region", 0);
-		if (!lli_node) {
-			ret = -EINVAL;
-			goto err_mcu;
-		}
-		ret = of_address_to_resource(lli_node, 0, &sram);
-		of_node_put(lli_node);
-		if (ret || sram.start < 0x4ff00000 || sram.end >= 0x4ff40000 ||
-		    !IS_ALIGNED(sram.start, 64) ||
-		    resource_size(&sram) < sizeof(*dsi->lli)) {
-			ret = -EINVAL;
-			goto err_mcu;
-		}
-		dsi->lli = (void *)(uintptr_t)sram.start;
-		dsi->lli_dma = sram.start;
-		dsi->lli_in_sram = true;
-	} else {
+	if (!IS_ENABLED(CONFIG_ESP32P4_NOMMU_XIP)) {
 		struct device_node *fb_node;
 		u32 lli_addr = 0;
+
+		ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+		if (ret)
+			goto err_mcu;
 
 		fb_node = of_get_compatible_child(of_chosen, P4_DSI_FB_COMPAT);
 		if (fb_node) {
@@ -1714,7 +1746,7 @@ struct esp32p4_dsi *esp32p4_dsi_create(struct device *dev,
 	return dsi;
 
 err_lli:
-	if (!dsi->lli_in_sram)
+	if (dsi->lli && !dsi->lli_in_sram)
 		dma_free_coherent(dev, sizeof(*dsi->lli), dsi->lli,
 				  dsi->lli_dma);
 	dsi->lli = NULL;
@@ -1750,9 +1782,10 @@ int esp32p4_dsi_probe(struct esp32p4_dsi *dsi)
 
 	if (dsi->panel_reset) {
 		/*
-		 * Only release LCD reset here. The touchscreen's supply
-		 * owns CTP reset and sequences it before Goodix probes.
+		 * The GPIO is asserted in create(). Use the reference board's
+		 * 100 ms LCD reset pulse. The touch supply owns CTP reset.
 		 */
+		msleep(100);
 		ret = gpiod_set_value_cansleep(dsi->panel_reset, 0);
 		if (ret)
 			return ret;
@@ -1802,6 +1835,31 @@ int esp32p4_dsi_probe(struct esp32p4_dsi *dsi)
 	dev_info(dsi->dev, "ESP32-P4 DSI panel ready (%ux%u)\n",
 		 dsi->width, dsi->height);
 	return 0;
+}
+
+/*
+ * ILI9881C datasheet, sections 5.3.3 and 5.3.4. Sample the sink after
+ * stopping DPI, when DBI can use bus turnaround without disrupting video.
+ * RDNUMED clears on read. Bit 7 reports counter overflow.
+ */
+void esp32p4_dsi_report_link(struct esp32p4_dsi *dsi)
+{
+	u8 errors, power;
+	int ret;
+
+	ret = dsi_dcs_read(dsi, 0x05, &errors, sizeof(errors));
+	if (ret) {
+		dev_dbg(dsi->dev, "panel DSI error counter unavailable: %d\n", ret);
+		return;
+	}
+	ret = dsi_dcs_read(dsi, 0x0a, &power, sizeof(power));
+	if (ret) {
+		dev_info(dsi->dev, "panel DSI error count %#02x, power mode unavailable: %d\n",
+			 errors, ret);
+		return;
+	}
+	dev_info(dsi->dev, "panel DSI error count %#02x, power mode %#02x\n",
+		 errors, power);
 }
 
 void esp32p4_dsi_destroy(struct esp32p4_dsi *dsi)

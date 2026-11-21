@@ -127,7 +127,6 @@
 &{/chosen/framebuffer@49000000} {
 	/delete-property/ espressif,dsi-lli;
 	/delete-property/ espressif,cache-writeback-entry;
-	memory-region = <&dsi_lli>;
 	reset-gpios = <&panel_mcu 0 GPIO_ACTIVE_LOW>;
 	backlight = <&panel_backlight>;
 };
@@ -145,11 +144,6 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 
 /* TRM ch.9 System and Memory - CPU and DMA aliases of HP L2MEM. */
 &{/reserved-memory} {
-	dsi_lli: dsi-descriptor@4ff00000 {
-		reg = <0x4ff00000 0x1000>;
-		no-map;
-	};
-
 	emac_dma: dma-pool@8ff04000 {
 		compatible = "shared-dma-pool";
 		reg = <0x8ff04000 0x10000>;
@@ -223,7 +217,6 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 &{/chosen/framebuffer@49000000} {
 	/delete-property/ espressif,dsi-lli;
 	/delete-property/ espressif,cache-writeback-entry;
-	memory-region = <&dsi_lli>;
 	/delete-property/ espressif,logical-framebuffer;
 };
 
