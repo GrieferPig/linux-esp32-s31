@@ -1,9 +1,239 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 #include <dt-bindings/gpio/gpio.h>
-#include "esp32p4-hardware.dts"
-#include "esp32p4-waveshare-peripheral-pins.dtsi"
-#include "esp32p4-waveshare-gpspi.dtsi"
-#include "esp32p4-waveshare-uart.dtsi"
+#include <dt-bindings/clock/esp32p4-peripheral-clock.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include "esp32p4-generic.dts"
+
+/* Set to 1 to select UART4 DMA and reserve AHB GDMA pair 2 for it. */
+#define ESP32P4_UART4_UHCI 0
+
+
+&{/soc} {
+	periphclk: clock-controller@500e6000 {
+		compatible = "espressif,esp32p4-rev1-peripheral-clock";
+		reg = <0x500e6000 0x100>;
+		clocks = <&xtal>;
+		#clock-cells = <1>;
+		#reset-cells = <1>;
+	};
+
+	/* TRM ch.48 I2C Controller — HP I2C0 master and IRQ44. */
+	i2c0: i2c@500c4000 {
+		compatible = "espressif,esp32p4-rev1-i2c";
+		reg = <0x500c4000 0x100>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <44 4>;
+		clocks = <&periphclk ESP32P4_CLK_I2C0>;
+		resets = <&periphclk ESP32P4_RST_I2C0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_i2c0>;
+		clock-frequency = <100000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* I2C1 owns the display pads by default. */
+		status = "disabled";
+	};
+
+	p4_pinctrl: pinctrl@500e0000 {
+		compatible = "waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl";
+		reg = <0x500e0000 0x700>, <0x500e1000 0x100>;
+		clocks = <&periphclk ESP32P4_CLK_IOMUX>;
+
+		pins_i2c0: i2c0-pins {
+			function = "i2c0";
+		};
+
+		pins_i2c1: i2c1-pins {
+			function = "i2c1";
+		};
+
+		pins_sdmmc0: sdmmc0-pins {
+			function = "sdmmc0";
+		};
+
+		pins_sdmmc1: sdmmc1-pins {
+			function = "sdmmc1";
+		};
+
+		pins_emac_rmii: emac-rmii-pins {
+			function = "emac-rmii";
+		};
+
+		pins_emac_mdio: emac-mdio-pins {
+			function = "emac-mdio";
+		};
+
+		pins_i2s0: i2s0-pins {
+			function = "i2s0";
+		};
+
+		pins_i2s1: i2s1-pins {
+			function = "i2s1";
+		};
+
+		pins_i2s2: i2s2-pins {
+			function = "i2s2";
+		};
+
+		pins_pcnt0: pcnt0-pins {
+			function = "pcnt0";
+		};
+
+		pins_ledc0: ledc0-pins {
+			function = "ledc0";
+		};
+
+		pins_mcpwm0: mcpwm0-pins {
+			function = "mcpwm0";
+		};
+
+		pins_mcpwm1: mcpwm1-pins {
+			function = "mcpwm1";
+		};
+
+		pins_rmt_loopback: rmt-loopback-pins {
+			function = "rmt-loopback";
+		};
+
+		pins_twai0_loopback: twai0-loopback-pins {
+			function = "twai0-loopback";
+		};
+
+		pins_twai1_loopback: twai1-loopback-pins {
+			function = "twai1-loopback";
+		};
+
+		pins_twai2_loopback: twai2-loopback-pins {
+			function = "twai2-loopback";
+		};
+
+		pins_uart1: uart1-pins {
+			function = "uart1";
+		};
+
+		pins_uart2: uart2-pins {
+			function = "uart2";
+		};
+
+		pins_uart3: uart3-pins {
+			function = "uart3";
+		};
+
+		pins_uart4: uart4-pins {
+			function = "uart4";
+		};
+
+		pins_gpspi2: gpspi2-pins {
+			function = "gpspi2";
+		};
+
+		pins_gpspi3: gpspi3-pins {
+			function = "gpspi3";
+		};
+	};
+};
+
+/ {
+	aliases {
+		spi2 = &gpspi2;
+		spi3 = &gpspi3;
+	};
+};
+
+&{/soc} {
+	/* TRM ch.47 SPI Controller and ch.14 Interrupt Matrix — SPI2/3. */
+	/* P6 GPIO20..23. No implicit spidev or external device. */
+	gpspi2: spi@500d0000 {
+		compatible = "espressif,esp32p4-rev1-gpspi";
+		reg = <0x500d0000 0x100>;
+		clocks = <&periphclk ESP32P4_CLK_GPSPI2>;
+		resets = <&periphclk ESP32P4_RST_GPSPI2>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <25 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&pins_gpspi2>;
+		pinctrl-names = "default";
+		num-cs = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	/* P6 GPIO20..23. No implicit spidev or external device. */
+	gpspi3: spi@500d1000 {
+		compatible = "espressif,esp32p4-rev1-gpspi";
+		reg = <0x500d1000 0x100>;
+		clocks = <&periphclk ESP32P4_CLK_GPSPI3>;
+		resets = <&periphclk ESP32P4_RST_GPSPI3>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <26 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&pins_gpspi3>;
+		pinctrl-names = "default";
+		num-cs = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/ {
+	aliases {
+		serial1 = &uart1;
+		serial2 = &uart2;
+		serial3 = &uart3;
+		serial4 = &uart4;
+	};
+};
+
+&{/soc} {
+	/* TRM ch.46 UART Controller and ch.14 Interrupt Matrix. */
+	uart1: serial@500cb000 {
+		compatible = "espressif,esp32p4-uart";
+		reg = <0x500cb000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <32 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&periphclk ESP32P4_CLK_UART1>;
+		resets = <&periphclk ESP32P4_RST_UART1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_uart1>;
+		status = "disabled";
+	};
+
+	uart2: serial@500cc000 {
+		compatible = "espressif,esp32p4-uart";
+		reg = <0x500cc000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <33 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&periphclk ESP32P4_CLK_UART2>;
+		resets = <&periphclk ESP32P4_RST_UART2>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_uart2>;
+		status = "disabled";
+	};
+
+	uart3: serial@500cd000 {
+		compatible = "espressif,esp32p4-uart";
+		reg = <0x500cd000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <34 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&periphclk ESP32P4_CLK_UART3>;
+		resets = <&periphclk ESP32P4_RST_UART3>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_uart3>;
+		status = "disabled";
+	};
+
+	uart4: serial@500ce000 {
+		compatible = "espressif,esp32p4-uart";
+		reg = <0x500ce000 0x1000>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <35 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&periphclk ESP32P4_CLK_UART4>;
+		resets = <&periphclk ESP32P4_RST_UART4>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_uart4>;
+		status = "disabled";
+	};
+};
 
 / {
 	model = "Waveshare ESP32-P4-WIFI6-DEV-KIT with 5-inch Raspberry Pi Touch Display 2";
@@ -230,7 +460,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	espressif,lpperi = <&lpperi>;
 	reg = <0x500e6000 0x100>, <0x5011104c 0x4>,
 	      <0x50111040 0x4>, <0x500e514c 0x4>, <0x50111000 0x4>;
-	clocks = <&xtal>, <&pll_f160m>, <&rmii_ref>;
+	clocks = <&xtal>, <&pll_f160m>, <&rmii_ref>, <&parlio_rx_pad>;
 };
 
 &{/soc} {
@@ -756,3 +986,99 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	dmas = <&dma2d 0>;
 	dma-names = "srm";
 };
+
+/* I3C and PARLIO share GPIO4/5. PARLIO also shares GPIO20/21 with ADC and SPI. */
+&p4_pinctrl {
+	pins_i3c_master: i3c-master-pins {
+		function = "i3c-master";
+	};
+};
+
+&{/soc} {
+	/* TRM ch.50 I3C master, ch.14 I3C_MST_INTR source 101. */
+	i3c0: i3c@500da000 {
+		compatible = "espressif,esp32p4-i3c";
+		reg = <0x500da000 0x200>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <101 4>;
+		clocks = <&periphclk ESP32P4_CLK_I3C>;
+		resets = <&periphclk ESP32P4_RST_I3C>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_i3c_master>;
+		i3c-scl-hz = <10000000>;
+		#address-cells = <3>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/ {
+	/* The loopback routes the configured TX clock to the receiver pad. */
+	parlio_rx_pad: clock-parlio-rx {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <1000000>;
+		status = "disabled";
+	};
+};
+
+&p4_pinctrl {
+	pins_parlio_loop: parlio-loopback-pins {
+		function = "parlio-loopback";
+	};
+};
+
+&{/soc} {
+	/* P4 v1.3 TRM ch.63 PARLIO, ch.6 AXI GDMA peripheral selector 3. */
+	parlio: parallel-io@500cf000 {
+		compatible = "espressif,esp32p4-parlio";
+		reg = <0x500cf000 0x400>;
+		interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+		interrupts = <113 4>, <114 4>;
+		interrupt-names = "rx", "tx";
+		clocks = <&periphclk ESP32P4_CLK_PARLIO_BUS>,
+			 <&periphclk ESP32P4_CLK_PARLIO_RX>,
+			 <&periphclk ESP32P4_CLK_PARLIO_TX>,
+			 <&xtal>, <&parlio_rx_pad>;
+		clock-names = "bus", "rx", "tx", "xtal", "rx-pad";
+		resets = <&periphclk ESP32P4_RST_PARLIO_BUS>,
+			 <&periphclk ESP32P4_RST_PARLIO_RX>,
+			 <&periphclk ESP32P4_RST_PARLIO_TX>;
+		reset-names = "bus", "rx", "tx";
+		dmas = <&axi_dma 2 3>, <&axi_dma 1 3>;
+		dma-names = "rx", "tx";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pins_parlio_loop>;
+		espressif,data-width = <4>;
+		clock-frequency = <1000000>;
+		status = "disabled";
+	};
+};
+
+#if ESP32P4_UART4_UHCI
+/* TRM ch.46 UHCI_CONF0.UART_SEL and ch.6 AHB GDMA peripheral request 2. */
+&uart4 {
+	compatible = "espressif,esp32p4-uhci-uart";
+	reg = <0x500ce000 0x1000>, <0x500df000 0x100>;
+	reg-names = "uart", "uhci";
+	/delete-property/ interrupt-parent;
+	/delete-property/ interrupts;
+	clocks = <&periphclk ESP32P4_CLK_UART4>, <&periphclk ESP32P4_CLK_UHCI>;
+	clock-names = "uart", "bus";
+	resets = <&periphclk ESP32P4_RST_UART4>, <&periphclk ESP32P4_RST_UHCI>;
+	reset-names = "uart", "uhci";
+	dmas = <&ahb_dma 2 2>;
+	dma-names = "tx";
+	status = "okay";
+};
+
+/* Pair 2 is dedicated to UHCI. Keep the ADC's LP one-shot controller. */
+&{/soc/adc@50127000} {
+	reg = <0x50127000 0x100>;
+	/delete-property/ reg-names;
+	/delete-property/ clocks;
+	/delete-property/ resets;
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+};
+#endif

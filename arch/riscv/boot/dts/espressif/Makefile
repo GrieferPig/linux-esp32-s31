@@ -16,7 +16,9 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3-dma.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gdma.dtbo
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-i80-ili9341.dtbo
-dtb-$(CONFIG_FB_ESP32S31_I80) += esp32s31-i80-ili9341.dtb
+ifneq ($(CONFIG_FB_ESP32S31_I80),)
+dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-i80-ili9341.dtb
+endif
 esp32s31-i80-ili9341-dtbs := esp32s31_generic.dtb esp32s31-overlay-i80-ili9341.dtbo
 dtb-$(CONFIG_FB_ESP32S31_I80_15MHZ) += esp32s31-i80-15mhz.dtb
 esp32s31-i80-15mhz-dtbs := esp32s31_generic.dtb esp32s31-overlay-i80-ili9341.dtbo esp32s31-i80-15mhz-clock.dtbo
@@ -37,7 +39,5 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-radio-bluetooth.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-radio-combo.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-lp.dtbo
 
-dtb-$(CONFIG_SOC_ESP32P4) += esp32p4-hardware.dtb
-dtb-$(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) += esp32p4-waveshare-touch-display-2.dtb
-dtb-$(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) += esp32p4-waveshare-native-peripherals.dtb
-dtb-$(CONFIG_PINCTRL_ESP32P4_PERIPHERAL) += esp32p4-waveshare-native-peripherals-spi.dtb
+dtb-$(CONFIG_SOC_ESP32P4) += esp32p4-generic.dtb
+dtb-$(CONFIG_SOC_ESP32P4) += esp32p4-waveshare-wifi6-dev-kit.dtb

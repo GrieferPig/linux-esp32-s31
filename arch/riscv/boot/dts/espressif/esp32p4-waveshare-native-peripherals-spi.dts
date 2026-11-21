@@ -1,7 +1,0 @@
-// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
-#include "esp32p4-waveshare-native-peripherals.dts"
-
-/* Only use this DTB after checking P6 for a conflicting HAT or wiring. */
-&gpspi2 {
-	status = "okay";
-};
