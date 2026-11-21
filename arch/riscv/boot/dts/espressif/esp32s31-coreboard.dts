@@ -1,10 +1,129 @@
 // SPDX-License-Identifier: GPL-2.0+
 
 /dts-v1/;
+#include <dt-bindings/input/input.h>
 #include "esp32s31-wroom-3.dtsi"
 #include "esp32s31-coreboard.dtsi"
 
 / {
 	model = "Espressif ESP32-S31-Function-CoreBoard-1";
 	compatible = "espressif,esp32s31-function-coreboard-1", "espressif,esp32s31";
+
+	coreboard_5v: regulator-board-5v {
+		compatible = "regulator-fixed";
+		regulator-name = "board-5v";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	coreboard_pa: audio-amplifier {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&gpio 57 GPIO_ACTIVE_HIGH>;
+		VCC-supply = <&coreboard_5v>;
+		sound-name-prefix = "PA";
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-boot {
+			label = "BOOT";
+			linux,code = <KEY_PROG1>;
+			gpios = <&gpio 61 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "S31 CoreBoard ES8311";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&coreboard_cpu_dai>;
+		simple-audio-card,frame-master = <&coreboard_cpu_dai>;
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,aux-devs = <&coreboard_pa>;
+		simple-audio-card,widgets = "Speaker", "Speaker", "Microphone", "Mic";
+		simple-audio-card,routing = "Speaker", "PA OUTL",
+					   "PA INL", "OUT", "MIC1", "Mic";
+
+		coreboard_cpu_dai: simple-audio-card,cpu {
+			sound-dai = <&i2s0>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&coreboard_codec>;
+		};
+	};
+};
+
+&emac {
+	status = "okay";
+};
+
+&gpio {
+	coreboard_i2c0: i2c0-pins {
+		scl-pins {
+			espressif,route-name = "i2c0.scl";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(50, 68, 0)>,
+				 <ESP32S31_MATRIX_IN(50, 68, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+		sda-pins {
+			espressif,route-name = "i2c0.sda";
+			espressif,route-kind = "matrix-bidirectional";
+			pinmux = <ESP32S31_MATRIX_OUT(51, 69, 0)>,
+				 <ESP32S31_MATRIX_IN(51, 69, 0)>;
+			drive-open-drain;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+	};
+
+	coreboard_i2s0: i2s0-pins {
+		i2s-pins {
+			espressif,route-names = "i2s0.bck-out", "i2s0.bck-in",
+					 "i2s0.ws-out", "i2s0.ws-in",
+					 "i2s0.data-out", "i2s0.data-in";
+			espressif,route-kinds = "matrix-output", "matrix-input",
+					 "matrix-output", "matrix-input",
+					 "matrix-output", "matrix-input";
+			pinmux = <ESP32S31_MATRIX_OUT(53, 25, 0)>,
+				 <ESP32S31_MATRIX_IN(53, 29, 0)>,
+				 <ESP32S31_MATRIX_OUT(55, 27, 0)>,
+				 <ESP32S31_MATRIX_IN(55, 30, 0)>,
+				 <ESP32S31_MATRIX_OUT(56, 28, 0)>,
+				 <ESP32S31_MATRIX_IN(54, 28, 0)>;
+			drive-strength = <20>;
+			bias-pull-up;
+			input-enable;
+		};
+
+		/* IDF I2S0_MCLK_PAD_OUT_IDX, routed to the codec's MCLK pin. */
+		mclk-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(52, 26, 0)>;
+			drive-strength = <20>;
+		};
+	};
+};
+
+&i2c0 {
+	pinctrl-0 = <&coreboard_i2c0>;
+	status = "okay";
+
+	coreboard_codec: codec@18 {
+		compatible = "everest,es8311";
+		reg = <0x18>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+&i2s0 {
+	#sound-dai-cells = <0>;
+	pinctrl-0 = <&coreboard_i2s0>;
+	status = "okay";
 };

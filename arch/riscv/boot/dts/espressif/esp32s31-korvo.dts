@@ -6,6 +6,52 @@
 / {
 	model = "Espressif ESP32-S31-Korvo-1";
 	compatible = "espressif,esp32s31-korvo-1", "espressif,esp32s31";
+
+	/* Espressif Korvo-1 schematic: SD_CTRL enables the microSD rail low. */
+	sd_vcc: regulator-sd {
+		compatible = "regulator-fixed";
+		regulator-name = "microSD";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&gpio 39 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&{/soc} {
+	lcd: lcd@20396000 {
+		/* S31 TRM ch.39 LCD_CAM — LCD_RGB_MODE_EN and LCD_VSYNC_INT. */
+		compatible = "espressif,esp32s31-lcd-rgb";
+		reg = <0x20396000 0x1000>, <0x2058714c 0x0c>;
+		reg-names = "lcdcam", "clkrst";
+		interrupt-parent = <&intmtx>;
+		interrupts = <13 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkc ESP32S31_CLK_PLL_F160>, <&clkc ESP32S31_CLK_PLL_F120>;
+		clock-names = "lcd", "core";
+		dmas = <&axi_gdma 0 0>;
+		dma-names = "tx";
+		pinctrl-names = "default";
+		pinctrl-0 = <&korvo_lcd_rgb>;
+		enable-gpios = <&gpio 38 GPIO_ACTIVE_HIGH>;
+		bus-width = <16>;
+		status = "disabled";
+
+		/* ESP-BSP Korvo-1 BSP_DISPLAY_PANEL_RGB_TIMING(). */
+		panel-timing {
+			clock-frequency = <18000000>;
+			hactive = <800>;
+			hfront-porch = <48>;
+			hback-porch = <40>;
+			hsync-len = <40>;
+			hsync-active = <0>;
+			vactive = <480>;
+			vfront-porch = <13>;
+			vback-porch = <32>;
+			vsync-len = <23>;
+			vsync-active = <0>;
+			de-active = <1>;
+			pixelclk-active = <0>;
+		};
+	};
 };
 
 &gpio {
@@ -31,9 +77,62 @@
 			input-enable;
 		};
 	};
+	korvo_lcd_rgb: lcd-rgb-pins {
+		data-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(8, 154, 0)>,
+				 <ESP32S31_MATRIX_OUT(9, 155, 0)>,
+				 <ESP32S31_MATRIX_OUT(10, 156, 0)>,
+				 <ESP32S31_MATRIX_OUT(11, 157, 0)>,
+				 <ESP32S31_MATRIX_OUT(12, 158, 0)>,
+				 <ESP32S31_MATRIX_OUT(13, 159, 0)>,
+				 <ESP32S31_MATRIX_OUT(14, 160, 0)>,
+				 <ESP32S31_MATRIX_OUT(15, 161, 0)>,
+				 <ESP32S31_MATRIX_OUT(16, 162, 0)>,
+				 <ESP32S31_MATRIX_OUT(17, 163, 0)>,
+				 <ESP32S31_MATRIX_OUT(18, 164, 0)>,
+				 <ESP32S31_MATRIX_OUT(19, 165, 0)>,
+				 <ESP32S31_MATRIX_OUT(33, 166, 0)>,
+				 <ESP32S31_MATRIX_OUT(34, 167, 0)>,
+				 <ESP32S31_MATRIX_OUT(35, 168, 0)>,
+				 <ESP32S31_MATRIX_OUT(36, 169, 0)>;
+			bias-disable;
+			drive-strength = <20>;
+		};
+
+		/* GPIO 40 PCLK, 43 DE, 44 HSYNC, 45 VSYNC. */
+		control-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(40, 149, 0)>,
+				 <ESP32S31_MATRIX_OUT(43, 151, 0)>,
+				 <ESP32S31_MATRIX_OUT(44, 152, 0)>,
+				 <ESP32S31_MATRIX_OUT(45, 153, 0)>;
+			bias-disable;
+			drive-strength = <20>;
+		};
+	};
 };
 
 &i2c0 {
 	pinctrl-0 = <&korvo_i2c0>;
+	status = "okay";
+
+	touchscreen@14 {
+		compatible = "goodix,gt1151";
+		reg = <0x14>;
+		touchscreen-size-x = <800>;
+		touchscreen-size-y = <480>;
+	};
+};
+
+&axi_gdma {
+	status = "okay";
+};
+
+/* S31 TRM ch.49 SDHOST; Korvo-1 populates SDMMC slot 0. */
+&sdmmc {
+	vmmc-supply = <&sd_vcc>;
+	broken-cd;
+	disable-wp;
+	no-1-8-v;
+	max-frequency = <25000000>;
 	status = "okay";
 };

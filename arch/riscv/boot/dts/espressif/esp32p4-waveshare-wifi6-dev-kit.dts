@@ -932,7 +932,7 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 		i3c-scl-hz = <10000000>;
 		#address-cells = <3>;
 		#size-cells = <0>;
-		status = "disabled";
+		status = "okay";
 	};
 };
 

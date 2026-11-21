@@ -7,3 +7,8 @@
 	model = "Espressif ESP32-S31 S-mode (generic)";
 	compatible = "espressif,esp32s31";
 };
+
+/* The USB host connector and its VBUS supply belong to the carrier. */
+&usb_otghs {
+	status = "disabled";
+};
