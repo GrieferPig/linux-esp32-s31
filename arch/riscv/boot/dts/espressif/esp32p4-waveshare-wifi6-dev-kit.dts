@@ -4,8 +4,7 @@
 #include <dt-bindings/interrupt-controller/irq.h>
 
 /dts-v1/;
-#include "esp32p4.dtsi"
-#include "esp32p4-16m.dtsi"
+#include "esp32p4-generic.dtsi"
 
 / {
 	chosen {

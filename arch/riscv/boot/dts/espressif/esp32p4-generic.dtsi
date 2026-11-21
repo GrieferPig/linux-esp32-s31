@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+
+#include "esp32p4.dtsi"
+
+/ {
+	chosen {
+		/* TRM ch.46 UART: UART0 connects to the USB-to-UART bridge. */
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+#include "esp32p4-16m.dtsi"

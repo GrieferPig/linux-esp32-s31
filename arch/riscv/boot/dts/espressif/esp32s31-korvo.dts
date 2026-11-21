@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 
 /dts-v1/;
-#include "esp32s31-wroom-3.dtsi"
+#include "esp32s31-generic.dtsi"
 
 / {
 	model = "Espressif ESP32-S31-Korvo-1";
@@ -134,5 +134,9 @@
 	disable-wp;
 	no-1-8-v;
 	max-frequency = <25000000>;
+	status = "okay";
+};
+
+&usb_otghs {
 	status = "okay";
 };

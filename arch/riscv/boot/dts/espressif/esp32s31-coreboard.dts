@@ -2,7 +2,7 @@
 
 /dts-v1/;
 #include <dt-bindings/input/input.h>
-#include "esp32s31-wroom-3.dtsi"
+#include "esp32s31-generic.dtsi"
 #include "esp32s31-coreboard.dtsi"
 
 / {
@@ -125,5 +125,9 @@
 &i2s0 {
 	#sound-dai-cells = <0>;
 	pinctrl-0 = <&coreboard_i2s0>;
+	status = "okay";
+};
+
+&usb_otghs {
 	status = "okay";
 };

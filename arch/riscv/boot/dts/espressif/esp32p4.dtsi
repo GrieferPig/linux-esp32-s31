@@ -11,8 +11,6 @@
 		ranges;
 		#size-cells = <0x01>;
 		#address-cells = <0x01>;
-		/* TRM ch.46 UART: UART0 connects to the USB-to-UART bridge. */
-		stdout-path = "serial0:115200n8";
 	};
 
 	aliases {

@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+
+
+#include "esp32s31-wroom-3.dtsi"
+
+/ {
+	chosen {
+		/* S31 TRM ch.40 UART: use the UART0 serial console. */
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+&systimer {
+	status = "okay";
+};
+
+/* The USB host connector and its VBUS supply belong to the carrier. */
+&usb_otghs {
+	status = "disabled";
+};

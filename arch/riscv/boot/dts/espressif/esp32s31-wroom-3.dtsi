@@ -72,8 +72,6 @@
 	};
 
 	chosen {
-		stdout-path = "serial0:115200n8";
-
 		opensbi-config {
 			compatible = "opensbi,config";
 			/* Match the U-Boot control FDT used for OpenSBI initialization. */
@@ -81,5 +79,3 @@
 		};
 	};
 };
-
-&systimer { status = "okay"; };
