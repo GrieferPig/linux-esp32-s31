@@ -20,8 +20,6 @@ ifneq ($(CONFIG_FB_ESP32S31_I80),)
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-i80-ili9341.dtb
 endif
 esp32s31-i80-ili9341-dtbs := esp32s31_generic.dtb esp32s31-overlay-i80-ili9341.dtbo
-dtb-$(CONFIG_FB_ESP32S31_I80_15MHZ) += esp32s31-i80-15mhz.dtb
-esp32s31-i80-15mhz-dtbs := esp32s31_generic.dtb esp32s31-overlay-i80-ili9341.dtbo esp32s31-i80-15mhz-clock.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gpspi2.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gpspi3.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gpspi2-target.dtbo

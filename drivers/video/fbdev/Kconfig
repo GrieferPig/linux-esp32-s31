@@ -1790,10 +1790,6 @@ config FB_ESP32S31_I80
 	  Enable the ESP32-S31 LCD_CAM 8-bit Intel 8080 interface with an
 	  ILI9341 panel. Provides RGB565 fbdev and framebuffer console.
 
-config FB_ESP32S31_I80_15MHZ
-	bool "Build the 15 MHz ESP32-S31 i80 test DTB"
-	depends on FB_ESP32S31_I80=y
-
 config FB_ESP32P4_DSI
 	bool "ESP32-P4 MIPI DSI controller and panel bring-up"
 	depends on FB && OF && SOC_ESP32P4 && !MMU
