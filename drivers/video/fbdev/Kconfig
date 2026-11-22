@@ -1781,6 +1781,15 @@ config FB_HYPERV
 	  This driver is deprecated, please use the Hyper-V DRM driver at
 	  drivers/gpu/drm/hyperv (CONFIG_DRM_HYPERV) instead.
 
+config FB_ESP32S31_RGB
+	tristate "ESP32-S31 LCD_CAM RGB framebuffer"
+	depends on FB && OF && SOC_ESP32S31 && MMU && ESPRESSIF_GDMA_AXI
+	select FB_IOMEM_HELPERS
+	select RATIONAL
+	select VIDEOMODE_HELPERS
+	help
+	  Enable framebuffer scanout on the ESP32-S31 parallel RGB port.
+
 config FB_ESP32S31_I80
 	tristate "ESP32-S31 Intel 8080 ILI9341 framebuffer"
 	depends on FB && OF && SOC_ESP32S31 && MMU && ESPRESSIF_GDMA_AXI && IIO

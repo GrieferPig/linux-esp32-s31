@@ -33,7 +33,7 @@
 		pinctrl-0 = <&korvo_lcd_rgb>;
 		enable-gpios = <&gpio 38 GPIO_ACTIVE_HIGH>;
 		bus-width = <16>;
-		status = "disabled";
+		status = "okay";
 
 		/* ESP-BSP Korvo-1 BSP_DISPLAY_PANEL_RGB_TIMING(). */
 		panel-timing {
