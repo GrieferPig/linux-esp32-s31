@@ -1686,7 +1686,9 @@ int dwc2_hcd_qh_add(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
 	status = dwc2_schedule_periodic(hsotg, qh);
 	if (status)
 		return status;
-	if (!hsotg->periodic_qh_count) {
+	/* DDMA puts periodic QHs on the ready list and schedules via HFLBADDR. */
+	if (!hsotg->periodic_qh_count &&
+	    !(hsotg->params.host_ddma_no_sof && hsotg->params.dma_desc_enable)) {
 		intr_mask = dwc2_readl(hsotg, GINTMSK);
 		intr_mask |= GINTSTS_SOF;
 		dwc2_writel(hsotg, intr_mask, GINTMSK);

@@ -85,6 +85,9 @@ static void dwc2_set_esp32p4_params(struct dwc2_hsotg *hsotg)
 	p->phy_type = DWC2_PHY_TYPE_PARAM_UTMI;
 	p->phy_utmi_width = 16;
 	p->host_dma = true;
+	/* TRM ch.54 USB 2.0 High-Speed OTG: scatter/gather DMA. */
+	p->dma_desc_enable = true;
+	p->host_ddma_no_sof = true;
 	/*
 	 * TRM v1.3 ch.47, USB 2.0 High-Speed OTG. After partial power
 	 * down, GINTSTS.CURMODE reports device mode during host resume.

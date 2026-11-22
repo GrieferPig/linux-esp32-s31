@@ -234,6 +234,8 @@ enum dwc2_ep0_state {
  *                      specified.
  *                       0 - Address DMA
  *                       1 - Descriptor DMA in FS (default, if available)
+ * @host_ddma_no_sof:   Use the hardware frame list without SOF interrupts
+ *                      when host descriptor DMA is active.
  * @speed:              Specifies the maximum speed of operation in host and
  *                      device mode. The actual speed depends on the speed of
  *                      the attached device and the value of phy_type.
@@ -488,6 +490,7 @@ struct dwc2_core_params {
 	bool host_dma;
 	bool dma_desc_enable;
 	bool dma_desc_fs_enable;
+	bool host_ddma_no_sof;
 	bool host_support_fs_ls_low_power;
 	bool host_ls_low_power_phy_clk;
 	bool oc_disable;
