@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* ESP32-S31 transactional multi-overlay loader with resource arbitration. */
+/* Espressif transactional multi-overlay loader with resource arbitration. */
 
 #include <linux/bitmap.h>
 #include <linux/fs.h>
@@ -22,6 +22,7 @@
 #define S31_OVERLAY_RESOURCE_LEN	256
 #define S31_MATRIX_INPUTS	256
 #define S31_GPIO_NR		62
+#define P4_GPIO_NR		57
 
 #define S31_PINMUX_TYPE_SHIFT	28
 #define S31_PINMUX_TYPE_MASK	0x3
@@ -40,6 +41,18 @@ struct s31_overlay {
 	char resources[S31_OVERLAY_RESOURCE_LEN];
 };
 
+struct esp_overlay_soc {
+	const char *device_name;
+	const char *gpio_compatible;
+	unsigned int gpio_count;
+	u64 console_gpios;
+	bool (*valid_gpio)(u32 pin);
+	int (*parse_pinmux)(struct s31_overlay *overlay, const fdt32_t *cells,
+			    unsigned int count);
+	bool reclaim_irqs;
+};
+
+static const struct esp_overlay_soc *overlay_soc;
 static DEFINE_MUTEX(s31_overlay_lock);
 static LIST_HEAD(s31_overlays);
 static int s31_overlay_last_id;
@@ -95,7 +108,8 @@ static int s31_of_overlay_remove(int *id)
 {
 	int ret;
 
-	WRITE_ONCE(s31_overlay_removing, true);
+	if (overlay_soc->reclaim_irqs)
+		WRITE_ONCE(s31_overlay_removing, true);
 	ret = of_overlay_remove(id);
 	WRITE_ONCE(s31_overlay_removing, false);
 	return ret;
@@ -122,13 +136,63 @@ static bool s31_valid_gpio(u32 pin)
 	       pin != 33 && pin != 34 && pin != 41;
 }
 
+static bool p4_valid_gpio(u32 pin)
+{
+	return pin < P4_GPIO_NR;
+}
+
+static int s31_parse_pinmux(struct s31_overlay *overlay, const fdt32_t *cells,
+			    unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		u32 cell = fdt32_to_cpu(cells[i]);
+		u32 type = (cell >> S31_PINMUX_TYPE_SHIFT) & S31_PINMUX_TYPE_MASK;
+		u32 pin = cell & 0xff;
+		u32 signal = (cell >> 8) & 0x1ff;
+
+		if (s31_valid_gpio(pin))
+			overlay->gpios |= BIT_ULL(pin);
+		else if (!(type == S31_PINMUX_MATRIX_IN &&
+			   (pin == S31_MATRIX_CONST_ONE || pin == S31_MATRIX_CONST_ZERO)))
+			return -EINVAL;
+		if (type == S31_PINMUX_MATRIX_IN) {
+			if (signal >= S31_MATRIX_INPUTS)
+				return -EINVAL;
+			__set_bit(signal, overlay->matrix_inputs);
+		}
+	}
+	return 0;
+}
+
+static const struct esp_overlay_soc overlay_s31 = {
+	.device_name = "s31-overlay",
+	.gpio_compatible = "espressif,esp32s31-pinctrl",
+	.gpio_count = S31_GPIO_NR,
+	.console_gpios = BIT_ULL(58) | BIT_ULL(59),
+	.valid_gpio = s31_valid_gpio,
+	.parse_pinmux = s31_parse_pinmux,
+	.reclaim_irqs = true,
+};
+
+static const struct esp_overlay_soc overlay_p4 = {
+	.device_name = "esp32-overlay",
+	.gpio_compatible = "waveshare,esp32p4-wifi6-dev-kit-peripheral-pinctrl",
+	.gpio_count = P4_GPIO_NR,
+	/* P4 TRM ch.11 IO MUX and ch.46 UART: console UART0 TX/RX. */
+	.console_gpios = BIT_ULL(37) | BIT_ULL(38),
+	.valid_gpio = p4_valid_gpio,
+};
+
 static int s31_overlay_parse(struct s31_overlay *overlay)
 {
 	const fdt32_t *cells;
 	const char *name, *resources;
 	int depth = 0, len, node = -1;
 
-	if (fdt_check_header(overlay->blob))
+	if (fdt_check_header(overlay->blob) ||
+	    fdt_totalsize(overlay->blob) > overlay->blob_len)
 		return -EINVAL;
 	name = fdt_getprop(overlay->blob, 0, "espressif,overlay-name", &len);
 	if (!name || len <= 0 || strnlen(name, len) == len ||
@@ -154,40 +218,26 @@ static int s31_overlay_parse(struct s31_overlay *overlay)
 		for (i = 0; i < len / sizeof(*cells); i++) {
 			u32 pin = fdt32_to_cpu(cells[i]);
 
-			if (!s31_valid_gpio(pin))
+			if (!overlay_soc->valid_gpio(pin))
 				return -EINVAL;
 			overlay->gpios |= BIT_ULL(pin);
 		}
 	}
 
+	if (!overlay_soc->parse_pinmux)
+		return 0;
+
 	while ((node = fdt_next_node(overlay->blob, node, &depth)) >= 0) {
-		int i, count;
+		int ret;
 
 		cells = fdt_getprop(overlay->blob, node, "pinmux", &len);
 		if (!cells)
 			continue;
 		if (len <= 0 || len % sizeof(*cells))
 			return -EINVAL;
-		count = len / sizeof(*cells);
-		for (i = 0; i < count; i++) {
-			u32 cell = fdt32_to_cpu(cells[i]);
-			u32 type = (cell >> S31_PINMUX_TYPE_SHIFT) &
-				   S31_PINMUX_TYPE_MASK;
-			u32 pin = cell & 0xff;
-			u32 signal = (cell >> 8) & 0x1ff;
-
-			if (s31_valid_gpio(pin))
-				overlay->gpios |= BIT_ULL(pin);
-			else if (!(type == S31_PINMUX_MATRIX_IN &&
-				   (pin == S31_MATRIX_CONST_ONE ||
-				    pin == S31_MATRIX_CONST_ZERO)))
-				return -EINVAL;
-			if (type == S31_PINMUX_MATRIX_IN) {
-				if (signal >= S31_MATRIX_INPUTS)
-					return -EINVAL;
-				__set_bit(signal, overlay->matrix_inputs);
-			}
-		}
+		ret = overlay_soc->parse_pinmux(overlay, cells, len / sizeof(*cells));
+		if (ret)
+			return ret;
 	}
 	return 0;
 }
@@ -223,20 +273,20 @@ static int s31_overlay_check_conflicts(struct s31_overlay *new,
 	unsigned int pin;
 
 	/* UART0 is the live console and is not supplied by an overlay. */
-	if (new->gpios & (BIT_ULL(58) | BIT_ULL(59))) {
-		pr_warn("s31-overlay: %s conflicts with console GPIO mask %#llx\n",
-			new->name, new->gpios & (BIT_ULL(58) | BIT_ULL(59)));
+	if (new->gpios & overlay_soc->console_gpios) {
+		pr_warn("esp32-overlay: %s conflicts with console GPIO mask %#llx\n",
+			new->name, new->gpios & overlay_soc->console_gpios);
 		return -EBUSY;
 	}
 
 	/* Also reject lines currently requested through the GPIO character API. */
-	np = of_find_compatible_node(NULL, NULL, "espressif,esp32s31-pinctrl");
+	np = of_find_compatible_node(NULL, NULL, overlay_soc->gpio_compatible);
 	if (np) {
 		gdev = gpio_device_find_by_fwnode(of_fwnode_handle(np));
 		of_node_put(np);
 		if (!IS_ERR_OR_NULL(gdev)) {
 			gc = gpio_device_get_chip(gdev);
-			for (pin = 0; pin < S31_GPIO_NR; pin++) {
+			for (pin = 0; pin < overlay_soc->gpio_count; pin++) {
 				char *label;
 
 				if (!(new->gpios & BIT_ULL(pin)))
@@ -244,7 +294,7 @@ static int s31_overlay_check_conflicts(struct s31_overlay *new,
 				label = gpiochip_dup_line_label(gc, pin);
 				if (IS_ERR_OR_NULL(label))
 					continue;
-				pr_warn("s31-overlay: %s conflicts with GPIO%u owner %s\n",
+				pr_warn("esp32-overlay: %s conflicts with GPIO%u owner %s\n",
 					new->name, pin, label);
 				kfree(label);
 				gpio_device_put(gdev);
@@ -258,19 +308,19 @@ static int s31_overlay_check_conflicts(struct s31_overlay *new,
 		if (active == replaced)
 			continue;
 		if (new->gpios & active->gpios) {
-			pr_warn("s31-overlay: %s conflicts with %s on GPIO mask %#llx\n",
+			pr_warn("esp32-overlay: %s conflicts with %s on GPIO mask %#llx\n",
 				new->name, active->name,
 				new->gpios & active->gpios);
 			return -EBUSY;
 		}
 		if (bitmap_intersects(new->matrix_inputs, active->matrix_inputs,
 				      S31_MATRIX_INPUTS)) {
-			pr_warn("s31-overlay: %s conflicts with %s on a matrix input\n",
+			pr_warn("esp32-overlay: %s conflicts with %s on a matrix input\n",
 				new->name, active->name);
 			return -EBUSY;
 		}
 		if (s31_stringlist_intersects(new->resources, active->resources)) {
-			pr_warn("s31-overlay: %s conflicts with %s on an exclusive resource\n",
+			pr_warn("esp32-overlay: %s conflicts with %s on an exclusive resource\n",
 				new->name, active->name);
 			return -EBUSY;
 		}
@@ -359,7 +409,7 @@ static ssize_t s31_overlay_write(struct file *file, const char __user *buf,
 		rollback = of_overlay_fdt_apply(old->blob, old->blob_len,
 						&old->id, NULL);
 		if (rollback) {
-			pr_err("s31-overlay: rollback of %s failed: %d\n",
+			pr_err("esp32-overlay: rollback of %s failed: %d\n",
 			       old->name, rollback);
 			kfree(old->blob);
 			kfree(old);
@@ -438,7 +488,6 @@ static const struct file_operations s31_overlay_fops = {
 
 static struct miscdevice s31_overlay_miscdev = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name = "s31-overlay",
 	.fops = &s31_overlay_fops,
 	.mode = 0600,
 };
@@ -447,14 +496,23 @@ static int __init s31_overlay_init(void)
 {
 	int ret;
 
-	ret = bus_register_notifier(&platform_bus_type,
-				    &s31_overlay_platform_nb);
-	if (ret)
-		return ret;
+	if (of_machine_is_compatible("espressif,esp32s31"))
+		overlay_soc = &overlay_s31;
+	else if (of_machine_is_compatible("espressif,esp32p4"))
+		overlay_soc = &overlay_p4;
+	else
+		return -ENODEV;
+
+	if (overlay_soc->reclaim_irqs) {
+		ret = bus_register_notifier(&platform_bus_type, &s31_overlay_platform_nb);
+		if (ret)
+			return ret;
+	}
+
+	s31_overlay_miscdev.name = overlay_soc->device_name;
 	ret = misc_register(&s31_overlay_miscdev);
-	if (ret)
-		bus_unregister_notifier(&platform_bus_type,
-					&s31_overlay_platform_nb);
+	if (ret && overlay_soc->reclaim_irqs)
+		bus_unregister_notifier(&platform_bus_type, &s31_overlay_platform_nb);
 	return ret;
 }
 module_init(s31_overlay_init);
@@ -462,10 +520,10 @@ module_init(s31_overlay_init);
 static void __exit s31_overlay_exit(void)
 {
 	misc_deregister(&s31_overlay_miscdev);
-	bus_unregister_notifier(&platform_bus_type,
-				&s31_overlay_platform_nb);
+	if (overlay_soc->reclaim_irqs)
+		bus_unregister_notifier(&platform_bus_type, &s31_overlay_platform_nb);
 }
 module_exit(s31_overlay_exit);
 
-MODULE_DESCRIPTION("ESP32-S31 multi-overlay loader and resource arbiter");
+MODULE_DESCRIPTION("Espressif multi-overlay loader and resource arbiter");
 MODULE_LICENSE("GPL");

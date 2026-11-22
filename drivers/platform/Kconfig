@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 config ESPRESSIF_DT_OVERLAY
-	bool "ESP32-S31 transactional Device Tree overlay manager"
-	depends on SOC_ESP32S31
+	bool "Espressif transactional Device Tree overlay manager"
+	depends on SOC_ESP32S31 || SOC_ESP32P4
 	select OF_OVERLAY
 	help
-	  Exposes /dev/s31-overlay. A complete DTBO written to the device
+	  Exposes /dev/s31-overlay on S31 and /dev/esp32-overlay on P4.
+	  A complete DTBO written to the device
 	  replaces the currently active overlay. Replacement is transactional:
 	  the previous overlay is restored if applying the new one fails.
 
