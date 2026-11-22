@@ -28,7 +28,8 @@
 	rootfs@40c00000 {
 		compatible = "mtd-rom";
 		linux,mtd-name = "rootfs";
-		reg = <0x40c00000 0x00400000>;
+		/* Leave the last MiB of NOR available for persistent data. */
+		reg = <0x40c00000 0x00300000>;
 		bank-width = <1>;
 	};
 };
