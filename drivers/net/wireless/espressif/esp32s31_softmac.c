@@ -73,7 +73,7 @@ static const bool sm_rx_ba = true;
  * Read-only parameter so crypto ownership cannot change while running. */
 static bool sm_legacy_tkip;
 module_param_named(legacy_tkip, sm_legacy_tkip, bool, 0400);
-MODULE_PARM_DESC(legacy_tkip, "experimental TKIP/CCMP software crypto, legacy rates only");
+MODULE_PARM_DESC(legacy_tkip, "experimental TKIP/CCMP software crypto; no native TX aggregation");
 
 static const bool sm_hw_ccmp = true;
 
@@ -1484,7 +1484,7 @@ static int sm_start(struct ieee80211_hw *hw)
 	memcpy(ctl.mac, hw->wiphy->perm_addr, ETH_ALEN);
 	ctl.channel = sm->channel ?: 1;
 	ctl.offset = ++sm->epoch;
-	ctl.field = (!sm_legacy_tkip && sm_ht ? 1 : 0) | (!sm_legacy_tkip && sm_ht && sm_he ? 2 : 0) |
+	ctl.field = (sm_ht ? 1 : 0) | (!sm_legacy_tkip && sm_ht && sm_he ? 2 : 0) |
 		(sm_rx_view ? S31_SOFTMAC_START_RX_VIEW : 0) |
 		(sm_rx_filter && sm_native_rx_filter ? S31_SOFTMAC_START_RX_RA_FILTER : 0) |
   (sm_native_rx_error_filter ? S31_SOFTMAC_START_RX_DROP_ERRORS : 0) |
@@ -1599,6 +1599,35 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 		sm_rx_mark_ready(sm, i, skb);
 	}
 }
+static void sm_trace_assoc(struct sk_buff *skb, int tx_rate)
+{
+	struct ieee80211_hdr *hdr = (void *)skb->data;
+	u8 ie[2], rates[32];
+	unsigned int off, count = 0;
+	bool ht = false;
+
+	if (ieee80211_is_assoc_req(hdr->frame_control))
+		off = 28;
+	else if (ieee80211_is_reassoc_req(hdr->frame_control))
+		off = 34;
+	else
+		return;
+	while (off + 2 <= skb->len && !skb_copy_bits(skb, off, ie, 2)) {
+		off += 2;
+		if (ie[1] > skb->len - off)
+			break;
+		if (ie[0] == WLAN_EID_HT_CAPABILITY)
+			ht = true;
+		if ((ie[0] == WLAN_EID_SUPP_RATES || ie[0] == WLAN_EID_EXT_SUPP_RATES) &&
+		    ie[1] <= sizeof(rates) - count &&
+		    !skb_copy_bits(skb, off, rates + count, ie[1]))
+			count += ie[1];
+		off += ie[1];
+	}
+	pr_info("esp32s31-softmac: legacy assoc TX rate_idx=%d HT=%u rates=%*ph\n",
+		tx_rate, ht, (int)count, rates);
+}
+
 static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
 		  struct sk_buff *skb)
 {
@@ -1635,6 +1664,8 @@ static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_
 		sm_status(sm, skb, false, 1, 0);
 		return;
 	}
+	if (sm_legacy_tkip)
+		sm_trace_assoc(skb, txinfo->control.rates[0].idx);
 	spin_lock_irqsave(&sm->lock, flags);
 	if (sm_tx_ampdu && sm->associated && sm->tx_ht_peer && ctl->sta &&
 	    ctl->sta->wme && !sm->tx_ba_requested &&
@@ -2418,7 +2449,7 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	sm->band.n_channels = ARRAY_SIZE(sm->channels);
 	sm->band.bitrates = sm->rates;
 	sm->band.n_bitrates = ARRAY_SIZE(sm->rates);
-	if (!sm_legacy_tkip) {
+	{
 		sm->band.ht_cap.ht_supported = true;
 		sm->band.ht_cap.cap = IEEE80211_HT_CAP_SGI_20;
 		sm->band.ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
@@ -2432,7 +2463,7 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 		 * Outstanding gate <=8, and operational callback rejects windows
 		 * smaller than that gate to bound losses/retries within the window. */
 		hw->max_tx_aggregation_subframes = sm_tx_ampdu ? 64 : 1;
-		{
+		if (!sm_legacy_tkip) {
 			ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
 			/* Finish Internet checksums at the final private SRAM copy,
 			 * before native publication/CCMP. Avoid a second PSRAM payload pass. */
