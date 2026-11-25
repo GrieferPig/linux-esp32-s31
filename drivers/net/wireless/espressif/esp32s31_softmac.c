@@ -69,6 +69,12 @@ static const bool sm_he_tx = true;
 
 static const bool sm_rx_ba = true;
 
+/* Experimental legacy interoperability: keep every key in mac80211.
+ * Read-only parameter so crypto ownership cannot change while running. */
+static bool sm_legacy_tkip;
+module_param_named(legacy_tkip, sm_legacy_tkip, bool, 0400);
+MODULE_PARM_DESC(legacy_tkip, "experimental TKIP/CCMP software crypto, legacy rates only");
+
 static const bool sm_hw_ccmp = true;
 
 static const bool sm_hw_tx_ccmp = true;
@@ -1478,7 +1484,7 @@ static int sm_start(struct ieee80211_hw *hw)
 	memcpy(ctl.mac, hw->wiphy->perm_addr, ETH_ALEN);
 	ctl.channel = sm->channel ?: 1;
 	ctl.offset = ++sm->epoch;
-	ctl.field = (sm_ht ? 1 : 0) | (sm_ht && sm_he ? 2 : 0) |
+	ctl.field = (!sm_legacy_tkip && sm_ht ? 1 : 0) | (!sm_legacy_tkip && sm_ht && sm_he ? 2 : 0) |
 		(sm_rx_view ? S31_SOFTMAC_START_RX_VIEW : 0) |
 		(sm_rx_filter && sm_native_rx_filter ? S31_SOFTMAC_START_RX_RA_FILTER : 0) |
   (sm_native_rx_error_filter ? S31_SOFTMAC_START_RX_DROP_ERRORS : 0) |
@@ -1864,14 +1870,14 @@ static void sm_bss_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                                 READ_ONCE(sm->running));
  if ((changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc)
   flush_work(&sm->filter_io);
- if ((sm_hw_ccmp || sm_hw_tx_ccmp) && (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc && READ_ONCE(sm->running)) {
+ if (!sm_legacy_tkip && (sm_hw_ccmp || sm_hw_tx_ccmp) && (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc && READ_ONCE(sm->running)) {
   struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_RX_KEY_DEL, .length = 16 };
   /* Software TX keys do not receive DISABLE_KEY callbacks. Disassociation
    * therefore explicitly retires all RX-only hardware slots. */
   for (ctl.field = 0; ctl.field < 5; ctl.field++)
    if (esp32s31_radio_wifi_control(&ctl)) pr_warn("esp32s31-softmac: RX key retirement failed\n");
  }
- if (sm_he && READ_ONCE(sm->running) &&
+ if (!sm_legacy_tkip && sm_he && READ_ONCE(sm->running) &&
      (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_BSSID | BSS_CHANGED_HE_BSS_COLOR))) {
   struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_HE_BSS };
   ctl.length = vif->cfg.assoc && info->he_support;
@@ -2090,7 +2096,7 @@ static int sm_sta_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                       struct ieee80211_sta *sta)
 {
  struct s31_sm *sm = hw->priv;
- WRITE_ONCE(sm->tx_ht_peer, sm_data_tx_mcs >= 0 &&
+ WRITE_ONCE(sm->tx_ht_peer, !sm_legacy_tkip && sm_data_tx_mcs >= 0 &&
             sta->deflink.ht_cap.ht_supported &&
             (sta->deflink.ht_cap.mcs.rx_mask[0] & BIT(min(sm_data_tx_mcs, 7))));
  WRITE_ONCE(sm->tx_he_peer, sm_he_tx && sm->tx_ht_peer &&
@@ -2185,6 +2191,16 @@ static int sm_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	bool tx_offload = sm_hw_tx_ccmp && pairwise;
 	u8 token = 0;
 	int ret;
+	if (sm_legacy_tkip) {
+		if (key->cipher != WLAN_CIPHER_SUITE_TKIP &&
+		    key->cipher != WLAN_CIPHER_SUITE_CCMP)
+			return -EOPNOTSUPP;
+		if (key->keyidx > 3 || (pairwise && !sta) ||
+		    key->keylen != (key->cipher == WLAN_CIPHER_SUITE_TKIP ? 32 : 16))
+			return -EINVAL;
+		/* No key slots programmed; explicitly allow mac80211 software crypto. */
+		return cmd == DISABLE_KEY ? 0 : 1;
+	}
 	if (key->cipher != WLAN_CIPHER_SUITE_CCMP)
 		return -EOPNOTSUPP;
 	/* Reusing a token while old plaintext may still be queued is unsafe.
@@ -2402,7 +2418,7 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	sm->band.n_channels = ARRAY_SIZE(sm->channels);
 	sm->band.bitrates = sm->rates;
 	sm->band.n_bitrates = ARRAY_SIZE(sm->rates);
-	{
+	if (!sm_legacy_tkip) {
 		sm->band.ht_cap.ht_supported = true;
 		sm->band.ht_cap.cap = IEEE80211_HT_CAP_SGI_20;
 		sm->band.ht_cap.ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
@@ -2427,7 +2443,7 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 			}
 		}
 	}
-	{
+	if (!sm_legacy_tkip) {
 		sm->iftype.types_mask = BIT(NL80211_IFTYPE_STATION);
 		sm->iftype.he_cap.has_he = true;
 		sm->iftype.he_cap.he_cap_elem.phy_cap_info[1] =
@@ -2459,7 +2475,7 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 	hw->max_rate_tries = 1;
 	/* mac80211 fast TX requires disabled fragmentation, not the largest
 	 * finite threshold. Native raw TX already rejects fragmented MPDUs. */
-	hw->wiphy->frag_threshold = sm_hw_tx_ccmp && sm_hw_tx_ccmp_fast ?
+	hw->wiphy->frag_threshold = !sm_legacy_tkip && sm_hw_tx_ccmp && sm_hw_tx_ccmp_fast ?
 		(u32)-1 : IEEE80211_MAX_FRAG_THRESHOLD;
 	hw->wiphy->rts_threshold = IEEE80211_MAX_RTS_THRESHOLD;
 	ieee80211_hw_set(hw, SIGNAL_DBM);
@@ -2469,8 +2485,15 @@ int s31_radio_wifi_frontend_init(struct device *parent)
 
 	{
 		static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
-		hw->wiphy->cipher_suites = ciphers;
-		hw->wiphy->n_cipher_suites = ARRAY_SIZE(ciphers);
+		static const u32 legacy_ciphers[] = {
+			WLAN_CIPHER_SUITE_CCMP, WLAN_CIPHER_SUITE_TKIP,
+		};
+
+		hw->wiphy->cipher_suites = sm_legacy_tkip ? legacy_ciphers : ciphers;
+		hw->wiphy->n_cipher_suites = sm_legacy_tkip ?
+			ARRAY_SIZE(legacy_ciphers) : ARRAY_SIZE(ciphers);
+		if (sm_legacy_tkip)
+			pr_warn("esp32s31-softmac: experimental legacy TKIP, all crypto in software\n");
 	}
 	SET_IEEE80211_DEV(hw, parent);
 
