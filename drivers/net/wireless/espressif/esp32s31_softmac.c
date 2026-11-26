@@ -69,8 +69,10 @@ static const bool sm_he_tx = true;
 
 static const bool sm_rx_ba = true;
 
-/* Experimental legacy interoperability: keep every key in mac80211.
- * Read-only parameter so crypto ownership cannot change while running. */
+/*
+ * Experimental legacy interoperability: keep every key in mac80211.
+ * Read-only parameter so crypto ownership cannot change while running.
+ */
 static bool sm_legacy_tkip;
 module_param_named(legacy_tkip, sm_legacy_tkip, bool, 0400);
 MODULE_PARM_DESC(legacy_tkip, "experimental TKIP/CCMP software crypto; no native TX aggregation");
@@ -1599,35 +1601,6 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 		sm_rx_mark_ready(sm, i, skb);
 	}
 }
-static void sm_trace_assoc(struct sk_buff *skb, int tx_rate)
-{
-	struct ieee80211_hdr *hdr = (void *)skb->data;
-	u8 ie[2], rates[32];
-	unsigned int off, count = 0;
-	bool ht = false;
-
-	if (ieee80211_is_assoc_req(hdr->frame_control))
-		off = 28;
-	else if (ieee80211_is_reassoc_req(hdr->frame_control))
-		off = 34;
-	else
-		return;
-	while (off + 2 <= skb->len && !skb_copy_bits(skb, off, ie, 2)) {
-		off += 2;
-		if (ie[1] > skb->len - off)
-			break;
-		if (ie[0] == WLAN_EID_HT_CAPABILITY)
-			ht = true;
-		if ((ie[0] == WLAN_EID_SUPP_RATES || ie[0] == WLAN_EID_EXT_SUPP_RATES) &&
-		    ie[1] <= sizeof(rates) - count &&
-		    !skb_copy_bits(skb, off, rates + count, ie[1]))
-			count += ie[1];
-		off += ie[1];
-	}
-	pr_info("esp32s31-softmac: legacy assoc TX rate_idx=%d HT=%u rates=%*ph\n",
-		tx_rate, ht, (int)count, rates);
-}
-
 static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_tx_control *ctl,
 		  struct sk_buff *skb)
 {
@@ -1664,8 +1637,6 @@ static void __aligned(64) sm_tx_inner(struct ieee80211_hw *hw, struct ieee80211_
 		sm_status(sm, skb, false, 1, 0);
 		return;
 	}
-	if (sm_legacy_tkip)
-		sm_trace_assoc(skb, txinfo->control.rates[0].idx);
 	spin_lock_irqsave(&sm->lock, flags);
 	if (sm_tx_ampdu && sm->associated && sm->tx_ht_peer && ctl->sta &&
 	    ctl->sta->wme && !sm->tx_ba_requested &&
@@ -1901,25 +1872,39 @@ static void sm_bss_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                                 READ_ONCE(sm->running));
  if ((changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc)
   flush_work(&sm->filter_io);
- if (!sm_legacy_tkip && (sm_hw_ccmp || sm_hw_tx_ccmp) && (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc && READ_ONCE(sm->running)) {
-  struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_RX_KEY_DEL, .length = 16 };
-  /* Software TX keys do not receive DISABLE_KEY callbacks. Disassociation
-   * therefore explicitly retires all RX-only hardware slots. */
-  for (ctl.field = 0; ctl.field < 5; ctl.field++)
-   if (esp32s31_radio_wifi_control(&ctl)) pr_warn("esp32s31-softmac: RX key retirement failed\n");
- }
- if (!sm_legacy_tkip && sm_he && READ_ONCE(sm->running) &&
-     (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_BSSID | BSS_CHANGED_HE_BSS_COLOR))) {
-  struct s31_wifi_control ctl = { .operation = S31_WIFI_SOFTMAC_HE_BSS };
-  ctl.length = vif->cfg.assoc && info->he_support;
-  ctl.field = vif->cfg.aid;
-  ctl.offset = info->he_bss_color.color;
-  ctl.total = info->he_bss_color.enabled;
-  ctl.hidden = info->he_bss_color.partial;
-  if (info->bssid) ether_addr_copy(ctl.mac, info->bssid);
-  if (esp32s31_radio_wifi_control(&ctl))
-   pr_warn("esp32s31-softmac: HE BSS setup failed\n");
- }
+	if (!sm_legacy_tkip && (sm_hw_ccmp || sm_hw_tx_ccmp) &&
+	    (changed & BSS_CHANGED_ASSOC) && !vif->cfg.assoc &&
+	    READ_ONCE(sm->running)) {
+		struct s31_wifi_control ctl = {
+			.operation = S31_WIFI_SOFTMAC_RX_KEY_DEL,
+			.length = 16,
+		};
+
+		/*
+		 * Software TX keys do not receive DISABLE_KEY callbacks.
+		 * Disassociation explicitly retires all RX-only hardware slots.
+		 */
+		for (ctl.field = 0; ctl.field < 5; ctl.field++)
+			if (esp32s31_radio_wifi_control(&ctl))
+				pr_warn("esp32s31-softmac: RX key retirement failed\n");
+	}
+	if (!sm_legacy_tkip && sm_he && READ_ONCE(sm->running) &&
+	    (changed & (BSS_CHANGED_ASSOC | BSS_CHANGED_BSSID |
+			BSS_CHANGED_HE_BSS_COLOR))) {
+		struct s31_wifi_control ctl = {
+			.operation = S31_WIFI_SOFTMAC_HE_BSS,
+		};
+
+		ctl.length = vif->cfg.assoc && info->he_support;
+		ctl.field = vif->cfg.aid;
+		ctl.offset = info->he_bss_color.color;
+		ctl.total = info->he_bss_color.enabled;
+		ctl.hidden = info->he_bss_color.partial;
+		if (info->bssid)
+			ether_addr_copy(ctl.mac, info->bssid);
+		if (esp32s31_radio_wifi_control(&ctl))
+			pr_warn("esp32s31-softmac: HE BSS setup failed\n");
+	}
  spin_lock_irqsave(&sm->lock,flags);
  sm_queue_filter_locked(sm);
  spin_unlock_irqrestore(&sm->lock,flags);
@@ -2127,9 +2112,9 @@ static int sm_sta_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                       struct ieee80211_sta *sta)
 {
  struct s31_sm *sm = hw->priv;
- WRITE_ONCE(sm->tx_ht_peer, !sm_legacy_tkip && sm_data_tx_mcs >= 0 &&
-            sta->deflink.ht_cap.ht_supported &&
-            (sta->deflink.ht_cap.mcs.rx_mask[0] & BIT(min(sm_data_tx_mcs, 7))));
+	WRITE_ONCE(sm->tx_ht_peer, !sm_legacy_tkip && sm_data_tx_mcs >= 0 &&
+		   sta->deflink.ht_cap.ht_supported &&
+		   (sta->deflink.ht_cap.mcs.rx_mask[0] & BIT(min(sm_data_tx_mcs, 7))));
  WRITE_ONCE(sm->tx_he_peer, sm_he_tx && sm->tx_ht_peer &&
             sta->deflink.he_cap.has_he &&
             (le16_to_cpu(sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80) & 3) != 3 &&
@@ -2222,6 +2207,7 @@ static int sm_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	bool tx_offload = sm_hw_tx_ccmp && pairwise;
 	u8 token = 0;
 	int ret;
+
 	if (sm_legacy_tkip) {
 		if (key->cipher != WLAN_CIPHER_SUITE_TKIP &&
 		    key->cipher != WLAN_CIPHER_SUITE_CCMP)
