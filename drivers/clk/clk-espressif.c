@@ -76,6 +76,11 @@
 #define HP_DMA2D_CTRL0			0xb0
 #define HP_PPA_CTRL0			0xb4
 #define HP_JPEG_CTRL0			0xb8
+/* S31 IDF bitscrambler_ll_set_bus_clock_{sys,rx,tx}_enable(). */
+#define HP_BITSCRAMBLER_CTRL0		0xa4
+#define HP_BITSCRAMBLER_CLK_EN		(BIT(0) | BIT(3) | BIT(6))
+#define HP_BITSCRAMBLER_RST_EN		(BIT(1) | BIT(4) | BIT(7))
+
 /* S31 IDF etm_ll_enable_bus_clock() and etm_ll_set_clock_source(). */
 #define HP_ETM_CTRL0			0xa8
 #define HP_ETM_APB_CLK_EN		BIT(1)
@@ -440,6 +445,8 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 	[ESP32S31_RST_CAM] = { HP_LCDCAM_CTRL0,
 		HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
 		HP_LCDCAM_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_BITSCRAMBLER] = { HP_BITSCRAMBLER_CTRL0,
+		HP_BITSCRAMBLER_RST_EN, 0, ESP32S31_BANK_HP },
 	[ESP32S31_RST_ETM] = { HP_ETM_CTRL0, HP_ETM_RST_EN, 0, ESP32S31_BANK_HP },
 	[ESP32S31_RST_CORDIC] = { HP_CORDIC_CTRL0, HP_CORDIC_APB_RST_EN,
 		0, ESP32S31_BANK_HP },
@@ -2135,6 +2142,13 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_CAM,
 				    "cam", ESP32S31_CLK_KIND_CAM,
 				    ESP32S31_XTAL_RATE / 2);
+	if (ret)
+		return ret;
+
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_BITSCRAMBLER, "bitscrambler",
+				     sys_rate, HP_BITSCRAMBLER_CTRL0,
+				     HP_BITSCRAMBLER_CLK_EN,
+				     HP_BITSCRAMBLER_RST_EN, 0);
 	if (ret)
 		return ret;
 

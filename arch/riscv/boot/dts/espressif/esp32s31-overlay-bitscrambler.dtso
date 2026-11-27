@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "bitscrambler";
+	espressif,resource-claims = "bitscrambler", "gpspi3", "axi-gdma-pair2";
+};
+
+&axi_gdma {
+	status = "okay";
+};
+
+&bitscrambler {
+	/* S31 TRM ch.3.4.2: AXI GDMA GPSPI3 request (2), used only for routing. */
+	dmas = <&axi_gdma 2 2>;
+	dma-names = "loopback";
+	status = "okay";
+};

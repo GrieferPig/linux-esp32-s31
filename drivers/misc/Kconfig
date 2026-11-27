@@ -668,6 +668,13 @@ config ESP32P4_PARLIO
 	help
 	  Expose the ESP32-P4 parallel I/O controller as a framed DMA device.
 
+config ESP32S31_BITSCRAMBLER
+	tristate "ESP32-S31 BitScrambler"
+	depends on SOC_ESP32S31 && ESPRESSIF_GDMA_AXI
+	help
+	  Run Espressif BitScrambler microcode and lookup tables on buffers
+	  passed through an internal AXI GDMA loopback.
+
 config ESP32S31_ETM
 	tristate "ESP32-S31 Event Task Matrix"
 	depends on SOC_ESP32S31 && GPIOLIB

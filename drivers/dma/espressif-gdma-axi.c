@@ -9,6 +9,7 @@
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/esp32s31-gdma.h>
 #include <linux/dmaengine.h>
 #include <linux/genalloc.h>
 #include <linux/interrupt.h>
@@ -33,6 +34,7 @@
 #define ESPRESSIF_GDMA_AXI_PATTERN_SIZE	512U
 #define ESP32P4_AXI_DESC_POOL_SIZE	SZ_8K
 #define ESPRESSIF_GDMA_AXI_PERIPH_MAX	5U
+#define ESP32S31_AXI_PERIPH_GPSPI3	2U
 #define ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT 0x3fU
 
 #define ESP32S31_AXI_RX_BASE(ch)		((ch) * 0x68)
@@ -156,6 +158,7 @@ struct esp32s31_axi_desc {
 	unsigned int rx_count;
 	unsigned int stash_count;
 	bool cyclic;
+	bool bitscrambler;
 	void __iomem *pool_base;
 	size_t pool_len;
 	struct esp32s31_axi_desc_node *tx;
@@ -290,7 +293,8 @@ static void esp32s31_axi_reset_pair(struct esp32s31_axi_chan *chan)
 }
 
 static void esp32s31_axi_config_pair(struct esp32s31_axi_chan *chan,
-				     enum dma_transfer_direction direction)
+				     enum dma_transfer_direction direction,
+				     bool bitscrambler)
 {
 	u32 rx_periph = ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT;
 	u32 tx_periph = ESPRESSIF_GDMA_AXI_PERIPH_DISCONNECT;
@@ -313,7 +317,11 @@ static void esp32s31_axi_config_pair(struct esp32s31_axi_chan *chan,
 	rx_conf = FIELD_PREP(ESP32S31_AXI_RX_BURST_SIZE, burst_sel) |
 		  ESP32S31_AXI_RX_DSCR_BURST_EN;
 
-	if (direction == DMA_MEM_TO_MEM) {
+	if (bitscrambler) {
+		/* IDF bitscrambler_loopback_create() uses one routed AXI pair. */
+		rx_periph = chan->request_id;
+		tx_periph = chan->request_id;
+	} else if (direction == DMA_MEM_TO_MEM) {
 		rx_periph = 6 + chan->id;
 		tx_periph = 6 + chan->id;
 		rx_conf |= ESP32S31_AXI_RX_MEM_TRANS_EN;
@@ -581,7 +589,8 @@ static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 static bool esp32s31_axi_compatible(struct esp32s31_axi_desc *a,
 				    struct esp32s31_axi_desc *b)
 {
-	return !a->cyclic && !b->cyclic && a->direction == b->direction;
+	return !a->cyclic && !b->cyclic && !a->bitscrambler && !b->bitscrambler &&
+	       a->direction == b->direction;
 }
 
 static void esp32s31_axi_start_desc(struct esp32s31_axi_chan *chan,
@@ -591,7 +600,7 @@ static void esp32s31_axi_start_desc(struct esp32s31_axi_chan *chan,
 	u32 tx_mask = ESP32S31_AXI_TX_DSCR_ERR;
 
 	esp32s31_axi_reset_pair(chan);
-	esp32s31_axi_config_pair(chan, desc->direction);
+	esp32s31_axi_config_pair(chan, desc->direction, desc->bitscrambler);
 	if (desc->direction != DMA_MEM_TO_DEV)
 		rx_mask |= ESP32S31_AXI_RX_SUC_EOF;
 	if (desc->cyclic && desc->direction == DMA_DEV_TO_MEM)
@@ -670,8 +679,29 @@ static void esp32s31_axi_complete_desc(struct esp32s31_axi_chan *chan,
 {
 	list_del_init(&desc->running_node);
 	desc->residue = 0;
+	if (desc->bitscrambler && result == DMA_TRANS_NOERROR) {
+		unsigned int i;
+		size_t received = 0;
+
+		/* TRM ch.3.4.1: RX writeback reports valid bytes and EOF. */
+		for (i = 0; i < desc->rx_count; i++) {
+			u32 ctrl = readl(desc->rx[i].hw);
+			size_t bytes = FIELD_GET(ESP32S31_DESC_LENGTH, ctrl);
+
+			if (ctrl & ESP32S31_DESC_OWNER_DMA || bytes > desc->rx[i].len) {
+				result = DMA_TRANS_WRITE_FAILED;
+				break;
+			}
+			received += bytes;
+			if (ctrl & ESP32S31_DESC_SUC_EOF)
+				break;
+		}
+		if (i == desc->rx_count)
+			result = DMA_TRANS_WRITE_FAILED;
+		desc->residue = desc->len - received;
+	}
 	desc->vd.tx_result.result = result;
-	desc->vd.tx_result.residue = 0;
+	desc->vd.tx_result.residue = desc->residue;
 	if (result != DMA_TRANS_NOERROR)
 		chan->error_cookie = desc->vd.tx.cookie;
 	else
@@ -841,6 +871,43 @@ out:
 	kfree(tx);
 	return NULL;
 }
+
+struct dma_async_tx_descriptor *
+esp32s31_gdma_prep_bitscrambler(struct dma_chan *dchan, dma_addr_t dst, size_t dst_len,
+				dma_addr_t src, size_t src_len, unsigned long flags)
+{
+	struct esp32s31_axi_seg tx[3] = {}, rx[3] = {};
+	struct esp32s31_axi_chan *chan;
+	struct esp32s31_axi_desc *desc;
+	unsigned int tx_count = 0, rx_count = 0;
+
+	if (dchan->device->device_prep_dma_memcpy != esp32s31_axi_prep_memcpy)
+		return NULL;
+	chan = to_esp32s31_axi_chan(dchan);
+	if (chan->gdma->soc != &esp32s31_axi_soc ||
+	    chan->request_id != ESP32S31_AXI_PERIPH_GPSPI3 ||
+	    !src_len || !dst_len || src_len > SZ_4K || dst_len > SZ_4K)
+		return NULL;
+
+	if (esp32s31_axi_build_linear(chan, tx, ARRAY_SIZE(tx), src, src_len, 0,
+				      false, &tx_count) ||
+	    esp32s31_axi_build_linear(chan, rx, ARRAY_SIZE(rx), dst, dst_len, 0,
+				      true, &rx_count))
+		return NULL;
+
+	tx[tx_count - 1].eof = true;
+	desc = esp32s31_axi_alloc_desc(chan, tx, tx_count, rx, rx_count, 0);
+	if (!desc)
+		return NULL;
+
+	desc->direction = DMA_MEM_TO_MEM;
+	desc->len = dst_len;
+	desc->residue = dst_len;
+	desc->bitscrambler = true;
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp32s31_gdma_prep_bitscrambler);
 
 static struct dma_async_tx_descriptor *
 esp32s31_axi_prep_memset(struct dma_chan *dchan, dma_addr_t dst, int value,
@@ -1136,7 +1203,7 @@ static void esp32s31_axi_hw_init(struct esp32s31_axi_gdma *gdma)
 	writel(val & ~ESP32S31_AXI_MISC_RST_WR, gdma->base + ESP32S31_AXI_MISC_CONF);
 	for (i = 0; i < ESPRESSIF_GDMA_AXI_CHANNELS; i++) {
 		esp32s31_axi_reset_pair(&gdma->chans[i]);
-		esp32s31_axi_config_pair(&gdma->chans[i], DMA_MEM_TO_MEM);
+		esp32s31_axi_config_pair(&gdma->chans[i], DMA_MEM_TO_MEM, false);
 	}
 }
 

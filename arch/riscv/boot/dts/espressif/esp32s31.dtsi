@@ -227,6 +227,17 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.5: BitScrambler bank; HP_SYSTEM control in IDF LL. */
+		bitscrambler: bitscrambler@20356000 {
+			compatible = "espressif,esp32s31-bitscrambler";
+			reg = <0x20356000 0x1000>, <0x20586140 0x4>,
+			      <0x20586220 0x4>;
+			reg-names = "unit", "peripheral-select", "memory-power";
+			clocks = <&clkc ESP32S31_CLK_BITSCRAMBLER>;
+			resets = <&clkc ESP32S31_RST_BITSCRAMBLER>;
+			status = "disabled";
+		};
+
 		uhci0: serial@2038a000 {
 			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038a000 0x1000>;
