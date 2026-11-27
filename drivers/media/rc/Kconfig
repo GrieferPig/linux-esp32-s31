@@ -178,6 +178,13 @@ config IR_ESP32P4_RMT
 	  Receive and transmit raw pulse trains through the ESP32-P4 RMT
 	  controller. Use the LIRC interface for raw pulse I/O.
 
+config IR_ESP32S31_RMT
+	tristate "Espressif ESP32-S31 RMT pulse transceiver"
+	depends on SOC_ESP32S31 && COMMON_CLK
+	help
+	  Receive and transmit raw pulse trains through the ESP32-S31 RMT
+	  controller. Use the LIRC interface for raw pulse I/O.
+
 config IR_GPIO_CIR
 	tristate "GPIO IR remote control"
 	depends on (OF && GPIOLIB) || COMPILE_TEST

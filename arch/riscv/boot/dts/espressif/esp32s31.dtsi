@@ -201,6 +201,19 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.52 RMT and ch.12 Interrupt Matrix (ETS_RMT_INTR_SOURCE = 22). */
+		rmt: rmt@20355000 {
+			compatible = "espressif,esp32s31-rmt";
+			reg = <0x20355000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <22 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_RMT>;
+			resets = <&clkc ESP32S31_RST_RMT>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&rmt_default>;
+			status = "okay";
+		};
+
 		uhci0: serial@2038a000 {
 			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038a000 0x1000>;
@@ -438,6 +451,16 @@
 				rx-pins {
 					pinmux = <ESP32S31_MATRIX_IN(43, 16, 0)>;
 					bias-pull-up;
+					input-enable;
+				};
+			};
+
+			/* IDF gpio_sig_map.h: RMT_SIG_OUT0_IDX=246, RMT_SIG_IN0_IDX=246. */
+			rmt_default: rmt-default-pins {
+				rmt-pins {
+					pinmux = <ESP32S31_MATRIX_OUT(45, 246, 0)>,
+						 <ESP32S31_MATRIX_IN(45, 246, 0)>;
+					drive-strength = <20>;
 					input-enable;
 				};
 			};
