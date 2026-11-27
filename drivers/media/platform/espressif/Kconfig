@@ -28,3 +28,14 @@ config VIDEO_ESP32P4_JPEG
 	help
 	  Decode baseline grayscale JPEG images through the ESP32-P4 JPEG
 	  codec and 2D DMA using the V4L2 memory-to-memory interface.
+
+config VIDEO_ESP32S31_JPEG
+	tristate "ESP32-S31 JPEG encoder and decoder"
+	depends on SOC_ESP32S31 && VIDEO_DEV && ESPRESSIF_DMA2D
+	select V4L2_JPEG_HELPER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  Encode and decode baseline JPEG images (grayscale and color)
+	  through the ESP32-S31 JPEG codec and 2D-DMA using V4L2 M2M.

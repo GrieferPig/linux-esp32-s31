@@ -31,6 +31,9 @@
 #define D2D_STATE		0x24
 #define D2D_TX_PERI		0x38
 #define D2D_RX_PERI		0x3c
+#define D2D_RX_COLOR_CONV	0x4c
+#define D2D_RX_SCRAMBLE		0x50
+#define D2D_RX_COLOR_PARAM0	0x54
 #define D2D_TX_PORT_BLK		0x6c
 
 #define D2D_RST_CONF		0xa04
@@ -44,6 +47,10 @@
 #define D2D_TX_RESET_AVAIL	BIT(24)
 #define D2D_RX_RESET_AVAIL	BIT(23)
 #define D2D_RX_M2M		BIT(0)
+#define D2D_DSCR_BURST_EN	BIT(2)
+#define D2D_MEM_BURST_128	(4U << 6)
+#define D2D_MB_SIZE_SHIFT	9
+#define D2D_REORDER_EN		BIT(16)
 #define D2D_TX_START		BIT(21)
 #define D2D_RX_START		BIT(22)
 #define D2D_REG_CLK_EN		BIT(2)
@@ -89,7 +96,14 @@ struct esp_dma2d_desc {
 		D2D_MEMCPY,
 		D2D_PPA,
 		D2D_JPEG_GRAY,
+		D2D_JPEG_XFER,
 	} mode;
+	/* S31 JPEG decode/encode transfer options (D2D_JPEG_XFER only). */
+	bool jpeg_encode;
+	u8 mb_size;
+	u8 rx_csc;
+	u8 rx_post_scramble;
+	u32 *rx_bytes_out;
 };
 
 struct esp_dma2d_soc {
@@ -132,7 +146,7 @@ static void esp_dma2d_desc_free(struct virt_dma_desc *vd)
 	if (chan->noncoherent_desc) {
 		if (desc->dma)
 			dma_unmap_single(chan->vc.chan.device->dev, desc->dma,
-					 2 * sizeof(*desc->hw), DMA_TO_DEVICE);
+					 2 * sizeof(*desc->hw), DMA_BIDIRECTIONAL);
 		kfree(desc->hw);
 	} else {
 		dma_pool_free(chan->pool, desc->hw, desc->dma);
@@ -170,7 +184,7 @@ static int esp_dma2d_map_desc(struct esp_dma2d_chan *chan,
 		return 0;
 
 	desc->dma = dma_map_single(dev, desc->hw, 2 * sizeof(*desc->hw),
-				   DMA_TO_DEVICE);
+				   DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(dev, desc->dma)) {
 		desc->dma = 0;
 		kfree(desc->hw);
@@ -344,6 +358,86 @@ esp_dma2d_prep_jpeg_gray(struct dma_chan *dchan, dma_addr_t src, size_t len,
 }
 EXPORT_SYMBOL_GPL(esp_dma2d_prep_jpeg_gray);
 
+/*
+ * S31 TRM ch.35 JPEG / IDF dma2d_ll.h: full 2D-DMA JPEG decode & encode
+ * descriptor builder with macro-block reorder and optional RX CSC.
+ */
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_jpeg_xfer(struct dma_chan *dchan,
+			 const struct esp_dma2d_jpeg_cfg *cfg,
+			 unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+	u32 high, low;
+
+	if (!cfg || dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !cfg->len_1d || cfg->len_1d > D2D_COPY_MAX ||
+	    upper_32_bits(cfg->buf_1d) || upper_32_bits(cfg->buf_2d) ||
+	    !cfg->width || !cfg->height || !cfg->block_w || !cfg->block_h ||
+	    cfg->width > D2D_COUNT_MAX || cfg->height > D2D_COUNT_MAX ||
+	    cfg->block_w > D2D_COUNT_MAX || cfg->block_h > D2D_COUNT_MAX)
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	desc->mode = D2D_JPEG_XFER;
+	desc->jpeg_encode = cfg->encode;
+	desc->mb_size = cfg->mb_size;
+	desc->rx_csc = cfg->rx_csc;
+	desc->rx_post_scramble = cfg->rx_post_scramble;
+	desc->rx_bytes_out = cfg->rx_bytes_out;
+
+	high = cfg->len_1d >> 14;
+	low = cfg->len_1d & D2D_COUNT_MAX;
+
+	if (cfg->encode) {
+		/* Encode: TX = 2D pixel image, RX = 1D compressed bitstream. */
+		desc->hw[0].control = cpu_to_le32(D2D_DESC_OWNER | D2D_DESC_2D |
+						  FIELD_PREP(D2D_DESC_HORIZ, cfg->block_w) |
+						  cfg->block_h);
+		desc->hw[0].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, cfg->pbyte) |
+						FIELD_PREP(D2D_DESC_HORIZ, cfg->width) |
+						cfg->height);
+		desc->hw[0].position = cpu_to_le32(D2D_DESC_MULTIPLE);
+		desc->hw[0].buffer = cpu_to_le32(cfg->buf_2d);
+
+		desc->hw[1].control = cpu_to_le32(D2D_DESC_OWNER | low);
+		desc->hw[1].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, 1) | high);
+		desc->hw[1].position = 0;
+		desc->hw[1].buffer = cpu_to_le32(cfg->buf_1d);
+	} else {
+		/* Decode: TX = 1D bitstream, RX = 2D decoded pixel image. */
+		desc->hw[0].control = cpu_to_le32(D2D_DESC_OWNER |
+						  FIELD_PREP(D2D_DESC_HORIZ, low) | low);
+		desc->hw[0].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, 1) |
+						FIELD_PREP(D2D_DESC_HORIZ, high) | high);
+		desc->hw[0].position = 0;
+		desc->hw[0].buffer = cpu_to_le32(cfg->buf_1d);
+
+		desc->hw[1].control = cpu_to_le32(D2D_DESC_OWNER | D2D_DESC_2D |
+						  FIELD_PREP(D2D_DESC_HORIZ, cfg->block_w) |
+						  cfg->block_h);
+		desc->hw[1].frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, cfg->pbyte) |
+						FIELD_PREP(D2D_DESC_HORIZ, cfg->width) |
+						cfg->height);
+		desc->hw[1].position = cpu_to_le32(D2D_DESC_MULTIPLE);
+		desc->hw[1].buffer = cpu_to_le32(cfg->buf_2d);
+	}
+
+	if (esp_dma2d_map_desc(chan, desc)) {
+		esp_dma2d_desc_free(&desc->vd);
+		return NULL;
+	}
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_jpeg_xfer);
+
 /* TRM ch.8.7.7 — CMD_DISABLE then RESET_AVAIL before reset or freeing memory. */
 static int esp_dma2d_stop(struct esp_dma2d_chan *chan)
 {
@@ -404,6 +498,59 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 		writel(0, chan->rx + D2D_CONF0);
 		writel(D2D_JPEG, chan->tx + D2D_TX_PERI);
 		writel(D2D_JPEG, chan->rx + D2D_RX_PERI);
+	} else if (desc->mode == D2D_JPEG_XFER) {
+		/* IDF jpeg_decode.c / jpeg_encode.c + dma2d_ll.h RX CSC & reorder. */
+		static const u32 bt601_yuv2rgb[6] = {
+			298U, 210164121U, 1995050U, 35540784U, 528682U, 195899392U,
+		};
+		u32 tx_conf = D2D_DSCR_BURST_EN | D2D_MEM_BURST_128;
+		u32 rx_conf = D2D_DSCR_BURST_EN | D2D_MEM_BURST_128;
+		u32 csc = (7U << 3) | 1U; /* input_sel=7 (disabled), output_sel=1 */
+		bool load_bt601 = false;
+
+		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
+		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
+		if (desc->jpeg_encode) {
+			tx_conf |= ((u32)desc->mb_size << D2D_MB_SIZE_SHIFT) | D2D_REORDER_EN;
+			rx_conf |= ((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT);
+		} else {
+			tx_conf |= ((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT);
+			rx_conf |= ((u32)desc->mb_size << D2D_MB_SIZE_SHIFT) | D2D_REORDER_EN;
+		}
+		writel(tx_conf, chan->tx + D2D_CONF0);
+		writel(rx_conf, chan->rx + D2D_CONF0);
+
+		switch (desc->rx_csc) {
+		case ESP_DMA2D_RX_CSC_YUV420_TO_RGB565_601:
+			csc = (0U << 3) | BIT(2) | 0U;
+			load_bt601 = true;
+			break;
+		case ESP_DMA2D_RX_CSC_YUV420_TO_RGB888_601:
+			csc = (0U << 3) | BIT(2) | 1U;
+			load_bt601 = true;
+			break;
+		case ESP_DMA2D_RX_CSC_YUV444_TO_RGB565_601:
+			csc = (2U << 3) | BIT(2) | 0U;
+			load_bt601 = true;
+			break;
+		case ESP_DMA2D_RX_CSC_YUV444_TO_RGB888_601:
+			csc = (2U << 3) | BIT(2) | 1U;
+			load_bt601 = true;
+			break;
+		default:
+			break;
+		}
+		writel(csc, chan->rx + D2D_RX_COLOR_CONV);
+		writel((u32)desc->rx_post_scramble << 3, chan->rx + D2D_RX_SCRAMBLE);
+		if (load_bt601) {
+			int k;
+
+			for (k = 0; k < 6; k++)
+				writel(bt601_yuv2rgb[k],
+				       chan->rx + D2D_RX_COLOR_PARAM0 + k * 4);
+		}
+		writel(D2D_JPEG, chan->tx + D2D_TX_PERI);
+		writel(D2D_JPEG, chan->rx + D2D_RX_PERI);
 	} else if (chan->has_srm) {
 		writel(D2D_RX_M2M, chan->rx + D2D_CONF0);
 		writel(D2D_M2M_DUMMY, chan->tx + D2D_TX_PERI);
@@ -453,6 +600,16 @@ static irqreturn_t esp_dma2d_irq(int irq, void *data)
 
 	if (desc) {
 		dma_rmb();
+		if (desc->rx_bytes_out) {
+			if (chan->noncoherent_desc)
+				dma_sync_single_for_cpu(chan->vc.chan.device->dev,
+							desc->dma,
+							2 * sizeof(*desc->hw),
+							DMA_FROM_DEVICE);
+			*desc->rx_bytes_out =
+				(FIELD_GET(D2D_DESC_HORIZ, le32_to_cpu(desc->hw[1].frame)) << 14) |
+				FIELD_GET(D2D_DESC_HORIZ, le32_to_cpu(desc->hw[1].control));
+		}
 		if (tx & D2D_TX_ERROR)
 			desc->vd.tx_result.result = DMA_TRANS_READ_FAILED;
 		else if (rx & D2D_RX_ERRORS)
@@ -655,6 +812,7 @@ static const struct esp_dma2d_soc esp32s31_dma2d = {
 	.sram_end = 0x2f07ffff,
 	.ext_start = 0x50000000,
 	.ext_end = 0x53ffffff,
+	.has_srm = true,
 	.noncoherent_desc = true,
 };
 

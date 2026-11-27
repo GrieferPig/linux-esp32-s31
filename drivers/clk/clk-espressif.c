@@ -74,6 +74,7 @@
 #define HP_SDIO_HOST_FUNC_CTRL0		0xc4
 #define HP_EMAC_CTRL0			0xc8
 #define HP_DMA2D_CTRL0			0xb0
+#define HP_JPEG_CTRL0			0xb8
 #define HP_RMT_CTRL0			0xbc
 #define HP_UART0_CTRL0			0x88
 #define HP_UART_CTRL_STRIDE		0x04
@@ -172,6 +173,13 @@
 #define HP_SYS_DMA2D_MEM_LP_CTRL		0x210
 #define HP_SYS_DMA2D_MEM_LP_EN		BIT(2)
 #define HP_SYS_DMA2D_MEM_FORCE_CTRL	BIT(3)
+/* S31 TRM ch.35 JPEG / IDF jpeg_ll_enable_bus_clock(), jpeg_ll_reset_module_register(). */
+#define HP_JPEG_SYS_CLK_EN		BIT(0)
+#define HP_JPEG_RST_EN			BIT(1)
+#define HP_JPEG_FORCE_NORST		BIT(2)
+#define HP_SYS_JPEG_MEM_LP_CTRL		0x2a0
+#define HP_SYS_JPEG_MEM_LP_EN		BIT(2)
+#define HP_SYS_JPEG_MEM_FORCE_CTRL	BIT(3)
 /* S31 TRM ch.52 RMT / IDF rmt_ll_enable_bus_clock(), rmt_ll_reset_register(), rmt_ll_mem_force_power_on(). */
 #define HP_RMT_SYS_CLK_EN		BIT(0)
 #define HP_RMT_RST_EN			BIT(1)
@@ -278,6 +286,7 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_WDT1,
 	ESP32S31_CLK_KIND_DMA2D,
 	ESP32S31_CLK_KIND_RMT,
+	ESP32S31_CLK_KIND_JPEG,
 	ESP32S31_CLK_KIND_GENERIC,
 };
 
@@ -365,6 +374,8 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 		HP_DMA2D_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_RMT] = { HP_RMT_CTRL0, HP_RMT_RST_EN,
 		HP_RMT_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_JPEG] = { HP_JPEG_CTRL0, HP_JPEG_RST_EN,
+		HP_JPEG_FORCE_NORST, ESP32S31_BANK_HP },
 };
 
 static void __iomem *esp32s31_reset_base(struct esp32s31_clk_priv *priv,
@@ -668,6 +679,20 @@ static void esp32s31_dma2d_prepare(struct esp32s31_clk_priv *priv)
 		     HP_DMA2D_SYS_CLK_EN | HP_DMA2D_FORCE_NORST);
 }
 
+static void esp32s31_jpeg_prepare(struct esp32s31_clk_priv *priv)
+{
+	/*
+	 * S31 TRM ch.35 JPEG / IDF jpeg_ll_mem_powered_by_pmu():
+	 * HP_SYSTEM_JPEG_MEM_LP_CTRL_REG (+0x2a0) defaults to LP_EN=1, LP_MODE=2.
+	 * Force power-on and release JPEG reset with sys_clk enabled.
+	 */
+	esp32s31_rmw(priv->hp_sys, HP_SYS_JPEG_MEM_LP_CTRL,
+		     HP_SYS_JPEG_MEM_LP_EN | HP_SYS_JPEG_MEM_FORCE_CTRL,
+		     HP_SYS_JPEG_MEM_FORCE_CTRL);
+	esp32s31_rmw(priv->hp, HP_JPEG_CTRL0, HP_JPEG_RST_EN,
+		     HP_JPEG_SYS_CLK_EN | HP_JPEG_FORCE_NORST);
+}
+
 static void esp32s31_rmt_prepare(struct esp32s31_clk_priv *priv)
 {
 	/*
@@ -784,6 +809,12 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_RMT:
 		if (!clk->initialized) {
 			esp32s31_rmt_prepare(priv);
+			clk->initialized = true;
+		}
+		break;
+	case ESP32S31_CLK_KIND_JPEG:
+		if (!clk->initialized) {
+			esp32s31_jpeg_prepare(priv);
 			clk->initialized = true;
 		}
 		break;
@@ -908,6 +939,10 @@ static void esp32s31_clk_unprepare(struct clk_hw *hw)
 			     HP_RMT_SYS_CLK_EN | HP_RMT_CLK_EN, 0);
 		clk->initialized = false;
 		break;
+	case ESP32S31_CLK_KIND_JPEG:
+		esp32s31_rmw(priv->hp, HP_JPEG_CTRL0, HP_JPEG_SYS_CLK_EN, 0);
+		clk->initialized = false;
+		break;
 	case ESP32S31_CLK_KIND_GENERIC:
 		esp32s31_rmw(priv->hp, clk->reg, clk->enable_mask, 0);
 		clk->initialized = false;
@@ -971,6 +1006,9 @@ static int esp32s31_clk_is_prepared(struct clk_hw *hw)
 		return (readl(priv->hp + HP_RMT_CTRL0) &
 			(HP_RMT_SYS_CLK_EN | HP_RMT_CLK_EN)) ==
 		       (HP_RMT_SYS_CLK_EN | HP_RMT_CLK_EN);
+	case ESP32S31_CLK_KIND_JPEG:
+		return !!(readl(priv->hp + HP_JPEG_CTRL0) &
+			  HP_JPEG_SYS_CLK_EN);
 	case ESP32S31_CLK_KIND_GENERIC:
 		reg = readl(priv->hp + clk->reg);
 		return (reg & clk->enable_mask) == clk->enable_mask;
@@ -1846,6 +1884,11 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_RMT,
 				    "rmt", ESP32S31_CLK_KIND_RMT,
 				    ESP32S31_XTAL_RATE);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_JPEG,
+				    "jpeg", ESP32S31_CLK_KIND_JPEG,
+				    sys_rate);
 	if (ret)
 		return ret;
 

@@ -185,6 +185,19 @@
 			status = "disabled";
 		};
 
+		/* S31 TRM ch.35 JPEG Codec and ch.12 Interrupt Matrix (ETS_JPEG_INTR_SOURCE = 101). */
+		jpeg: jpeg@20344000 {
+			compatible = "espressif,esp32s31-jpeg";
+			reg = <0x20344000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <101 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_JPEG>;
+			resets = <&clkc ESP32S31_RST_JPEG>;
+			dmas = <&dma2d 0>;
+			dma-names = "codec";
+			status = "okay";
+		};
+
 		/* S31 TRM ch.6 2D-DMA and ch.12 Interrupt Matrix — two M2M TX/RX pairs. */
 		dma2d: dma-controller@20346000 {
 			compatible = "espressif,esp32s31-dma2d";

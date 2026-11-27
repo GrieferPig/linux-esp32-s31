@@ -31,7 +31,8 @@
 #define ESP32S31_RST_I2S1		26
 #define ESP32S31_RST_DMA2D		27
 #define ESP32S31_RST_RMT		28
+#define ESP32S31_RST_JPEG		29
 
-#define ESP32S31_RST_NR			29
+#define ESP32S31_RST_NR			30
 
 #endif
