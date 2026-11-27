@@ -76,6 +76,7 @@
 #define HP_DMA2D_CTRL0			0xb0
 #define HP_PPA_CTRL0			0xb4
 #define HP_JPEG_CTRL0			0xb8
+#define HP_CORDIC_CTRL0			0x1b4
 #define HP_RMT_CTRL0			0xbc
 #define HP_LCDCAM_CTRL0			0x14c
 #define HP_LCDCAM_LCDCAM_CTRL0		0x154
@@ -191,6 +192,13 @@
 #define HP_SYS_PPA_MEM_LP_CTRL		0x29c
 #define HP_SYS_PPA_MEM_LP_EN		BIT(2)
 #define HP_SYS_PPA_MEM_FORCE_CTRL	BIT(3)
+/* S31 TRM ch.5 System and Memory / IDF cordic_ll_enable_bus_clock(),
+ * cordic_ll_enable_clock() and cordic_ll_set_clock_source(): XTAL is selector 0.
+ */
+#define HP_CORDIC_APB_CLK_EN		BIT(0)
+#define HP_CORDIC_APB_RST_EN		BIT(1)
+#define HP_CORDIC_CLK_EN		BIT(4)
+#define HP_CORDIC_CLK_SRC_SEL		GENMASK(8, 7)
 /* S31 TRM ch.39 LCD_CAM / IDF cam_ll_enable_bus_clock(), cam_ll_reset_register(), cam_ll_enable_clk(). */
 #define HP_LCDCAM_APB_CLK_EN		BIT(0)
 #define HP_LCDCAM_APB_RST_EN		BIT(1)
@@ -406,6 +414,8 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 	[ESP32S31_RST_CAM] = { HP_LCDCAM_CTRL0,
 		HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
 		HP_LCDCAM_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_CORDIC] = { HP_CORDIC_CTRL0, HP_CORDIC_APB_RST_EN,
+		0, ESP32S31_BANK_HP },
 };
 
 static void __iomem *esp32s31_reset_base(struct esp32s31_clk_priv *priv,
@@ -1994,6 +2004,13 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_CAM,
 				    "cam", ESP32S31_CLK_KIND_CAM,
 				    ESP32S31_XTAL_RATE / 2);
+	if (ret)
+		return ret;
+
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_CORDIC, "cordic",
+				     ESP32S31_XTAL_RATE, HP_CORDIC_CTRL0,
+				     HP_CORDIC_APB_CLK_EN | HP_CORDIC_CLK_EN,
+				     HP_CORDIC_APB_RST_EN | HP_CORDIC_CLK_SRC_SEL, 0);
 	if (ret)
 		return ret;
 

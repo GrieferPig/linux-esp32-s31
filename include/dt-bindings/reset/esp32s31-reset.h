@@ -35,6 +35,7 @@
 #define ESP32S31_RST_PPA		30
 #define ESP32S31_RST_CAM		31
 
-#define ESP32S31_RST_NR			32
+#define ESP32S31_RST_CORDIC		32
+#define ESP32S31_RST_NR			33
 
 #endif

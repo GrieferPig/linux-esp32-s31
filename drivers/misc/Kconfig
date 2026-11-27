@@ -668,4 +668,11 @@ config ESP32P4_PARLIO
 	help
 	  Expose the ESP32-P4 parallel I/O controller as a framed DMA device.
 
+config ESP32S31_CORDIC
+	tristate "Espressif ESP32-S31 CORDIC accelerator"
+	depends on SOC_ESP32S31 && OF && COMMON_CLK && RESET_CONTROLLER
+	help
+	  Calculate fixed-point trigonometric and hyperbolic functions with
+	  the ESP32-S31 CORDIC accelerator.
+
 endmenu

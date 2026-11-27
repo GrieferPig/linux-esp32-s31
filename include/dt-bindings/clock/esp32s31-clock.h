@@ -64,6 +64,7 @@
 #define ESP32S31_CLK_PPA		57
 #define ESP32S31_CLK_CAM		58
 
-#define ESP32S31_CLK_NR			59
+#define ESP32S31_CLK_CORDIC		59
+#define ESP32S31_CLK_NR			60
 
 #endif

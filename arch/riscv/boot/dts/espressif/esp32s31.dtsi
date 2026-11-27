@@ -1213,6 +1213,14 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.5 System and Memory, CORDIC address aperture. */
+		cordic: cordic@2039b000 {
+			compatible = "espressif,esp32s31-cordic";
+			reg = <0x2039b000 0x1000>;
+			clocks = <&clkc ESP32S31_CLK_CORDIC>;
+			resets = <&clkc ESP32S31_RST_CORDIC>;
+		};
+
 		/* S31 TRM ch.39 LCD_CAM DVP / IDF cam_ll.h + gdma_channel.h (CAM0=0). */
 		cam: cam@20396000 {
 			compatible = "espressif,esp32s31-cam";
