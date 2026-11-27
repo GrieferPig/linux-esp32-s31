@@ -61,6 +61,8 @@
 #define JPEG_CQNR_TBL_SEL	GENMASK(11, 10)
 #define JPEG_COLOR_SPACE	GENMASK(14, 12)
 #define JPEG_DHT_FIFO_EN	BIT(15)
+#define JPEG_DEC_TIMEOUT_THRES	GENMASK(22, 17)
+#define JPEG_DEC_TIMEOUT_DEF	FIELD_PREP(JPEG_DEC_TIMEOUT_THRES, 32)
 #define JPEG_SOFT_RST		BIT(24)
 #define JPEG_TAILER_EN		BIT(27)
 #define JPEG_DECODE		BIT(31)
@@ -670,6 +672,8 @@ static int s31_jpeg_decode(struct s31_jpeg_ctx *ctx, struct vb2_buffer *src,
 	dcfg.buf_2d = vb2_dma_contig_plane_dma_addr(dst, 0);
 	dcfg.width = proc_w;
 	dcfg.height = proc_h;
+	if (dcfg.block_w > proc_w)
+		dcfg.block_w = proc_w;
 
 	desc = esp_dma2d_prep_jpeg_xfer(dma, &dcfg, DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
 	if (!desc) {
@@ -685,21 +689,35 @@ static int s31_jpeg_decode(struct s31_jpeg_ctx *ctx, struct vb2_buffer *src,
 
 	config = readl(base + JPEG_CONFIG) & ~(JPEG_SOFT_RST | JPEG_START);
 	writel(config | JPEG_SOFT_RST, base + JPEG_CONFIG);
-	config = JPEG_DECODE | JPEG_QNR_FIFO_EN | JPEG_DHT_FIFO_EN | JPEG_FF_CHECK_EN;
+	/*
+	 * S31 TRM ch.35 JPEG_CONFIG_REG: preserve JPEG_DECODE_TIMEOUT_THRES=32
+	 * (0 sets timeout to 2^0 - 1 = 0 cycles and immediately triggers
+	 * DECODE_TIMEOUT). Clear PIC_SIZE before loading new dimensions
+	 * (IDF jpeg_decode.c:820 digital issue).
+	 */
+	config = JPEG_DECODE | JPEG_DEC_TIMEOUT_DEF | JPEG_QNR_FIFO_EN |
+		 JPEG_DHT_FIFO_EN | JPEG_FF_CHECK_EN;
 	writel(config, base + JPEG_CONFIG);
+	writel(0, base + JPEG_PIC_SIZE);
 
-	/* IDF jpeg_parse_header_info_to_hw(): write present DQT tables. */
+	/* IDF jpeg_parse_marker.c:110 — un-zigzag DQT to raster order for T0..T3QNR. */
 	for (i = 0; i < 4; i++) {
 		if (quant[i].length == 64) {
+			u8 qtbl[64];
+
+			for (j = 0; j < 64; j++)
+				qtbl[zigzag_order[j]] = quant[i].start[j];
 			dqt_info |= (i << (i * 8));
 			writel(dqt_info, base + JPEG_DQT_INFO);
 			for (j = 0; j < 64; j++)
-				writel(quant[i].start[j], base + JPEG_T0QNR + i * 4);
+				writel(qtbl[j], base + JPEG_T0QNR + i * 4);
 		}
 	}
 
 	writel((proc_w << 16) | proc_h, base + JPEG_PIC_SIZE);
-	writel((nf << 16) | header.restart_interval, base + JPEG_DEC_CONF);
+	/* Preserve default DEZIGZAG_READY_CTL / SOS_CHECK / RST_CHECK bits [31:24]. */
+	writel((readl(base + JPEG_DEC_CONF) & ~GENMASK(23, 0)) |
+	       (nf << 16) | header.restart_interval, base + JPEG_DEC_CONF);
 	for (i = 0; i < nf; i++) {
 		const struct v4l2_jpeg_frame_component_spec *c = &header.frame.component[i];
 		u32 val = ((u32)c->component_identifier << 16) |
@@ -737,6 +755,9 @@ static int s31_jpeg_decode(struct s31_jpeg_ctx *ctx, struct vb2_buffer *src,
 	writel(0, base + JPEG_IRQ_ENA);
 	synchronize_irq(jpeg->irq);
 	if (ret) {
+		dev_err_ratelimited(jpeg->dev,
+				    "decode failed: %d, status=%#x, dma=%d\n",
+				    ret, jpeg->codec_status, jpeg->dma_result);
 		writel(config | JPEG_SOFT_RST, base + JPEG_CONFIG);
 		writel(config, base + JPEG_CONFIG);
 		dmaengine_terminate_sync(dma);
@@ -906,6 +927,8 @@ static int s31_jpeg_encode(struct s31_jpeg_ctx *ctx, struct vb2_buffer *src,
 	dcfg.len_1d = dst_cap - hdr_len;
 	dcfg.width = ctx->source.width;
 	dcfg.height = ctx->source.height;
+	if (dcfg.block_w > dcfg.width)
+		dcfg.block_w = dcfg.width;
 	dcfg.rx_csc = ESP_DMA2D_RX_CSC_NONE;
 	dcfg.rx_bytes_out = &rx_bytes;
 
@@ -958,6 +981,9 @@ static int s31_jpeg_encode(struct s31_jpeg_ctx *ctx, struct vb2_buffer *src,
 	writel(0, base + JPEG_IRQ_ENA);
 	synchronize_irq(jpeg->irq);
 	if (ret) {
+		dev_err_ratelimited(jpeg->dev,
+				    "encode failed: %d, status=%#x, dma=%d\n",
+				    ret, jpeg->codec_status, jpeg->dma_result);
 		writel(config | JPEG_SOFT_RST, base + JPEG_CONFIG);
 		writel(config, base + JPEG_CONFIG);
 		dmaengine_terminate_sync(dma);

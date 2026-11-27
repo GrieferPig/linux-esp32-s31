@@ -47,9 +47,11 @@
 #define D2D_TX_RESET_AVAIL	BIT(24)
 #define D2D_RX_RESET_AVAIL	BIT(23)
 #define D2D_RX_M2M		BIT(0)
+#define D2D_OUT_EOF_MODE	BIT(1)
 #define D2D_DSCR_BURST_EN	BIT(2)
 #define D2D_MEM_BURST_128	(4U << 6)
 #define D2D_MB_SIZE_SHIFT	9
+#define D2D_PAGE_BOUND_EN	BIT(12)
 #define D2D_REORDER_EN		BIT(16)
 #define D2D_TX_START		BIT(21)
 #define D2D_RX_START		BIT(22)
@@ -81,6 +83,7 @@
 #define D2D_PPA_BLEND_RX	2
 #define D2D_SRM_RGB565		3
 #define D2D_SRM_RGB_PADDING	18
+#define D2D_SRM_RGB_PADDING_32	34
 #define D2D_SRM_RX_BLOCK	2
 #define D2D_MAX_PAIRS		2
 
@@ -608,19 +611,39 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 	if (desc->vd.tx.cookie == chan->error_cookie)
 		WRITE_ONCE(chan->error_cookie, 0);
 	if (desc->mode == D2D_PPA) {
+		u32 conf = D2D_PORT_ENABLE;
+
 		/* TRM ch.8.7.3–4: reset the channel FSMs before configuring a port. */
 		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
 		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
-		writel(D2D_PORT_ENABLE, chan->tx + D2D_CONF0);
-		writel(D2D_PORT_ENABLE, chan->rx + D2D_CONF0);
-		writel(D2D_SRM_RGB_PADDING | (D2D_SRM_RGB_PADDING << 14),
-		       chan->tx + D2D_TX_PORT_BLK);
+		if (chan->noncoherent_desc) {
+			/* S31 IDF dma2d_connect() / ppa_srm.c: MB_NONE + burst + page_bound + disable RX CSC. */
+			conf |= D2D_DSCR_BURST_EN | D2D_MEM_BURST_128 | D2D_PAGE_BOUND_EN |
+				((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT);
+			writel((7U << 3) | 1U, chan->rx + D2D_RX_COLOR_CONV);
+			writel(0, chan->rx + D2D_RX_SCRAMBLE);
+		}
+		writel(conf | (chan->noncoherent_desc ? D2D_OUT_EOF_MODE : 0),
+		       chan->tx + D2D_CONF0);
+		writel(conf, chan->rx + D2D_CONF0);
+		if (chan->noncoherent_desc) {
+			/* S31 IDF ppa_srm.c: default 32x32 MB -> 34x34 RGB port block. */
+			writel(D2D_SRM_RGB_PADDING_32 | (D2D_SRM_RGB_PADDING_32 << 14),
+			       chan->tx + D2D_TX_PORT_BLK);
+		} else {
+			writel(D2D_SRM_RGB_PADDING | (D2D_SRM_RGB_PADDING << 14),
+			       chan->tx + D2D_TX_PORT_BLK);
+		}
 		writel(D2D_PPA_SRM, chan->tx + D2D_TX_PERI);
 		writel(D2D_PPA_SRM, chan->rx + D2D_RX_PERI);
 	} else if (desc->mode == D2D_PPA_FILL) {
 		/* IDF ppa_fill.c: RX-only single-block 2D transfer from PPA_BLEND. */
 		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
-		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->rx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128 | D2D_PAGE_BOUND_EN |
+		       ((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT),
+		       chan->rx + D2D_CONF0);
+		writel((7U << 3) | 1U, chan->rx + D2D_RX_COLOR_CONV);
+		writel(0, chan->rx + D2D_RX_SCRAMBLE);
 		writel(D2D_PPA_BLEND_RX, chan->rx + D2D_RX_PERI);
 		dma_wmb();
 		writel(desc->dma + sizeof(*desc->hw), chan->rx + D2D_LINK_ADDR);
@@ -630,16 +653,23 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 		return;
 	} else if (desc->mode == D2D_PPA_BLEND_BG) {
 		/* IDF ppa_blend.c: BG TX + output RX on PPA_BLEND. */
+		u32 conf = D2D_DSCR_BURST_EN | D2D_MEM_BURST_128 | D2D_PAGE_BOUND_EN |
+			   ((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT);
+
 		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
 		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
-		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->tx + D2D_CONF0);
-		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->rx + D2D_CONF0);
+		writel(conf | D2D_OUT_EOF_MODE, chan->tx + D2D_CONF0);
+		writel(conf, chan->rx + D2D_CONF0);
+		writel((7U << 3) | 1U, chan->rx + D2D_RX_COLOR_CONV);
+		writel(0, chan->rx + D2D_RX_SCRAMBLE);
 		writel(D2D_PPA_BLEND_BG_TX, chan->tx + D2D_TX_PERI);
 		writel(D2D_PPA_BLEND_RX, chan->rx + D2D_RX_PERI);
 	} else if (desc->mode == D2D_PPA_BLEND_FG) {
 		/* IDF ppa_blend.c: FG TX-only on PPA_BLEND. */
 		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
-		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->tx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128 | D2D_PAGE_BOUND_EN |
+		       D2D_OUT_EOF_MODE | ((u32)ESP_DMA2D_MB_NONE << D2D_MB_SIZE_SHIFT),
+		       chan->tx + D2D_CONF0);
 		writel(D2D_PPA_BLEND_FG_TX, chan->tx + D2D_TX_PERI);
 		dma_wmb();
 		writel(desc->dma, chan->tx + D2D_LINK_ADDR);

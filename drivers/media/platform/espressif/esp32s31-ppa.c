@@ -46,6 +46,8 @@
 #define PPA_BLEND1_RX_CM	GENMASK(7, 4)
 #define PPA_BLEND_TX_CM		GENMASK(11, 8)
 
+#define PPA_SRM_BYTE_ORDER	0x28
+#define PPA_SRM_BK_SIZE_16X16	BIT(3)
 #define PPA_BLEND_BYTE_ORDER	0x2c
 
 #define PPA_BLEND_TRANS_MODE	0x34
@@ -305,6 +307,9 @@ static int ppa_do_fill(struct esp32s31_ppa_dev *ppa,
 	writel(FIELD_PREP(PPA_BLEND_HB, req->block_w) |
 	       FIELD_PREP(PPA_BLEND_VB, req->block_h),
 	       ppa->base + PPA_BLEND_TX_SIZE);
+	/* IDF ppa_ll_blend_start(): latch fill+blend bits before MODE_UPDATE. */
+	writel(PPA_BLEND_FILL_EN | PPA_BLEND_EN,
+	       ppa->base + PPA_BLEND_TRANS_MODE);
 	writel(PPA_BLEND_FILL_EN | PPA_BLEND_EN | PPA_BLEND_MODE_UPDATE,
 	       ppa->base + PPA_BLEND_TRANS_MODE);
 
@@ -519,6 +524,8 @@ static int ppa_do_blend(struct esp32s31_ppa_dev *ppa,
 	writel(0x00000000, ppa->base + PPA_CK_FG_HIGH);
 	writel(0x00000000, ppa->base + PPA_CK_DEFAULT);
 
+	/* IDF ppa_ll_blend_start(): latch BLEND_EN before MODE_UPDATE. */
+	writel(PPA_BLEND_EN, ppa->base + PPA_BLEND_TRANS_MODE);
 	writel(PPA_BLEND_EN | PPA_BLEND_MODE_UPDATE,
 	       ppa->base + PPA_BLEND_TRANS_MODE);
 
@@ -876,6 +883,9 @@ static int ppa_process_srm(struct esp32s31_ppa_ctx *ctx,
 	if (ret)
 		goto release;
 	writel(PPA_REG_CLK, ppa->base + PPA_REG_CONF);
+	/* IDF ppa_srm.c: reset SRM engine before programming DMA and registers. */
+	writel(PPA_SRM_RESET, ppa->base + PPA_SRM_CTRL);
+	writel(0, ppa->base + PPA_SRM_CTRL);
 
 	desc = esp_dma2d_prep_ppa_srm(chan, &source, &target,
 				      DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
@@ -892,6 +902,11 @@ static int ppa_process_srm(struct esp32s31_ppa_ctx *ctx,
 		goto release;
 
 	writel(PPA_SRM_IRQS, ppa->base + PPA_INT_CLR);
+	/*
+	 * S31 TRM ch.34 / IDF ppa_srm.c: default srm_bk_size_sel=0 (32x32)
+	 * pairs with 34x34 2D-DMA dscr-port block size.
+	 */
+	writel(0, ppa->base + PPA_SRM_BYTE_ORDER);
 	dma_async_issue_pending(chan);
 	writel(PPA_SRM_RX_RGB565 | PPA_SRM_TX_RGB565,
 	       ppa->base + PPA_SRM_COLOR);
@@ -907,8 +922,7 @@ static int ppa_process_srm(struct esp32s31_ppa_ctx *ctx,
 	if (error)
 		ret = -EIO;
 	if (ret) {
-		dev_err_ratelimited(ppa->dev,
-				    "SRM failed: %d, err=%#x, state=%#x\n",
+		dev_err_ratelimited(ppa->dev, "SRM failed: %d, err=%#x, state=%#x\n",
 				    ret, error, readl(ppa->base + PPA_SRM_STATUS));
 		writel(PPA_SRM_RESET, ppa->base + PPA_SRM_CTRL);
 		writel(0, ppa->base + PPA_SRM_CTRL);
