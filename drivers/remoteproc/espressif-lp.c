@@ -7,15 +7,13 @@
 #include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/delay.h>
-#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/kfifo.h>
 #include <linux/ktime.h>
 #include <linux/mailbox_controller.h>
 #include <linux/irq.h>
-#include <linux/math64.h>
-#include <linux/mfd/syscon.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -23,56 +21,27 @@
 #include <linux/platform_device.h>
 #include <linux/poll.h>
 #include <linux/pm_wakeirq.h>
-#include <linux/regmap.h>
 #include <linux/remoteproc.h>
 #include <linux/reboot.h>
 #include <linux/suspend.h>
-#include <linux/iopoll.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
 #include <linux/soc/espressif/esp32s31-lp.h>
 
-#include "remoteproc_internal.h"
+#define S31_LP_RESET_VECTOR             0x2e000080U
 
-#define S31_LP_SRAM_BASE                0x2e000000ULL
-#define S31_LP_SRAM_SIZE                0x00008000ULL
-#define S31_LP_RESET_VECTOR             (S31_LP_SRAM_BASE + 0x80)
-
+/* S31 TRM ch.2 Low-Power CPU: LP_SYS_LP_CORE_BOOT_ADDR_REG. */
 #define S31_LP_SYS_BOOT_ADDR_REG        0x18
 #define S31_LP_SYS_STORE0_REG           0x2c
-#define S31_LP_SYS_STORE1_REG           0x30
 #define S31_LP_SYS_STORE2_REG           0x34
 #define S31_LP_SYS_STORE3_REG           0x38
 #define S31_LP_SYS_STORE4_REG           0x3c
 #define S31_LP_SYS_STORE5_REG           0x40
+#define S31_LP_STAGE_RUNNING            0x4c500004U
 #define S31_DEEP_SLEEP_MAGIC            0x53314453U
-#define S31_LP_SYS_DEBUG_PC_REG         0x190
-#define S31_LP_SYS_EXCEPTION_PC_REG     0x194
-
-#define S31_LP_CLKRST_CPU_CTRL_REG      0x04
-#define S31_LP_CLKRST_INTR_CTRL_REG     0x28
-#define S31_LP_CLKRST_MAILBOX_REG       0x38
-#define S31_LP_CLKRST_CPU_REG           0x44
-#define S31_LP_CPU_CLK_EN               BIT(30)
-#define S31_LP_CPU_RESET                BIT(31)
-#define S31_LP_INTR_CLK_EN              BIT(30)
-#define S31_LP_INTR_RESET               BIT(31)
-#define S31_LP_MAILBOX_CLK_EN           BIT(30)
-#define S31_LP_DBGM_UNAVAILABLE         BIT(31)
-
-#define S31_PMU_LP_CPU_PWR0_REG         0x1ac
-#define S31_PMU_LP_CPU_PWR1_REG         0x1b0
-#define S31_PMU_LP_CPU_PWR2_REG         0x1b4
-#define S31_PMU_HP_LP_COMM_REG          0x1b8
-#define S31_PMU_LP_CPU_STALL            BIT(29)
-#define S31_PMU_LP_CPU_SLEEP_RESET      BIT(30)
-#define S31_PMU_LP_CPU_SLEEP_REQ        BIT(31)
-#define S31_PMU_LP_WAKE_HP_CPU          BIT(1)
-#define S31_PMU_HP_TRIGGER_LP           BIT(31)
 
 #define S31_MB_MSG(n)                   ((n) * 4)
-#define S31_MB_HP_RAW                   0x50
 #define S31_MB_HP_ST                    0x54
 #define S31_MB_HP_ENA                   0x58
 #define S31_MB_HP_CLR                   0x5c
@@ -83,43 +52,14 @@
 #define S31_MB_TX_ACK_MASK              (BIT(9) | BIT(11) | BIT(13) | BIT(15))
 #define S31_MB_IRQ_MASK                 (S31_MB_RX_MASK | S31_MB_TX_ACK_MASK)
 
-#define S31_LP_PERI_PMS_BASE            0x20706000
-#define S31_LP_PERI_PMS_SIZE            0x100
-#define S31_LP_PERI_PMS_SYSREG_CTRL     0x00
-#define S31_LP_PERI_PMS_TIMER_CTRL      0x24
-#define S31_LP_PERI_PMS_PERICLKRST_CTRL 0x38
-#define S31_LP_PERI_PMS_IOMUX_CTRL      0x3c
-#define S31_LP_PERI_PMS_MAILBOX_CTRL    0x64
-#define S31_LP_PERI_PMS_READ_REE_MASK   GENMASK(3, 1)
-#define S31_LP_PERI_PMS_WRITE_REE_MASK  GENMASK(7, 5)
-#define S31_LP_PERI_PMS_LOCK            BIT(8)
-#define S31_LP_PERI_PMS_REE_ACCESS      (S31_LP_PERI_PMS_READ_REE_MASK | \
-					 S31_LP_PERI_PMS_WRITE_REE_MASK)
-
 #define S31_LP_RX_DEPTH                 64
 #define S31_LP_TIMEOUT_MS               1000
 
-#define S31_RTC_TIMER_UPDATE_REG        0x10
-#define S31_RTC_TIMER_BUF0_LOW_REG      0x14
-#define S31_RTC_TIMER_BUF0_HIGH_REG     0x18
-#define S31_RTC_TIMER_DATE_REG          0x3fc
-#define S31_RTC_TIMER_MAIN_UPDATE       BIT(27)
-#define S31_RTC_TIMER_MAIN_STALL        BIT(30)
-#define S31_RTC_TIMER_MAIN_RESET        BIT(31)
-#define S31_RTC_TIMER_CLK_EN            BIT(31)
-#define S31_RTC_CAL_FRACT               19
-#define S31_RTC_CAL_SAMPLE_US           100000
-
 struct esp32s31_lp {
 	struct device *dev;
-	struct rproc *rproc;
 	void __iomem *sram;
 	void __iomem *mailbox;
-	void __iomem *lp_pms;
 	void __iomem *lp_sys;
-	void __iomem *lp_clkrst;
-	void __iomem *rtc_timer;
-	struct regmap *pmu;
 	struct clk *cpu_clk;
 	struct notifier_block reboot_notifier;
 	int irq;
@@ -165,54 +105,6 @@ struct esp32s31_lp {
 	struct s31_lp_sleep_control gpio_test_control;
 	int gpio_test_result;
 };
-
-static u64 esp32s31_lp_rtc_count(struct esp32s31_lp *lp)
-{
-	u32 high;
-
-	writel(S31_RTC_TIMER_MAIN_UPDATE,
-	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-	high = readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_HIGH_REG) & 0xffff;
-	return ((u64)high << 32) |
-		readl(lp->rtc_timer + S31_RTC_TIMER_BUF0_LOW_REG);
-}
-
-static int esp32s31_lp_calibrate_rtc_slow(struct esp32s31_lp *lp)
-{
-	u64 started_ns, elapsed_us, first, delta, cal, hz;
-	u32 update;
-
-	writel(readl(lp->rtc_timer + S31_RTC_TIMER_DATE_REG) |
-	       S31_RTC_TIMER_CLK_EN,
-	       lp->rtc_timer + S31_RTC_TIMER_DATE_REG);
-	update = readl(lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-	writel(update | S31_RTC_TIMER_MAIN_RESET,
-	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-	writel(update & ~(S31_RTC_TIMER_MAIN_RESET | S31_RTC_TIMER_MAIN_STALL),
-	       lp->rtc_timer + S31_RTC_TIMER_UPDATE_REG);
-
-	first = esp32s31_lp_rtc_count(lp);
-	started_ns = ktime_get_raw_ns();
-	usleep_range(S31_RTC_CAL_SAMPLE_US, S31_RTC_CAL_SAMPLE_US + 1000);
-	delta = esp32s31_lp_rtc_count(lp) - first;
-	elapsed_us = div_u64(ktime_get_raw_ns() - started_ns, NSEC_PER_USEC);
-	if (!delta || !elapsed_us)
-		return -EIO;
-
-	cal = div64_u64(elapsed_us << S31_RTC_CAL_FRACT, delta);
-	hz = div64_u64(delta * USEC_PER_SEC, elapsed_us);
-	/* Reject a stopped counter and an accidentally selected fast clock. */
-	if (hz < 20000 || hz > 300000 || !cal || cal > U32_MAX)
-		return dev_err_probe(lp->dev, -ERANGE,
-				     "invalid RTC slow clock calibration: %llu Hz, cal=%llu\n",
-				     hz, cal);
-
-	writel((u32)cal, lp->lp_sys + S31_LP_SYS_STORE1_REG);
-	dev_info(lp->dev,
-		 "RTC slow clock calibrated at %llu Hz (Q13.19 period %llu)\n",
-		 hz, cal);
-	return 0;
-}
 
 static struct esp32s31_lp *esp32s31_lp_sleep_owner;
 static unsigned int esp32s31_lp_s2idle_wake_ms;
@@ -380,6 +272,10 @@ static int esp32s31_lp_start_tx(struct esp32s31_lp *lp, u32 message)
 	u8 slot;
 
 	spin_lock_irqsave(&lp->tx_state_lock, flags);
+	if (!READ_ONCE(lp->ready)) {
+		spin_unlock_irqrestore(&lp->tx_state_lock, flags);
+		return -ENOTCONN;
+	}
 	if (lp->tx_pending) {
 		spin_unlock_irqrestore(&lp->tx_state_lock, flags);
 		return -EBUSY;
@@ -473,8 +369,6 @@ static irqreturn_t esp32s31_lp_irq(int irq, void *data)
 		handled |= BIT(slot);
 
 		WRITE_ONCE(lp->last_message, message);
-		if (message == S31_LP_MSG_READY)
-			WRITE_ONCE(lp->ready, true);
 		if (message == S31_LP_MSG_WAKE) {
 			pm_wakeup_event(lp->dev, 0);
 			s2idle_wake();
@@ -519,164 +413,6 @@ static irqreturn_t esp32s31_lp_irq(int irq, void *data)
 		writel(status & ~handled, lp->mailbox + S31_MB_HP_CLR);
 
 	return IRQ_HANDLED;
-}
-
-static int esp32s31_lp_grant_peripheral(struct esp32s31_lp *lp, u32 offset,
-					const char *name, u32 *value)
-{
-	u32 pms = readl(lp->lp_pms + offset);
-
-	if ((pms & S31_LP_PERI_PMS_REE_ACCESS) == S31_LP_PERI_PMS_REE_ACCESS)
-		goto out;
-	if (pms & S31_LP_PERI_PMS_LOCK) {
-		dev_err(lp->dev, "LP %s PMS locked without REE access (0x%08x)\n",
-			name, pms);
-		return -EACCES;
-	}
-
-	writel(pms | S31_LP_PERI_PMS_REE_ACCESS, lp->lp_pms + offset);
-	pms = readl(lp->lp_pms + offset);
-	if ((pms & S31_LP_PERI_PMS_REE_ACCESS) != S31_LP_PERI_PMS_REE_ACCESS) {
-		dev_err(lp->dev, "failed to enable LP %s REE access (0x%08x)\n",
-			name, pms);
-		return -EACCES;
-	}
-
-out:
-	if (value)
-		*value = pms;
-	return 0;
-}
-
-static int esp32s31_lp_start(struct rproc *rproc)
-{
-	struct esp32s31_lp *lp = rproc->priv;
-	u64 bootaddr = rproc->bootaddr;
-	u32 pmu_pwr0;
-	u32 pmu_pwr1;
-	u32 pmu_pwr2;
-	u32 pmu_comm;
-	u32 status;
-	u32 value;
-	u32 pms;
-	int ret;
-
-	if (bootaddr < S31_LP_SRAM_BASE || bootaddr >= S31_LP_SRAM_BASE + S31_LP_SRAM_SIZE)
-		return -EINVAL;
-
-	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_SYSREG_CTRL,
-					  "system registers", NULL);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_TIMER_CTRL,
-					  "RTC timer", NULL);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_calibrate_rtc_slow(lp);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_PERICLKRST_CTRL,
-					  "peripheral clock/reset", NULL);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_IOMUX_CTRL,
-					  "IOMUX", NULL);
-	if (ret)
-		return ret;
-	ret = esp32s31_lp_grant_peripheral(lp, S31_LP_PERI_PMS_MAILBOX_CTRL,
-					  "mailbox", &pms);
-	if (ret)
-		return ret;
-
-	writel((u32)bootaddr, lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG);
-	writel(0, lp->lp_sys + S31_LP_SYS_STORE0_REG);
-
-	/* Mirror ESP-IDF lp_core_ll_reset_register() and bus-clock setup. */
-	value = readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG);
-	writel(value | S31_LP_CPU_RESET,
-	       lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG);
-	value = readl(lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG);
-	writel(value | S31_LP_INTR_RESET,
-	       lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG) &
-	       ~S31_LP_CPU_RESET, lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG) &
-	       ~S31_LP_INTR_RESET, lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG) |
-	       S31_LP_CPU_CLK_EN, lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG) |
-	       S31_LP_INTR_CLK_EN, lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_REG) &
-	       ~S31_LP_DBGM_UNAVAILABLE, lp->lp_clkrst + S31_LP_CLKRST_CPU_REG);
-
-	regmap_update_bits(lp->pmu, S31_PMU_LP_CPU_PWR0_REG,
-			   S31_PMU_LP_CPU_STALL | S31_PMU_LP_CPU_SLEEP_RESET,
-			   S31_PMU_LP_CPU_STALL | S31_PMU_LP_CPU_SLEEP_RESET);
-	regmap_write(lp->pmu, S31_PMU_LP_CPU_PWR2_REG, S31_PMU_LP_WAKE_HP_CPU);
-	regmap_write(lp->pmu, S31_PMU_HP_LP_COMM_REG, S31_PMU_HP_TRIGGER_LP);
-
-	/*
-	 * The native LP mailbox runtime resets the whole mailbox before sending
-	 * READY.  That reset also clears HP interrupt enables, so restore them
-	 * while waiting for the first LP-to-HP message.  Poll RAW rather than ST
-	 * to close the reset/enable race, then run the normal IRQ handler to ACK
-	 * READY and release the LP firmware from its synchronous send.
-	 */
-	ret = readl_poll_timeout(lp->mailbox + S31_MB_HP_RAW, status,
-		({
-			writel(S31_MB_CLK_EN, lp->mailbox + S31_MB_CLK_REG);
-			writel(S31_MB_IRQ_MASK, lp->mailbox + S31_MB_HP_ENA);
-			status = readl(lp->mailbox + S31_MB_HP_RAW);
-			READ_ONCE(lp->ready) || (status & S31_MB_RX_MASK);
-		}), 10, 500000);
-	if (ret) {
-		dev_err(lp->dev,
-			"LP-core did not signal READY: msg0=%08x msg1=%08x lp=%08x/%08x/%08x hp=%08x/%08x/%08x clk=%08x pms=%08x\n",
-			readl(lp->mailbox + S31_MB_MSG(0)),
-			readl(lp->mailbox + S31_MB_MSG(1)),
-			readl(lp->mailbox + 0x40),
-			readl(lp->mailbox + 0x44),
-			readl(lp->mailbox + 0x48),
-			status,
-			readl(lp->mailbox + S31_MB_HP_ST),
-			readl(lp->mailbox + S31_MB_HP_ENA),
-			readl(lp->mailbox + S31_MB_CLK_REG), pms);
-		regmap_read(lp->pmu, S31_PMU_LP_CPU_PWR0_REG, &pmu_pwr0);
-		regmap_read(lp->pmu, S31_PMU_LP_CPU_PWR1_REG, &pmu_pwr1);
-		regmap_read(lp->pmu, S31_PMU_LP_CPU_PWR2_REG, &pmu_pwr2);
-		regmap_read(lp->pmu, S31_PMU_HP_LP_COMM_REG, &pmu_comm);
-		dev_err(lp->dev,
-			"state boot=%08x stage=%08x pc=%08x exc=%08x cpu=%08x intr=%08x mbclk=%08x dbg=%08x pmu=%08x/%08x/%08x/%08x\n",
-			readl(lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG),
-			readl(lp->lp_sys + S31_LP_SYS_STORE0_REG),
-			readl(lp->lp_sys + S31_LP_SYS_DEBUG_PC_REG),
-			readl(lp->lp_sys + S31_LP_SYS_EXCEPTION_PC_REG),
-			readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_CTRL_REG),
-			readl(lp->lp_clkrst + S31_LP_CLKRST_INTR_CTRL_REG),
-			readl(lp->lp_clkrst + S31_LP_CLKRST_MAILBOX_REG),
-			readl(lp->lp_clkrst + S31_LP_CLKRST_CPU_REG),
-			pmu_pwr0, pmu_pwr1, pmu_pwr2, pmu_comm);
-		return ret;
-	}
-
-	if (!READ_ONCE(lp->ready))
-		esp32s31_lp_irq(lp->irq, lp);
-	if (!READ_ONCE(lp->ready)) {
-		dev_err(lp->dev, "LP-core first message was not READY (0x%08x)\n",
-			READ_ONCE(lp->last_message));
-		return -EPROTO;
-	}
-
-	return 0;
-}
-
-static int esp32s31_lp_stop(struct rproc *rproc)
-{
-	struct esp32s31_lp *lp = rproc->priv;
-
-	regmap_write(lp->pmu, S31_PMU_LP_CPU_PWR1_REG,
-		     S31_PMU_LP_CPU_SLEEP_REQ);
-	return 0;
 }
 
 static u32 esp32s31_lp_crc(const void *buffer, size_t length)
@@ -888,37 +624,59 @@ void esp32s31_lp_system_suspend_finish(void)
 }
 EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_finish);
 
-static void *esp32s31_lp_da_to_va(struct rproc *rproc, u64 da, size_t len,
-				  bool *is_iomem)
+static int esp32s31_lp_attach(struct rproc *rproc)
 {
 	struct esp32s31_lp *lp = rproc->priv;
-	u64 offset;
+	struct s31_lp_sleep_control control;
+	int ret;
 
-	if (da < S31_LP_SRAM_BASE)
-		return NULL;
-	offset = da - S31_LP_SRAM_BASE;
-	if (offset > S31_LP_SRAM_SIZE || len > S31_LP_SRAM_SIZE - offset)
-		return NULL;
+	if (readl(lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG) != S31_LP_RESET_VECTOR ||
+	    readl(lp->lp_sys + S31_LP_SYS_STORE0_REG) != S31_LP_STAGE_RUNNING)
+		return dev_err_probe(lp->dev, -ENODEV,
+				     "bootloader did not start LP firmware\n");
 
-	if (is_iomem)
-		*is_iomem = true;
-	return (__force void *)(lp->sram + offset);
-}
+	ret = esp32s31_lp_read_control(lp, &control);
+	if (ret)
+		return dev_err_probe(lp->dev, ret, "invalid LP sleep control\n");
+	if (!(control.capabilities & S31_LP_CAP_HANDSHAKE) ||
+	    control.state == S31_LP_SLEEP_BOOT)
+		return -EPROTO;
 
-static int esp32s31_lp_parse_fw(struct rproc *rproc,
-				const struct firmware *firmware)
-{
+	/* TRM ch.11 LP Mailbox: enable HP delivery and keep any pending messages. */
+	if (!(readl(lp->mailbox + S31_MB_CLK_REG) & S31_MB_CLK_EN))
+		return -EIO;
+	writel(S31_MB_IRQ_MASK, lp->mailbox + S31_MB_HP_ENA);
+	WRITE_ONCE(lp->ready, true);
 	return 0;
 }
 
+static int esp32s31_lp_detach(struct rproc *rproc)
+{
+	struct esp32s31_lp *lp = rproc->priv;
+	unsigned long flags;
+	int ret = 0;
+
+	mutex_lock(&lp->rpc_lock);
+	mutex_lock(&lp->user_tx_lock);
+	spin_lock_irqsave(&lp->tx_state_lock, flags);
+	if (lp->tx_pending) {
+		ret = -EBUSY;
+	} else {
+		WRITE_ONCE(lp->ready, false);
+		writel(0, lp->mailbox + S31_MB_HP_ENA);
+	}
+	spin_unlock_irqrestore(&lp->tx_state_lock, flags);
+	if (!ret)
+		synchronize_irq(lp->irq);
+	mutex_unlock(&lp->user_tx_lock);
+	mutex_unlock(&lp->rpc_lock);
+
+	return ret;
+}
+
 static const struct rproc_ops esp32s31_lp_rproc_ops = {
-	.start = esp32s31_lp_start,
-	.stop = esp32s31_lp_stop,
-	.da_to_va = esp32s31_lp_da_to_va,
-	.load = rproc_elf_load_segments,
-	.parse_fw = esp32s31_lp_parse_fw,
-	.sanity_check = rproc_elf_sanity_check,
-	.get_boot_addr = rproc_elf_get_boot_addr,
+	.attach = esp32s31_lp_attach,
+	.detach = esp32s31_lp_detach,
 };
 
 static int esp32s31_lp_open(struct inode *inode, struct file *file)
@@ -1361,7 +1119,6 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct esp32s31_lp *lp;
 	struct rproc *rproc;
-	struct resource *resource;
 	const char *firmware = "esp32s31/s31-lp-core.elf";
 	int ret;
 
@@ -1373,7 +1130,6 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 
 	lp = rproc->priv;
 	lp->dev = dev;
-	lp->rproc = rproc;
 	lp->reboot_notifier.notifier_call = esp32s31_lp_reboot_notify;
 	platform_set_drvdata(pdev, lp);
 
@@ -1389,10 +1145,6 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	if (IS_ERR(lp->mailbox))
 		return PTR_ERR(lp->mailbox);
 
-	lp->lp_pms = devm_ioremap(&pdev->dev, S31_LP_PERI_PMS_BASE,
-				  S31_LP_PERI_PMS_SIZE);
-	if (!lp->lp_pms)
-		return -ENOMEM;
 	lp->lp_sys = devm_platform_ioremap_resource_byname(pdev, "lp-sys");
 	if (IS_ERR(lp->lp_sys))
 		return PTR_ERR(lp->lp_sys);
@@ -1402,21 +1154,6 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	 * previous-wake record. */
 	writel(0, lp->lp_sys + S31_LP_SYS_STORE4_REG);
 	writel(0, lp->lp_sys + S31_LP_SYS_STORE5_REG);
-	lp->rtc_timer = devm_platform_ioremap_resource_byname(pdev, "rtc-timer");
-	if (IS_ERR(lp->rtc_timer))
-		return PTR_ERR(lp->rtc_timer);
-	resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, "lp-clkrst");
-	if (!resource)
-		return -EINVAL;
-	/* LP clock/reset registers share the SoC clock-controller aperture. */
-	lp->lp_clkrst = devm_ioremap(dev, resource->start,
-				    resource_size(resource));
-	if (!lp->lp_clkrst)
-		return -ENOMEM;
-
-	lp->pmu = syscon_regmap_lookup_by_phandle(dev->of_node, "espressif,pmu");
-	if (IS_ERR(lp->pmu))
-		return dev_err_probe(dev, PTR_ERR(lp->pmu), "failed to get PMU syscon\n");
 
 	spin_lock_init(&lp->tx_state_lock);
 	spin_lock_init(&lp->rx_lock);
@@ -1433,14 +1170,6 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, esp32s31_lp_fifo_free, lp);
 	if (ret)
 		return ret;
-
-	writel(readl(lp->mailbox + S31_MB_CLK_REG) | S31_MB_CLK_EN,
-	       lp->mailbox + S31_MB_CLK_REG);
-	writel(readl(lp->lp_clkrst + S31_LP_CLKRST_MAILBOX_REG) |
-	       S31_LP_MAILBOX_CLK_EN,
-	       lp->lp_clkrst + S31_LP_CLKRST_MAILBOX_REG);
-	writel(~0U, lp->mailbox + S31_MB_HP_CLR);
-	writel(S31_MB_IRQ_MASK, lp->mailbox + S31_MB_HP_ENA);
 
 	lp->irq = platform_get_irq(pdev, 0);
 	if (lp->irq < 0)
@@ -1490,8 +1219,8 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	/* The firmware lives in the SquashFS root, which is mounted after probe. */
-	rproc->auto_boot = false;
+	rproc->state = RPROC_DETACHED;
+	rproc->auto_boot = true;
 	ret = devm_rproc_add(dev, rproc);
 	if (ret)
 		return ret;
