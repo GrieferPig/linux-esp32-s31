@@ -13,6 +13,14 @@
 	status = "okay";
 };
 
+&axi_gdma {
+	status = "okay";
+};
+
+&cam {
+	status = "okay";
+};
+
 /* The USB host connector and its VBUS supply belong to the carrier. */
 &usb_otghs {
 	status = "disabled";

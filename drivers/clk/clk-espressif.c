@@ -77,6 +77,9 @@
 #define HP_PPA_CTRL0			0xb4
 #define HP_JPEG_CTRL0			0xb8
 #define HP_RMT_CTRL0			0xbc
+#define HP_LCDCAM_CTRL0			0x14c
+#define HP_LCDCAM_LCDCAM_CTRL0		0x154
+#define HP_LCDCAM_CAM_CTRL0		0x158
 #define HP_UART0_CTRL0			0x88
 #define HP_UART_CTRL_STRIDE		0x04
 #define HP_GPSPI2_CTRL0			0x6c
@@ -188,6 +191,18 @@
 #define HP_SYS_PPA_MEM_LP_CTRL		0x29c
 #define HP_SYS_PPA_MEM_LP_EN		BIT(2)
 #define HP_SYS_PPA_MEM_FORCE_CTRL	BIT(3)
+/* S31 TRM ch.39 LCD_CAM / IDF cam_ll_enable_bus_clock(), cam_ll_reset_register(), cam_ll_enable_clk(). */
+#define HP_LCDCAM_APB_CLK_EN		BIT(0)
+#define HP_LCDCAM_APB_RST_EN		BIT(1)
+#define HP_LCDCAM_SYS_CLK_EN		BIT(2)
+#define HP_LCDCAM_RST_EN		BIT(3)
+#define HP_LCDCAM_FORCE_NORST		BIT(4)
+#define HP_LCDCAM_CLK_SRC_SEL		GENMASK(1, 0)
+#define HP_LCDCAM_CLK_EN		BIT(2)
+#define HP_LCDCAM_CLK_DIV_NUM		GENMASK(10, 3)
+#define HP_SYS_LCDCAM_MEM_LP_CTRL	0x264
+#define HP_SYS_LCDCAM_MEM_LP_EN		BIT(2)
+#define HP_SYS_LCDCAM_MEM_FORCE_CTRL	BIT(3)
 /* S31 TRM ch.52 RMT / IDF rmt_ll_enable_bus_clock(), rmt_ll_reset_register(), rmt_ll_mem_force_power_on(). */
 #define HP_RMT_SYS_CLK_EN		BIT(0)
 #define HP_RMT_RST_EN			BIT(1)
@@ -296,6 +311,7 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_RMT,
 	ESP32S31_CLK_KIND_JPEG,
 	ESP32S31_CLK_KIND_PPA,
+	ESP32S31_CLK_KIND_CAM,
 	ESP32S31_CLK_KIND_GENERIC,
 };
 
@@ -387,6 +403,9 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 		HP_JPEG_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_PPA] = { HP_PPA_CTRL0, HP_PPA_RST_EN,
 		HP_PPA_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_CAM] = { HP_LCDCAM_CTRL0,
+		HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
+		HP_LCDCAM_FORCE_NORST, ESP32S31_BANK_HP },
 };
 
 static void __iomem *esp32s31_reset_base(struct esp32s31_clk_priv *priv,
@@ -718,6 +737,28 @@ static void esp32s31_ppa_prepare(struct esp32s31_clk_priv *priv)
 		     HP_PPA_SYS_CLK_EN | HP_PPA_FORCE_NORST);
 }
 
+static void esp32s31_cam_prepare(struct esp32s31_clk_priv *priv)
+{
+	/*
+	 * S31 TRM ch.39 LCD_CAM / IDF cam_ll_enable_bus_clock(), cam_ll_enable_clk():
+	 * Force-power-on LCDCAM internal SRAM (+0x264), enable APB/SYS/LCDCAM core
+	 * clocks, and enable CAM XCLK (XTAL 40 MHz / 2 = 20 MHz).
+	 */
+	esp32s31_rmw(priv->hp_sys, HP_SYS_LCDCAM_MEM_LP_CTRL,
+		     HP_SYS_LCDCAM_MEM_LP_EN | HP_SYS_LCDCAM_MEM_FORCE_CTRL,
+		     HP_SYS_LCDCAM_MEM_FORCE_CTRL);
+	esp32s31_rmw(priv->hp, HP_LCDCAM_CTRL0,
+		     HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
+		     HP_LCDCAM_APB_CLK_EN | HP_LCDCAM_SYS_CLK_EN |
+		     HP_LCDCAM_FORCE_NORST);
+	esp32s31_rmw(priv->hp, HP_LCDCAM_LCDCAM_CTRL0,
+		     HP_LCDCAM_CLK_SRC_SEL | HP_LCDCAM_CLK_DIV_NUM,
+		     FIELD_PREP(HP_LCDCAM_CLK_SRC_SEL, 1) | HP_LCDCAM_CLK_EN);
+	esp32s31_rmw(priv->hp, HP_LCDCAM_CAM_CTRL0,
+		     HP_LCDCAM_CLK_SRC_SEL | HP_LCDCAM_CLK_DIV_NUM,
+		     FIELD_PREP(HP_LCDCAM_CLK_DIV_NUM, 1) | HP_LCDCAM_CLK_EN);
+}
+
 static void esp32s31_rmt_prepare(struct esp32s31_clk_priv *priv)
 {
 	/*
@@ -846,6 +887,12 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_PPA:
 		if (!clk->initialized) {
 			esp32s31_ppa_prepare(priv);
+			clk->initialized = true;
+		}
+		break;
+	case ESP32S31_CLK_KIND_CAM:
+		if (!clk->initialized) {
+			esp32s31_cam_prepare(priv);
 			clk->initialized = true;
 		}
 		break;
@@ -978,6 +1025,13 @@ static void esp32s31_clk_unprepare(struct clk_hw *hw)
 		esp32s31_rmw(priv->hp, HP_PPA_CTRL0, HP_PPA_SYS_CLK_EN, 0);
 		clk->initialized = false;
 		break;
+	case ESP32S31_CLK_KIND_CAM:
+		esp32s31_rmw(priv->hp, HP_LCDCAM_CAM_CTRL0, HP_LCDCAM_CLK_EN, 0);
+		esp32s31_rmw(priv->hp, HP_LCDCAM_LCDCAM_CTRL0, HP_LCDCAM_CLK_EN, 0);
+		esp32s31_rmw(priv->hp, HP_LCDCAM_CTRL0,
+			     HP_LCDCAM_APB_CLK_EN | HP_LCDCAM_SYS_CLK_EN, 0);
+		clk->initialized = false;
+		break;
 	case ESP32S31_CLK_KIND_GENERIC:
 		esp32s31_rmw(priv->hp, clk->reg, clk->enable_mask, 0);
 		clk->initialized = false;
@@ -1047,6 +1101,9 @@ static int esp32s31_clk_is_prepared(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_PPA:
 		return !!(readl(priv->hp + HP_PPA_CTRL0) &
 			  HP_PPA_SYS_CLK_EN);
+	case ESP32S31_CLK_KIND_CAM:
+		return !!(readl(priv->hp + HP_LCDCAM_CAM_CTRL0) &
+			  HP_LCDCAM_CLK_EN);
 	case ESP32S31_CLK_KIND_GENERIC:
 		reg = readl(priv->hp + clk->reg);
 		return (reg & clk->enable_mask) == clk->enable_mask;
@@ -1932,6 +1989,11 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_PPA,
 				    "ppa", ESP32S31_CLK_KIND_PPA,
 				    sys_rate);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_CAM,
+				    "cam", ESP32S31_CLK_KIND_CAM,
+				    ESP32S31_XTAL_RATE / 2);
 	if (ret)
 		return ret;
 

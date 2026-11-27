@@ -4,3 +4,4 @@ obj-$(CONFIG_VIDEO_ESP32P4_PPA) += esp32p4-ppa.o
 obj-$(CONFIG_VIDEO_ESP32P4_JPEG) += esp32p4-jpeg.o
 obj-$(CONFIG_VIDEO_ESP32S31_JPEG) += esp32s31-jpeg.o
 obj-$(CONFIG_VIDEO_ESP32S31_PPA) += esp32s31-ppa.o
+obj-$(CONFIG_VIDEO_ESP32S31_CAM) += esp32s31-cam.o

@@ -1213,6 +1213,20 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.39 LCD_CAM DVP / IDF cam_ll.h + gdma_channel.h (CAM0=0). */
+		cam: cam@20396000 {
+			compatible = "espressif,esp32s31-cam";
+			reg = <0x20396000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_CAM>;
+			resets = <&clkc ESP32S31_RST_CAM>;
+			dmas = <&axi_gdma 1 0>;
+			dma-names = "rx";
+			bus-width = <8>;
+			status = "disabled";
+		};
+
 		gptimer0: timer@20580000 {
 			compatible = "espressif,esp32s31-gptimer";
 			reg = <0x20580000 0x48>;

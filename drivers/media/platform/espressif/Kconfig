@@ -49,3 +49,12 @@ config VIDEO_ESP32S31_PPA
 	help
 	  V4L2 memory-to-memory scaling, rotation, mirroring (SRM), solid fill,
 	  and alpha blending through the ESP32-S31 PPA and 2D-DMA.
+
+config VIDEO_ESP32S31_CAM
+	tristate "ESP32-S31 LCD_CAM DVP camera capture"
+	depends on SOC_ESP32S31 && VIDEO_DEV && ESPRESSIF_GDMA_AXI
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  V4L2 video capture driver for the ESP32-S31 LCD_CAM parallel DVP
+	  camera receiver using AXI-GDMA.

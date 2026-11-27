@@ -127,6 +127,11 @@
 	status = "okay";
 };
 
+/* Korvo-1 owns LCD_CAM @20396000 for its 16-bit RGB LCD panel. */
+&cam {
+	status = "disabled";
+};
+
 /* S31 TRM ch.49 SDHOST; Korvo-1 populates SDMMC slot 0. */
 &sdmmc {
 	vmmc-supply = <&sd_vcc>;
