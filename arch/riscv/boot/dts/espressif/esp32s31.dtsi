@@ -185,6 +185,22 @@
 			status = "disabled";
 		};
 
+		/* S31 TRM ch.6 2D-DMA and ch.12 Interrupt Matrix — two M2M TX/RX pairs. */
+		dma2d: dma-controller@20346000 {
+			compatible = "espressif,esp32s31-dma2d";
+			reg = <0x20346000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <108 IRQ_TYPE_LEVEL_HIGH>,
+				     <105 IRQ_TYPE_LEVEL_HIGH>,
+				     <109 IRQ_TYPE_LEVEL_HIGH>,
+				     <106 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx0", "rx0", "tx1", "rx1";
+			clocks = <&clkc ESP32S31_CLK_DMA2D>;
+			resets = <&clkc ESP32S31_RST_DMA2D>;
+			#dma-cells = <1>;
+			status = "okay";
+		};
+
 		uhci0: serial@2038a000 {
 			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038a000 0x1000>;

@@ -98,6 +98,7 @@ struct esp_dma2d_soc {
 	u32 ext_start;
 	u32 ext_end;
 	bool has_srm;
+	bool noncoherent_desc;
 };
 
 struct esp_dma2d_chan {
@@ -110,6 +111,7 @@ struct esp_dma2d_chan {
 	int tx_irq;
 	int rx_irq;
 	bool has_srm;
+	bool noncoherent_desc;
 };
 
 struct esp_dma2d {
@@ -127,7 +129,14 @@ static void esp_dma2d_desc_free(struct virt_dma_desc *vd)
 	struct esp_dma2d_desc *desc = container_of(vd, struct esp_dma2d_desc, vd);
 	struct esp_dma2d_chan *chan = to_dma2d_chan(vd->tx.chan);
 
-	dma_pool_free(chan->pool, desc->hw, desc->dma);
+	if (chan->noncoherent_desc) {
+		if (desc->dma)
+			dma_unmap_single(chan->vc.chan.device->dev, desc->dma,
+					 2 * sizeof(*desc->hw), DMA_TO_DEVICE);
+		kfree(desc->hw);
+	} else {
+		dma_pool_free(chan->pool, desc->hw, desc->dma);
+	}
 	kfree(desc);
 }
 
@@ -139,13 +148,37 @@ static struct esp_dma2d_desc *esp_dma2d_alloc(struct esp_dma2d_chan *chan)
 	if (!desc)
 		return NULL;
 
-	desc->hw = dma_pool_zalloc(chan->pool, GFP_ATOMIC, &desc->dma);
+	if (chan->noncoherent_desc)
+		desc->hw = kzalloc(ALIGN(2 * sizeof(*desc->hw), ARCH_DMA_MINALIGN),
+				   GFP_ATOMIC);
+	else
+		desc->hw = dma_pool_zalloc(chan->pool, GFP_ATOMIC, &desc->dma);
 	if (!desc->hw) {
 		kfree(desc);
 		return NULL;
 	}
 
 	return desc;
+}
+
+static int esp_dma2d_map_desc(struct esp_dma2d_chan *chan,
+			      struct esp_dma2d_desc *desc)
+{
+	struct device *dev = chan->vc.chan.device->dev;
+
+	if (!chan->noncoherent_desc)
+		return 0;
+
+	desc->dma = dma_map_single(dev, desc->hw, 2 * sizeof(*desc->hw),
+				   DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, desc->dma)) {
+		desc->dma = 0;
+		kfree(desc->hw);
+		kfree(desc);
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 static struct dma_async_tx_descriptor *
@@ -172,6 +205,9 @@ esp_dma2d_prep_memcpy(struct dma_chan *dchan, dma_addr_t dst,
 	desc->hw[0].buffer = cpu_to_le32(src);
 	desc->hw[1].buffer = cpu_to_le32(dst);
 
+	if (esp_dma2d_map_desc(chan, desc))
+		return NULL;
+
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 
@@ -197,6 +233,10 @@ esp_dma2d_prep_interleaved(struct dma_chan *dchan,
 	    check_add_overflow(width, dmaengine_get_dst_icg(xt, xt->sgl), &dst_stride) ||
 	    src_stride > D2D_COUNT_MAX || dst_stride > D2D_COUNT_MAX)
 		return NULL;
+	/* S31 PSRAM writes have 2-byte minimum granularity; odd widths overwrite the first gap byte. */
+	if (chan->noncoherent_desc &&
+	    !IS_ALIGNED(xt->dst_start | width | dst_stride, 2))
+		return NULL;
 
 	desc = esp_dma2d_alloc(chan);
 	if (!desc)
@@ -213,6 +253,9 @@ esp_dma2d_prep_interleaved(struct dma_chan *dchan,
 					FIELD_PREP(D2D_DESC_HORIZ, dst_stride) | rows);
 	desc->hw[0].buffer = cpu_to_le32(xt->src_start);
 	desc->hw[1].buffer = cpu_to_le32(xt->dst_start);
+
+	if (esp_dma2d_map_desc(chan, desc))
+		return NULL;
 
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
@@ -525,10 +568,15 @@ static int esp_dma2d_probe(struct platform_device *pdev)
 	if (!dma)
 		return -ENOMEM;
 
-	pool = dmam_pool_create("esp-dma2d", dev, 2 * sizeof(struct esp_dma2d_hw_desc),
-				__alignof__(struct esp_dma2d_hw_desc), 0);
-	if (!pool)
-		return -ENOMEM;
+	if (soc->noncoherent_desc) {
+		pool = NULL;
+	} else {
+		pool = dmam_pool_create("esp-dma2d", dev,
+					2 * sizeof(struct esp_dma2d_hw_desc),
+					__alignof__(struct esp_dma2d_hw_desc), 0);
+		if (!pool)
+			return -ENOMEM;
+	}
 
 	engine = &dma->engine;
 	engine->dev = dev;
@@ -550,6 +598,7 @@ static int esp_dma2d_probe(struct platform_device *pdev)
 
 		chan->pool = pool;
 		chan->has_srm = soc->has_srm;
+		chan->noncoherent_desc = soc->noncoherent_desc;
 		chan->tx = base + i * D2D_CH_STRIDE;
 		chan->rx = base + D2D_RX_BASE + i * D2D_CH_STRIDE;
 		chan->tx_irq = platform_get_irq(pdev, 2 * i);
@@ -597,12 +646,16 @@ static const struct esp_dma2d_soc esp32p4_dma2d = {
 	.has_srm = true,
 };
 
-/* The S31 uses the same descriptor and channel registers with its bus apertures. */
+/* The S31 uses the same descriptor and channel registers with its bus apertures.
+ * S31 PSRAM is non-coherent without Svpbmt, so descriptors must be streamed via
+ * dma_map_single() to flush D-cache before starting 2D-DMA.
+ */
 static const struct esp_dma2d_soc esp32s31_dma2d = {
 	.sram_start = 0x2f000000,
 	.sram_end = 0x2f07ffff,
 	.ext_start = 0x50000000,
 	.ext_end = 0x53ffffff,
+	.noncoherent_desc = true,
 };
 
 static const struct of_device_id esp_dma2d_of_match[] = {

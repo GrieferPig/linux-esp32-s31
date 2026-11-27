@@ -73,6 +73,7 @@
 #define HP_SDIO_HOST_CTRL0		0xc0
 #define HP_SDIO_HOST_FUNC_CTRL0		0xc4
 #define HP_EMAC_CTRL0			0xc8
+#define HP_DMA2D_CTRL0			0xb0
 #define HP_UART0_CTRL0			0x88
 #define HP_UART_CTRL_STRIDE		0x04
 #define HP_GPSPI2_CTRL0			0x6c
@@ -163,6 +164,13 @@
 #define HP_SYS_TWAI1_MEM_LP_CTRL		0x2a4
 #define HP_SYS_TWAI_MEM_LP_EN		BIT(2)
 #define HP_SYS_TWAI_MEM_FORCE_CTRL	BIT(3)
+/* S31 TRM ch.6 2D-DMA / IDF dma2d_ll_enable_bus_clock(), dma2d_ll_reset_register(), dma2d_ll_mem_force_power_on(). */
+#define HP_DMA2D_SYS_CLK_EN		BIT(0)
+#define HP_DMA2D_RST_EN			BIT(1)
+#define HP_DMA2D_FORCE_NORST		BIT(2)
+#define HP_SYS_DMA2D_MEM_LP_CTRL		0x210
+#define HP_SYS_DMA2D_MEM_LP_EN		BIT(2)
+#define HP_SYS_DMA2D_MEM_FORCE_CTRL	BIT(3)
 
 #define CNNT_CLK_EN			0x00
 #define CNNT_SYS_SDMMC_MEM_LP_CTRL	0x10
@@ -255,6 +263,7 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_TWAI0,
 	ESP32S31_CLK_KIND_TWAI1,
 	ESP32S31_CLK_KIND_WDT1,
+	ESP32S31_CLK_KIND_DMA2D,
 	ESP32S31_CLK_KIND_GENERIC,
 };
 
@@ -338,6 +347,8 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 		HP_I2S_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_I2S1] = { HP_I2S0_APB_CTRL0 + HP_I2S_CTRL_STRIDE,
 		HP_I2S_APB_RST_EN, HP_I2S_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_DMA2D] = { HP_DMA2D_CTRL0, HP_DMA2D_RST_EN,
+		HP_DMA2D_FORCE_NORST, ESP32S31_BANK_HP },
 };
 
 static void __iomem *esp32s31_reset_base(struct esp32s31_clk_priv *priv,
@@ -627,6 +638,20 @@ static void esp32s31_twai_prepare(struct esp32s31_clk_priv *priv,
 	esp32s31_rmw(priv->hp, reg, HP_TWAI_RST_EN, 0);
 }
 
+static void esp32s31_dma2d_prepare(struct esp32s31_clk_priv *priv)
+{
+	/*
+	 * S31 TRM ch.6 2D-DMA / IDF dma2d_ll_mem_force_power_on() and
+	 * dma2d_ll_enable_bus_clock(): 2D-DMA memory defaults to powered down
+	 * in HP_SYSTEM_DMA2D_MEM_LP_CTRL_REG (LP_EN=1, LP_MODE=2).
+	 */
+	esp32s31_rmw(priv->hp_sys, HP_SYS_DMA2D_MEM_LP_CTRL,
+		     HP_SYS_DMA2D_MEM_LP_EN | HP_SYS_DMA2D_MEM_FORCE_CTRL,
+		     HP_SYS_DMA2D_MEM_FORCE_CTRL);
+	esp32s31_rmw(priv->hp, HP_DMA2D_CTRL0, HP_DMA2D_RST_EN,
+		     HP_DMA2D_SYS_CLK_EN | HP_DMA2D_FORCE_NORST);
+}
+
 static int esp32s31_clk_prepare(struct clk_hw *hw)
 {
 	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
@@ -714,6 +739,12 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_WDT1:
 		if (!clk->initialized) {
 			esp32s31_wdt1_prepare(priv);
+			clk->initialized = true;
+		}
+		break;
+	case ESP32S31_CLK_KIND_DMA2D:
+		if (!clk->initialized) {
+			esp32s31_dma2d_prepare(priv);
 			clk->initialized = true;
 		}
 		break;
@@ -829,6 +860,10 @@ static void esp32s31_clk_unprepare(struct clk_hw *hw)
 			      HP_TIMERGRP_APB_CLK_EN | HP_TIMERGRP_WDT_CLK_EN, 0);
 		clk->initialized = false;
 		break;
+	case ESP32S31_CLK_KIND_DMA2D:
+		esp32s31_rmw(priv->hp, HP_DMA2D_CTRL0, HP_DMA2D_SYS_CLK_EN, 0);
+		clk->initialized = false;
+		break;
 	case ESP32S31_CLK_KIND_GENERIC:
 		esp32s31_rmw(priv->hp, clk->reg, clk->enable_mask, 0);
 		clk->initialized = false;
@@ -885,6 +920,9 @@ static int esp32s31_clk_is_prepared(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_WDT1:
 		return !!(readl(priv->hp + HP_TIMERGRP1_CTRL0) &
 			  HP_TIMERGRP_WDT_CLK_EN);
+	case ESP32S31_CLK_KIND_DMA2D:
+		return !!(readl(priv->hp + HP_DMA2D_CTRL0) &
+			  HP_DMA2D_SYS_CLK_EN);
 	case ESP32S31_CLK_KIND_GENERIC:
 		reg = readl(priv->hp + clk->reg);
 		return (reg & clk->enable_mask) == clk->enable_mask;
@@ -1750,6 +1788,11 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_I2S1,
 				    "i2s1", ESP32S31_CLK_KIND_I2S1,
 				    12288000UL);
+	if (ret)
+		return ret;
+	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_DMA2D,
+				    "dma2d", ESP32S31_CLK_KIND_DMA2D,
+				    sys_rate);
 	if (ret)
 		return ret;
 

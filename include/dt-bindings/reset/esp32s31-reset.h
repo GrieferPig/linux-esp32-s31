@@ -29,7 +29,8 @@
 #define ESP32S31_RST_GPSPI3		24
 #define ESP32S31_RST_I2S0		25
 #define ESP32S31_RST_I2S1		26
+#define ESP32S31_RST_DMA2D		27
 
-#define ESP32S31_RST_NR			27
+#define ESP32S31_RST_NR			28
 
 #endif
