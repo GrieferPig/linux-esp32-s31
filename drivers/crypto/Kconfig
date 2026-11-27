@@ -25,6 +25,16 @@ config CRYPTO_DEV_ESP32S31
 	  ESP32-S31.  RSA is exposed through the akcipher API and ECC point
 	  multiplication through the P-256 and P-384 ECDH KPP algorithms.
 
+config CRYPTO_DEV_ESP32S31_ECDSA
+	tristate "Espressif ESP32-S31 ECDSA verification"
+	depends on SOC_ESP32S31 && OF && ESP32S31_RADIO_SMODE_DRIVER
+	select CRYPTO_ECDSA
+	help
+	  Verify P-256 and P-384 signatures in the ESP32-S31 ECDSA accelerator.
+	  Submit operations to the ESP-IDF crypto owner shared with Wi-Fi and BT.
+	  The device tree selects the firmware-backed accelerator. The firmware
+	  must advertise the matching ECDSA control ABI.
+
 config CRYPTO_DEV_ESP32P4
 	tristate "Espressif ESP32-P4 crypto accelerators"
 	depends on SOC_ESP32P4 && OF

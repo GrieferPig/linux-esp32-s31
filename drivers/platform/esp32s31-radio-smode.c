@@ -3890,7 +3890,8 @@ void s31_radio_wifi_ap_station(const u8 *mac, bool joined)
 	rcu_read_unlock();
 }
 
-int esp32s31_radio_wifi_control(const struct s31_wifi_control *control)
+static int s31_radio_control(const struct s31_wifi_control *control,
+			     struct s31_wifi_control *reply)
 {
 	struct s31_radio_command command = { .type = S31_RADIO_COMMAND_WIFI_CONTROL };
 	int ret;
@@ -3921,6 +3922,9 @@ int esp32s31_radio_wifi_control(const struct s31_wifi_control *control)
 		ret = -ETIMEDOUT;
 	} else if (!ret) {
 		ret = READ_ONCE(s31_wifi_control_result);
+		if (!ret && reply)
+			memcpy(reply, s31_radio_sram_linux_alias(s31_wifi_control_buffer),
+			       sizeof(*reply));
 	}
 	if (!s31_wifi_control_poisoned)
 		memzero_explicit(s31_radio_sram_linux_alias(s31_wifi_control_buffer),
@@ -3929,7 +3933,21 @@ out:
 	mutex_unlock(&s31_wifi_control_mutex);
 	return ret;
 }
+
+int esp32s31_radio_wifi_control(const struct s31_wifi_control *control)
+{
+	return s31_radio_control(control, NULL);
+}
 EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_control);
+
+int esp32s31_radio_security_control(struct s31_wifi_control *control)
+{
+	if (control->operation < S31_RADIO_SECURITY_CAP ||
+	    control->operation > S31_RADIO_ECDSA_VERIFY)
+		return -EINVAL;
+	return s31_radio_control(control, control);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_security_control);
 
 bool esp32s31_radio_wifi_tx_has_space(void)
 {

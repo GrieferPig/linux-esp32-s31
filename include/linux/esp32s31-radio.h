@@ -129,6 +129,7 @@ bool esp32s31_radio_softmac_tx_cancel(u32 cookie, u32 epoch);
 /* Sleepable cold drain; callers close/join submitters before calling. */
 void esp32s31_radio_softmac_tx_quiesce(u32 epoch);
 int esp32s31_radio_wifi_control(const struct s31_wifi_control *control);
+int esp32s31_radio_security_control(struct s31_wifi_control *control);
 bool esp32s31_radio_wifi_tx_has_space(void);
 bool esp32s31_radio_wifi_rx_pending(void);
 void esp32s31_radio_wifi_rx_complete(void);

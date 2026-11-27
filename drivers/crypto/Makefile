@@ -40,6 +40,7 @@ obj-$(CONFIG_CRYPTO_DEV_TEGRA) += tegra/
 obj-$(CONFIG_CRYPTO_DEV_VIRTIO) += virtio/
 #obj-$(CONFIG_CRYPTO_DEV_VMX) += vmx/
 obj-$(CONFIG_CRYPTO_DEV_BCM_SPU) += bcm/
+obj-$(CONFIG_CRYPTO_DEV_ESP32S31_ECDSA)	+= esp32s31-ecdsa.o
 obj-$(CONFIG_CRYPTO_DEV_ESPRESSIF) += espressif-crypto.o
 obj-$(CONFIG_CRYPTO_DEV_SAFEXCEL) += inside-secure/
 obj-$(CONFIG_CRYPTO_DEV_ARTPEC6) += axis/

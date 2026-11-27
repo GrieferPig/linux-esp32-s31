@@ -49,6 +49,8 @@ enum s31_wifi_control_op {
 	S31_WIFI_SOFTMAC_TX_VIEW_CAP = 28,
 	S31_WIFI_SOFTMAC_COEX_BSS = 31,
 	S31_WIFI_SOFTMAC_TX_BATCH_CAP = 33,
+	S31_RADIO_SECURITY_CAP = 34,
+	S31_RADIO_ECDSA_VERIFY = 35,
 };
 
 /* Exact association selection, independent of credential representation. */
@@ -113,6 +115,18 @@ struct s31_wifi_control {
 	uint32_t total;
 	uint32_t length;
 	uint8_t data[S31_EAP_CHUNK];
+};
+
+#define S31_RADIO_SECURITY_ABI 1U
+#define S31_RADIO_ECDSA_MAX_BYTES 48U
+
+/* Little-endian parameters for the shared ROM/IDF crypto owner. */
+struct s31_radio_ecdsa_request {
+	uint8_t digest[S31_RADIO_ECDSA_MAX_BYTES];
+	uint8_t r[S31_RADIO_ECDSA_MAX_BYTES];
+	uint8_t s[S31_RADIO_ECDSA_MAX_BYTES];
+	uint8_t x[S31_RADIO_ECDSA_MAX_BYTES];
+	uint8_t y[S31_RADIO_ECDSA_MAX_BYTES];
 };
 
 #define S31_WIFI_IF_STA 0U
