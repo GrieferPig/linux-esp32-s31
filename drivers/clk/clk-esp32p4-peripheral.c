@@ -67,6 +67,16 @@
 /* TRM rev1.3 ch.10 and ch.33.7: JPEG_SYS_CLK_EN and RST_EN_JPEG. */
 #define JPEG_SYS_EN		BIT(8)
 #define HP_JPEG_RESET		BIT(30)
+/* TRM rev1.3 ch.10: LCD_CAM, ISP, and H.264 clocks and resets (hw_ver1). */
+#define LCDCAM_APB_EN		BIT(1)	/* SOC_CLK3 (+0x20) */
+#define LCD_CLK_EN		BIT(31)	/* I2S_CLK19 (+0x64) */
+#define CAM_CLK_EN		BIT(29)	/* I3C_CLK119 (+0x8c) */
+#define ISP_CLK_EN		BIT(25)	/* CRYPTO_CLK25 (+0xa8) */
+#define H264_SYS_EN		BIT(31)	/* SOC_CLK1 (+0x18) */
+#define H264_CLK_EN		BIT(19)	/* IOMUX_CLK26 (+0xac) */
+#define HP_ISP_RESET		BIT(29)	/* HP_RST0 (+0xc0) */
+#define HP_LCDCAM_RESET		BIT(9)	/* HP_RST2 (+0xc8) */
+#define HP_H264_RESET		BIT(24)	/* HP_RST2 (+0xc8) */
 /* TRM ch.12 Reset and Clock — UHCI_SYS_CLK_EN, APB_CLK_EN and RST_EN. */
 #define UHCI_SYS_EN		BIT(17)
 #define UHCI_APB_EN		BIT(6)
@@ -601,6 +611,24 @@ static int p4_clk_enable(struct clk_hw *hw)
 	case ESP32P4_CLK_JPEG:
 		p4_update(cc, SOC_CLK1, JPEG_SYS_EN, JPEG_SYS_EN);
 		break;
+	case ESP32P4_CLK_LCDCAM:
+		p4_update(cc, SOC_CLK3, LCDCAM_APB_EN, LCDCAM_APB_EN);
+		break;
+	case ESP32P4_CLK_LCD:
+		p4_update(cc, SOC_CLK3, LCDCAM_APB_EN, LCDCAM_APB_EN);
+		p4_update(cc, I2S_CLK19, LCD_CLK_EN, LCD_CLK_EN);
+		break;
+	case ESP32P4_CLK_CAM:
+		p4_update(cc, SOC_CLK3, LCDCAM_APB_EN, LCDCAM_APB_EN);
+		p4_update(cc, I3C_CLK119, CAM_CLK_EN, CAM_CLK_EN);
+		break;
+	case ESP32P4_CLK_ISP:
+		p4_update(cc, CRYPTO_CLK25, ISP_CLK_EN, ISP_CLK_EN);
+		break;
+	case ESP32P4_CLK_H264:
+		p4_update(cc, SOC_CLK1, H264_SYS_EN, H264_SYS_EN);
+		p4_update(cc, IOMUX_CLK26, H264_CLK_EN, H264_CLK_EN);
+		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, PPA_SYS_EN);
 		break;
@@ -781,6 +809,22 @@ static void p4_clk_disable(struct clk_hw *hw)
 		break;
 	case ESP32P4_CLK_JPEG:
 		p4_update(cc, SOC_CLK1, JPEG_SYS_EN, 0);
+		break;
+	case ESP32P4_CLK_LCDCAM:
+		p4_update(cc, SOC_CLK3, LCDCAM_APB_EN, 0);
+		break;
+	case ESP32P4_CLK_LCD:
+		p4_update(cc, I2S_CLK19, LCD_CLK_EN, 0);
+		break;
+	case ESP32P4_CLK_CAM:
+		p4_update(cc, I3C_CLK119, CAM_CLK_EN, 0);
+		break;
+	case ESP32P4_CLK_ISP:
+		p4_update(cc, CRYPTO_CLK25, ISP_CLK_EN, 0);
+		break;
+	case ESP32P4_CLK_H264:
+		p4_update(cc, IOMUX_CLK26, H264_CLK_EN, 0);
+		p4_update(cc, SOC_CLK1, H264_SYS_EN, 0);
 		break;
 	case ESP32P4_CLK_PPA:
 		p4_update(cc, SOC_CLK1, PPA_SYS_EN, 0);
@@ -1222,6 +1266,18 @@ static int p4_reset(struct reset_controller_dev *rcdev, unsigned long id)
 		reg = HP_RST0;
 		bit = HP_JPEG_RESET;
 		break;
+	case ESP32P4_RST_LCDCAM:
+		reg = HP_RST2;
+		bit = HP_LCDCAM_RESET;
+		break;
+	case ESP32P4_RST_ISP:
+		reg = HP_RST0;
+		bit = HP_ISP_RESET;
+		break;
+	case ESP32P4_RST_H264:
+		reg = HP_RST2;
+		bit = HP_H264_RESET;
+		break;
 	case ESP32P4_RST_PPA:
 		reg = HP_RST1;
 		bit = HP_PPA_RESET;
@@ -1329,6 +1385,7 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 		"p4-lp-uart",
 		"p4-usbfs", "p4-adc", "p4-ppa", "p4-uhci", "p4-i3c",
 		"p4-parlio-bus", "p4-parlio-rx", "p4-parlio-tx", "p4-jpeg",
+		"p4-lcdcam", "p4-lcd", "p4-cam", "p4-isp", "p4-h264",
 	};
 	struct device *dev = &pdev->dev;
 	struct clk_hw_onecell_data *data;
@@ -1398,6 +1455,11 @@ static int p4_peripheral_probe(struct platform_device *pdev)
 					i == ESP32P4_CLK_AXI_GDMA ||
 					i == ESP32P4_CLK_DMA2D || i == ESP32P4_CLK_PPA ||
 					i == ESP32P4_CLK_JPEG ||
+					i == ESP32P4_CLK_LCDCAM ||
+					i == ESP32P4_CLK_LCD ||
+					i == ESP32P4_CLK_CAM ||
+					i == ESP32P4_CLK_ISP ||
+					i == ESP32P4_CLK_H264 ||
 					i == ESP32P4_CLK_UHCI ||
 					i == ESP32P4_CLK_PCNT) ? 0 : 1,
 		};

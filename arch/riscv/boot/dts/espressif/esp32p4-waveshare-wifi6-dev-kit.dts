@@ -1010,6 +1010,14 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	/delete-property/ status;
 };
 
+&isp {
+	status = "okay";
+};
+
+&h264 {
+	status = "okay";
+};
+
 &dma2d {
 	/delete-property/ status;
 };

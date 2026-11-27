@@ -248,5 +248,43 @@
 			resets = <&periphclk ESP32P4_RST_RMT>;
 			status = "disabled";
 		};
+
+		/* TRM rev1.3 ch.37 LCD_CAM — parallel LCD & DVP camera (IRQ 36, AXI-GDMA 0). */
+		lcdcam: lcdcam@500dc000 {
+			compatible = "espressif,esp32p4-lcdcam";
+			reg = <0x500dc000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <36 4>;
+			clocks = <&periphclk ESP32P4_CLK_LCD>,
+				 <&periphclk ESP32P4_CLK_CAM>;
+			clock-names = "lcd", "cam";
+			resets = <&periphclk ESP32P4_RST_LCDCAM>;
+			dmas = <&axi_dma 1 0>, <&axi_dma 2 0>;
+			dma-names = "tx", "rx";
+			status = "disabled";
+		};
+
+		/* TRM rev1.3 ch.39 ISP — control interface (0x500a1000, IRQ 100). */
+		isp: isp@500a1000 {
+			compatible = "espressif,esp32p4-isp";
+			reg = <0x500a1000 0x1000>;
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <100 4>;
+			clocks = <&periphclk ESP32P4_CLK_ISP>;
+			resets = <&periphclk ESP32P4_RST_ISP>;
+			status = "disabled";
+		};
+
+		/* TRM rev1.3 ch.34 H.264 encoder (0x50084000) + H264 2D-DMA (0x500a7000, IRQ 126). */
+		h264: h264@50084000 {
+			compatible = "espressif,esp32p4-h264";
+			reg = <0x50084000 0x1000>, <0x500a7000 0x1000>;
+			reg-names = "core", "dma";
+			interrupt-parent = <&{/soc/interrupt-controller@20800000}>;
+			interrupts = <126 4>;
+			clocks = <&periphclk ESP32P4_CLK_H264>;
+			resets = <&periphclk ESP32P4_RST_H264>;
+			status = "disabled";
+		};
 	};
 };

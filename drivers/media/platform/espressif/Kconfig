@@ -19,15 +19,41 @@ config VIDEO_ESP32P4_PPA
 	  through the ESP32-P4 PPA and 2D DMA.
 
 config VIDEO_ESP32P4_JPEG
-	bool "ESP32-P4 JPEG decoder"
+	bool "ESP32-P4 JPEG encoder and decoder"
 	depends on SOC_ESP32P4 && VIDEO_DEV && ESPRESSIF_DMA2D=y
 	select V4L2_JPEG_HELPER
 	select V4L2_MEM2MEM_DEV
 	select VIDEOBUF2_DMA_CONTIG
 	select VIDEOBUF2_V4L2
 	help
-	  Decode baseline grayscale JPEG images through the ESP32-P4 JPEG
-	  codec and 2D DMA using the V4L2 memory-to-memory interface.
+	  Encode and decode baseline JPEG images (grayscale and color)
+	  through the ESP32-P4 JPEG codec and 2D DMA using V4L2 M2M.
+
+config VIDEO_ESP32P4_LCDCAM
+	bool "ESP32-P4 LCD_CAM parallel LCD and DVP camera capture"
+	depends on SOC_ESP32P4 && VIDEO_DEV && ESPRESSIF_GDMA_AXI
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  Parallel RGB/I80 LCD output and V4L2 DVP camera capture through
+	  the ESP32-P4 LCD_CAM controller and AXI-GDMA.
+
+config VIDEO_ESP32P4_ISP
+	bool "ESP32-P4 ISP control interface"
+	depends on SOC_ESP32P4 && VIDEO_DEV
+	help
+	  V4L2 control and statistics interface (color, CCM, BF, sharpen,
+	  AWB, AE) for the ESP32-P4 Image Signal Processor.
+
+config VIDEO_ESP32P4_H264
+	bool "ESP32-P4 H.264 hardware encoder"
+	depends on SOC_ESP32P4 && VIDEO_DEV
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  V4L2 memory-to-memory H.264 baseline encoder through the
+	  ESP32-P4 H.264 core and dedicated H264 2D-DMA.
 
 config VIDEO_ESP32S31_JPEG
 	tristate "ESP32-S31 JPEG encoder and decoder"
