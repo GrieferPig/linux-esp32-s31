@@ -83,6 +83,9 @@
 #define HP_LCDCAM_CAM_CTRL0		0x158
 #define HP_UART0_CTRL0			0x88
 #define HP_UART_CTRL_STRIDE		0x04
+#define HP_PARLIO_BUS_CTRL0		0x98
+#define HP_PARLIO_RX_CTRL0		0x9c
+#define HP_PARLIO_TX_CTRL0		0xa0
 #define HP_GPSPI2_CTRL0			0x6c
 #define HP_GPSPI_CTRL_STRIDE		0x04
 #define HP_I2S0_APB_CTRL0		0xe4
@@ -192,6 +195,20 @@
 #define HP_SYS_PPA_MEM_LP_CTRL		0x29c
 #define HP_SYS_PPA_MEM_LP_EN		BIT(2)
 #define HP_SYS_PPA_MEM_FORCE_CTRL	BIT(3)
+/* S31 TRM ch.33 PARLIO and ESP-IDF parlio_ll.h clock-domain controls. */
+#define HP_PARLIO_SYS_CLK_EN		BIT(0)
+#define HP_PARLIO_APB_CLK_EN		BIT(1)
+#define HP_PARLIO_BUS_RST_EN		BIT(2)
+#define HP_PARLIO_CORE_RST_EN		BIT(0)
+#define HP_PARLIO_CORE_SRC		GENMASK(3, 2)
+#define HP_PARLIO_CORE_CLK_EN		BIT(4)
+#define HP_PARLIO_CORE_DIV		GENMASK(12, 5)
+#define HP_PARLIO_CORE_FRAC		GENMASK(28, 13)
+#define HP_PARLIO_EXTERNAL_SRC		3
+#define HP_ALIVE_PARLIO_PAD_CTRL	0x04
+#define HP_ALIVE_PARLIO_PAD_TX_EN	BIT(30)
+#define HP_ALIVE_PARLIO_PAD_RX_EN	BIT(31)
+
 /* S31 TRM ch.5 System and Memory / IDF cordic_ll_enable_bus_clock(),
  * cordic_ll_enable_clock() and cordic_ll_set_clock_source(): XTAL is selector 0.
  */
@@ -320,6 +337,8 @@ enum esp32s31_clk_kind {
 	ESP32S31_CLK_KIND_JPEG,
 	ESP32S31_CLK_KIND_PPA,
 	ESP32S31_CLK_KIND_CAM,
+	ESP32S31_CLK_KIND_PARLIO_RX,
+	ESP32S31_CLK_KIND_PARLIO_TX,
 	ESP32S31_CLK_KIND_GENERIC,
 };
 
@@ -415,6 +434,12 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 		HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
 		HP_LCDCAM_FORCE_NORST, ESP32S31_BANK_HP },
 	[ESP32S31_RST_CORDIC] = { HP_CORDIC_CTRL0, HP_CORDIC_APB_RST_EN,
+		0, ESP32S31_BANK_HP },
+	[ESP32S31_RST_PARLIO_BUS] = { HP_PARLIO_BUS_CTRL0, HP_PARLIO_BUS_RST_EN,
+		0, ESP32S31_BANK_HP },
+	[ESP32S31_RST_PARLIO_RX] = { HP_PARLIO_RX_CTRL0, HP_PARLIO_CORE_RST_EN,
+		0, ESP32S31_BANK_HP },
+	[ESP32S31_RST_PARLIO_TX] = { HP_PARLIO_TX_CTRL0, HP_PARLIO_CORE_RST_EN,
 		0, ESP32S31_BANK_HP },
 };
 
@@ -906,6 +931,10 @@ static int esp32s31_clk_prepare(struct clk_hw *hw)
 			clk->initialized = true;
 		}
 		break;
+	case ESP32S31_CLK_KIND_PARLIO_RX:
+	case ESP32S31_CLK_KIND_PARLIO_TX:
+		esp32s31_rmw(priv->hp, clk->reg, 0, HP_PARLIO_CORE_CLK_EN);
+		break;
 	case ESP32S31_CLK_KIND_GENERIC:
 		if (!clk->initialized) {
 			esp32s31_rmw(priv->hp, clk->reg, clk->reset_mask,
@@ -1042,6 +1071,10 @@ static void esp32s31_clk_unprepare(struct clk_hw *hw)
 			     HP_LCDCAM_APB_CLK_EN | HP_LCDCAM_SYS_CLK_EN, 0);
 		clk->initialized = false;
 		break;
+	case ESP32S31_CLK_KIND_PARLIO_RX:
+	case ESP32S31_CLK_KIND_PARLIO_TX:
+		esp32s31_rmw(priv->hp, clk->reg, HP_PARLIO_CORE_CLK_EN, 0);
+		break;
 	case ESP32S31_CLK_KIND_GENERIC:
 		esp32s31_rmw(priv->hp, clk->reg, clk->enable_mask, 0);
 		clk->initialized = false;
@@ -1114,6 +1147,9 @@ static int esp32s31_clk_is_prepared(struct clk_hw *hw)
 	case ESP32S31_CLK_KIND_CAM:
 		return !!(readl(priv->hp + HP_LCDCAM_CAM_CTRL0) &
 			  HP_LCDCAM_CLK_EN);
+	case ESP32S31_CLK_KIND_PARLIO_RX:
+	case ESP32S31_CLK_KIND_PARLIO_TX:
+		return !!(readl(priv->hp + clk->reg) & HP_PARLIO_CORE_CLK_EN);
 	case ESP32S31_CLK_KIND_GENERIC:
 		reg = readl(priv->hp + clk->reg);
 		return (reg & clk->enable_mask) == clk->enable_mask;
@@ -1452,6 +1488,84 @@ static const struct clk_ops esp32s31_i2s_ops = {
 	.set_rate = esp32s31_i2s_set_rate,
 };
 
+static u8 esp32s31_parlio_rx_parent(struct clk_hw *hw)
+{
+	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
+	u32 value = readl(clk->priv->hp + HP_PARLIO_RX_CTRL0);
+
+	return FIELD_GET(HP_PARLIO_CORE_SRC, value) == HP_PARLIO_EXTERNAL_SRC;
+}
+
+static int esp32s31_parlio_rx_set_parent(struct clk_hw *hw, u8 index)
+{
+	struct esp32s31_clk_priv *priv = to_esp32s31_clk(hw)->priv;
+	unsigned long flags;
+	u32 source = index ? HP_PARLIO_EXTERNAL_SRC : 0;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	esp32s31_rmw(priv->hp_alive, HP_ALIVE_PARLIO_PAD_CTRL,
+		     HP_ALIVE_PARLIO_PAD_RX_EN, index ? HP_ALIVE_PARLIO_PAD_RX_EN : 0);
+	esp32s31_rmw(priv->hp, HP_PARLIO_RX_CTRL0,
+		     HP_PARLIO_CORE_SRC | HP_PARLIO_CORE_DIV | HP_PARLIO_CORE_FRAC,
+		     FIELD_PREP(HP_PARLIO_CORE_SRC, source));
+	spin_unlock_irqrestore(&priv->lock, flags);
+	return 0;
+}
+
+static unsigned long esp32s31_parlio_rate(struct clk_hw *hw, unsigned long parent)
+{
+	struct esp32s31_clk *clk = to_esp32s31_clk(hw);
+	u32 value = readl(clk->priv->hp + clk->reg);
+
+	return parent / (FIELD_GET(HP_PARLIO_CORE_DIV, value) + 1);
+}
+
+static unsigned int esp32s31_parlio_tx_div(unsigned long parent, unsigned long rate)
+{
+	return clamp_t(unsigned int, DIV_ROUND_CLOSEST(parent, max(1UL, rate)), 1, 256);
+}
+
+static long esp32s31_parlio_tx_round_rate(struct clk_hw *hw, unsigned long rate,
+					      unsigned long *parent_rate)
+{
+	return *parent_rate / esp32s31_parlio_tx_div(*parent_rate, rate);
+}
+
+static int esp32s31_parlio_tx_set_rate(struct clk_hw *hw, unsigned long rate,
+					   unsigned long parent_rate)
+{
+	struct esp32s31_clk_priv *priv = to_esp32s31_clk(hw)->priv;
+	unsigned long flags;
+	u32 divider = esp32s31_parlio_tx_div(parent_rate, rate) - 1;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	esp32s31_rmw(priv->hp_alive, HP_ALIVE_PARLIO_PAD_CTRL, HP_ALIVE_PARLIO_PAD_TX_EN, 0);
+	esp32s31_rmw(priv->hp, HP_PARLIO_TX_CTRL0,
+		     HP_PARLIO_CORE_SRC | HP_PARLIO_CORE_DIV | HP_PARLIO_CORE_FRAC,
+		     FIELD_PREP(HP_PARLIO_CORE_DIV, divider));
+	spin_unlock_irqrestore(&priv->lock, flags);
+	return 0;
+}
+
+static const struct clk_ops esp32s31_parlio_rx_ops = {
+	.prepare = esp32s31_clk_prepare,
+	.unprepare = esp32s31_clk_unprepare,
+	.is_prepared = esp32s31_clk_is_prepared,
+	.get_parent = esp32s31_parlio_rx_parent,
+	.set_parent = esp32s31_parlio_rx_set_parent,
+	.determine_rate = __clk_mux_determine_rate,
+	.recalc_rate = esp32s31_parlio_rate,
+};
+
+static const struct clk_ops esp32s31_parlio_tx_ops = {
+	.prepare = esp32s31_clk_prepare,
+	.unprepare = esp32s31_clk_unprepare,
+	.is_prepared = esp32s31_clk_is_prepared,
+	.recalc_rate = esp32s31_parlio_rate,
+	.round_rate = esp32s31_parlio_tx_round_rate,
+	.set_rate = esp32s31_parlio_tx_set_rate,
+};
+
 static bool esp32s31_clk_is_critical(unsigned int id)
 {
 	switch (id) {
@@ -1511,6 +1625,12 @@ static int __esp32s31_register_clk(struct device *dev,
 	case ESP32S31_CLK_KIND_I2S0:
 	case ESP32S31_CLK_KIND_I2S1:
 		ops = &esp32s31_i2s_ops;
+		break;
+	case ESP32S31_CLK_KIND_PARLIO_RX:
+		ops = &esp32s31_parlio_rx_ops;
+		break;
+	case ESP32S31_CLK_KIND_PARLIO_TX:
+		ops = &esp32s31_parlio_tx_ops;
 		break;
 	default:
 		ops = &esp32s31_gate_ops;
@@ -1604,6 +1724,9 @@ static int esp32s31_register_gate(struct device *dev,
 }
 
 static const char * const esp32s31_xtal_parent[] = { "xtal" };
+static const char * const esp32s31_parlio_rx_parents[] = {
+	"xtal", "s31-parlio-pad-rx",
+};
 static const char * const esp32s31_bbpll_parent[] = { "bbpll" };
 static const char * const esp32s31_mpll_parent[] = { "mpll" };
 static const char * const esp32s31_ref50_parents[] = { "cpll", "mpll" };
@@ -2011,6 +2134,25 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 				     ESP32S31_XTAL_RATE, HP_CORDIC_CTRL0,
 				     HP_CORDIC_APB_CLK_EN | HP_CORDIC_CLK_EN,
 				     HP_CORDIC_APB_RST_EN | HP_CORDIC_CLK_SRC_SEL, 0);
+	if (ret)
+		return ret;
+
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_PARLIO_BUS, "parlio-bus",
+				     sys_rate, HP_PARLIO_BUS_CTRL0,
+				     HP_PARLIO_SYS_CLK_EN | HP_PARLIO_APB_CLK_EN,
+				     HP_PARLIO_BUS_RST_EN, 0);
+	if (ret)
+		return ret;
+	ret = __esp32s31_register_clk(dev, priv, ESP32S31_CLK_PARLIO_RX, "parlio-rx",
+				      ESP32S31_CLK_KIND_PARLIO_RX, 0,
+				      HP_PARLIO_RX_CTRL0, esp32s31_parlio_rx_parents,
+				      ARRAY_SIZE(esp32s31_parlio_rx_parents));
+	if (ret)
+		return ret;
+	ret = __esp32s31_register_clk(dev, priv, ESP32S31_CLK_PARLIO_TX, "parlio-tx",
+				      ESP32S31_CLK_KIND_PARLIO_TX, 0,
+				      HP_PARLIO_TX_CTRL0, esp32s31_xtal_parent,
+				      ARRAY_SIZE(esp32s31_xtal_parent));
 	if (ret)
 		return ret;
 

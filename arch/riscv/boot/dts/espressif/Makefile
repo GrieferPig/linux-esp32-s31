@@ -20,6 +20,7 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart1.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart2.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3-dma.dtbo
+dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-parlio.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gdma.dtbo
 ifneq ($(CONFIG_FB_ESP32S31_I80),)
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-i80-ili9341.dtbo

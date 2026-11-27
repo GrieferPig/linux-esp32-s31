@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/esp32s31-clock.h>
+#include <dt-bindings/pinctrl/esp32s31-pinmux.h>
+
+/ {
+	espressif,overlay-name = "parlio";
+	espressif,resource-claims = "parlio", "axi-gdma-pair0", "axi-gdma-pair2",
+				    "gpio42", "gpio43", "gpio44", "gpio46", "gpio48";
+};
+
+&{/} {
+	/* PARLIO RX samples the clock output on the same pad. */
+	s31_parlio_rx_pad: clock-parlio-rx {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <1000000>;
+		clock-output-names = "s31-parlio-pad-rx";
+	};
+};
+
+&gpio {
+	s31_parlio_pins: parlio-loopback-pins {
+		data-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(42, 188, 0)>,
+				 <ESP32S31_MATRIX_IN(42, 188, 0)>,
+				 <ESP32S31_MATRIX_OUT(43, 189, 0)>,
+				 <ESP32S31_MATRIX_IN(43, 189, 0)>,
+				 <ESP32S31_MATRIX_OUT(44, 190, 0)>,
+				 <ESP32S31_MATRIX_IN(44, 190, 0)>,
+				 <ESP32S31_MATRIX_OUT(48, 191, 0)>,
+				 <ESP32S31_MATRIX_IN(48, 191, 0)>;
+			input-enable;
+		};
+
+		clock-pins {
+			pinmux = <ESP32S31_MATRIX_OUT(46, 187, 0)>,
+				 <ESP32S31_MATRIX_IN(46, 186, 0)>;
+			input-enable;
+		};
+	};
+};
+
+&axi_gdma {
+	status = "okay";
+};
+
+&parlio {
+	clocks = <&clkc ESP32S31_CLK_PARLIO_BUS>,
+		 <&clkc ESP32S31_CLK_PARLIO_RX>,
+		 <&clkc ESP32S31_CLK_PARLIO_TX>,
+		 <&clkc ESP32S31_CLK_XTAL>,
+		 <&s31_parlio_rx_pad>;
+	clock-names = "bus", "rx", "tx", "xtal", "rx-pad";
+	/* CAM owns pair 1 in the stock S31 board profiles. */
+	dmas = <&axi_gdma 2 3>, <&axi_gdma 0 3>;
+	dma-names = "rx", "tx";
+	pinctrl-names = "default";
+	pinctrl-0 = <&s31_parlio_pins>;
+	espressif,data-width = <4>;
+	clock-frequency = <1000000>;
+	status = "okay";
+};

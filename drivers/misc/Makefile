@@ -76,4 +76,5 @@ obj-y				+= keba/
 obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_ESP32P4_PARLIO)	+= esp32p4-parlio.o
+obj-$(CONFIG_ESP32S31_PARLIO)	+= esp32s31-parlio.o
 obj-$(CONFIG_ESP32S31_CORDIC)	+= esp32s31-cordic.o

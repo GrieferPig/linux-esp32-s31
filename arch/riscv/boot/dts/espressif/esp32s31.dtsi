@@ -1036,6 +1036,25 @@
 			interrupt-parent = <&clic>;
 		};
 
+		/* S31 TRM ch.33 PARLIO and ch.3 GDMA: AXI DMA selector 3. */
+		parlio: parallel-io@2038e000 {
+			compatible = "espressif,esp32s31-parlio";
+			reg = <0x2038e000 0x400>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <117 IRQ_TYPE_LEVEL_HIGH>, <118 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx", "tx";
+			clocks = <&clkc ESP32S31_CLK_PARLIO_BUS>,
+				 <&clkc ESP32S31_CLK_PARLIO_RX>,
+				 <&clkc ESP32S31_CLK_PARLIO_TX>,
+				 <&clkc ESP32S31_CLK_XTAL>;
+			clock-names = "bus", "rx", "tx", "xtal";
+			resets = <&clkc ESP32S31_RST_PARLIO_BUS>,
+				 <&clkc ESP32S31_RST_PARLIO_RX>,
+				 <&clkc ESP32S31_RST_PARLIO_TX>;
+			reset-names = "bus", "rx", "tx";
+			status = "disabled";
+		};
+
 		uart1: serial@2038b000 {
 			compatible = "espressif,esp32s31-uart";
 			reg = <0x2038b000 0x1000>;
