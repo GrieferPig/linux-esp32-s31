@@ -9,7 +9,10 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <uapi/linux/esp-ppa.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
@@ -19,12 +22,39 @@
 
 #include "../../../dma/espressif-dma2d.h"
 
-/* TRM ch.40 PPA — SRM color mode, conversion parameters and status. */
+/* TRM ch.40 PPA — SRM and Blend/Fill registers (IDF hw_ver1/soc/ppa_reg.h). */
 #define PPA_IRQ_CLEAR		0x1c
 #define PPA_SRM_IRQS		(BIT(0) | BIT(2))
+#define PPA_BLEND_IRQS		(BIT(1) | BIT(3))
 #define PPA_SRM_COLOR		0x20
 #define PPA_SRM_RX_RGB565	FIELD_PREP(GENMASK(3, 0), 2)
 #define PPA_SRM_TX_RGB565	FIELD_PREP(GENMASK(7, 4), 2)
+#define PPA_BLEND_COLOR		0x24
+#define PPA_BLEND0_RX_CM	GENMASK(3, 0)
+#define PPA_BLEND1_RX_CM	GENMASK(7, 4)
+#define PPA_BLEND_TX_CM		GENMASK(11, 8)
+#define PPA_BLEND_BYTE_ORDER	0x2c
+#define PPA_BLEND_TRANS_MODE	0x34
+#define PPA_BLEND_EN		BIT(0)
+#define PPA_BLEND_FILL_EN	BIT(2)
+#define PPA_BLEND_MODE_UPDATE	BIT(3)
+#define PPA_BLEND_RST		BIT(4)
+#define PPA_BLEND_TX_SIZE	0x3c
+#define PPA_BLEND_HB		GENMASK(13, 0)
+#define PPA_BLEND_VB		GENMASK(27, 14)
+#define PPA_BLEND_FIX_ALPHA	0x40
+#define PPA_BLEND0_FIX_ALPHA	GENMASK(7, 0)
+#define PPA_BLEND1_FIX_ALPHA	GENMASK(15, 8)
+#define PPA_BLEND0_ALPHA_MOD	GENMASK(17, 16)
+#define PPA_BLEND1_ALPHA_MOD	GENMASK(19, 18)
+#define PPA_BLEND0_ALPHA_INV	BIT(20)
+#define PPA_BLEND1_ALPHA_INV	BIT(21)
+#define PPA_BLEND_FIX_PIXEL	0x4c
+#define PPA_CK_FG_LOW		0x50
+#define PPA_CK_FG_HIGH		0x54
+#define PPA_CK_BG_LOW		0x58
+#define PPA_CK_BG_HIGH		0x5c
+#define PPA_CK_DEFAULT		0x60
 #define PPA_SRM_CTRL		0x64
 #define PPA_SCALE_X_INT		GENMASK(7, 0)
 #define PPA_SCALE_X_FRAC	GENMASK(11, 8)
@@ -37,11 +67,18 @@
 #define PPA_MIRROR_Y		BIT(29)
 #define PPA_REG_CONF		0x6c
 #define PPA_REG_CLK		BIT(0)
+#define PPA_BLEND_ST		0x74
 #define PPA_SRM_ERROR		0x78
 #define PPA_SRM_STATUS		0x7c
 
+#define PPA_CM_ARGB8888		0
+#define PPA_CM_RGB888		1
+#define PPA_CM_RGB565		2
+#define PPA_CM_GRAY8		12
+
 #define PPA_MAX_DIMENSION	1280
 #define PPA_MIN_DIMENSION	2
+#define PPA_MAX_IOCTL_BUF	(2 * 1024 * 1024)
 #define PPA_SCALE_FRAC		16
 #define PPA_TIMEOUT_MS		100
 
@@ -54,9 +91,12 @@ struct ppa_device {
 	struct video_device video;
 	struct v4l2_m2m_dev *m2m;
 	struct mutex lock;
+	struct mutex hw_lock;
 	struct work_struct work;
 	struct completion dma_done;
+	struct completion fg_done;
 	enum dmaengine_tx_result dma_result;
+	enum dmaengine_tx_result fg_result;
 	struct ppa_context *running;
 	bool disconnected;
 };
@@ -149,6 +189,10 @@ static int ppa_reqbufs(struct file *file, void *fh, struct v4l2_requestbuffers *
 	return v4l2_m2m_ioctl_reqbufs(file, fh, req);
 }
 
+static void ppa_dma_complete(void *data, const struct dmaengine_result *result);
+static long ppa_default_ioctl(struct file *file, void *fh, bool valid_prio,
+			      unsigned int cmd, void *arg);
+
 static const struct v4l2_ioctl_ops ppa_ioctl_ops = {
 	.vidioc_querycap = ppa_querycap,
 	.vidioc_enum_fmt_vid_cap = ppa_enum_fmt,
@@ -165,6 +209,7 @@ static const struct v4l2_ioctl_ops ppa_ioctl_ops = {
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
 	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+	.vidioc_default = ppa_default_ioctl,
 };
 
 static int ppa_queue_setup(struct vb2_queue *q, unsigned int *buffers,
@@ -354,6 +399,371 @@ static void ppa_dma_complete(void *data, const struct dmaengine_result *result)
 	complete(&ppa->dma_done);
 }
 
+static void ppa_fg_complete(void *data, const struct dmaengine_result *result)
+{
+	struct ppa_device *ppa = data;
+
+	ppa->fg_result = result->result;
+	complete(&ppa->fg_done);
+}
+
+static int ppa_pixfmt_info(u32 pixfmt, u8 *cm, u8 *pbyte, u8 *bpp)
+{
+	switch (pixfmt) {
+	case V4L2_PIX_FMT_GREY:
+		*cm = PPA_CM_GRAY8;
+		*pbyte = 1;
+		*bpp = 1;
+		return 0;
+	case V4L2_PIX_FMT_RGB565:
+		*cm = PPA_CM_RGB565;
+		*pbyte = 3;
+		*bpp = 2;
+		return 0;
+	case V4L2_PIX_FMT_RGB24:
+		*cm = PPA_CM_RGB888;
+		*pbyte = 4;
+		*bpp = 3;
+		return 0;
+	case V4L2_PIX_FMT_ABGR32:
+	case V4L2_PIX_FMT_XBGR32:
+		*cm = PPA_CM_ARGB8888;
+		*pbyte = 5;
+		*bpp = 4;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/* TRM ch.40 PPA / IDF ppa_fill.c: solid ROI fill via BLEND engine + RX 2D-DMA. */
+static int ppa_do_fill(struct ppa_device *ppa, const struct esp_ppa_fill_req *req)
+{
+	struct esp_dma2d_ppa_rect dst_rect;
+	struct dma_async_tx_descriptor *desc;
+	struct dma_chan *chan;
+	dma_cookie_t cookie;
+	dma_addr_t dst_dma;
+	size_t buf_size;
+	void *dst_buf;
+	u8 cm, pbyte, bpp;
+	int ret;
+
+	if (!req->dst_ptr || !req->width || !req->height ||
+	    !req->block_w || !req->block_h ||
+	    req->width > PPA_MAX_DIMENSION || req->height > PPA_MAX_DIMENSION ||
+	    req->x + req->block_w > req->width ||
+	    req->y + req->block_h > req->height)
+		return -EINVAL;
+	if (ppa_pixfmt_info(req->pixfmt, &cm, &pbyte, &bpp))
+		return -EINVAL;
+
+	buf_size = (size_t)req->width * req->height * bpp;
+	if (!buf_size || buf_size > PPA_MAX_IOCTL_BUF)
+		return -EINVAL;
+
+	dst_buf = kmalloc(ALIGN(buf_size, 64), GFP_KERNEL);
+	if (!dst_buf)
+		return -ENOMEM;
+
+	if (req->x || req->y || req->block_w != req->width ||
+	    req->block_h != req->height) {
+		if (copy_from_user(dst_buf, u64_to_user_ptr(req->dst_ptr), buf_size)) {
+			ret = -EFAULT;
+			goto free_buf;
+		}
+	}
+
+	dst_dma = dma_map_single(ppa->dev, dst_buf, buf_size, DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(ppa->dev, dst_dma)) {
+		ret = -ENOMEM;
+		goto free_buf;
+	}
+
+	mutex_lock(&ppa->hw_lock);
+	chan = dma_request_chan(ppa->dev, "srm");
+	if (IS_ERR(chan)) {
+		ret = PTR_ERR(chan);
+		goto unlock_hw;
+	}
+	ret = clk_prepare_enable(ppa->clk);
+	if (ret)
+		goto release_chan;
+	ret = reset_control_reset(ppa->reset);
+	if (ret)
+		goto disable_clk;
+
+	writel(PPA_REG_CLK, ppa->base + PPA_REG_CONF);
+	writel(PPA_BLEND_RST, ppa->base + PPA_BLEND_TRANS_MODE);
+	writel(0, ppa->base + PPA_BLEND_TRANS_MODE);
+	writel(PPA_BLEND_IRQS, ppa->base + PPA_IRQ_CLEAR);
+
+	dst_rect = (struct esp_dma2d_ppa_rect) {
+		.address = dst_dma,
+		.pic_w = req->width, .pic_h = req->height,
+		.block_w = req->block_w, .block_h = req->block_h,
+		.x = req->x, .y = req->y, .pbyte = pbyte,
+	};
+	desc = esp_dma2d_prep_ppa_fill(chan, &dst_rect,
+				       DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	if (!desc) {
+		ret = -EIO;
+		goto disable_clk;
+	}
+	reinit_completion(&ppa->dma_done);
+	desc->callback_result = ppa_dma_complete;
+	desc->callback_param = ppa;
+	cookie = dmaengine_submit(desc);
+	ret = dma_submit_error(cookie);
+	if (ret)
+		goto disable_clk;
+
+	dma_async_issue_pending(chan);
+	writel(req->color, ppa->base + PPA_BLEND_FIX_PIXEL);
+	writel(FIELD_PREP(PPA_BLEND_TX_CM, cm), ppa->base + PPA_BLEND_COLOR);
+	writel(FIELD_PREP(PPA_BLEND_HB, req->block_w) |
+	       FIELD_PREP(PPA_BLEND_VB, req->block_h),
+	       ppa->base + PPA_BLEND_TX_SIZE);
+	writel(PPA_BLEND_FILL_EN | PPA_BLEND_EN | PPA_BLEND_MODE_UPDATE,
+	       ppa->base + PPA_BLEND_TRANS_MODE);
+
+	if (!wait_for_completion_timeout(&ppa->dma_done, msecs_to_jiffies(PPA_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+	else if (ppa->dma_result != DMA_TRANS_NOERROR)
+		ret = -EIO;
+
+	if (ret) {
+		dev_err_ratelimited(ppa->dev, "FILL failed: %d, st=%#x\n",
+				    ret, readl(ppa->base + PPA_BLEND_ST));
+		writel(PPA_BLEND_RST, ppa->base + PPA_BLEND_TRANS_MODE);
+		writel(0, ppa->base + PPA_BLEND_TRANS_MODE);
+		dmaengine_terminate_sync(chan);
+	}
+
+disable_clk:
+	clk_disable_unprepare(ppa->clk);
+release_chan:
+	dma_release_channel(chan);
+unlock_hw:
+	mutex_unlock(&ppa->hw_lock);
+	dma_unmap_single(ppa->dev, dst_dma, buf_size, DMA_BIDIRECTIONAL);
+	if (!ret && copy_to_user(u64_to_user_ptr(req->dst_ptr), dst_buf, buf_size))
+		ret = -EFAULT;
+free_buf:
+	kfree(dst_buf);
+	return ret;
+}
+
+static u32 ppa_encode_alpha(u8 bg_mode, u8 bg_val, u8 fg_mode, u8 fg_val)
+{
+	u32 reg = 0;
+
+	if (bg_mode == ESP_PPA_ALPHA_FIX_VALUE)
+		reg |= FIELD_PREP(PPA_BLEND0_ALPHA_MOD, 1) | FIELD_PREP(PPA_BLEND0_FIX_ALPHA, bg_val);
+	else if (bg_mode == ESP_PPA_ALPHA_SCALE)
+		reg |= FIELD_PREP(PPA_BLEND0_ALPHA_MOD, 2) | FIELD_PREP(PPA_BLEND0_FIX_ALPHA, bg_val);
+	else if (bg_mode == ESP_PPA_ALPHA_INVERT)
+		reg |= PPA_BLEND0_ALPHA_INV;
+
+	if (fg_mode == ESP_PPA_ALPHA_FIX_VALUE)
+		reg |= FIELD_PREP(PPA_BLEND1_ALPHA_MOD, 1) | FIELD_PREP(PPA_BLEND1_FIX_ALPHA, fg_val);
+	else if (fg_mode == ESP_PPA_ALPHA_SCALE)
+		reg |= FIELD_PREP(PPA_BLEND1_ALPHA_MOD, 2) | FIELD_PREP(PPA_BLEND1_FIX_ALPHA, fg_val);
+	else if (fg_mode == ESP_PPA_ALPHA_INVERT)
+		reg |= PPA_BLEND1_ALPHA_INV;
+
+	return reg;
+}
+
+/* TRM ch.40 PPA / IDF ppa_blend.c: two-plane alpha blend via BG+FG TX and RX 2D-DMA. */
+static int ppa_do_blend(struct ppa_device *ppa, const struct esp_ppa_blend_req *req)
+{
+	struct esp_dma2d_ppa_rect bg_rect, fg_rect, dst_rect;
+	struct dma_async_tx_descriptor *bg_desc, *fg_desc;
+	struct dma_chan *bg_chan, *fg_chan;
+	dma_cookie_t c1, c2;
+	dma_addr_t bg_dma, fg_dma, dst_dma;
+	size_t bg_sz, fg_sz, dst_sz;
+	void *bg_buf = NULL, *fg_buf = NULL, *dst_buf = NULL;
+	u8 bg_cm, bg_pbyte, bg_bpp, fg_cm, fg_pbyte, fg_bpp, dst_cm, dst_pbyte, dst_bpp;
+	int ret;
+
+	if (!req->bg_ptr || !req->fg_ptr || !req->dst_ptr ||
+	    !req->width || !req->height ||
+	    req->width > PPA_MAX_DIMENSION || req->height > PPA_MAX_DIMENSION ||
+	    req->bg_alpha_mode > ESP_PPA_ALPHA_INVERT ||
+	    req->fg_alpha_mode > ESP_PPA_ALPHA_INVERT)
+		return -EINVAL;
+	if (ppa_pixfmt_info(req->bg_pixfmt, &bg_cm, &bg_pbyte, &bg_bpp) ||
+	    ppa_pixfmt_info(req->fg_pixfmt, &fg_cm, &fg_pbyte, &fg_bpp) ||
+	    ppa_pixfmt_info(req->dst_pixfmt, &dst_cm, &dst_pbyte, &dst_bpp) ||
+	    fg_cm == PPA_CM_GRAY8)
+		return -EINVAL;
+
+	bg_sz = (size_t)req->width * req->height * bg_bpp;
+	fg_sz = (size_t)req->width * req->height * fg_bpp;
+	dst_sz = (size_t)req->width * req->height * dst_bpp;
+	if (bg_sz > PPA_MAX_IOCTL_BUF || fg_sz > PPA_MAX_IOCTL_BUF ||
+	    dst_sz > PPA_MAX_IOCTL_BUF)
+		return -EINVAL;
+
+	bg_buf = kmalloc(ALIGN(bg_sz, 64), GFP_KERNEL);
+	fg_buf = kmalloc(ALIGN(fg_sz, 64), GFP_KERNEL);
+	dst_buf = kmalloc(ALIGN(dst_sz, 64), GFP_KERNEL);
+	if (!bg_buf || !fg_buf || !dst_buf) {
+		ret = -ENOMEM;
+		goto free_bufs;
+	}
+	if (copy_from_user(bg_buf, u64_to_user_ptr(req->bg_ptr), bg_sz) ||
+	    copy_from_user(fg_buf, u64_to_user_ptr(req->fg_ptr), fg_sz)) {
+		ret = -EFAULT;
+		goto free_bufs;
+	}
+
+	bg_dma = dma_map_single(ppa->dev, bg_buf, bg_sz, DMA_TO_DEVICE);
+	fg_dma = dma_map_single(ppa->dev, fg_buf, fg_sz, DMA_TO_DEVICE);
+	dst_dma = dma_map_single(ppa->dev, dst_buf, dst_sz, DMA_FROM_DEVICE);
+	if (dma_mapping_error(ppa->dev, bg_dma) ||
+	    dma_mapping_error(ppa->dev, fg_dma) ||
+	    dma_mapping_error(ppa->dev, dst_dma)) {
+		ret = -ENOMEM;
+		goto unmap_bufs;
+	}
+
+	mutex_lock(&ppa->hw_lock);
+	bg_chan = dma_request_chan(ppa->dev, "srm");
+	if (IS_ERR(bg_chan)) {
+		ret = PTR_ERR(bg_chan);
+		goto unlock_hw;
+	}
+	fg_chan = dma_request_chan(ppa->dev, "fg");
+	if (IS_ERR(fg_chan)) {
+		ret = PTR_ERR(fg_chan);
+		goto release_bg;
+	}
+	ret = clk_prepare_enable(ppa->clk);
+	if (ret)
+		goto release_fg;
+	ret = reset_control_reset(ppa->reset);
+	if (ret)
+		goto disable_clk;
+
+	writel(PPA_REG_CLK, ppa->base + PPA_REG_CONF);
+	writel(PPA_BLEND_RST, ppa->base + PPA_BLEND_TRANS_MODE);
+	writel(0, ppa->base + PPA_BLEND_TRANS_MODE);
+	writel(PPA_BLEND_IRQS, ppa->base + PPA_IRQ_CLEAR);
+
+	bg_rect = (struct esp_dma2d_ppa_rect) {
+		.address = bg_dma, .pic_w = req->width, .pic_h = req->height,
+		.block_w = req->width, .block_h = req->height, .pbyte = bg_pbyte,
+	};
+	fg_rect = (struct esp_dma2d_ppa_rect) {
+		.address = fg_dma, .pic_w = req->width, .pic_h = req->height,
+		.block_w = req->width, .block_h = req->height, .pbyte = fg_pbyte,
+	};
+	dst_rect = (struct esp_dma2d_ppa_rect) {
+		.address = dst_dma, .pic_w = req->width, .pic_h = req->height,
+		.block_w = req->width, .block_h = req->height, .pbyte = dst_pbyte,
+	};
+
+	bg_desc = esp_dma2d_prep_ppa_blend_bg(bg_chan, &bg_rect, &dst_rect,
+					      DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	fg_desc = esp_dma2d_prep_ppa_blend_fg(fg_chan, &fg_rect,
+					      DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	if (!bg_desc || !fg_desc) {
+		ret = -EIO;
+		goto disable_clk;
+	}
+
+	reinit_completion(&ppa->dma_done);
+	reinit_completion(&ppa->fg_done);
+	bg_desc->callback_result = ppa_dma_complete;
+	bg_desc->callback_param = ppa;
+	fg_desc->callback_result = ppa_fg_complete;
+	fg_desc->callback_param = ppa;
+	c1 = dmaengine_submit(bg_desc);
+	c2 = dmaengine_submit(fg_desc);
+	ret = dma_submit_error(c1) ?: dma_submit_error(c2);
+	if (ret)
+		goto disable_clk;
+
+	dma_async_issue_pending(bg_chan);
+	dma_async_issue_pending(fg_chan);
+
+	writel(FIELD_PREP(PPA_BLEND0_RX_CM, bg_cm) |
+	       FIELD_PREP(PPA_BLEND1_RX_CM, fg_cm) |
+	       FIELD_PREP(PPA_BLEND_TX_CM, dst_cm),
+	       ppa->base + PPA_BLEND_COLOR);
+	writel(0, ppa->base + PPA_BLEND_BYTE_ORDER);
+	writel(ppa_encode_alpha(req->bg_alpha_mode, req->bg_alpha,
+				req->fg_alpha_mode, req->fg_alpha),
+	       ppa->base + PPA_BLEND_FIX_ALPHA);
+	writel(FIELD_PREP(PPA_BLEND_HB, req->width) |
+	       FIELD_PREP(PPA_BLEND_VB, req->height),
+	       ppa->base + PPA_BLEND_TX_SIZE);
+	writel(0x00ffffff, ppa->base + PPA_CK_BG_LOW);
+	writel(0x00000000, ppa->base + PPA_CK_BG_HIGH);
+	writel(0x00ffffff, ppa->base + PPA_CK_FG_LOW);
+	writel(0x00000000, ppa->base + PPA_CK_FG_HIGH);
+	writel(0x00000000, ppa->base + PPA_CK_DEFAULT);
+	writel(PPA_BLEND_EN | PPA_BLEND_MODE_UPDATE,
+	       ppa->base + PPA_BLEND_TRANS_MODE);
+
+	if (!wait_for_completion_timeout(&ppa->dma_done, msecs_to_jiffies(PPA_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+	else if (ppa->dma_result != DMA_TRANS_NOERROR)
+		ret = -EIO;
+	if (!ret && !wait_for_completion_timeout(&ppa->fg_done, msecs_to_jiffies(PPA_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+
+	if (ret) {
+		dev_err_ratelimited(ppa->dev, "BLEND failed: %d, st=%#x\n",
+				    ret, readl(ppa->base + PPA_BLEND_ST));
+		writel(PPA_BLEND_RST, ppa->base + PPA_BLEND_TRANS_MODE);
+		writel(0, ppa->base + PPA_BLEND_TRANS_MODE);
+		dmaengine_terminate_sync(bg_chan);
+		dmaengine_terminate_sync(fg_chan);
+	}
+
+disable_clk:
+	clk_disable_unprepare(ppa->clk);
+release_fg:
+	dma_release_channel(fg_chan);
+release_bg:
+	dma_release_channel(bg_chan);
+unlock_hw:
+	mutex_unlock(&ppa->hw_lock);
+unmap_bufs:
+	if (!dma_mapping_error(ppa->dev, dst_dma))
+		dma_unmap_single(ppa->dev, dst_dma, dst_sz, DMA_FROM_DEVICE);
+	if (!dma_mapping_error(ppa->dev, fg_dma))
+		dma_unmap_single(ppa->dev, fg_dma, fg_sz, DMA_TO_DEVICE);
+	if (!dma_mapping_error(ppa->dev, bg_dma))
+		dma_unmap_single(ppa->dev, bg_dma, bg_sz, DMA_TO_DEVICE);
+	if (!ret && copy_to_user(u64_to_user_ptr(req->dst_ptr), dst_buf, dst_sz))
+		ret = -EFAULT;
+free_bufs:
+	kfree(dst_buf);
+	kfree(fg_buf);
+	kfree(bg_buf);
+	return ret;
+}
+
+static long ppa_default_ioctl(struct file *file, void *fh, bool valid_prio,
+			      unsigned int cmd, void *arg)
+{
+	struct ppa_device *ppa = video_drvdata(file);
+
+	switch (cmd) {
+	case ESP_PPA_IOC_FILL:
+		return ppa_do_fill(ppa, arg);
+	case ESP_PPA_IOC_BLEND:
+		return ppa_do_blend(ppa, arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
 static int ppa_process(struct ppa_context *ctx, struct vb2_v4l2_buffer *src,
 		       struct vb2_v4l2_buffer *dst)
 {
@@ -377,9 +787,12 @@ static int ppa_process(struct ppa_context *ctx, struct vb2_v4l2_buffer *src,
 	ret = ppa_scale_ctrl(ctx, &config);
 	if (ret)
 		return ret;
+	mutex_lock(&ppa->hw_lock);
 	chan = dma_request_chan(ppa->dev, "srm");
-	if (IS_ERR(chan))
-		return PTR_ERR(chan);
+	if (IS_ERR(chan)) {
+		ret = PTR_ERR(chan);
+		goto unlock_hw;
+	}
 	ret = clk_prepare_enable(ppa->clk);
 	if (ret)
 		goto release_channel;
@@ -437,6 +850,8 @@ release:
 	clk_disable_unprepare(ppa->clk);
 release_channel:
 	dma_release_channel(chan);
+unlock_hw:
+	mutex_unlock(&ppa->hw_lock);
 	return ret;
 }
 
@@ -510,7 +925,9 @@ static int ppa_probe(struct platform_device *pdev)
 	ppa->clk = clk;
 	ppa->reset = reset;
 	mutex_init(&ppa->lock);
+	mutex_init(&ppa->hw_lock);
 	init_completion(&ppa->dma_done);
+	init_completion(&ppa->fg_done);
 	INIT_WORK(&ppa->work, ppa_worker);
 
 	ret = v4l2_device_register(dev, &ppa->v4l2);

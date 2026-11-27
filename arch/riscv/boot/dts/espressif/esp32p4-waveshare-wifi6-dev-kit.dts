@@ -906,8 +906,8 @@ panel_mcu: &{/soc/i2c@500c5000/backlight@45} {
 	interrupts = <96 4>;
 	clocks = <&periphclk ESP32P4_CLK_PPA>;
 	resets = <&periphclk ESP32P4_RST_PPA>;
-	dmas = <&dma2d 0>;
-	dma-names = "srm";
+	dmas = <&dma2d 0>, <&dma2d 1>;
+	dma-names = "srm", "fg";
 };
 
 /* I3C and PARLIO share GPIO4/5. PARLIO also shares GPIO20/21 with ADC and SPI. */
