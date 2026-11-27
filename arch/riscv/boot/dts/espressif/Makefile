@@ -17,6 +17,7 @@ dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-analog.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-timers.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-watchdogs.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart1.dtbo
+dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart1-dma.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart2.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-uart3-dma.dtbo

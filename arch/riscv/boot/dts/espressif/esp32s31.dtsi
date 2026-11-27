@@ -240,6 +240,16 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.25 UART Controller: one UHCI shared by the HP UARTs. */
+		uart_dma: uart-dma@20398000 {
+			compatible = "espressif,esp32s31-uhci";
+			reg = <0x20398000 0x1000>, <0x2f076400 0x2800>;
+			reg-names = "uhci", "dma-buf";
+			clocks = <&clkc ESP32S31_CLK_UHCI>;
+			resets = <&clkc ESP32S31_RST_UHCI>;
+			status = "disabled";
+		};
+
 		clkc: clock-controller@20587000 {
 			compatible = "espressif,esp32s31-clock";
 			reg = <0x20587000 0x1000>, <0x20586000 0x1000>,

@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+/ {
+	espressif,overlay-name = "uart1-dma";
+	espressif,resource-claims = "uart1", "uhci0", "ahb-gdma-pair0",
+				    "gpio42", "gpio43";
+};
+
+&ahb_gdma {
+	status = "okay";
+};
+
+&uart_dma {
+	status = "okay";
+};
+
+&uart1 {
+	espressif,uhci = <&uart_dma>;
+	dmas = <&ahb_gdma 0 0>;
+	dma-names = "tx";
+	status = "okay";
+};

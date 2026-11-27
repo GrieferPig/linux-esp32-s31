@@ -14,9 +14,11 @@
 #include <linux/genalloc.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
+#include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/sizes.h>
@@ -98,10 +100,12 @@ struct ahb_layout {
 	u32 mem_last;
 	u16 channel_regs[AHB_CHANNEL_REGS];
 	bool coherent_pool;
+	bool lazy_irqs;
 };
 
 static const struct ahb_layout esp32s31_ahb_layout = {
 	.num_channels = 5,
+	.lazy_irqs = true,
 	.channel_stride = 0x100,
 	.link_addr_stride = 0x100,
 	.misc_conf = 0xa4,
@@ -1058,6 +1062,50 @@ static void esp32s31_ahb_synchronize(struct dma_chan *dchan)
 	vchan_synchronize(&chan->vc);
 }
 
+static int esp32s31_ahb_request_irq(struct esp32s31_ahb_chan *chan,
+				   unsigned int index)
+{
+	struct device *dev = chan->gdma->dma_dev.dev;
+	int irq, ret;
+
+	irq = of_irq_get(dev->of_node, index);
+	if (irq < 0)
+		return irq;
+	if (!irq)
+		return dev_err_probe(dev, -ENOSPC, "cannot map GDMA IRQ %u\n", index);
+
+	ret = request_irq(irq, esp32s31_ahb_irq, 0, dev_name(dev), chan);
+	if (ret) {
+		irq_dispose_mapping(irq);
+		return ret;
+	}
+	return irq;
+}
+
+static int esp32s31_ahb_alloc_resources(struct dma_chan *dchan)
+{
+	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
+	int rx, tx;
+
+	/*
+	 * S31 TRM ch.3 & ch.12: each RX/TX channel has a separate matrix
+	 * source. Claim two CLIC inputs only while this pair has a user.
+	 */
+	rx = esp32s31_ahb_request_irq(chan, chan->id);
+	if (rx < 0)
+		return rx;
+	chan->rx_irq = rx;
+	tx = esp32s31_ahb_request_irq(chan, chan->gdma->layout->num_channels + chan->id);
+	if (tx < 0) {
+		free_irq(rx, chan);
+		irq_dispose_mapping(rx);
+		chan->rx_irq = 0;
+		return tx;
+	}
+	chan->tx_irq = tx;
+	return 0;
+}
+
 static void esp32s31_ahb_free_resources(struct dma_chan *dchan)
 {
 	struct esp32s31_ahb_chan *chan = to_ahb_chan(dchan);
@@ -1066,6 +1114,14 @@ static void esp32s31_ahb_free_resources(struct dma_chan *dchan)
 	vchan_free_chan_resources(&chan->vc);
 	chan->request_id = U32_MAX;
 	chan->users = 0;
+	if (chan->gdma->layout->lazy_irqs) {
+		free_irq(chan->tx_irq, chan);
+		irq_dispose_mapping(chan->tx_irq);
+		chan->tx_irq = 0;
+		free_irq(chan->rx_irq, chan);
+		irq_dispose_mapping(chan->rx_irq);
+		chan->rx_irq = 0;
+	}
 }
 
 static struct dma_chan *esp32s31_ahb_of_xlate(struct of_phandle_args *spec,
@@ -1078,6 +1134,13 @@ static struct dma_chan *esp32s31_ahb_of_xlate(struct of_phandle_args *spec,
 	    spec->args[1] >= 32)
 		return NULL;
 	chan = &gdma->chans[spec->args[0]];
+	if (gdma->layout->lazy_irqs) {
+		struct dma_chan *dchan = dma_get_slave_channel(&chan->vc.chan);
+
+		if (dchan)
+			chan->request_id = spec->args[1];
+		return dchan;
+	}
 	if (chan->users >= 2)
 		return NULL;
 	chan->request_id = spec->args[1];
@@ -1165,6 +1228,10 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 	dma_dev->dst_addr_widths = dma_dev->src_addr_widths;
 	dma_dev->residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
 	dma_dev->device_free_chan_resources = esp32s31_ahb_free_resources;
+	if (gdma->layout->lazy_irqs) {
+		dma_cap_set(DMA_PRIVATE, dma_dev->cap_mask);
+		dma_dev->device_alloc_chan_resources = esp32s31_ahb_alloc_resources;
+	}
 	dma_dev->device_prep_dma_memcpy = esp32s31_ahb_prep_memcpy;
 	dma_dev->device_config = esp32s31_ahb_slave_config;
 	dma_dev->device_prep_slave_sg = esp32s31_ahb_prep_slave_sg;
@@ -1185,17 +1252,20 @@ static int esp32s31_ahb_probe(struct platform_device *pdev)
 
 	for (i = 0; i < gdma->layout->num_channels; i++) {
 		struct esp32s31_ahb_chan *chan = &gdma->chans[i];
-		int irq = platform_get_irq(pdev, i);
+		int irq;
 
-		if (irq < 0)
-			return irq;
 		chan->gdma = gdma;
 		chan->id = i;
 		chan->request_id = U32_MAX;
-		chan->rx_irq = irq;
 		chan->vc.desc_free = esp32s31_ahb_free_desc;
 		vchan_init(&chan->vc, i < gdma->layout->memcpy_first ?
 			   &gdma->slave_dev : dma_dev);
+		if (gdma->layout->lazy_irqs)
+			continue;
+		irq = platform_get_irq(pdev, i);
+		if (irq < 0)
+			return irq;
+		chan->rx_irq = irq;
 		ret = devm_request_irq(dev, irq, esp32s31_ahb_irq, 0,
 				       dev_name(dev), chan);
 		if (ret)

@@ -12,6 +12,7 @@
 #include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/ptrace.h>
@@ -35,6 +36,7 @@
 #define UHCI_CONF0		0x00
 #define UHCI_CONF1		0x14
 #define UHCI_ESCAPE_CONF	0x20
+#define S31_UHCI_ESC_CONF0	0x6c
 #define UHCI_PKT_THRES		0x7c
 #define UHCI_LEN_EOF_EN		BIT(9)
 #define UHCI_UART_IDLE_EOF_EN	BIT(8)
@@ -43,6 +45,10 @@
 #define UHCI_RX_RST		BIT(1)
 #define UHCI_UART_SEL_MASK	GENMASK(4, 2)
 #define UHCI_SYS_RST_EN		BIT(2)
+/* S31 TRM 25.4.10 and UHCI_ESC_CONF0: optional SLIP framing. */
+#define S31_UHCI_SEPER_EN	BIT(5)
+#define S31_UHCI_SLIP_CHARS	0x00dcdbc0
+#define S31_UHCI_SLIP_ESCAPE	(BIT(0) | BIT(1) | BIT(4) | BIT(5))
 #define UHCI_DMA_RING_SLOTS	4U
 #define UHCI_DMA_PERIOD		1536U
 #define UHCI_DMA_RING_BYTES	(UHCI_DMA_RING_SLOTS * UHCI_DMA_PERIOD)
@@ -185,6 +191,8 @@ struct esp32_port {
 	bool tx_dma_active;
 	bool rx_dma_active;
 	bool dma_started;
+	bool s31_uhci_phandle;
+	bool s31_uhci_slip;
 	struct esp32_uhci_dma_slot tx_slots[UHCI_TX_SLOTS];
 	struct esp32_uhci_dma_slot rx_slots[UHCI_DMA_RING_SLOTS];
 	u8 rx_stage[UHCI_DMA_PERIOD];
@@ -406,7 +414,7 @@ static void esp32_uhci_tx_done(void *arg);
 
 static int esp32_uhci_hw_init(struct esp32_port *sport)
 {
-	u32 val;
+	u32 framing, val;
 	int ret;
 
 	if (sport->uhci_rst) {
@@ -418,25 +426,34 @@ static int esp32_uhci_hw_init(struct esp32_port *sport)
 		writel(val | UHCI_SYS_RST_EN, sport->uhci_clkrst);
 		writel(val & ~UHCI_SYS_RST_EN, sport->uhci_clkrst);
 	}
-	/* P4 TRM ch.46 UHCI_CONF0: UART_SEL selects HP UART0 through UART4. */
+	/*
+	 * UART_SEL selects HP UART0 through UART3 on S31 (TRM ch.25,
+	 * UHCI_CONF0), or through UART4 on P4 (TRM ch.46).
+	 */
+	framing = sport->s31_uhci_slip ? S31_UHCI_SEPER_EN : UHCI_UART_IDLE_EOF_EN;
 	writel(UHCI_CLK_EN, sport->uhci_base + UHCI_CONF0);
-	writel(UHCI_CLK_EN | UHCI_UART_IDLE_EOF_EN |
+	writel(UHCI_CLK_EN | framing |
 	       FIELD_PREP(UHCI_UART_SEL_MASK, sport->port.line),
 	       sport->uhci_base + UHCI_CONF0);
 	writel(0, sport->uhci_base + UHCI_CONF1);
-	writel(0, sport->uhci_base + UHCI_ESCAPE_CONF);
+	if (sport->s31_uhci_slip)
+		writel(S31_UHCI_SLIP_CHARS, sport->uhci_base + S31_UHCI_ESC_CONF0);
+	writel(sport->s31_uhci_slip ? S31_UHCI_SLIP_ESCAPE : 0,
+	       sport->uhci_base + UHCI_ESCAPE_CONF);
 	/*
 	 * UART idle EOF completes the last partial descriptor of each burst.
 	 * Keep the length threshold disabled so RX can also stream full descriptors.
 	 */
-	writel(0, sport->uhci_base + UHCI_PKT_THRES);
+	if (!sport->s31_uhci_slip)
+		writel(0, sport->uhci_base + UHCI_PKT_THRES);
 	/* IDF enables the UART core clocks in addition to the bus clock. */
 	val = esp32_uart_read(&sport->port, UART_CLK_CONF_REG);
 	esp32_uart_write(&sport->port, UART_CLK_CONF_REG,
 			 val | UART_TX_SCLK_EN | UART_RX_SCLK_EN);
-	return 0;
+	if (!sport->s31_uhci_phandle)
+		return 0;
 
-	/* UART0 is exclusively owned by UHCI after startup. */
+	/* UHCI owns this UART while the DMA ring is active. */
 	esp32_uart_write(&sport->port, UART_INT_ENA_REG, 0);
 	esp32_uart_write(&sport->port, UART_INT_CLR_REG, 0xffffffff);
 	/* Drop any loader/PIO bytes before UHCI starts feeding the UART. */
@@ -447,6 +464,7 @@ static int esp32_uhci_hw_init(struct esp32_port *sport)
 	esp32_uart_write(&sport->port, UART_CONF0_REG, val &
 			 ~(UART_RXFIFO_RST | UART_TXFIFO_RST));
 	esp32_uart_update(&sport->port);
+	return 0;
 }
 
 static int esp32_uhci_prime_rx_ring_locked(struct esp32_port *sport)
@@ -1507,9 +1525,67 @@ static struct uart_driver esp32_uart_reg = {
 	.cons		= &esp32_uart_console,
 };
 
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+static void esp32s31_uart_put_uhci_reset(void *arg)
+{
+	reset_control_put(arg);
+}
+
+static int esp32s31_uart_uhci_resources(struct platform_device *pdev,
+				       struct esp32_port *sport,
+				       struct device_node *uhci)
+{
+	struct device *dev = &pdev->dev;
+	struct resource res;
+	int ret;
+
+	if (sport->port.line > 3 ||
+	    !of_device_is_compatible(uhci, "espressif,esp32s31-uhci") ||
+	    !of_device_is_available(uhci))
+		return -EINVAL;
+
+	ret = of_address_to_resource(uhci, 0, &res);
+	if (ret)
+		return ret;
+	sport->uhci_base = devm_ioremap_resource(dev, &res);
+	if (IS_ERR(sport->uhci_base))
+		return PTR_ERR(sport->uhci_base);
+
+	ret = of_address_to_resource(uhci, 1, &res);
+	if (ret)
+		return ret;
+	if (resource_size(&res) < UHCI_DMA_BUF_BYTES)
+		return -EINVAL;
+
+	/* AHB GDMA uses loader-reserved internal HP SRAM for both rings. */
+	sport->tx_buf = devm_ioremap_resource(dev, &res);
+	if (IS_ERR(sport->tx_buf))
+		return PTR_ERR(sport->tx_buf);
+	sport->tx_dma_addr = res.start;
+
+	sport->uhci_clk = devm_get_clk_from_child(dev, uhci, NULL);
+	if (IS_ERR(sport->uhci_clk))
+		return PTR_ERR(sport->uhci_clk);
+	sport->uhci_rst = of_reset_control_get_exclusive(uhci, NULL);
+	if (IS_ERR(sport->uhci_rst))
+		return PTR_ERR(sport->uhci_rst);
+	ret = devm_add_action_or_reset(dev, esp32s31_uart_put_uhci_reset,
+				       sport->uhci_rst);
+	if (ret)
+		return ret;
+
+	sport->s31_uhci_phandle = true;
+	sport->s31_uhci_slip = device_property_read_bool(dev, "espressif,uhci-slip");
+	return 0;
+}
+#endif
+
 static int esp32_uart_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
+#if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	struct device_node *uhci __free(device_node) = NULL;
+#endif
 	const struct esp32_uart_variant *variant;
 	struct uart_port *port;
 	struct esp32_port *sport;
@@ -1539,38 +1615,52 @@ static int esp32_uart_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 #if IS_ENABLED(CONFIG_SERIAL_ESP32_UHCI)
+	if (variant == &esp32s31_variant && of_property_present(np, "espressif,uhci")) {
+		uhci = of_parse_phandle(np, "espressif,uhci", 0);
+		if (!uhci)
+			return -EINVAL;
+		variant = &esp32s31_uhci_variant;
+	}
+
 	if (variant->uhci_dma) {
-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "uart");
+		res = uhci ? platform_get_resource(pdev, IORESOURCE_MEM, 0) :
+		      platform_get_resource_byname(pdev, IORESOURCE_MEM, "uart");
 		if (!res)
 			return -ENODEV;
 		port->mapbase = res->start;
 		port->membase = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(port->membase))
 			return PTR_ERR(port->membase);
-		sport->uhci_base = devm_platform_ioremap_resource_byname(pdev,
-									"uhci");
-		if (IS_ERR(sport->uhci_base))
-			return PTR_ERR(sport->uhci_base);
-		if (variant->uhci_native_resources) {
-			if (port->line > 4)
-				return dev_err_probe(&pdev->dev, -EINVAL,
-						     "UHCI requires an HP UART alias\n");
-			sport->uhci_rst = devm_reset_control_get_exclusive(&pdev->dev,
-									 "uhci");
-			if (IS_ERR(sport->uhci_rst))
-				return PTR_ERR(sport->uhci_rst);
+		if (uhci) {
+			ret = esp32s31_uart_uhci_resources(pdev, sport, uhci);
+			if (ret)
+				return dev_err_probe(&pdev->dev, ret, "UHCI unavailable\n");
 		} else {
-			sport->uhci_clkrst = devm_platform_ioremap_resource_byname(pdev,
-										"clkrst");
-			if (IS_ERR(sport->uhci_clkrst))
-				return PTR_ERR(sport->uhci_clkrst);
+			sport->uhci_base = devm_platform_ioremap_resource_byname(pdev,
+										"uhci");
+			if (IS_ERR(sport->uhci_base))
+				return PTR_ERR(sport->uhci_base);
+			if (variant->uhci_native_resources) {
+				if (port->line > 4)
+					return dev_err_probe(&pdev->dev, -EINVAL,
+							     "UHCI requires an HP UART alias\n");
+				sport->uhci_rst = devm_reset_control_get_exclusive(&pdev->dev,
+										 "uhci");
+				if (IS_ERR(sport->uhci_rst))
+					return PTR_ERR(sport->uhci_rst);
+			} else {
+				sport->uhci_clkrst = devm_platform_ioremap_resource_byname(pdev,
+											"clkrst");
+				if (IS_ERR(sport->uhci_clkrst))
+					return PTR_ERR(sport->uhci_clkrst);
+			}
+			sport->uhci_clk = devm_clk_get(&pdev->dev, "bus");
+			if (IS_ERR(sport->uhci_clk))
+				return PTR_ERR(sport->uhci_clk);
 		}
-		sport->clk = devm_clk_get(&pdev->dev, "uart");
+		sport->clk = devm_clk_get(&pdev->dev, uhci ? NULL : "uart");
 		if (IS_ERR(sport->clk))
 			return PTR_ERR(sport->clk);
-		sport->uhci_clk = devm_clk_get(&pdev->dev, "bus");
-		if (IS_ERR(sport->uhci_clk))
-			return PTR_ERR(sport->uhci_clk);
 		sport->tx_dma = dma_request_chan(&pdev->dev, "tx");
 		if (IS_ERR(sport->tx_dma))
 			return PTR_ERR(sport->tx_dma);
@@ -1592,7 +1682,7 @@ static int esp32_uart_probe(struct platform_device *pdev)
 				goto err_dma;
 			}
 			sport->tx_buf = (void __iomem *)ring;
-		} else {
+		} else if (!uhci) {
 			res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dma-buf");
 			if (!res || resource_size(res) < UHCI_DMA_BUF_BYTES) {
 				ret = -EINVAL;
