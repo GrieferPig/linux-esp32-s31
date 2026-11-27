@@ -60,4 +60,35 @@ esp_dma2d_prep_jpeg_xfer(struct dma_chan *chan,
 			 const struct esp_dma2d_jpeg_cfg *cfg,
 			 unsigned long flags);
 
+/*
+ * S31 TRM ch.34 PPA / P4 TRM ch.40 PPA: 2D-DMA helpers for PPA fill
+ * (RX-only) and PPA alpha-blend (BG TX + RX on one pair, FG TX on second).
+ */
+struct esp_dma2d_ppa_rect {
+	dma_addr_t address;
+	u16 pic_w;
+	u16 pic_h;
+	u16 block_w;
+	u16 block_h;
+	u16 x;
+	u16 y;
+	u8 pbyte;
+};
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_fill(struct dma_chan *chan,
+			const struct esp_dma2d_ppa_rect *dst,
+			unsigned long flags);
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_blend_bg(struct dma_chan *chan,
+			    const struct esp_dma2d_ppa_rect *bg,
+			    const struct esp_dma2d_ppa_rect *dst,
+			    unsigned long flags);
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_blend_fg(struct dma_chan *chan,
+			    const struct esp_dma2d_ppa_rect *fg,
+			    unsigned long flags);
+
 #endif

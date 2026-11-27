@@ -56,6 +56,7 @@
 #define D2D_REG_CLK_EN		BIT(2)
 #define D2D_PORT_ENABLE		BIT(11)
 
+#define D2D_TX_EOF		BIT(1)
 #define D2D_TX_ERROR		BIT(2)
 #define D2D_RX_EOF		BIT(1)
 #define D2D_RX_ERRORS		(BIT(2) | BIT(3) | BIT(10))
@@ -73,8 +74,11 @@
 #define D2D_JPEG		0
 #define D2D_JPEG_GRAY_MCU	8
 #define D2D_M2M_DUMMY		4
-/* TRM ch.40 PPA: the SRM uses a dedicated input and output selector. */
+/* TRM ch.40 PPA: the SRM and blend engines use dedicated peripheral selectors. */
 #define D2D_PPA_SRM		1
+#define D2D_PPA_BLEND_BG_TX	2
+#define D2D_PPA_BLEND_FG_TX	3
+#define D2D_PPA_BLEND_RX	2
 #define D2D_SRM_RGB565		3
 #define D2D_SRM_RGB_PADDING	18
 #define D2D_SRM_RX_BLOCK	2
@@ -95,6 +99,9 @@ struct esp_dma2d_desc {
 	enum {
 		D2D_MEMCPY,
 		D2D_PPA,
+		D2D_PPA_FILL,
+		D2D_PPA_BLEND_BG,
+		D2D_PPA_BLEND_FG,
 		D2D_JPEG_GRAY,
 		D2D_JPEG_XFER,
 	} mode;
@@ -312,9 +319,129 @@ esp_dma2d_prep_ppa_srm(struct dma_chan *dchan, const struct esp_dma2d_image *src
 	/* With the descriptor port enabled, SRM supplies actual RX blocks. */
 	esp_dma2d_srm_desc(&desc->hw[1], dst, D2D_SRM_RX_BLOCK, D2D_SRM_RX_BLOCK);
 
+	if (esp_dma2d_map_desc(chan, desc)) {
+		esp_dma2d_desc_free(&desc->vd);
+		return NULL;
+	}
+
 	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
 }
 EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_srm);
+
+static bool esp_dma2d_ppa_rect_valid(const struct esp_dma2d_ppa_rect *r)
+{
+	return r && !upper_32_bits(r->address) &&
+	       r->pic_w && r->pic_h && r->block_w && r->block_h &&
+	       r->pic_w <= D2D_COUNT_MAX && r->pic_h <= D2D_COUNT_MAX &&
+	       r->block_w <= D2D_COUNT_MAX && r->block_h <= D2D_COUNT_MAX &&
+	       r->x + r->block_w <= r->pic_w && r->y + r->block_h <= r->pic_h &&
+	       r->pbyte <= FIELD_MAX(D2D_DESC_PIXEL);
+}
+
+static void esp_dma2d_fill_rect_desc(struct esp_dma2d_hw_desc *hw,
+				     const struct esp_dma2d_ppa_rect *r)
+{
+	hw->control = cpu_to_le32(D2D_DESC_OWNER | D2D_DESC_EOF | D2D_DESC_2D |
+				  FIELD_PREP(D2D_DESC_HORIZ, r->block_w) |
+				  r->block_h);
+	hw->frame = cpu_to_le32(FIELD_PREP(D2D_DESC_PIXEL, r->pbyte) |
+				FIELD_PREP(D2D_DESC_HORIZ, r->pic_w) | r->pic_h);
+	hw->position = cpu_to_le32(FIELD_PREP(D2D_DESC_HORIZ, r->x) | r->y);
+	hw->buffer = cpu_to_le32(r->address);
+}
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_fill(struct dma_chan *dchan,
+			const struct esp_dma2d_ppa_rect *dst,
+			unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+
+	if (dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !esp_dma2d_ppa_rect_valid(dst))
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	desc->mode = D2D_PPA_FILL;
+	esp_dma2d_fill_rect_desc(&desc->hw[1], dst);
+
+	if (esp_dma2d_map_desc(chan, desc)) {
+		esp_dma2d_desc_free(&desc->vd);
+		return NULL;
+	}
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_fill);
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_blend_bg(struct dma_chan *dchan,
+			    const struct esp_dma2d_ppa_rect *bg,
+			    const struct esp_dma2d_ppa_rect *dst,
+			    unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+
+	if (dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !esp_dma2d_ppa_rect_valid(bg) ||
+	    !esp_dma2d_ppa_rect_valid(dst))
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	desc->mode = D2D_PPA_BLEND_BG;
+	esp_dma2d_fill_rect_desc(&desc->hw[0], bg);
+	esp_dma2d_fill_rect_desc(&desc->hw[1], dst);
+
+	if (esp_dma2d_map_desc(chan, desc)) {
+		esp_dma2d_desc_free(&desc->vd);
+		return NULL;
+	}
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_blend_bg);
+
+struct dma_async_tx_descriptor *
+esp_dma2d_prep_ppa_blend_fg(struct dma_chan *dchan,
+			    const struct esp_dma2d_ppa_rect *fg,
+			    unsigned long flags)
+{
+	struct esp_dma2d_chan *chan;
+	struct esp_dma2d_desc *desc;
+
+	if (dchan->device->device_prep_interleaved_dma != esp_dma2d_prep_interleaved)
+		return NULL;
+	chan = to_dma2d_chan(dchan);
+	if (!chan->has_srm || !esp_dma2d_ppa_rect_valid(fg))
+		return NULL;
+
+	desc = esp_dma2d_alloc(chan);
+	if (!desc)
+		return NULL;
+
+	desc->mode = D2D_PPA_BLEND_FG;
+	esp_dma2d_fill_rect_desc(&desc->hw[0], fg);
+
+	if (esp_dma2d_map_desc(chan, desc)) {
+		esp_dma2d_desc_free(&desc->vd);
+		return NULL;
+	}
+
+	return vchan_tx_prep(&chan->vc, &desc->vd, flags);
+}
+EXPORT_SYMBOL_GPL(esp_dma2d_prep_ppa_blend_fg);
 
 struct dma_async_tx_descriptor *
 esp_dma2d_prep_jpeg_gray(struct dma_chan *dchan, dma_addr_t src, size_t len,
@@ -490,6 +617,36 @@ static void esp_dma2d_start(struct esp_dma2d_chan *chan)
 		       chan->tx + D2D_TX_PORT_BLK);
 		writel(D2D_PPA_SRM, chan->tx + D2D_TX_PERI);
 		writel(D2D_PPA_SRM, chan->rx + D2D_RX_PERI);
+	} else if (desc->mode == D2D_PPA_FILL) {
+		/* IDF ppa_fill.c: RX-only single-block 2D transfer from PPA_BLEND. */
+		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->rx + D2D_CONF0);
+		writel(D2D_PPA_BLEND_RX, chan->rx + D2D_RX_PERI);
+		dma_wmb();
+		writel(desc->dma + sizeof(*desc->hw), chan->rx + D2D_LINK_ADDR);
+		writel(0, chan->tx + D2D_INT_ENA);
+		writel(D2D_RX_EOF | D2D_RX_ERRORS, chan->rx + D2D_INT_ENA);
+		writel(D2D_RX_START, chan->rx + D2D_LINK_CONF);
+		return;
+	} else if (desc->mode == D2D_PPA_BLEND_BG) {
+		/* IDF ppa_blend.c: BG TX + output RX on PPA_BLEND. */
+		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
+		writel(D2D_CH_RST, chan->rx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->tx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->rx + D2D_CONF0);
+		writel(D2D_PPA_BLEND_BG_TX, chan->tx + D2D_TX_PERI);
+		writel(D2D_PPA_BLEND_RX, chan->rx + D2D_RX_PERI);
+	} else if (desc->mode == D2D_PPA_BLEND_FG) {
+		/* IDF ppa_blend.c: FG TX-only on PPA_BLEND. */
+		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
+		writel(D2D_DSCR_BURST_EN | D2D_MEM_BURST_128, chan->tx + D2D_CONF0);
+		writel(D2D_PPA_BLEND_FG_TX, chan->tx + D2D_TX_PERI);
+		dma_wmb();
+		writel(desc->dma, chan->tx + D2D_LINK_ADDR);
+		writel(D2D_TX_EOF | D2D_TX_ERROR, chan->tx + D2D_INT_ENA);
+		writel(0, chan->rx + D2D_INT_ENA);
+		writel(D2D_TX_START, chan->tx + D2D_LINK_CONF);
+		return;
 	} else if (desc->mode == D2D_JPEG_GRAY) {
 		writel(D2D_CH_RST, chan->tx + D2D_CONF0);
 		writel(D2D_CH_RST, chan->rx + D2D_CONF0);

@@ -1200,6 +1200,19 @@
 			status = "disabled";
 		};
 
+		/* S31 TRM ch.34 PPA / IDF esp32s31.peripherals.ld + interrupts.h. */
+		ppa: ppa@20345000 {
+			compatible = "espressif,esp32s31-ppa";
+			reg = <0x20345000 0x1000>;
+			interrupt-parent = <&intmtx>;
+			interrupts = <102 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkc ESP32S31_CLK_PPA>;
+			resets = <&clkc ESP32S31_RST_PPA>;
+			dmas = <&dma2d 0>, <&dma2d 1>;
+			dma-names = "srm", "fg";
+			status = "okay";
+		};
+
 		gptimer0: timer@20580000 {
 			compatible = "espressif,esp32s31-gptimer";
 			reg = <0x20580000 0x48>;

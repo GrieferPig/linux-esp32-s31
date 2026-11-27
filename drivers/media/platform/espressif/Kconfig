@@ -39,3 +39,13 @@ config VIDEO_ESP32S31_JPEG
 	help
 	  Encode and decode baseline JPEG images (grayscale and color)
 	  through the ESP32-S31 JPEG codec and 2D-DMA using V4L2 M2M.
+
+config VIDEO_ESP32S31_PPA
+	tristate "ESP32-S31 Pixel Processing Accelerator"
+	depends on SOC_ESP32S31 && VIDEO_DEV && ESPRESSIF_DMA2D
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_V4L2
+	help
+	  V4L2 memory-to-memory scaling, rotation, mirroring (SRM), solid fill,
+	  and alpha blending through the ESP32-S31 PPA and 2D-DMA.

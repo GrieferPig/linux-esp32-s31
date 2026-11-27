@@ -61,7 +61,8 @@
 #define ESP32S31_CLK_DMA2D		54
 #define ESP32S31_CLK_RMT		55
 #define ESP32S31_CLK_JPEG		56
+#define ESP32S31_CLK_PPA		57
 
-#define ESP32S31_CLK_NR			57
+#define ESP32S31_CLK_NR			58
 
 #endif
