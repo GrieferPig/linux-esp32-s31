@@ -240,6 +240,16 @@
 			status = "okay";
 		};
 
+		/* S31 TRM ch.5: SOC_ETM and GPIO_EXT address windows. */
+		etm: event-matrix@20393000 {
+			compatible = "espressif,esp32s31-etm";
+			reg = <0x20393000 0x1000>, <0x20583f58 0x34>;
+			reg-names = "matrix", "gpio-tasks";
+			clocks = <&clkc ESP32S31_CLK_ETM>;
+			resets = <&clkc ESP32S31_RST_ETM>;
+			status = "disabled";
+		};
+
 		/* S31 TRM ch.25 UART Controller: one UHCI shared by the HP UARTs. */
 		uart_dma: uart-dma@20398000 {
 			compatible = "espressif,esp32s31-uhci";

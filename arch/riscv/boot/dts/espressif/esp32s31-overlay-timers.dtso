@@ -4,6 +4,7 @@
 
 / {
 	espressif,overlay-name = "timers";
+	espressif,resource-claims = "gptimer0", "gptimer1";
 };
 
 &systimer { status = "okay"; };

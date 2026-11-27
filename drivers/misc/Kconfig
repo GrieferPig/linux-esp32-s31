@@ -668,6 +668,13 @@ config ESP32P4_PARLIO
 	help
 	  Expose the ESP32-P4 parallel I/O controller as a framed DMA device.
 
+config ESP32S31_ETM
+	tristate "ESP32-S31 Event Task Matrix"
+	depends on SOC_ESP32S31 && GPIOLIB
+	help
+	  Route timer compare events to GPIO tasks using the ESP32-S31
+	  Event Task Matrix. Routes can be set in DT or through a misc device.
+
 config ESP32S31_PARLIO
 	tristate "Espressif ESP32-S31 parallel I/O controller"
 	depends on SOC_ESP32S31 && OF && DMA_ENGINE && COMMON_CLK

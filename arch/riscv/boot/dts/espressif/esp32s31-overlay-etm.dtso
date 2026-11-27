@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	espressif,overlay-name = "etm";
+	espressif,resource-claims = "etm", "gpio47", "gptimer0", "gptimer1";
+};
+
+&{/soc} {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	timer@20580000 {
+		reg = <0x20580000 0x48>, <0x205800fc 0x4>;
+		reg-names = "timers", "etm-enable";
+		espressif,etm-alarm-mask = <1>;
+		status = "okay";
+	};
+
+	timer@20581000 {
+		reg = <0x20581000 0x48>, <0x205810fc 0x4>;
+		reg-names = "timers", "etm-enable";
+		espressif,etm-alarm-mask = <1>;
+		status = "okay";
+	};
+};
+
+&etm {
+	task-gpios = <&gpio 47 GPIO_ACTIVE_HIGH>;
+	/* IDF soc_etm_source.h: TG1_EVT_CNT_CMP_TIMER0 -> GPIO_TASK_CH0_TOGGLE. */
+	espressif,routes = <32 75 17>;
+	status = "okay";
+};

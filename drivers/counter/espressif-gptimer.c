@@ -37,6 +37,8 @@
 #define GPTIMER_INT_ENA		0x00
 #define GPTIMER_INT_ST		0x08
 #define GPTIMER_INT_CLR		0x0c
+/* S31 TRM ch.7 Timer Group: TIMG_REGCLK.TIMG_ETM_EN. */
+#define S31_GPTIMER_ETM_EN	BIT(28)
 
 struct esp_gptimer_alarm {
 	struct counter_device *counter;
@@ -47,10 +49,12 @@ struct esp_gptimer_alarm {
 struct esp32s31_gptimer {
 	void __iomem *base;
 	void __iomem *interrupts;
+	void __iomem *etm_enable;
 	struct clk *clk;
 	spinlock_t lock;
 	u32 alarm_mask;
 	u32 armed_mask;
+	u32 etm_alarm_mask;
 	struct esp_gptimer_alarm alarms[2];
 	u32 reserved_timer_mask;
 	struct counter_count counts[2];
@@ -153,7 +157,7 @@ static int esp32s31_gptimer_enable_write(struct counter_device *counter,
 
 	spin_lock_irqsave(&timer->lock, flags);
 	config = readl(timer->base + GPTIMER_CONFIG(count->id));
-	if (!(timer->alarm_mask & BIT(count->id)))
+	if (!((timer->alarm_mask | timer->etm_alarm_mask) & BIT(count->id)))
 		config &= ~(GPTIMER_ALARM_EN | GPTIMER_AUTORELOAD);
 	if (enable) {
 		config |= GPTIMER_ENABLE;
@@ -225,7 +229,9 @@ static int esp_gptimer_alarm_write(struct counter_device *counter,
 	if (value >= BIT_ULL(54))
 		return -ERANGE;
 	spin_lock_irqsave(&timer->lock, flags);
-	if (timer->armed_mask & BIT(count->id)) {
+	if ((timer->armed_mask & BIT(count->id)) ||
+	    ((timer->etm_alarm_mask & BIT(count->id)) &&
+	     (readl(timer->base + GPTIMER_CONFIG(count->id)) & GPTIMER_ALARM_EN))) {
 		spin_unlock_irqrestore(&timer->lock, flags);
 		return -EBUSY;
 	}
@@ -241,7 +247,10 @@ static int esp_gptimer_alarm_enable_read(struct counter_device *counter,
 {
 	struct esp32s31_gptimer *timer = counter_priv(counter);
 
-	*enable = !!(READ_ONCE(timer->armed_mask) & BIT(count->id));
+	if (timer->etm_alarm_mask & BIT(count->id))
+		*enable = !!(readl(timer->base + GPTIMER_CONFIG(count->id)) & GPTIMER_ALARM_EN);
+	else
+		*enable = !!(READ_ONCE(timer->armed_mask) & BIT(count->id));
 	return 0;
 }
 
@@ -257,14 +266,15 @@ static int esp_gptimer_alarm_enable_write(struct counter_device *counter,
 	spin_lock_irqsave(&timer->lock, flags);
 	config = readl(reg);
 	if (enable) {
-		timer->armed_mask |= BIT(count->id);
+		if (timer->alarm_mask & BIT(count->id))
+			timer->armed_mask |= BIT(count->id);
 		config |= GPTIMER_ALARM_EN;
 	} else {
 		timer->armed_mask &= ~BIT(count->id);
 		config &= ~GPTIMER_ALARM_EN;
 	}
 	writel(config, reg);
-	if (!enable)
+	if (!enable && timer->interrupts)
 		writel(BIT(count->id), timer->interrupts + GPTIMER_INT_CLR);
 	spin_unlock_irqrestore(&timer->lock, flags);
 	return 0;
@@ -303,6 +313,8 @@ static int esp_gptimer_watch_validate(struct counter_device *counter,
 {
 	struct esp32s31_gptimer *timer = counter_priv(counter);
 
+	if (timer->etm_alarm_mask)
+		return -EOPNOTSUPP;
 	if (!timer->alarm_mask)
 		return 0;
 	if (watch->event != COUNTER_EVENT_THRESHOLD ||
@@ -397,6 +409,23 @@ static const struct counter_ops esp32s31_gptimer_ops = {
 	.watch_validate = esp_gptimer_watch_validate,
 };
 
+static void s31_gptimer_disable_etm(void *arg)
+{
+	struct esp32s31_gptimer *timer = arg;
+	u32 cfg;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(timer->counts); i++) {
+		if (timer->etm_alarm_mask & BIT(i)) {
+			cfg = readl(timer->base + GPTIMER_CONFIG(i));
+			writel(cfg & ~(GPTIMER_ENABLE | GPTIMER_ALARM_EN),
+			       timer->base + GPTIMER_CONFIG(i));
+		}
+	}
+	cfg = readl(timer->etm_enable);
+	writel(cfg & ~S31_GPTIMER_ETM_EN, timer->etm_enable);
+}
+
 static int esp32s31_gptimer_probe(struct platform_device *pdev)
 {
 	struct counter_device *counter;
@@ -431,6 +460,24 @@ static int esp32s31_gptimer_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "invalid reserved timer mask %#x\n",
 				     timer->reserved_timer_mask);
+	if (of_device_is_compatible(pdev->dev.of_node, "espressif,esp32s31-gptimer") &&
+	    of_property_present(pdev->dev.of_node, "espressif,etm-alarm-mask")) {
+		ret = of_property_read_u32(pdev->dev.of_node, "espressif,etm-alarm-mask",
+					   &timer->etm_alarm_mask);
+		if (ret)
+			return ret;
+		if (!timer->etm_alarm_mask ||
+		    timer->etm_alarm_mask & (~GENMASK(1, 0) | timer->reserved_timer_mask))
+			return -EINVAL;
+		timer->etm_enable =
+			devm_platform_ioremap_resource_byname(pdev, "etm-enable");
+		if (IS_ERR(timer->etm_enable))
+			return PTR_ERR(timer->etm_enable);
+		writel(readl(timer->etm_enable) | S31_GPTIMER_ETM_EN, timer->etm_enable);
+		ret = devm_add_action_or_reset(&pdev->dev, s31_gptimer_disable_etm, timer);
+		if (ret)
+			return ret;
+	}
 	prescaler = clamp_t(u32, DIV_ROUND_CLOSEST(clk_get_rate(timer->clk),
 						     1000000), 2, 65536);
 
@@ -464,6 +511,8 @@ static int esp32s31_gptimer_probe(struct platform_device *pdev)
 			if (ret)
 				return ret;
 
+		}
+		if (timer->interrupts || (timer->etm_alarm_mask & BIT(i))) {
 			timer->count_ext[exposed][2] = (struct counter_comp)
 				COUNTER_COMP_COUNT_U64("alarm_value", esp_gptimer_alarm_read,
 						       esp_gptimer_alarm_write);

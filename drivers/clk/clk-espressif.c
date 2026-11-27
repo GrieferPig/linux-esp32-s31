@@ -76,6 +76,13 @@
 #define HP_DMA2D_CTRL0			0xb0
 #define HP_PPA_CTRL0			0xb4
 #define HP_JPEG_CTRL0			0xb8
+/* S31 IDF etm_ll_enable_bus_clock() and etm_ll_set_clock_source(). */
+#define HP_ETM_CTRL0			0xa8
+#define HP_ETM_APB_CLK_EN		BIT(1)
+#define HP_ETM_RST_EN			BIT(2)
+#define HP_ETM_CLK_SRC_SEL		GENMASK(5, 4)
+#define HP_ETM_CLK_EN			BIT(6)
+
 #define HP_CORDIC_CTRL0			0x1b4
 #define HP_RMT_CTRL0			0xbc
 #define HP_LCDCAM_CTRL0			0x14c
@@ -433,6 +440,7 @@ static const struct esp32s31_reset_desc esp32s31_resets[ESP32S31_RST_NR] = {
 	[ESP32S31_RST_CAM] = { HP_LCDCAM_CTRL0,
 		HP_LCDCAM_APB_RST_EN | HP_LCDCAM_RST_EN,
 		HP_LCDCAM_FORCE_NORST, ESP32S31_BANK_HP },
+	[ESP32S31_RST_ETM] = { HP_ETM_CTRL0, HP_ETM_RST_EN, 0, ESP32S31_BANK_HP },
 	[ESP32S31_RST_CORDIC] = { HP_CORDIC_CTRL0, HP_CORDIC_APB_RST_EN,
 		0, ESP32S31_BANK_HP },
 	[ESP32S31_RST_PARLIO_BUS] = { HP_PARLIO_BUS_CTRL0, HP_PARLIO_BUS_RST_EN,
@@ -2127,6 +2135,13 @@ static int esp32s31_clk_probe(struct platform_device *pdev)
 	ret = esp32s31_register_clk(dev, priv, ESP32S31_CLK_CAM,
 				    "cam", ESP32S31_CLK_KIND_CAM,
 				    ESP32S31_XTAL_RATE / 2);
+	if (ret)
+		return ret;
+
+	ret = esp32s31_register_gate(dev, priv, ESP32S31_CLK_ETM, "soc-etm",
+				     ESP32S31_XTAL_RATE, HP_ETM_CTRL0,
+				     HP_ETM_APB_CLK_EN | HP_ETM_CLK_EN,
+				     HP_ETM_RST_EN | HP_ETM_CLK_SRC_SEL, 0);
 	if (ret)
 		return ret;
 
