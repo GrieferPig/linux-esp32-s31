@@ -24,6 +24,7 @@
 #include <linux/pm_wakeirq.h>
 #include <linux/remoteproc.h>
 #include <linux/reboot.h>
+#include <linux/spi/spi.h>
 #include <linux/suspend.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -101,6 +102,14 @@ struct esp32s31_lp {
 	u32 i2c_hz;
 	u32 i2c_flags;
 	bool i2c_registered;
+#endif
+
+#if IS_REACHABLE(CONFIG_SPI)
+	struct spi_controller *spi;
+	struct mutex spi_lock;
+	u32 spi_pins;
+	u32 spi_mode;
+	bool spi_selected;
 #endif
 
 	struct miscdevice miscdev;
@@ -863,6 +872,224 @@ static int esp32s31_lp_add_i2c(struct esp32s31_lp *lp)
 }
 #endif
 
+#if IS_REACHABLE(CONFIG_SPI)
+static int esp32s31_lp_spi_rpc(struct esp32s31_lp *lp, u32 mode, u32 speed, u32 action,
+			       const u8 *tx, u8 *rx, unsigned int len, u32 *effective)
+{
+	struct s31_lp_rpc_slot req = {
+		.operation = S31_LP_RPC_SPI,
+		.args = { lp->spi_pins, speed, mode, action },
+		.input_len = tx ? len : 0,
+		.output_len = rx ? len : 0,
+	};
+	int ret;
+
+	if (tx)
+		memcpy(req.data, tx, len);
+	ret = esp32s31_lp_peripheral_rpc(lp, &req);
+	if (ret)
+		return ret;
+	if (rx) {
+		if (req.output_len != len)
+			return -EPROTO;
+		memcpy(rx, req.data, len);
+	}
+	if (effective)
+		*effective = req.args[1];
+	return 0;
+}
+
+static int esp32s31_lp_spi_release(struct esp32s31_lp *lp)
+{
+	int ret;
+
+	if (!lp->spi_selected)
+		return 0;
+	ret = esp32s31_lp_spi_rpc(lp, lp->spi_mode, 0, S31_LP_SPI_RELEASE,
+				   NULL, NULL, 0, NULL);
+	if (!ret)
+		lp->spi_selected = false;
+	return ret;
+}
+
+static int esp32s31_lp_spi_message(struct spi_controller *ctlr, struct spi_message *msg)
+{
+	struct esp32s31_lp *lp = spi_controller_get_devdata(ctlr);
+	struct spi_device *spi = msg->spi;
+	const u32 mode = spi->mode & (SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST);
+	struct spi_transfer *xfer, *last = NULL;
+	bool keep_cs = false;
+	int ret = 0;
+
+	static_assert(S31_LP_SPI_CPHA == SPI_CPHA && S31_LP_SPI_CPOL == SPI_CPOL);
+	static_assert(S31_LP_SPI_CS_HIGH == SPI_CS_HIGH && S31_LP_SPI_LSB_FIRST == SPI_LSB_FIRST);
+
+	mutex_lock(&lp->spi_lock);
+	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+		u32 speed = xfer->speed_hz;
+		bool first = !last;
+		const u8 *tx = xfer->tx_buf;
+		u8 *rx = xfer->rx_buf;
+
+		/* Drop a selection retained by the preceding message or transfer. */
+		if (lp->spi_selected && (xfer->cs_off || lp->spi_mode != mode)) {
+			ret = spi_delay_exec(&spi->cs_hold, last ?: xfer);
+			if (!ret)
+				ret = esp32s31_lp_spi_release(lp);
+			if (!ret)
+				ret = spi_delay_exec(&spi->cs_inactive, last ?: xfer);
+			if (ret)
+				break;
+		}
+		last = xfer;
+		if (!xfer->cs_off && (first || !lp->spi_selected)) {
+			/* SELECT is idempotent, including after an interrupted RPC. */
+			lp->spi_selected = true;
+			lp->spi_mode = mode;
+			ret = esp32s31_lp_spi_rpc(lp, mode, speed, S31_LP_SPI_SELECT,
+						   NULL, NULL, 0, &xfer->effective_speed_hz);
+			if (ret == -ENOTCONN)
+				lp->spi_selected = false;
+			if (ret)
+				break;
+			ret = spi_delay_exec(&spi->cs_setup, xfer);
+			if (ret)
+				break;
+		}
+
+		if (xfer->len && !tx && !rx) {
+			ret = -EINVAL;
+			break;
+		}
+		for (unsigned int offset = 0; offset < xfer->len; ) {
+			unsigned int count = xfer->word_delay.value ? 1 :
+					     min(xfer->len - offset, S31_LP_SPI_CHUNK_BYTES);
+
+			ret = esp32s31_lp_spi_rpc(lp, mode, speed, S31_LP_SPI_CLOCK,
+						   tx ? tx + offset : NULL,
+						   rx ? rx + offset : NULL, count,
+						   &xfer->effective_speed_hz);
+			if (ret)
+				break;
+			offset += count;
+			msg->actual_length += count;
+			if (offset < xfer->len && xfer->word_delay.value) {
+				ret = spi_delay_exec(&xfer->word_delay, xfer);
+				if (ret)
+					break;
+			}
+		}
+		if (ret)
+			break;
+
+		ret = spi_transfer_delay_exec(xfer);
+		if (ret)
+			break;
+		if (!xfer->cs_change)
+			continue;
+		if (list_is_last(&xfer->transfer_list, &msg->transfers)) {
+			keep_cs = !xfer->cs_off;
+			continue;
+		}
+		if (lp->spi_selected) {
+			ret = spi_delay_exec(&spi->cs_hold, xfer);
+			if (!ret)
+				ret = esp32s31_lp_spi_release(lp);
+			if (!ret)
+				ret = spi_delay_exec(&spi->cs_inactive, xfer);
+			if (ret)
+				break;
+		}
+		if (!xfer->cs_change_delay.value &&
+		    xfer->cs_change_delay.unit == SPI_DELAY_UNIT_USECS) {
+			/* Match the default delay in the SPI core. */
+			udelay(10);
+		} else {
+			ret = spi_delay_exec(&xfer->cs_change_delay, xfer);
+			if (ret)
+				break;
+		}
+	}
+
+	if ((ret || !keep_cs) && lp->spi_selected) {
+		int cleanup;
+
+		if (!ret && last)
+			ret = spi_delay_exec(&spi->cs_hold, last);
+		cleanup = esp32s31_lp_spi_release(lp);
+		if (!ret)
+			ret = cleanup;
+		if (!ret && last)
+			ret = spi_delay_exec(&spi->cs_inactive, last);
+	}
+	mutex_unlock(&lp->spi_lock);
+
+	msg->status = ret;
+	spi_finalize_current_message(ctlr);
+	return 0;
+}
+
+static void esp32s31_lp_del_spi(void *data)
+{
+	struct esp32s31_lp *lp = data;
+
+	if (lp->spi) {
+		struct device_node *node = lp->spi->dev.of_node;
+
+		spi_unregister_controller(lp->spi);
+		of_node_put(node);
+	}
+}
+
+static int esp32s31_lp_add_spi(struct esp32s31_lp *lp)
+{
+	struct device_node *node __free(device_node) =
+		of_get_compatible_child(lp->dev->of_node, "espressif,esp32s31-lp-spi");
+	struct s31_lp_rpc_slot caps = { .operation = S31_LP_RPC_CAPABILITIES };
+	struct spi_controller *ctlr;
+	u32 pin[4], mask = 0;
+	int ret;
+
+	if (!of_device_is_available(node) || lp->spi)
+		return 0;
+	/* SCLK, MOSI, MISO, and LP-driven chip select. */
+	if (of_property_read_u32_array(node, "espressif,pins", pin, ARRAY_SIZE(pin)))
+		return -EINVAL;
+	for (unsigned int i = 0; i < ARRAY_SIZE(pin); i++) {
+		if (pin[i] >= S31_LP_GPIO_COUNT || mask & BIT(pin[i]))
+			return -EINVAL;
+		mask |= BIT(pin[i]);
+	}
+	ret = esp32s31_lp_peripheral_rpc(lp, &caps);
+	if (ret)
+		return ret;
+	if (!(caps.args[0] & S31_LP_SERVICE_SPI))
+		return -EOPNOTSUPP;
+
+	ctlr = spi_alloc_host(lp->dev, 0);
+	if (!ctlr)
+		return -ENOMEM;
+	lp->spi_pins = pin[0] | pin[1] << 8 | pin[2] << 16 | pin[3] << 24;
+	ctlr->dev.of_node = node;
+	ctlr->bus_num = -1;
+	ctlr->num_chipselect = 1;
+	ctlr->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST;
+	ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
+	ctlr->min_speed_hz = S31_LP_SPI_MIN_HZ;
+	ctlr->max_speed_hz = S31_LP_SPI_MAX_HZ;
+	ctlr->transfer_one_message = esp32s31_lp_spi_message;
+	spi_controller_set_devdata(ctlr, lp);
+	ret = spi_register_controller(ctlr);
+	if (ret) {
+		spi_controller_put(ctlr);
+		return ret;
+	}
+	of_node_get(node);
+	lp->spi = ctlr;
+	return 0;
+}
+#endif
+
 static int esp32s31_lp_attach(struct rproc *rproc)
 {
 	struct esp32s31_lp *lp = rproc->priv;
@@ -902,6 +1129,11 @@ static int esp32s31_lp_attach(struct rproc *rproc)
 	if (ret)
 		dev_warn(lp->dev, "LP I2C unavailable: %d\n", ret);
 #endif
+#if IS_REACHABLE(CONFIG_SPI)
+	ret = esp32s31_lp_add_spi(lp);
+	if (ret)
+		dev_warn(lp->dev, "LP SPI unavailable: %d\n", ret);
+#endif
 	return 0;
 }
 
@@ -911,6 +1143,12 @@ static int esp32s31_lp_detach(struct rproc *rproc)
 	unsigned long flags;
 	int ret = 0;
 
+#if IS_REACHABLE(CONFIG_SPI)
+	mutex_lock(&lp->spi_lock);
+	ret = esp32s31_lp_spi_release(lp);
+	if (ret)
+		goto unlock_spi;
+#endif
 	mutex_lock(&lp->rpc_lock);
 	mutex_lock(&lp->user_tx_lock);
 	spin_lock_irqsave(&lp->tx_state_lock, flags);
@@ -925,7 +1163,10 @@ static int esp32s31_lp_detach(struct rproc *rproc)
 		synchronize_irq(lp->irq);
 	mutex_unlock(&lp->user_tx_lock);
 	mutex_unlock(&lp->rpc_lock);
-
+#if IS_REACHABLE(CONFIG_SPI)
+unlock_spi:
+	mutex_unlock(&lp->spi_lock);
+#endif
 	return ret;
 }
 
@@ -1491,6 +1732,13 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 
 #if IS_REACHABLE(CONFIG_I2C)
 	ret = devm_add_action_or_reset(dev, esp32s31_lp_del_i2c, lp);
+	if (ret)
+		return ret;
+#endif
+
+#if IS_REACHABLE(CONFIG_SPI)
+	mutex_init(&lp->spi_lock);
+	ret = devm_add_action_or_reset(dev, esp32s31_lp_del_spi, lp);
 	if (ret)
 		return ret;
 #endif

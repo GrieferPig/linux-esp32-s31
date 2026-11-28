@@ -61,6 +61,7 @@ typedef uint32_t s31_lp_u32;
 enum s31_lp_rpc_operation {
 	S31_LP_RPC_CAPABILITIES = 1,
 	S31_LP_RPC_I2C_XFER,
+	S31_LP_RPC_SPI,
 };
 
 enum s31_lp_rpc_result {
@@ -75,6 +76,7 @@ enum s31_lp_rpc_result {
 };
 
 #define S31_LP_SERVICE_I2C		(1U << 0)
+#define S31_LP_SERVICE_SPI		(1U << 1)
 #define S31_LP_GPIO_COUNT		8U
 #define S31_LP_I2C_FIFO_BYTES		16U
 #define S31_LP_I2C_STANDARD_HZ		100000U
@@ -87,6 +89,21 @@ enum s31_lp_rpc_result {
  * length. Nonzero lengths in both fields request a repeated START.
  * Read data replaces write data in the slot.
  */
+
+/* SPI args: pin bytes in SCLK/MOSI/MISO/CS order, speed in Hz, mode, action. */
+#define S31_LP_SPI_CHUNK_BYTES		60U
+#define S31_LP_SPI_MIN_HZ		50000U
+#define S31_LP_SPI_MAX_HZ		10000000U
+#define S31_LP_SPI_CPHA			(1U << 0)
+#define S31_LP_SPI_CPOL			(1U << 1)
+#define S31_LP_SPI_CS_HIGH		(1U << 2)
+#define S31_LP_SPI_LSB_FIRST		(1U << 3)
+
+enum s31_lp_spi_action {
+	S31_LP_SPI_CLOCK,
+	S31_LP_SPI_SELECT,
+	S31_LP_SPI_RELEASE,
+};
 
 /*
  * HP publishes a request by advancing producer before ringing the mailbox.

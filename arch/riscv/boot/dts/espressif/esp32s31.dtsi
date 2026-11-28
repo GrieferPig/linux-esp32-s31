@@ -307,6 +307,13 @@
 				#size-cells = <0>;
 				status = "disabled";
 			};
+
+			lp_spi: spi {
+				compatible = "espressif,esp32s31-lp-spi";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+			};
 		};
 
 		pmu: power-controller@20704000 {
