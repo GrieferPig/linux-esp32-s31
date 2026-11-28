@@ -53,6 +53,13 @@ enum s31_wifi_control_op {
 	S31_RADIO_ECDSA_VERIFY = 35,
 	S31_RADIO_DS_CAP = 36,
 	S31_RADIO_DS_SIGN = 37,
+	S31_RADIO_WPAN_CAP = 48,
+	S31_RADIO_WPAN_START = 49,
+	S31_RADIO_WPAN_STOP = 50,
+	S31_RADIO_WPAN_CHANNEL = 51,
+	S31_RADIO_WPAN_FILTER = 52,
+	S31_RADIO_WPAN_TX = 53,
+	S31_RADIO_WPAN_ED = 54,
 };
 
 /* Exact association selection, independent of credential representation. */
@@ -149,6 +156,19 @@ enum s31_radio_ds_status {
 	S31_RADIO_DS_NO_MEMORY,
 	S31_RADIO_DS_IO_ERROR,
 };
+
+#define S31_RADIO_WPAN_ABI 1U
+#define S31_WPAN_MAX_PSDU 127U
+#define S31_WPAN_FCS_BYTES 2U
+#define S31_RADIO_IF_WPAN_RX 32U
+#define S31_RADIO_IF_WPAN_TX 33U
+#define S31_RADIO_IF_WPAN_ED 34U
+
+/* Matching IEEE 802.15.4 status codes, independent of the vendor enum. */
+#define S31_WPAN_TX_OK 0U
+#define S31_WPAN_TX_CHANNEL_BUSY 1U
+#define S31_WPAN_TX_NO_ACK 2U
+#define S31_WPAN_TX_FAILED 3U
 
 #define S31_WIFI_IF_STA 0U
 #define S31_WIFI_IF_AP 1U

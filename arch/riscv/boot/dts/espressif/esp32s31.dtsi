@@ -346,6 +346,12 @@
 			};
 		};
 
+		wpan: wpan {
+			compatible = "espressif,esp32s31-wpan";
+			espressif,radio = <&radio>;
+			status = "disabled";
+		};
+
 		ana_i2c: regulator@20704208 {
 			compatible = "espressif,esp32s31-ana-i2c";
 			reg = <0x20704208 0x4>;

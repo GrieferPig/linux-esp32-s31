@@ -3866,11 +3866,55 @@ void s31_radio_wifi_mgmt(const u8 *bssid, u8 subtype, const u8 *body,
 	rcu_read_unlock();
 }
 
+static DEFINE_MUTEX(s31_wpan_ops_lock);
+static const struct esp32s31_radio_wpan_ops __rcu *s31_wpan_ops;
+static void *s31_wpan_context;
+
+int esp32s31_radio_wpan_register(const struct esp32s31_radio_wpan_ops *ops, void *context)
+{
+	int ret = 0;
+
+	mutex_lock(&s31_wpan_ops_lock);
+	if (rcu_access_pointer(s31_wpan_ops)) {
+		ret = -EBUSY;
+	} else {
+		s31_wpan_context = context;
+		rcu_assign_pointer(s31_wpan_ops, ops);
+	}
+	mutex_unlock(&s31_wpan_ops_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_wpan_register);
+
+void esp32s31_radio_wpan_unregister(const struct esp32s31_radio_wpan_ops *ops)
+{
+	mutex_lock(&s31_wpan_ops_lock);
+	if (rcu_access_pointer(s31_wpan_ops) == ops) {
+		RCU_INIT_POINTER(s31_wpan_ops, NULL);
+		synchronize_rcu();
+		s31_wpan_context = NULL;
+	}
+	mutex_unlock(&s31_wpan_ops_lock);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_wpan_unregister);
+
 void s31_radio_wifi_receive_aux(u8 interface, const u8 *frame, u16 length,
 			      u8 channel, s8 signal)
 {
 
 	const struct esp32s31_radio_wifi_ops *ops;
+
+	if (interface >= S31_RADIO_IF_WPAN_RX && interface <= S31_RADIO_IF_WPAN_ED) {
+		const struct esp32s31_radio_wpan_ops *wpan;
+
+		rcu_read_lock();
+		wpan = rcu_dereference(s31_wpan_ops);
+		if (wpan)
+			wpan->event(READ_ONCE(s31_wpan_context), interface, frame,
+				    length, channel, signal);
+		rcu_read_unlock();
+		return;
+	}
 
 	rcu_read_lock();
 	ops = smp_load_acquire(&s31_wifi_ops);
@@ -4002,6 +4046,17 @@ int esp32s31_radio_ds_sign(struct s31_radio_ds_payload *payload,
 	}
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_ds_sign);
+
+
+int esp32s31_radio_wpan_control(struct s31_wifi_control *control)
+{
+	if (control->operation < S31_RADIO_WPAN_CAP ||
+	    control->operation > S31_RADIO_WPAN_ED)
+		return -EINVAL;
+	return s31_radio_control(control, control, NULL);
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_wpan_control);
+
 
 bool esp32s31_radio_wifi_tx_has_space(void)
 {

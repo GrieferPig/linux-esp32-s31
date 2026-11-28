@@ -11,6 +11,14 @@ menuconfig IEEE802154_DRIVERS
 	  If you say N, all options in this submenu will be skipped and
 	  disabled.
 
+config IEEE802154_ESP32S31
+	tristate "Espressif ESP32-S31 IEEE 802.15.4 radio"
+	depends on IEEE802154_DRIVERS && MAC802154
+	depends on SOC_ESP32S31 && ESP32S31_RADIO_SMODE_DRIVER
+	help
+	  Use the ESP32-S31 IEEE 802.15.4 MAC and PHY via the native radio
+	  firmware. The firmware arbitrates radio access with Wi-Fi and BT.
+
 config IEEE802154_FAKELB
 	depends on IEEE802154_DRIVERS && MAC802154
 	tristate "IEEE 802.15.4 loopback driver"

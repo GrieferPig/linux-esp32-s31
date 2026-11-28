@@ -26,6 +26,7 @@ dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-etm.dtbo
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-bitscrambler.dtbo
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-ds.dtbo
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-ecdsa.dtbo
+dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-wpan.dtbo
 dtb-$(CONFIG_ARCH_ESPRESSIF) += esp32s31-overlay-gdma.dtbo
 ifneq ($(CONFIG_FB_ESP32S31_I80),)
 dtb-$(CONFIG_SOC_ESP32S31) += esp32s31-overlay-i80-ili9341.dtbo

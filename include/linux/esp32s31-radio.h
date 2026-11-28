@@ -132,6 +132,14 @@ int esp32s31_radio_wifi_control(const struct s31_wifi_control *control);
 int esp32s31_radio_security_control(struct s31_wifi_control *control);
 int esp32s31_radio_ds_sign(struct s31_radio_ds_payload *payload,
 			       u32 slot, u32 bytes);
+int esp32s31_radio_wpan_control(struct s31_wifi_control *control);
+struct esp32s31_radio_wpan_ops {
+	void (*event)(void *context, u8 type, const u8 *frame, u16 length,
+		      u8 status, s8 signal);
+};
+int esp32s31_radio_wpan_register(const struct esp32s31_radio_wpan_ops *ops, void *context);
+void esp32s31_radio_wpan_unregister(const struct esp32s31_radio_wpan_ops *ops);
+
 bool esp32s31_radio_wifi_tx_has_space(void);
 bool esp32s31_radio_wifi_rx_pending(void);
 void esp32s31_radio_wifi_rx_complete(void);
