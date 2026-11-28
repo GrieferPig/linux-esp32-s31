@@ -74,6 +74,7 @@ struct esp32s31_lp {
 	struct mutex user_tx_lock;
 	struct mutex rpc_lock;
 	struct completion rpc_done;
+	bool peripheral_rpc;
 	u32 rpc_expected;
 	u32 rpc_response;
 	atomic_t rpc_sequence;
@@ -450,6 +451,15 @@ static int esp32s31_lp_read_control(struct esp32s31_lp *lp,
 	return -EBADMSG;
 }
 
+static u32 esp32s31_lp_next_sequence(struct esp32s31_lp *lp)
+{
+	u32 sequence = atomic_inc_return(&lp->rpc_sequence) & S31_LP_SEQUENCE_MASK;
+
+	if (!sequence)
+		sequence = atomic_inc_return(&lp->rpc_sequence) & S31_LP_SEQUENCE_MASK;
+	return sequence;
+}
+
 static int esp32s31_lp_sleep_rpc(u32 command, u32 expected,
 				 struct s31_lp_sleep_control *control,
 				 bool write_request)
@@ -465,11 +475,7 @@ static int esp32s31_lp_sleep_rpc(u32 command, u32 expected,
 		return -EINVAL;
 
 	mutex_lock(&lp->rpc_lock);
-	sequence = (u32)atomic_inc_return(&lp->rpc_sequence) &
-		   S31_LP_SEQUENCE_MASK;
-	if (!sequence)
-		sequence = (u32)atomic_inc_return(&lp->rpc_sequence) &
-			   S31_LP_SEQUENCE_MASK;
+	sequence = esp32s31_lp_next_sequence(lp);
 
 	if (write_request) {
 		control->magic = S31_LP_SLEEP_CONTROL_MAGIC;
@@ -624,11 +630,102 @@ void esp32s31_lp_system_suspend_finish(void)
 }
 EXPORT_SYMBOL_GPL(esp32s31_lp_system_suspend_finish);
 
+static int esp32s31_lp_peripheral_rpc(struct esp32s31_lp *lp,
+				      struct s31_lp_rpc_slot *request)
+{
+	struct s31_lp_rpc_ring __iomem *ring = lp->sram + S31_LP_RPC_OFFSET;
+	struct s31_lp_rpc_slot __iomem *slot;
+	u32 operation = request->operation;
+	u32 producer, sequence;
+	long timeout;
+	int ret;
+
+	ret = mutex_lock_interruptible(&lp->rpc_lock);
+	if (ret)
+		return ret;
+	if (!READ_ONCE(lp->ready)) {
+		ret = -ENOTCONN;
+		goto unlock;
+	}
+	if (!lp->peripheral_rpc) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
+
+	producer = readl(&ring->producer);
+	if (producer != readl(&ring->consumer)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	sequence = esp32s31_lp_next_sequence(lp);
+	slot = &ring->slots[producer % S31_LP_RPC_SLOTS];
+	request->generation = producer + 1;
+	request->sequence = sequence;
+	memcpy_toio(slot, request, sizeof(*request));
+	/* TRM ch.11 LP Mailbox: the doorbell follows the LP SRAM publication. */
+	writel(producer + 1, &ring->producer);
+
+	reinit_completion(&lp->rpc_done);
+	WRITE_ONCE(lp->rpc_response, 0);
+	WRITE_ONCE(lp->rpc_expected, S31_LP_RSP_PERIPHERAL_RPC | sequence);
+	ret = esp32s31_lp_send_sync(lp, S31_LP_CMD_PERIPHERAL_RPC | sequence);
+	if (ret) {
+		/* These errors occur before start_tx writes the mailbox. */
+		if (ret == -EBUSY || ret == -ENOTCONN)
+			writel(producer, &ring->producer);
+		goto clear;
+	}
+
+	timeout = wait_for_completion_interruptible_timeout(&lp->rpc_done,
+						msecs_to_jiffies(S31_LP_TIMEOUT_MS));
+	if (timeout <= 0) {
+		ret = timeout ? (int)timeout : -ETIMEDOUT;
+		goto clear;
+	}
+	if (READ_ONCE(lp->rpc_response) != (S31_LP_RSP_PERIPHERAL_RPC | sequence) ||
+	    readl(&ring->consumer) != producer + 1) {
+		ret = -EPROTO;
+		goto clear;
+	}
+
+	memcpy_fromio(request, slot, sizeof(*request));
+	if (request->generation != producer + 1 || request->operation != operation ||
+	    request->sequence != sequence || request->output_len > sizeof(request->data)) {
+		ret = -EPROTO;
+		goto clear;
+	}
+	switch (request->result) {
+	case S31_LP_RPC_OK:
+		ret = 0;
+		break;
+	case S31_LP_RPC_INVALID:
+		ret = -EINVAL;
+		break;
+	case S31_LP_RPC_UNSUPPORTED:
+		ret = -EOPNOTSUPP;
+		break;
+	default:
+		ret = -EPROTO;
+		break;
+	}
+
+clear:
+	WRITE_ONCE(lp->rpc_expected, 0);
+unlock:
+	mutex_unlock(&lp->rpc_lock);
+	return ret;
+}
+
 static int esp32s31_lp_attach(struct rproc *rproc)
 {
 	struct esp32s31_lp *lp = rproc->priv;
+	struct s31_lp_rpc_ring __iomem *ring = lp->sram + S31_LP_RPC_OFFSET;
 	struct s31_lp_sleep_control control;
 	int ret;
+
+	static_assert(sizeof(*ring) <= S31_LP_RPC_BYTES);
+	static_assert(S31_LP_SLEEP_CONTROL_OFFSET + sizeof(control) <= S31_LP_RPC_OFFSET);
 
 	if (readl(lp->lp_sys + S31_LP_SYS_BOOT_ADDR_REG) != S31_LP_RESET_VECTOR ||
 	    readl(lp->lp_sys + S31_LP_SYS_STORE0_REG) != S31_LP_STAGE_RUNNING)
@@ -640,6 +737,12 @@ static int esp32s31_lp_attach(struct rproc *rproc)
 		return dev_err_probe(lp->dev, ret, "invalid LP sleep control\n");
 	if (!(control.capabilities & S31_LP_CAP_HANDSHAKE) ||
 	    control.state == S31_LP_SLEEP_BOOT)
+		return -EPROTO;
+
+	lp->peripheral_rpc = control.capabilities & S31_LP_CAP_PERIPHERAL_RPC;
+	if (lp->peripheral_rpc &&
+	    (readl(&ring->magic) != S31_LP_RPC_MAGIC ||
+	     readl(&ring->version) != S31_LP_RPC_VERSION))
 		return -EPROTO;
 
 	/* TRM ch.11 LP Mailbox: enable HP delivery and keep any pending messages. */
@@ -801,6 +904,20 @@ static ssize_t tx_message_store(struct device *dev,
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(tx_message);
+
+static ssize_t rpc_capabilities_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct esp32s31_lp *lp = dev_get_drvdata(dev);
+	struct s31_lp_rpc_slot request = { .operation = S31_LP_RPC_CAPABILITIES };
+	int ret = esp32s31_lp_peripheral_rpc(lp, &request);
+
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "version=%u services=0x%08x\n",
+			  S31_LP_RPC_VERSION, request.args[0]);
+}
+static DEVICE_ATTR_RO(rpc_capabilities);
 
 static ssize_t ping_show(struct device *dev, struct device_attribute *attr,
 			 char *buffer)
@@ -1072,6 +1189,7 @@ static struct attribute *esp32s31_lp_attrs[] = {
 	&dev_attr_last_message.attr,
 	&dev_attr_mailbox_stats.attr,
 	&dev_attr_tx_message.attr,
+	&dev_attr_rpc_capabilities.attr,
 	&dev_attr_ping.attr,
 	&dev_attr_sleep_test.attr,
 	&dev_attr_gpio_test.attr,

@@ -32,6 +32,8 @@ typedef uint32_t s31_lp_u32;
 #define S31_LP_RSP_SLEEP_STATUS		0x80060000U
 #define S31_LP_CMD_SLEEP_RECLAIM	0x00070000U
 #define S31_LP_RSP_SLEEP_RECLAIMED	0x80070000U
+#define S31_LP_CMD_PERIPHERAL_RPC	0x00080000U
+#define S31_LP_RSP_PERIPHERAL_RPC	0x80080000U
 #define S31_LP_RSP_ERROR		0xffff0000U
 
 /* Last KiB of the 32-KiB LP SRAM is outside the LP firmware link region. */
@@ -44,6 +46,52 @@ typedef uint32_t s31_lp_u32;
 #define S31_LP_CAP_GPIO_WAKE		(1U << 2)
 #define S31_LP_CAP_WAKE_LOG		(1U << 3)
 #define S31_LP_CAP_RETENTION_DESC	(1U << 4)
+
+#define S31_LP_CAP_PERIPHERAL_RPC	(1U << 5)
+
+/* TRM ch.5.3.2.3 LP SRAM: use the ELF-excluded tail after S1PM. */
+#define S31_LP_RPC_OFFSET		0x00007d00U
+#define S31_LP_RPC_ADDR			0x2e007d00U
+#define S31_LP_RPC_BYTES		0x300U
+#define S31_LP_RPC_MAGIC		0x53315250U /* "S1RP" */
+#define S31_LP_RPC_VERSION		1U
+#define S31_LP_RPC_SLOTS		4U
+#define S31_LP_RPC_DATA_BYTES		128U
+
+enum s31_lp_rpc_operation {
+	S31_LP_RPC_CAPABILITIES = 1,
+};
+
+enum s31_lp_rpc_result {
+	S31_LP_RPC_OK,
+	S31_LP_RPC_INVALID,
+	S31_LP_RPC_UNSUPPORTED,
+};
+
+/*
+ * HP publishes a request by advancing producer before ringing the mailbox.
+ * LP releases the slot by advancing consumer after writing the result.
+ * Unconsumed slots remain owned by LP across HP timeout and signal paths.
+ * Counters wrap modulo 2^32.
+ */
+struct s31_lp_rpc_slot {
+	s31_lp_u32 generation;
+	s31_lp_u32 sequence;
+	s31_lp_u32 operation;
+	s31_lp_u32 input_len;
+	s31_lp_u32 output_len;
+	s31_lp_u32 result;
+	s31_lp_u32 args[4];
+	unsigned char data[S31_LP_RPC_DATA_BYTES];
+};
+
+struct s31_lp_rpc_ring {
+	s31_lp_u32 magic;
+	s31_lp_u32 version;
+	s31_lp_u32 producer;
+	s31_lp_u32 consumer;
+	struct s31_lp_rpc_slot slots[S31_LP_RPC_SLOTS];
+};
 
 #define S31_LP_WAKE_TIMER		(1U << 0)
 #define S31_LP_WAKE_GPIO		(1U << 1)
