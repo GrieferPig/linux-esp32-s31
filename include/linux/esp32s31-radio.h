@@ -130,6 +130,8 @@ bool esp32s31_radio_softmac_tx_cancel(u32 cookie, u32 epoch);
 void esp32s31_radio_softmac_tx_quiesce(u32 epoch);
 int esp32s31_radio_wifi_control(const struct s31_wifi_control *control);
 int esp32s31_radio_security_control(struct s31_wifi_control *control);
+int esp32s31_radio_ds_sign(struct s31_radio_ds_payload *payload,
+			       u32 slot, u32 bytes);
 bool esp32s31_radio_wifi_tx_has_space(void);
 bool esp32s31_radio_wifi_rx_pending(void);
 void esp32s31_radio_wifi_rx_complete(void);

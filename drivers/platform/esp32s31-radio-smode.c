@@ -964,6 +964,7 @@ static struct esp32s31_radio_wifi_connect_params *s31_wifi_connect_params;
 static struct s31_wifi_scan_params *s31_wifi_scan_params;
 static u16 *s31_wifi_disconnect_reason;
 static struct s31_wifi_control *s31_wifi_control_buffer;
+static struct s31_radio_ds_payload *s31_radio_ds_inflight;
 static DEFINE_MUTEX(s31_wifi_control_mutex);
 static DECLARE_COMPLETION(s31_wifi_control_done);
 static int s31_wifi_control_result;
@@ -3891,8 +3892,10 @@ void s31_radio_wifi_ap_station(const u8 *mac, bool joined)
 }
 
 static int s31_radio_control(const struct s31_wifi_control *control,
-			     struct s31_wifi_control *reply)
+			     struct s31_wifi_control *reply,
+			     struct s31_radio_ds_payload *ds)
 {
+	struct s31_wifi_control *wire;
 	struct s31_radio_command command = { .type = S31_RADIO_COMMAND_WIFI_CONTROL };
 	int ret;
 
@@ -3902,11 +3905,21 @@ static int s31_radio_control(const struct s31_wifi_control *control,
 		ret = -ENODEV;
 		goto out;
 	}
-	memcpy(s31_radio_sram_linux_alias(s31_wifi_control_buffer), control, sizeof(*control));
+	wire = s31_radio_sram_linux_alias(s31_wifi_control_buffer);
+	if (ds) {
+		s31_radio_ds_inflight = s31_radio_sram_alloc(sizeof(*ds));
+		if (!s31_radio_ds_inflight) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		memcpy(s31_radio_sram_linux_alias(s31_radio_ds_inflight), ds, sizeof(*ds));
+	}
+	memcpy(wire, control, sizeof(*control));
+	if (ds)
+		wire->offset = (uintptr_t)s31_radio_ds_inflight;
 	reinit_completion(&s31_wifi_control_done);
 	if (smp_load_acquire(&s31_wifi_control_started)) {
 		ret = s31_wifi_control_publish();
-
 	} else {
 		INIT_LIST_HEAD(&command.node);
 		init_completion(&command.done);
@@ -3923,12 +3936,20 @@ static int s31_radio_control(const struct s31_wifi_control *control,
 	} else if (!ret) {
 		ret = READ_ONCE(s31_wifi_control_result);
 		if (!ret && reply)
-			memcpy(reply, s31_radio_sram_linux_alias(s31_wifi_control_buffer),
-			       sizeof(*reply));
+			memcpy(reply, wire, sizeof(*reply));
+		if (!ret && ds && wire->field == S31_RADIO_DS_OK)
+			memcpy(ds, s31_radio_sram_linux_alias(s31_radio_ds_inflight),
+			       sizeof(*ds));
 	}
-	if (!s31_wifi_control_poisoned)
-		memzero_explicit(s31_radio_sram_linux_alias(s31_wifi_control_buffer),
-				 sizeof(*control));
+	if (!s31_wifi_control_poisoned) {
+		memzero_explicit(wire, sizeof(*wire));
+		if (ds) {
+			memzero_explicit(s31_radio_sram_linux_alias(s31_radio_ds_inflight),
+					 sizeof(*ds));
+			s31_radio_sram_free(s31_radio_ds_inflight);
+			s31_radio_ds_inflight = NULL;
+		}
+	}
 out:
 	mutex_unlock(&s31_wifi_control_mutex);
 	return ret;
@@ -3936,18 +3957,51 @@ out:
 
 int esp32s31_radio_wifi_control(const struct s31_wifi_control *control)
 {
-	return s31_radio_control(control, NULL);
+	return s31_radio_control(control, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_wifi_control);
 
 int esp32s31_radio_security_control(struct s31_wifi_control *control)
 {
 	if (control->operation < S31_RADIO_SECURITY_CAP ||
-	    control->operation > S31_RADIO_ECDSA_VERIFY)
+	    control->operation > S31_RADIO_DS_CAP)
 		return -EINVAL;
-	return s31_radio_control(control, control);
+	return s31_radio_control(control, control, NULL);
 }
 EXPORT_SYMBOL_GPL(esp32s31_radio_security_control);
+
+int esp32s31_radio_ds_sign(struct s31_radio_ds_payload *payload,
+			       u32 slot, u32 bytes)
+{
+	struct s31_wifi_control control = {
+		.operation = S31_RADIO_DS_SIGN,
+		.total = slot,
+		.length = bytes,
+	};
+	int ret;
+
+	if (slot >= S31_RADIO_DS_SLOTS ||
+	    (bytes != 128 && bytes != 256 && bytes != 384 && bytes != 512))
+		return -EINVAL;
+
+	ret = s31_radio_control(&control, &control, payload);
+	if (ret)
+		return ret;
+
+	switch (control.field) {
+	case S31_RADIO_DS_OK:
+		return 0;
+	case S31_RADIO_DS_NO_KEY:
+		return -ENOKEY;
+	case S31_RADIO_DS_BAD_BLOB:
+		return -EKEYREJECTED;
+	case S31_RADIO_DS_NO_MEMORY:
+		return -ENOMEM;
+	default:
+		return -EIO;
+	}
+}
+EXPORT_SYMBOL_GPL(esp32s31_radio_ds_sign);
 
 bool esp32s31_radio_wifi_tx_has_space(void)
 {
@@ -4810,6 +4864,12 @@ int s31_radio_runtime_shutdown(void)
 	if (s31_wifi_control_sync)
 		s31_linux_dispatch_sync_destroy(s31_wifi_control_sync);
 	s31_wifi_control_sync = NULL;
+	if (s31_radio_ds_inflight) {
+		memzero_explicit(s31_radio_sram_linux_alias(s31_radio_ds_inflight),
+				 sizeof(*s31_radio_ds_inflight));
+		s31_radio_sram_free(s31_radio_ds_inflight);
+		s31_radio_ds_inflight = NULL;
+	}
 	s31_radio_sram_free(s31_wifi_disconnect_reason);
 	s31_radio_sram_free(s31_wifi_control_buffer);
 	s31_wifi_control_buffer = NULL;

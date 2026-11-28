@@ -389,6 +389,12 @@
 			status = "disabled";
 		};
 
+		digital_signature: digital-signature {
+			compatible = "espressif,esp32s31-ds";
+			espressif,radio = <&radio>;
+			status = "disabled";
+		};
+
 		ecdsa: ecdsa {
 			compatible = "espressif,esp32s31-ecdsa";
 			espressif,radio = <&radio>;

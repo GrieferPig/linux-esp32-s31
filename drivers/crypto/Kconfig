@@ -25,6 +25,14 @@ config CRYPTO_DEV_ESP32S31
 	  ESP32-S31.  RSA is exposed through the akcipher API and ECC point
 	  multiplication through the P-256 and P-384 ECDH KPP algorithms.
 
+config CRYPTO_DEV_ESP32S31_DS
+	tristate "ESP32-S31 protected RSA signature peripheral"
+	depends on SOC_ESP32S31 && OF && ESP32S31_RADIO_SMODE_DRIVER
+	help
+	  Sign a padded RSA representative with an encrypted key blob and a
+	  pre-provisioned eFuse key. The native S31 crypto owner arbitrates
+	  the RSA, HMAC, SHA and AES peripherals.
+
 config CRYPTO_DEV_ESP32S31_ECDSA
 	tristate "Espressif ESP32-S31 ECDSA verification"
 	depends on SOC_ESP32S31 && OF && ESP32S31_RADIO_SMODE_DRIVER

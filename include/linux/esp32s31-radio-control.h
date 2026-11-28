@@ -51,6 +51,8 @@ enum s31_wifi_control_op {
 	S31_WIFI_SOFTMAC_TX_BATCH_CAP = 33,
 	S31_RADIO_SECURITY_CAP = 34,
 	S31_RADIO_ECDSA_VERIFY = 35,
+	S31_RADIO_DS_CAP = 36,
+	S31_RADIO_DS_SIGN = 37,
 };
 
 /* Exact association selection, independent of credential representation. */
@@ -127,6 +129,25 @@ struct s31_radio_ecdsa_request {
 	uint8_t s[S31_RADIO_ECDSA_MAX_BYTES];
 	uint8_t x[S31_RADIO_ECDSA_MAX_BYTES];
 	uint8_t y[S31_RADIO_ECDSA_MAX_BYTES];
+};
+
+#define S31_RADIO_DS_ABI 1U
+#define S31_RADIO_DS_BLOB_BYTES 1604U
+#define S31_RADIO_DS_RSA_BYTES 512U
+#define S31_RADIO_DS_SLOTS 5U
+
+struct s31_radio_ds_payload {
+	uint32_t key[S31_RADIO_DS_BLOB_BYTES / sizeof(uint32_t)];
+	uint8_t message[S31_RADIO_DS_RSA_BYTES];
+	uint8_t signature[S31_RADIO_DS_RSA_BYTES];
+};
+
+enum s31_radio_ds_status {
+	S31_RADIO_DS_OK,
+	S31_RADIO_DS_NO_KEY,
+	S31_RADIO_DS_BAD_BLOB,
+	S31_RADIO_DS_NO_MEMORY,
+	S31_RADIO_DS_IO_ERROR,
 };
 
 #define S31_WIFI_IF_STA 0U
