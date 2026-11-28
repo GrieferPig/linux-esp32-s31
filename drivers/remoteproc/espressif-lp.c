@@ -33,6 +33,7 @@
 #include <linux/workqueue.h>
 
 #include <linux/soc/espressif/esp32s31-lp.h>
+#include <uapi/linux/esp32s31-lp.h>
 
 #define S31_LP_RESET_VECTOR             0x2e000080U
 
@@ -1651,12 +1652,63 @@ static __poll_t esp32s31_lp_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static long esp32s31_lp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct esp32s31_lp *lp = file->private_data;
+	void __user *user = (void __user *)arg;
+	struct s31_lp_rpc_slot request = {
+		.operation = S31_LP_RPC_GDMA,
+	};
+	struct esp32s31_lp_gdma_copy copy;
+	u32 capacity;
+	int ret;
+
+	static_assert(sizeof(copy.data) == sizeof(request.data));
+
+	switch (cmd) {
+	case ESP32S31_LP_IOC_GDMA_INFO:
+		request.args[0] = S31_LP_GDMA_INFO;
+		ret = esp32s31_lp_peripheral_rpc(lp, &request);
+		if (ret)
+			return ret;
+		capacity = request.args[1];
+		if (!capacity || capacity > sizeof(request.data))
+			return -EPROTO;
+		return put_user(capacity, (__u32 __user *)user);
+
+	case ESP32S31_LP_IOC_GDMA_COPY:
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EBADF;
+		if (copy_from_user(&copy, user, sizeof(copy)))
+			return -EFAULT;
+		if (copy.reserved || !copy.length || copy.length > sizeof(copy.data))
+			return -EINVAL;
+
+		request.args[0] = S31_LP_GDMA_COPY;
+		request.input_len = copy.length;
+		request.output_len = copy.length;
+		memcpy(request.data, copy.data, copy.length);
+		ret = esp32s31_lp_peripheral_rpc(lp, &request);
+		if (ret)
+			return ret;
+		if (request.output_len != copy.length)
+			return -EPROTO;
+		memcpy(copy.data, request.data, copy.length);
+		return copy_to_user(user, &copy, sizeof(copy)) ? -EFAULT : 0;
+
+	default:
+		return -ENOTTY;
+	}
+}
+
 static const struct file_operations esp32s31_lp_fops = {
 	.owner = THIS_MODULE,
 	.open = esp32s31_lp_open,
 	.read = esp32s31_lp_read,
 	.write = esp32s31_lp_write,
 	.poll = esp32s31_lp_poll,
+	.unlocked_ioctl = esp32s31_lp_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.llseek = noop_llseek,
 };
 

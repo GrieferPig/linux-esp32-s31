@@ -64,6 +64,7 @@ enum s31_lp_rpc_operation {
 	S31_LP_RPC_I2C_XFER,
 	S31_LP_RPC_SPI,
 	S31_LP_RPC_UART,
+	S31_LP_RPC_GDMA,
 };
 
 enum s31_lp_rpc_result {
@@ -80,6 +81,7 @@ enum s31_lp_rpc_result {
 #define S31_LP_SERVICE_I2C		(1U << 0)
 #define S31_LP_SERVICE_SPI		(1U << 1)
 #define S31_LP_SERVICE_UART		(1U << 2)
+#define S31_LP_SERVICE_GDMA		(1U << 3)
 #define S31_LP_GPIO_COUNT		8U
 #define S31_LP_I2C_FIFO_BYTES		16U
 #define S31_LP_I2C_STANDARD_HZ		100000U
@@ -131,6 +133,17 @@ enum s31_lp_uart_action {
 	S31_LP_UART_CONFIG,
 	S31_LP_UART_STOP,
 	S31_LP_UART_EXCHANGE,
+};
+
+/*
+ * GDMA args[0] selects INFO or COPY. Other incoming arguments must be
+ * zero. INFO returns the maximum COPY length in args[1]. COPY moves
+ * input_len bytes between LP firmware buffers and returns them in data.
+ * A successful reply follows RX success EOF.
+ */
+enum s31_lp_gdma_action {
+	S31_LP_GDMA_INFO,
+	S31_LP_GDMA_COPY,
 };
 
 /*
