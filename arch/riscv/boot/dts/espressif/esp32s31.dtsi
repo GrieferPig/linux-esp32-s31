@@ -300,6 +300,13 @@
 			clock-names = "cpu";
 			#mbox-cells = <0>;
 			status = "okay";
+
+			lp_i2c: i2c {
+				compatible = "espressif,esp32s31-lp-i2c";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "disabled";
+			};
 		};
 
 		pmu: power-controller@20704000 {

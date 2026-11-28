@@ -60,13 +60,33 @@ typedef uint32_t s31_lp_u32;
 
 enum s31_lp_rpc_operation {
 	S31_LP_RPC_CAPABILITIES = 1,
+	S31_LP_RPC_I2C_XFER,
 };
 
 enum s31_lp_rpc_result {
 	S31_LP_RPC_OK,
 	S31_LP_RPC_INVALID,
 	S31_LP_RPC_UNSUPPORTED,
+	S31_LP_RPC_BUSY,
+	S31_LP_RPC_NACK,
+	S31_LP_RPC_TIMEOUT,
+	S31_LP_RPC_IO,
+	S31_LP_RPC_ARBITRATION,
 };
+
+#define S31_LP_SERVICE_I2C		(1U << 0)
+#define S31_LP_GPIO_COUNT		8U
+#define S31_LP_I2C_FIFO_BYTES		16U
+#define S31_LP_I2C_STANDARD_HZ		100000U
+#define S31_LP_I2C_FAST_HZ		400000U
+#define S31_LP_I2C_PULLUP		(1U << 0)
+
+/*
+ * I2C args: [0] 7-bit address, [1] SDA | SCL << 8, [2] SCL Hz,
+ * [3] flags. input_len is the write length and output_len is the read
+ * length. Nonzero lengths in both fields request a repeated START.
+ * Read data replaces write data in the slot.
+ */
 
 /*
  * HP publishes a request by advancing producer before ringing the mailbox.

@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/i2c.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kfifo.h>
@@ -93,6 +94,14 @@ struct esp32s31_lp {
 	atomic64_t rx_count;
 	atomic64_t ack_count;
 	atomic64_t timeout_count;
+
+#if IS_REACHABLE(CONFIG_I2C)
+	struct i2c_adapter i2c;
+	u32 i2c_pins;
+	u32 i2c_hz;
+	u32 i2c_flags;
+	bool i2c_registered;
+#endif
 
 	struct miscdevice miscdev;
 	struct s31_lp_sleep_control s2idle_control;
@@ -636,6 +645,7 @@ static int esp32s31_lp_peripheral_rpc(struct esp32s31_lp *lp,
 	struct s31_lp_rpc_ring __iomem *ring = lp->sram + S31_LP_RPC_OFFSET;
 	struct s31_lp_rpc_slot __iomem *slot;
 	u32 operation = request->operation;
+	u32 output_capacity = request->output_len;
 	u32 producer, sequence;
 	long timeout;
 	int ret;
@@ -643,7 +653,8 @@ static int esp32s31_lp_peripheral_rpc(struct esp32s31_lp *lp,
 	ret = mutex_lock_interruptible(&lp->rpc_lock);
 	if (ret)
 		return ret;
-	if (!READ_ONCE(lp->ready)) {
+	/* Pair with attach publishing the validated firmware capabilities. */
+	if (!smp_load_acquire(&lp->ready)) {
 		ret = -ENOTCONN;
 		goto unlock;
 	}
@@ -691,7 +702,7 @@ static int esp32s31_lp_peripheral_rpc(struct esp32s31_lp *lp,
 
 	memcpy_fromio(request, slot, sizeof(*request));
 	if (request->generation != producer + 1 || request->operation != operation ||
-	    request->sequence != sequence || request->output_len > sizeof(request->data)) {
+	    request->sequence != sequence || request->output_len > output_capacity) {
 		ret = -EPROTO;
 		goto clear;
 	}
@@ -701,6 +712,21 @@ static int esp32s31_lp_peripheral_rpc(struct esp32s31_lp *lp,
 		break;
 	case S31_LP_RPC_INVALID:
 		ret = -EINVAL;
+		break;
+	case S31_LP_RPC_BUSY:
+		ret = -EBUSY;
+		break;
+	case S31_LP_RPC_NACK:
+		ret = -EREMOTEIO;
+		break;
+	case S31_LP_RPC_TIMEOUT:
+		ret = -ETIMEDOUT;
+		break;
+	case S31_LP_RPC_IO:
+		ret = -EIO;
+		break;
+	case S31_LP_RPC_ARBITRATION:
+		ret = -EAGAIN;
 		break;
 	case S31_LP_RPC_UNSUPPORTED:
 		ret = -EOPNOTSUPP;
@@ -716,6 +742,126 @@ unlock:
 	mutex_unlock(&lp->rpc_lock);
 	return ret;
 }
+
+#if IS_REACHABLE(CONFIG_I2C)
+static int esp32s31_lp_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
+{
+	struct esp32s31_lp *lp = i2c_get_adapdata(adapter);
+	struct s31_lp_rpc_slot request = {
+		.operation = S31_LP_RPC_I2C_XFER,
+		.args = { 0, lp->i2c_pins, lp->i2c_hz, lp->i2c_flags },
+	};
+	struct i2c_msg *rd = NULL, *wr = NULL;
+	int ret;
+
+	if (num < 1 || num > 2)
+		return -EINVAL;
+	request.args[0] = msgs[0].addr;
+	for (int i = 0; i < num; i++) {
+		if (msgs[i].len > sizeof(request.data))
+			return -EMSGSIZE;
+		if (msgs[i].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE))
+			return -EOPNOTSUPP;
+		if (msgs[i].flags & I2C_M_RD)
+			rd = &msgs[i];
+		else
+			wr = &msgs[i];
+	}
+
+	if (wr) {
+		request.input_len = wr->len;
+		memcpy(request.data, wr->buf, wr->len);
+	}
+	if (rd)
+		request.output_len = rd->len;
+
+	ret = esp32s31_lp_peripheral_rpc(lp, &request);
+	if (ret)
+		return ret;
+	if (rd) {
+		if (request.output_len != rd->len)
+			return -EPROTO;
+		memcpy(rd->buf, request.data, rd->len);
+	}
+	return num;
+}
+
+static u32 esp32s31_lp_i2c_functionality(struct i2c_adapter *adapter)
+{
+	return I2C_FUNC_I2C;
+}
+
+/* TRM ch.26.5 LP I2C has a 16-byte FIFO, including address bytes on TX. */
+static const struct i2c_adapter_quirks esp32s31_lp_i2c_quirks = {
+	.flags = I2C_AQ_COMB_WRITE_THEN_READ | I2C_AQ_NO_ZERO_LEN,
+	.max_num_msgs = 2,
+	.max_write_len = S31_LP_I2C_FIFO_BYTES - 1,
+	.max_read_len = S31_LP_I2C_FIFO_BYTES,
+	.max_comb_1st_msg_len = S31_LP_I2C_FIFO_BYTES - 2,
+	.max_comb_2nd_msg_len = S31_LP_I2C_FIFO_BYTES,
+};
+
+static const struct i2c_algorithm esp32s31_lp_i2c_algo = {
+	.xfer = esp32s31_lp_i2c_xfer,
+	.functionality = esp32s31_lp_i2c_functionality,
+};
+
+static void esp32s31_lp_del_i2c(void *data)
+{
+	struct esp32s31_lp *lp = data;
+	struct device_node *node = lp->i2c.dev.of_node;
+
+	if (lp->i2c_registered) {
+		i2c_del_adapter(&lp->i2c);
+		of_node_put(node);
+	}
+}
+
+static int esp32s31_lp_add_i2c(struct esp32s31_lp *lp)
+{
+	struct device_node *node __free(device_node) =
+		of_get_compatible_child(lp->dev->of_node, "espressif,esp32s31-lp-i2c");
+	struct s31_lp_rpc_slot caps = { .operation = S31_LP_RPC_CAPABILITIES };
+	struct i2c_adapter *adapter = &lp->i2c;
+	u32 sda, scl, hz = S31_LP_I2C_STANDARD_HZ;
+	int ret;
+
+	if (!of_device_is_available(node) || lp->i2c_registered)
+		return 0;
+	if (of_property_read_u32(node, "espressif,sda-pin", &sda) ||
+	    of_property_read_u32(node, "espressif,scl-pin", &scl) ||
+	    sda >= S31_LP_GPIO_COUNT || scl >= S31_LP_GPIO_COUNT || sda == scl)
+		return -EINVAL;
+	if (of_property_present(node, "clock-frequency") &&
+	    of_property_read_u32(node, "clock-frequency", &hz))
+		return -EINVAL;
+	if (hz != S31_LP_I2C_STANDARD_HZ && hz != S31_LP_I2C_FAST_HZ)
+		return -EINVAL;
+	ret = esp32s31_lp_peripheral_rpc(lp, &caps);
+	if (ret)
+		return ret;
+	if (!(caps.args[0] & S31_LP_SERVICE_I2C))
+		return -EOPNOTSUPP;
+
+	lp->i2c_pins = sda | scl << 8;
+	lp->i2c_hz = hz;
+	lp->i2c_flags = of_property_read_bool(node, "espressif,internal-pullups") ?
+			S31_LP_I2C_PULLUP : 0;
+	adapter->owner = THIS_MODULE;
+	adapter->algo = &esp32s31_lp_i2c_algo;
+	adapter->quirks = &esp32s31_lp_i2c_quirks;
+	adapter->dev.parent = lp->dev;
+	adapter->dev.of_node = node;
+	strscpy(adapter->name, "ESP32-S31 LP I2C", sizeof(adapter->name));
+	i2c_set_adapdata(adapter, lp);
+	ret = i2c_add_adapter(adapter);
+	if (!ret) {
+		of_node_get(node);
+		lp->i2c_registered = true;
+	}
+	return ret;
+}
+#endif
 
 static int esp32s31_lp_attach(struct rproc *rproc)
 {
@@ -749,7 +895,13 @@ static int esp32s31_lp_attach(struct rproc *rproc)
 	if (!(readl(lp->mailbox + S31_MB_CLK_REG) & S31_MB_CLK_EN))
 		return -EIO;
 	writel(S31_MB_IRQ_MASK, lp->mailbox + S31_MB_HP_ENA);
-	WRITE_ONCE(lp->ready, true);
+	/* Publish peripheral_rpc before accepting its first request. */
+	smp_store_release(&lp->ready, true);
+#if IS_REACHABLE(CONFIG_I2C)
+	ret = esp32s31_lp_add_i2c(lp);
+	if (ret)
+		dev_warn(lp->dev, "LP I2C unavailable: %d\n", ret);
+#endif
 	return 0;
 }
 
@@ -1336,6 +1488,12 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 	ret = devm_device_add_group(dev, &esp32s31_lp_group);
 	if (ret)
 		return ret;
+
+#if IS_REACHABLE(CONFIG_I2C)
+	ret = devm_add_action_or_reset(dev, esp32s31_lp_del_i2c, lp);
+	if (ret)
+		return ret;
+#endif
 
 	rproc->state = RPROC_DETACHED;
 	rproc->auto_boot = true;
