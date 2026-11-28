@@ -9,7 +9,7 @@
  * One parallel-I/O frame. A zero buffer address disables that direction.
  * A zero data_width selects the maximum width declared for the board.
  * Both buffers have length bytes, with low data lanes in low bits.
- * The frame contains a whole number of 32-bit FIFO words (length % 4 == 0).
+ * length is the frame size in bytes.
  */
 struct esp32s31_parlio_frame {
 	__aligned_u64 tx_buf;

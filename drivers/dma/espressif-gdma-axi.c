@@ -562,6 +562,55 @@ static void __iomem *esp32s31_axi_pattern(struct esp32s31_axi_desc *desc)
 	return (void __iomem *)ALIGN(cursor, ESPRESSIF_GDMA_AXI_BURST_SIZE);
 }
 
+static DEFINE_RAW_SPINLOCK(esp32s31_psram_rmw_lock);
+
+/*
+ * The S31 direct PSRAM window (TRM ch.5.3.3.1) duplicates byte stores
+ * across adjacent lanes. Recover sub-word DMA fragments with aligned
+ * word accesses. Serialize read-modify-write between GDMA channels
+ * so disjoint fragments in the same word keep each other's data.
+ */
+static void esp32s31_axi_write_psram_fragment(void __iomem *dst, const u8 *src,
+					      size_t len)
+{
+	unsigned int offset = (unsigned long)dst & (sizeof(u32) - 1);
+	void __iomem *word = dst - offset;
+	unsigned long flags;
+	u32 mask = GENMASK((offset + len) * BITS_PER_BYTE - 1,
+			   offset * BITS_PER_BYTE);
+	u32 value = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		value |= (u32)src[i] << ((offset + i) * BITS_PER_BYTE);
+
+	raw_spin_lock_irqsave(&esp32s31_psram_rmw_lock, flags);
+	writel((readl(word) & ~mask) | value, word);
+	readl(word);	/* Complete the write before another channel updates the word. */
+	raw_spin_unlock_irqrestore(&esp32s31_psram_rmw_lock, flags);
+}
+
+static void esp32s31_axi_write_psram(void __iomem *dst, const u8 *src, size_t len)
+{
+	size_t offset = (unsigned long)dst & (sizeof(u32) - 1);
+	size_t words;
+
+	if (offset) {
+		size_t head = min(len, sizeof(u32) - offset);
+
+		esp32s31_axi_write_psram_fragment(dst, src, head);
+		dst += head;
+		src += head;
+		len -= head;
+	}
+
+	words = round_down(len, sizeof(u32));
+	memcpy_toio(dst, src, words);
+	if (len != words)
+		esp32s31_axi_write_psram_fragment(dst + words, src + words,
+						  len - words);
+}
+
 static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 				       struct esp32s31_axi_desc *desc,
 				       int period)
@@ -580,7 +629,11 @@ static void esp32s31_axi_recover_stash(struct esp32s31_axi_chan *chan,
 		dst = chan->gdma->psram_direct +
 		      (stash->recovery - chan->gdma->soc->psram_base);
 		memcpy_fromio(data, stash->hw, stash->len);
-		memcpy_toio(dst, data, stash->len);
+		if (IS_ENABLED(CONFIG_SOC_ESP32S31) &&
+		    chan->gdma->soc == &esp32s31_axi_soc)
+			esp32s31_axi_write_psram(dst, data, stash->len);
+		else
+			memcpy_toio(dst, data, stash->len);
 	}
 	/* Publish uncached alias recovery writes before signaling completion. */
 	wmb();

@@ -301,11 +301,7 @@ static ssize_t s31_parlio_frame(struct file *file, void __user *rx, const void _
 		return 0;
 	if (length > PARLIO_MAX_BYTES)
 		return -EMSGSIZE;
-	/*
-	 * On rev0.0 the first byte of a partial final FIFO word can be
-	 * replaced by its second byte, even with aligned GDMA buffers.
-	 */
-	if (!IS_ALIGNED(length, sizeof(u32)) || (!rx && !tx))
+	if (!rx && !tx)
 		return -EINVAL;
 	width = width ?: s31->width;
 	if (width > s31->width || !is_power_of_2(width))
