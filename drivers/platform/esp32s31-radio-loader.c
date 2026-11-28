@@ -4,6 +4,7 @@
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/rcupdate.h>
 #include <linux/string.h>
 #include <asm/cacheflush.h>
 #include "esp32s31-radio-internal.h"
@@ -50,6 +51,59 @@ extern const struct s31_fw_import s31_fw_import_table[];
 extern const u32 s31_fw_import_count;
 
 static struct s31_radio_fw_exports s31_fw;
+typedef int (*s31_sha256_compress_fn)(__be32 state[8], const u32 block[16]);
+static s31_sha256_compress_fn __rcu s31_sha256_compress;
+static DEFINE_PER_CPU(bool, s31_sha256_call);
+
+bool s31_radio_fw_sha256_in_call(void)
+{
+	return irqs_disabled() && this_cpu_read(s31_sha256_call);
+}
+
+
+bool s31_radio_fw_sha256_enable(void)
+{
+	const struct s31_xip_header *h = s31_xip_image;
+
+	if (!h || !h->sha256_compress)
+		return false;
+	rcu_assign_pointer(s31_sha256_compress,
+			   (s31_sha256_compress_fn)(uintptr_t)h->sha256_compress);
+	return true;
+}
+
+void s31_radio_fw_sha256_disable(void)
+{
+	rcu_assign_pointer(s31_sha256_compress, NULL);
+	synchronize_rcu();
+}
+
+int s31_radio_fw_sha256_block(__be32 state[8], const u32 block[16])
+{
+	s31_sha256_compress_fn compress;
+	unsigned long flags;
+	int ret = -ENODEV;
+
+	rcu_read_lock();
+	compress = rcu_dereference(s31_sha256_compress);
+	if (compress && !in_nmi()) {
+		local_irq_save(flags);
+		ret = -EBUSY;
+		if (!this_cpu_read(s31_sha256_call)) {
+			/*
+			 * The leaf SHA call may use the IDF RCC portMUX.
+			 * Its Linux caller has no schedulable radio identity.
+			 */
+			this_cpu_write(s31_sha256_call, true);
+			ret = compress(state, block);
+			this_cpu_write(s31_sha256_call, false);
+		}
+		local_irq_restore(flags);
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
 static unsigned long s31_fw_import_lookup(const char *name, bool weak)
 {
 	u32 index;
@@ -96,6 +150,8 @@ static int s31_fw_xip_load(struct device *device)
 
 	static_assert(sizeof(s31_fw) == S31_XIP_EXPORTS * sizeof(u32));
 	static_assert(sizeof(struct s31_xip_header) <= S31_XIP_HEADER_SIZE);
+	static_assert(offsetof(struct s31_xip_header, sha256_compress) ==
+		      S31_XIP_WIFI_IRAM_FIELDS_OFFSET + 8);
 	static_assert(offsetof(struct s31_xip_header, wifi_iram_offset) ==
 		      S31_XIP_WIFI_IRAM_FIELDS_OFFSET);
 	if (!h || !s31_xip_valid(h, (u32)(uintptr_t)esp32s31_radio_xip_ram))

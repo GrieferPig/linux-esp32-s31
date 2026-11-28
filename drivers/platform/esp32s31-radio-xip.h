@@ -33,6 +33,8 @@ struct s31_xip_header {
 	struct s31_xip_import imports[S31_XIP_MAX_IMPORTS];
 	/* Version 2: pristine Wi-Fi IRAM copy inside the flash body. */
 	u32 wifi_iram_offset, wifi_iram_size;
+	/* Optional native SHA-256 block operation. Older producers leave it zero. */
+	u32 sha256_compress;
 };
 
 /* Bounds/address preflight shared with the image-format validator. */
@@ -79,6 +81,11 @@ static inline bool s31_xip_valid(const struct s31_xip_header *h, u32 ram)
 		if (h->exports[i] & 1)
 			return false;
 	}
+	if (h->sha256_compress &&
+	    (h->sha256_compress < S31_XIP_BASE + S31_XIP_HEADER_SIZE ||
+	     h->sha256_compress >= S31_XIP_BASE + h->wifi_iram_offset ||
+	     (h->sha256_compress & 1)))
+		return false;
 	if (h->exports[22] < ram ||
 	    !s31_xip_range(h->exports[22] - ram, 4,
 			  h->bss_offset + h->bss_size) || (h->exports[22] & 3))

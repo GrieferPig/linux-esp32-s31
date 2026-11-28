@@ -20,6 +20,8 @@ config ESP32S31_RADIO_SMODE_DRIVER
 	select RT_MUTEXES
 	select ESP32S31_RADIO_SCHEDULER
 	select CFG80211
+	select CRYPTO_HASH
+	select CRYPTO_LIB_SHA256
 	help
 	  Build the reloadable esp32s31-radio.ko. It owns the shared PHY, SRAM,
 	  clocks and interrupts and exposes cfg80211 plus direct HCI from one

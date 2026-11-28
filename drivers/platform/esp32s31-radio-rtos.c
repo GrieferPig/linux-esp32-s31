@@ -1856,6 +1856,8 @@ unsigned long s31_linux_sync_owner(void *opaque, u32 op)
     if (op == S31_SYNC_AUX_CONTEXT) {
         bool bootstrap = s31_control_bootstrap_owns(this_cpu_read(s31_foreign_installed));
 
+        if (s31_radio_fw_sha256_in_call())
+            return 1;
         if (raw_smp_processor_id() != 0)
             return 0;
         if (bootstrap)

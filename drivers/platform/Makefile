@@ -9,7 +9,7 @@ obj-$(CONFIG_ESP32S31_RADIO_SMODE_DRIVER) += esp32s31-radio.o
 esp32s31-radio-y := esp32s31-radio-module.o \
 	esp32s31-radio-smode.o esp32s31-radio-rtos.o \
 	esp32s31-radio-loader.o esp32s31-radio-imports.o \
-	esp32s31-radio-wifi.o esp32s31-radio-btdm.o
+	esp32s31-radio-wifi.o esp32s31-radio-btdm.o esp32s31-radio-hmac.o
 
 # The radio facade supplies the generated import table from the build's
 # generated directory. Assemble it directly into the native kernel O tree;

@@ -16,6 +16,7 @@ const char s31_radio_modinfo_anchor[] __used __section(".modinfo") =
 
 static bool s31_radio_started;
 static bool s31_radio_suspended;
+static bool s31_radio_hmac_registered;
 static u32 s31_radio_configured_features;
 static char *s31_radio_mode = "combo";
 static bool s31_radio_direct_hci = true;
@@ -79,6 +80,15 @@ static int esp32s31_radio_probe(struct platform_device *pdev)
 		if (ret)
 			goto detach_wifi;
 	}
+	if (s31_radio_fw_sha256_enable() && !s31_radio_hmac_registered) {
+		ret = s31_radio_hmac_register();
+		if (ret) {
+			s31_radio_fw_sha256_disable();
+			dev_warn(&pdev->dev, "can't register hardware HMAC: %d\n", ret);
+		} else {
+			s31_radio_hmac_registered = true;
+		}
+	}
 	dev_info(&pdev->dev, "single module ABI %u mode=%s direct_hci=%u ready for:%s%s\n",
 		 ESP32S31_RADIO_CORE_ABI_VERSION,
 		 s31_radio_mode, s31_radio_direct_hci,
@@ -101,6 +111,8 @@ clear_core:
 
 static void esp32s31_radio_remove(struct platform_device *pdev)
 {
+	if (s31_radio_hmac_registered)
+		s31_radio_fw_sha256_disable();
 
 	/* Unregister while command admission and the payload are still alive.
 	 * ieee80211_unregister_hw invokes .stop for an active interface; its
@@ -151,6 +163,8 @@ static int esp32s31_radio_resume(struct device *dev)
 		s31_radio_started = false;
 		goto power_down;
 	}
+	if (s31_radio_hmac_registered)
+		s31_radio_fw_sha256_enable();
 	s31_radio_suspended = false;
 	dev_info(dev, "radio runtime restored; wireless links reconnect after suspend\n");
 	return 0;
@@ -190,6 +204,8 @@ static int esp32s31_radio_suspend(struct device *dev)
 	/* Deinit the closed MAC/controller, stop all compatibility tasks, remove
 	 * device IRQs, and free DMA rings before allowing APPWR to remove power.
 	 * Keep frontend objects and the pristine payload data for warm restart. */
+	if (s31_radio_hmac_registered)
+		s31_radio_fw_sha256_disable();
 	ret = s31_radio_runtime_shutdown();
 	s31_radio_started = false;
 	s31_radio_suspended = true;
@@ -211,6 +227,8 @@ static void esp32s31_radio_shutdown(struct platform_device *pdev)
 			s31_radio_wifi_frontend_suspend();
 		if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
 			s31_radio_btdm_frontend_suspend();
+		if (s31_radio_hmac_registered)
+			s31_radio_fw_sha256_disable();
 		s31_radio_runtime_shutdown();
 		s31_radio_started = false;
 		s31_linux_pmu_radio_vote(false);
@@ -236,7 +254,19 @@ static struct platform_driver esp32s31_radio_driver = {
 		.pm = pm_sleep_ptr(&esp32s31_radio_pm_ops),
 	},
 };
-module_platform_driver(esp32s31_radio_driver);
+static int __init esp32s31_radio_init(void)
+{
+	return platform_driver_register(&esp32s31_radio_driver);
+}
+module_init(esp32s31_radio_init);
+
+static void __exit esp32s31_radio_exit(void)
+{
+	platform_driver_unregister(&esp32s31_radio_driver);
+	if (s31_radio_hmac_registered)
+		s31_radio_hmac_unregister();
+}
+module_exit(esp32s31_radio_exit);
 
 MODULE_DESCRIPTION("ESP32-S31 reloadable Wi-Fi/Bluetooth radio module");
 MODULE_AUTHOR("S31 Linux contributors");
