@@ -314,6 +314,11 @@
 				#size-cells = <0>;
 				status = "disabled";
 			};
+
+			lp_uart: serial {
+				compatible = "espressif,esp32s31-lp-uart";
+				status = "disabled";
+			};
 		};
 
 		pmu: power-controller@20704000 {

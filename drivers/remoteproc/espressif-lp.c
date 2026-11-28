@@ -26,8 +26,11 @@
 #include <linux/reboot.h>
 #include <linux/spi/spi.h>
 #include <linux/suspend.h>
+#include <linux/tty.h>
+#include <linux/tty_flip.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <linux/soc/espressif/esp32s31-lp.h>
 
@@ -56,6 +59,20 @@
 
 #define S31_LP_RX_DEPTH                 64
 #define S31_LP_TIMEOUT_MS               1000
+
+#if IS_ENABLED(CONFIG_TTY)
+struct esp32s31_lp_uart {
+	struct tty_port port;
+	struct tty_driver *driver;
+	struct esp32s31_lp *lp;
+	struct work_struct work;
+	struct mutex lock;
+	u32 pins;
+	unsigned int tx_pending;
+	bool active;
+	bool needs_stop;
+};
+#endif
 
 struct esp32s31_lp {
 	struct device *dev;
@@ -112,6 +129,12 @@ struct esp32s31_lp {
 	bool spi_selected;
 #endif
 
+#if IS_ENABLED(CONFIG_TTY)
+	struct esp32s31_lp_uart *uart;
+	struct mutex uart_lock;
+	bool uart_removing;
+#endif
+
 	struct miscdevice miscdev;
 	struct s31_lp_sleep_control s2idle_control;
 	bool s2idle_armed;
@@ -124,6 +147,10 @@ struct esp32s31_lp {
 	struct s31_lp_sleep_control gpio_test_control;
 	int gpio_test_result;
 };
+
+#if IS_ENABLED(CONFIG_TTY)
+static void esp32s31_lp_uart_event(struct esp32s31_lp *lp);
+#endif
 
 static struct esp32s31_lp *esp32s31_lp_sleep_owner;
 static unsigned int esp32s31_lp_s2idle_wake_ms;
@@ -387,6 +414,10 @@ static irqreturn_t esp32s31_lp_irq(int irq, void *data)
 		       lp->mailbox + S31_MB_HP_CLR);
 		handled |= BIT(slot);
 
+#if IS_ENABLED(CONFIG_TTY)
+		if (message == S31_LP_MSG_UART_EVENT)
+			esp32s31_lp_uart_event(lp);
+#endif
 		WRITE_ONCE(lp->last_message, message);
 		if (message == S31_LP_MSG_WAKE) {
 			pm_wakeup_event(lp->dev, 0);
@@ -1090,6 +1121,362 @@ static int esp32s31_lp_add_spi(struct esp32s31_lp *lp)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_TTY)
+static int esp32s31_lp_uart_config(struct esp32s31_lp_uart *uart, struct tty_struct *tty)
+{
+	tcflag_t cflag = tty->termios.c_cflag;
+	unsigned int baud = tty_get_baud_rate(tty);
+	u32 format = (cflag & CSIZE) >> __ffs(CSIZE);
+	struct s31_lp_rpc_slot request = {
+		.operation = S31_LP_RPC_UART,
+		.args = { S31_LP_UART_CONFIG, uart->pins },
+	};
+	int ret;
+
+	if (!uart->lp)
+		return -ENODEV;
+	if (!READ_ONCE(uart->lp->ready))
+		return -ENOTCONN;
+
+	if (cflag & CSTOPB)
+		format |= S31_LP_UART_STOP_2;
+	if (cflag & PARENB)
+		format |= S31_LP_UART_PARITY;
+	if (cflag & PARODD)
+		format |= S31_LP_UART_ODD;
+
+	request.args[2] = clamp(baud ?: 115200, S31_LP_UART_MIN_BAUD, S31_LP_UART_MAX_BAUD);
+	request.args[3] = format;
+
+	/* A timed-out CONFIG may still be executed by the LP firmware. */
+	uart->needs_stop = true;
+	ret = esp32s31_lp_peripheral_rpc(uart->lp, &request);
+	if (ret)
+		return ret;
+	if (!request.args[2])
+		return -EPROTO;
+
+	tty->termios.c_cflag &= ~(CMSPAR | CRTSCTS);
+	tty->termios.c_cflag |= CLOCAL;
+	tty_encode_baud_rate(tty, request.args[2], request.args[2]);
+	return 0;
+}
+
+static int esp32s31_lp_uart_stop(struct esp32s31_lp_uart *uart)
+{
+	struct s31_lp_rpc_slot request = {
+		.operation = S31_LP_RPC_UART,
+		.args = { S31_LP_UART_STOP },
+	};
+	int ret;
+
+	if (!uart->needs_stop)
+		return 0;
+	ret = esp32s31_lp_peripheral_rpc(uart->lp, &request);
+	if (!ret)
+		uart->needs_stop = false;
+	return ret;
+}
+
+static int esp32s31_lp_uart_activate(struct tty_port *port, struct tty_struct *tty)
+{
+	struct esp32s31_lp_uart *uart = container_of(port, struct esp32s31_lp_uart, port);
+	int ret;
+
+	mutex_lock(&uart->lock);
+	ret = esp32s31_lp_uart_config(uart, tty);
+	if (!ret) {
+		WRITE_ONCE(uart->tx_pending, 0);
+		WRITE_ONCE(uart->active, true);
+	} else if (uart->lp && esp32s31_lp_uart_stop(uart)) {
+		dev_warn(uart->lp->dev, "could not disable LP UART after activation failed\n");
+	}
+	mutex_unlock(&uart->lock);
+	return ret;
+}
+
+static void esp32s31_lp_uart_shutdown(struct tty_port *port)
+{
+	struct esp32s31_lp_uart *uart = container_of(port, struct esp32s31_lp_uart, port);
+	int ret;
+
+	mutex_lock(&uart->lock);
+	WRITE_ONCE(uart->active, false);
+	if (uart->lp) {
+		ret = esp32s31_lp_uart_stop(uart);
+		if (ret)
+			dev_warn(uart->lp->dev, "LP UART shutdown failed: %d\n", ret);
+	}
+	mutex_unlock(&uart->lock);
+}
+
+static void esp32s31_lp_uart_destruct(struct tty_port *port)
+{
+	kfree(container_of(port, struct esp32s31_lp_uart, port));
+}
+
+static const struct tty_port_operations esp32s31_lp_uart_port_ops = {
+	.activate = esp32s31_lp_uart_activate,
+	.shutdown = esp32s31_lp_uart_shutdown,
+	.destruct = esp32s31_lp_uart_destruct,
+};
+
+static int esp32s31_lp_uart_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct esp32s31_lp_uart *uart = driver->driver_state;
+	struct tty_port *port = tty_port_get(&uart->port);
+	int ret;
+
+	ret = tty_port_install(port, driver, tty);
+	if (ret)
+		tty_port_put(port);
+	return ret;
+}
+
+static void esp32s31_lp_uart_tty_put(struct tty_struct *tty)
+{
+	tty_port_put(tty->port);
+}
+
+static int esp32s31_lp_uart_exchange(struct esp32s31_lp_uart *uart, const u8 *buf,
+				    unsigned int len)
+{
+	struct s31_lp_rpc_slot request = {
+		.operation = S31_LP_RPC_UART,
+		.input_len = len,
+		.output_len = S31_LP_RPC_DATA_BYTES,
+		.args = { S31_LP_UART_EXCHANGE },
+	};
+	u32 errors;
+	int ret, copied;
+
+	if (len)
+		memcpy(request.data, buf, len);
+	ret = esp32s31_lp_peripheral_rpc(uart->lp, &request);
+	if (ret)
+		return ret;
+	if (request.args[1] > len || request.args[2] > 1)
+		return -EPROTO;
+
+	if (request.args[1] || request.args[2])
+		WRITE_ONCE(uart->tx_pending, request.args[1]);
+	errors = request.args[3];
+	copied = tty_insert_flip_string(&uart->port, request.data, request.output_len);
+	if (errors & S31_LP_UART_BREAK)
+		tty_insert_flip_char(&uart->port, 0, TTY_BREAK);
+	if (errors & S31_LP_UART_BAD_FRAME)
+		tty_insert_flip_char(&uart->port, 0, TTY_FRAME);
+	if (errors & S31_LP_UART_BAD_PARITY)
+		tty_insert_flip_char(&uart->port, 0, TTY_PARITY);
+	if (errors & S31_LP_UART_OVERRUN || copied != request.output_len)
+		tty_insert_flip_char(&uart->port, 0, TTY_OVERRUN);
+	if (request.output_len || errors)
+		tty_flip_buffer_push(&uart->port);
+	return request.args[1];
+}
+
+static void esp32s31_lp_uart_work(struct work_struct *work)
+{
+	struct esp32s31_lp_uart *uart = container_of(work, struct esp32s31_lp_uart, work);
+	bool wake = false;
+	int ret;
+
+	mutex_lock(&uart->lock);
+	if (uart->active) {
+		ret = esp32s31_lp_uart_exchange(uart, NULL, 0);
+		if (ret < 0)
+			dev_warn_ratelimited(uart->lp->dev, "LP UART event failed: %d\n", ret);
+		wake = !ret && !uart->tx_pending;
+	}
+	mutex_unlock(&uart->lock);
+
+	if (wake)
+		tty_port_tty_wakeup(&uart->port);
+}
+
+static void esp32s31_lp_uart_event(struct esp32s31_lp *lp)
+{
+	struct esp32s31_lp_uart *uart = READ_ONCE(lp->uart);
+
+	if (uart)
+		schedule_work(&uart->work);
+}
+
+static ssize_t esp32s31_lp_uart_write(struct tty_struct *tty, const u8 *buf, size_t len)
+{
+	struct esp32s31_lp_uart *uart = container_of(tty->port, struct esp32s31_lp_uart, port);
+	int ret = -EIO;
+
+	mutex_lock(&uart->lock);
+	if (uart->active)
+		ret = esp32s31_lp_uart_exchange(uart, buf,
+					       min_t(size_t, len, S31_LP_UART_TX_BYTES));
+	mutex_unlock(&uart->lock);
+	return ret;
+}
+
+static unsigned int esp32s31_lp_uart_room(struct tty_struct *tty)
+{
+	struct esp32s31_lp_uart *uart = container_of(tty->port, struct esp32s31_lp_uart, port);
+
+	return READ_ONCE(uart->active) && !READ_ONCE(uart->tx_pending) ? S31_LP_UART_TX_BYTES : 0;
+}
+
+static unsigned int esp32s31_lp_uart_pending(struct tty_struct *tty)
+{
+	struct esp32s31_lp_uart *uart = container_of(tty->port, struct esp32s31_lp_uart, port);
+
+	return READ_ONCE(uart->active) ? READ_ONCE(uart->tx_pending) : 0;
+}
+
+static void esp32s31_lp_uart_termios(struct tty_struct *tty, const struct ktermios *old)
+{
+	struct esp32s31_lp_uart *uart = container_of(tty->port, struct esp32s31_lp_uart, port);
+	int ret;
+
+	mutex_lock(&uart->lock);
+	if (uart->active) {
+		ret = esp32s31_lp_uart_config(uart, tty);
+		if (ret) {
+			tty_termios_copy_hw(&tty->termios, old);
+			dev_warn_ratelimited(uart->lp->dev, "LP UART config failed: %d\n", ret);
+		}
+	}
+	mutex_unlock(&uart->lock);
+}
+
+static int esp32s31_lp_uart_open(struct tty_struct *tty, struct file *file)
+{
+	return tty_port_open(tty->port, tty, file);
+}
+
+static void esp32s31_lp_uart_close(struct tty_struct *tty, struct file *file)
+{
+	tty_port_close(tty->port, tty, file);
+}
+
+static void esp32s31_lp_uart_hangup(struct tty_struct *tty)
+{
+	tty_port_hangup(tty->port);
+}
+
+static const struct tty_operations esp32s31_lp_uart_tty_ops = {
+	.install = esp32s31_lp_uart_install,
+	.cleanup = esp32s31_lp_uart_tty_put,
+	.open = esp32s31_lp_uart_open,
+	.close = esp32s31_lp_uart_close,
+	.hangup = esp32s31_lp_uart_hangup,
+	.write = esp32s31_lp_uart_write,
+	.write_room = esp32s31_lp_uart_room,
+	.chars_in_buffer = esp32s31_lp_uart_pending,
+	.set_termios = esp32s31_lp_uart_termios,
+};
+
+static void esp32s31_lp_del_uart(void *data)
+{
+	struct esp32s31_lp *lp = data;
+	struct esp32s31_lp_uart *uart;
+	int ret;
+
+	mutex_lock(&lp->uart_lock);
+	lp->uart_removing = true;
+	uart = lp->uart;
+	WRITE_ONCE(lp->uart, NULL);
+	mutex_unlock(&lp->uart_lock);
+	if (!uart)
+		return;
+
+	synchronize_irq(lp->irq);
+	cancel_work_sync(&uart->work);
+	mutex_lock(&uart->lock);
+	WRITE_ONCE(uart->active, false);
+	ret = esp32s31_lp_uart_stop(uart);
+	if (ret)
+		dev_warn(lp->dev, "could not disable LP UART on removal: %d\n", ret);
+	uart->lp = NULL;
+	mutex_unlock(&uart->lock);
+
+	tty_port_tty_hangup(&uart->port, false);
+	tty_unregister_device(uart->driver, 0);
+	tty_unregister_driver(uart->driver);
+	tty_driver_kref_put(uart->driver);
+	tty_port_put(&uart->port);
+}
+
+static int esp32s31_lp_add_uart(struct esp32s31_lp *lp)
+{
+	struct s31_lp_rpc_slot caps = { .operation = S31_LP_RPC_CAPABILITIES };
+	struct device_node *node __free(device_node) =
+		of_get_child_by_name(lp->dev->of_node, "serial");
+	struct esp32s31_lp_uart *uart;
+	struct tty_driver *driver;
+	struct device *tty_dev;
+	u32 pin[2];
+	int ret;
+
+	guard(mutex)(&lp->uart_lock);
+	if (lp->uart || lp->uart_removing || !of_device_is_available(node))
+		return 0;
+
+	if (of_property_count_u32_elems(node, "espressif,pins") != ARRAY_SIZE(pin) ||
+	    of_property_read_u32_array(node, "espressif,pins", pin, ARRAY_SIZE(pin)) ||
+	    pin[0] >= S31_LP_GPIO_COUNT || pin[1] >= S31_LP_GPIO_COUNT || pin[0] == pin[1])
+		return -EINVAL;
+
+	ret = esp32s31_lp_peripheral_rpc(lp, &caps);
+	if (ret)
+		return ret;
+	if (!(caps.args[0] & S31_LP_SERVICE_UART))
+		return -EOPNOTSUPP;
+
+	driver = tty_alloc_driver(1, TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
+	if (IS_ERR(driver))
+		return PTR_ERR(driver);
+	uart = kzalloc(sizeof(*uart), GFP_KERNEL);
+	if (!uart) {
+		tty_driver_kref_put(driver);
+		return -ENOMEM;
+	}
+
+	uart->lp = lp;
+	uart->driver = driver;
+	uart->pins = pin[0] | pin[1] << 8;
+	mutex_init(&uart->lock);
+	INIT_WORK(&uart->work, esp32s31_lp_uart_work);
+	tty_port_init(&uart->port);
+	uart->port.ops = &esp32s31_lp_uart_port_ops;
+
+	driver->driver_state = uart;
+	driver->driver_name = "esp32s31-lp-uart";
+	driver->name = "ttyLP";
+	driver->type = TTY_DRIVER_TYPE_SERIAL;
+	driver->subtype = SERIAL_TYPE_NORMAL;
+	driver->init_termios = tty_std_termios;
+	driver->init_termios.c_cflag = B115200 | CS8 | CREAD | CLOCAL;
+	tty_set_operations(driver, &esp32s31_lp_uart_tty_ops);
+	ret = tty_register_driver(driver);
+	if (ret)
+		goto free_uart;
+
+	WRITE_ONCE(lp->uart, uart);
+	tty_dev = tty_port_register_device(&uart->port, driver, 0, lp->dev);
+	if (IS_ERR(tty_dev)) {
+		ret = PTR_ERR(tty_dev);
+		WRITE_ONCE(lp->uart, NULL);
+		synchronize_irq(lp->irq);
+		cancel_work_sync(&uart->work);
+		tty_unregister_driver(driver);
+		goto free_uart;
+	}
+	return 0;
+
+free_uart:
+	tty_driver_kref_put(driver);
+	tty_port_put(&uart->port);
+	return ret;
+}
+#endif
+
 static int esp32s31_lp_attach(struct rproc *rproc)
 {
 	struct esp32s31_lp *lp = rproc->priv;
@@ -1134,6 +1521,11 @@ static int esp32s31_lp_attach(struct rproc *rproc)
 	if (ret)
 		dev_warn(lp->dev, "LP SPI unavailable: %d\n", ret);
 #endif
+#if IS_ENABLED(CONFIG_TTY)
+	ret = esp32s31_lp_add_uart(lp);
+	if (ret)
+		dev_warn(lp->dev, "LP UART unavailable: %d\n", ret);
+#endif
 	return 0;
 }
 
@@ -1142,6 +1534,18 @@ static int esp32s31_lp_detach(struct rproc *rproc)
 	struct esp32s31_lp *lp = rproc->priv;
 	unsigned long flags;
 	int ret = 0;
+
+#if IS_ENABLED(CONFIG_TTY)
+	guard(mutex)(&lp->uart_lock);
+	if (lp->uart) {
+		mutex_lock(&lp->uart->lock);
+		ret = lp->uart->active ? -EBUSY : esp32s31_lp_uart_stop(lp->uart);
+		if (ret) {
+			mutex_unlock(&lp->uart->lock);
+			return ret;
+		}
+	}
+#endif
 
 #if IS_REACHABLE(CONFIG_SPI)
 	mutex_lock(&lp->spi_lock);
@@ -1166,6 +1570,10 @@ static int esp32s31_lp_detach(struct rproc *rproc)
 #if IS_REACHABLE(CONFIG_SPI)
 unlock_spi:
 	mutex_unlock(&lp->spi_lock);
+#endif
+#if IS_ENABLED(CONFIG_TTY)
+	if (lp->uart)
+		mutex_unlock(&lp->uart->lock);
 #endif
 	return ret;
 }
@@ -1743,11 +2151,21 @@ static int esp32s31_lp_probe(struct platform_device *pdev)
 		return ret;
 #endif
 
+#if IS_ENABLED(CONFIG_TTY)
+	mutex_init(&lp->uart_lock);
+#endif
+
 	rproc->state = RPROC_DETACHED;
 	rproc->auto_boot = true;
 	ret = devm_rproc_add(dev, rproc);
 	if (ret)
 		return ret;
+
+#if IS_ENABLED(CONFIG_TTY)
+	ret = devm_add_action_or_reset(dev, esp32s31_lp_del_uart, lp);
+	if (ret)
+		return ret;
+#endif
 
 	if (cmpxchg(&esp32s31_lp_sleep_owner, NULL, lp))
 		return dev_err_probe(dev, -EBUSY,

@@ -18,6 +18,7 @@ typedef uint32_t s31_lp_u32;
 
 #define S31_LP_MSG_READY		0x53310001U
 #define S31_LP_MSG_WAKE			0x53310002U
+#define S31_LP_MSG_UART_EVENT		0x53310003U
 #define S31_LP_CMD_PING			0x00010000U
 #define S31_LP_RSP_PONG			0x80010000U
 #define S31_LP_CMD_STATUS		0x00020000U
@@ -62,6 +63,7 @@ enum s31_lp_rpc_operation {
 	S31_LP_RPC_CAPABILITIES = 1,
 	S31_LP_RPC_I2C_XFER,
 	S31_LP_RPC_SPI,
+	S31_LP_RPC_UART,
 };
 
 enum s31_lp_rpc_result {
@@ -77,6 +79,7 @@ enum s31_lp_rpc_result {
 
 #define S31_LP_SERVICE_I2C		(1U << 0)
 #define S31_LP_SERVICE_SPI		(1U << 1)
+#define S31_LP_SERVICE_UART		(1U << 2)
 #define S31_LP_GPIO_COUNT		8U
 #define S31_LP_I2C_FIFO_BYTES		16U
 #define S31_LP_I2C_STANDARD_HZ		100000U
@@ -103,6 +106,31 @@ enum s31_lp_spi_action {
 	S31_LP_SPI_CLOCK,
 	S31_LP_SPI_SELECT,
 	S31_LP_SPI_RELEASE,
+};
+
+#define S31_LP_UART_MIN_BAUD		50U
+#define S31_LP_UART_MAX_BAUD		115200U
+#define S31_LP_UART_TX_BYTES		16U
+#define S31_LP_UART_BITS_MASK		3U /* 0 to 3 represent 5 to 8 data bits */
+#define S31_LP_UART_STOP_2		(1U << 2)
+#define S31_LP_UART_PARITY		(1U << 3)
+#define S31_LP_UART_ODD			(1U << 4)
+#define S31_LP_UART_OVERRUN		(1U << 0)
+#define S31_LP_UART_BAD_FRAME		(1U << 1)
+#define S31_LP_UART_BAD_PARITY		(1U << 2)
+#define S31_LP_UART_BREAK		(1U << 3)
+
+/*
+ * CONFIG args: action, TX | RX << 8, baud, format. Returns actual baud in
+ * args[2]. STOP disables the port. Both require zero input and output.
+ * EXCHANGE args: action. Writes up to input_len and returns the accepted
+ * count in args[1]. args[2] reports whether TX is idle, and args[3] carries
+ * RX errors. Read data replaces write data, up to the requested output_len.
+ */
+enum s31_lp_uart_action {
+	S31_LP_UART_CONFIG,
+	S31_LP_UART_STOP,
+	S31_LP_UART_EXCHANGE,
 };
 
 /*
