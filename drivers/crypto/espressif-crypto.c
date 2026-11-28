@@ -536,21 +536,47 @@ static int s31_sha_finup(struct shash_desc *desc, const u8 *data,
 	return ret ?: s31_sha_final(desc, out);
 }
 
-#define S31_SHA_ALG(_name, _driver, _digest, _block, _init) { \
+/*
+ * S31 TRM ch.17 SHA Accelerator: save SHA_H_MEM and the block-aligned
+ * byte count for the HMAC template. Partial message bytes belong only
+ * to the full shash export.
+ */
+static int s31_sha256_export_core(struct shash_desc *desc, void *out)
+{
+	const struct s31_sha_ctx *ctx = shash_desc_ctx(desc);
+	struct s31_sha_ctx state = *ctx;
+
+	state.total = round_down(state.total, (u64)SHA256_BLOCK_SIZE);
+	memset(state.buffer, 0, sizeof(state.buffer));
+	memcpy(out, &state, sizeof(state));
+	memzero_explicit(&state, sizeof(state));
+	return 0;
+}
+
+static int s31_sha256_import_core(struct shash_desc *desc, const void *in)
+{
+	struct s31_sha_ctx *ctx = shash_desc_ctx(desc);
+
+	memcpy(ctx, in, sizeof(*ctx));
+	return 0;
+}
+
+#define S31_SHA_ALG(_name, _driver, _digest, _block, _init, ...) { \
 	.digestsize = _digest, .init = _init, .update = s31_sha_update, \
 	.final = s31_sha_final, .finup = s31_sha_finup, \
+	__VA_ARGS__ \
 	.descsize = sizeof(struct s31_sha_ctx), \
 	.base = { .cra_name = _name, .cra_driver_name = _driver, \
 		.cra_priority = 300, .cra_blocksize = _block, .cra_module = THIS_MODULE } \
 }
 
-#define ESP_SHA_ALGS(soc) \
+#define ESP_SHA_ALGS(soc, ...) \
 	S31_SHA_ALG("sha1", "sha1-" soc, SHA1_DIGEST_SIZE, SHA1_BLOCK_SIZE, \
 		    s31_sha1_init), \
 	S31_SHA_ALG("sha224", "sha224-" soc, SHA224_DIGEST_SIZE, SHA224_BLOCK_SIZE, \
 		    s31_sha224_init), \
 	S31_SHA_ALG("sha256", "sha256-" soc, SHA256_DIGEST_SIZE, SHA256_BLOCK_SIZE, \
-		    s31_sha256_init), \
+		    s31_sha256_init, __VA_ARGS__), \
 	S31_SHA_ALG("sha384", "sha384-" soc, SHA384_DIGEST_SIZE, SHA384_BLOCK_SIZE, \
 		    s31_sha384_init), \
 	S31_SHA_ALG("sha512", "sha512-" soc, SHA512_DIGEST_SIZE, SHA512_BLOCK_SIZE, \
@@ -560,7 +586,11 @@ static int s31_sha_finup(struct shash_desc *desc, const u8 *data,
 	S31_SHA_ALG("sha512-256", "sha512-256-" soc, SHA256_DIGEST_SIZE, \
 		    SHA512_BLOCK_SIZE, s31_sha512_256_init)
 
-static struct shash_alg s31_sha_algs[] = { ESP_SHA_ALGS("esp32s31") };
+static struct shash_alg s31_sha_algs[] = {
+	ESP_SHA_ALGS("esp32s31",
+		     .export_core = s31_sha256_export_core,
+		     .import_core = s31_sha256_import_core,)
+};
 static struct shash_alg p4_sha_algs[] = { ESP_SHA_ALGS("esp32p4") };
 
 static void s31_be_to_limbs(u32 *dst, unsigned int words, const u8 *src,
